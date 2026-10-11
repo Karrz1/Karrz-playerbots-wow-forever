@@ -1,0 +1,70 @@
+// Boss-relative positioning for raid encounters (FaceAway / StandBehind in RaidEncounters.h). Pure geometry, so the
+// numbers are tested without a world. Angles are radians, orientation as in the core: direction (cos o, sin o).
+//
+// Magmadar (MC): the main tank takes the boss to the far side from the raid, so the boss turns its back on everybody else,
+// and the rest of the raid stands in the sector behind the boss.
+
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+
+namespace Playerbot::Raid::geo {
+
+constexpr float kPi = 3.14159265358979f;
+
+inline float NormalizeAngle(float a)
+{
+    while (a > kPi) a -= 2.0f * kPi;
+    while (a < -kPi) a += 2.0f * kPi;
+    return a;
+}
+
+inline float Bearing(float fromX, float fromY, float toX, float toY) { return std::atan2(toY - fromY, toX - fromX); }
+
+// How far (0..pi) the point lies off the line straight behind the boss. 0 = directly behind, pi = directly in front.
+inline float OffRear(float bossX, float bossY, float bossFacing, float px, float py)
+{
+    return std::fabs(NormalizeAngle(Bearing(bossX, bossY, px, py) - (bossFacing + kPi)));
+}
+
+inline bool InRearSector(float bossX, float bossY, float bossFacing, float px, float py, float halfAngle, float minDist, float maxDist)
+{
+    float const d = std::hypot(px - bossX, py - bossY);
+    return d >= minDist && d <= maxDist && OffRear(bossX, bossY, bossFacing, px, py) <= halfAngle;
+}
+
+// The spot behind the boss a bot walks to: keeps its own side (nearest edge of the sector, pulled in to 60% of the half
+// angle so a bot does not stand on the line and flip every time the boss turns a little) and its distance clamped into
+// [minDist, maxDist]. A bot already inside the sector keeps its bearing.
+inline void RearSpot(float bossX, float bossY, float bossFacing, float px, float py, float halfAngle, float minDist, float maxDist,
+                     float& outX, float& outY)
+{
+    float const rear = bossFacing + kPi;
+    float off = NormalizeAngle(Bearing(bossX, bossY, px, py) - rear);
+    float const edge = halfAngle * 0.6f;
+    if (off > edge) off = edge;
+    if (off < -edge) off = -edge;
+    float const d = std::clamp(std::hypot(px - bossX, py - bossY), minDist, maxDist);
+    outX = bossX + d * std::cos(rear + off);
+    outY = bossY + d * std::sin(rear + off);
+}
+
+// The tank's spot: <reach> yards from the boss on the line from the raid's centre through the boss, so the boss stands between.
+inline void FaceAwaySpot(float bossX, float bossY, float raidX, float raidY, float reach, float& outX, float& outY)
+{
+    float const away = Bearing(raidX, raidY, bossX, bossY);
+    outX = bossX + reach * std::cos(away);
+    outY = bossY + reach * std::sin(away);
+}
+
+// True when the boss is already turned away: the tank (the boss's victim) is on the opposite side of it from the raid's centre,
+// within <tolerance> radians of the straight line.
+inline bool TankOpposesRaid(float bossX, float bossY, float tankX, float tankY, float raidX, float raidY, float tolerance)
+{
+    float const toTank = Bearing(bossX, bossY, tankX, tankY);
+    float const toRaid = Bearing(bossX, bossY, raidX, raidY);
+    return std::fabs(NormalizeAngle(toTank - toRaid)) >= kPi - tolerance;
+}
+
+} // namespace Playerbot::Raid::geo
