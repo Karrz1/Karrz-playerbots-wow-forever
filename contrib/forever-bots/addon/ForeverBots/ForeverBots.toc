@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: Karrz's Player Bots
+## Notes: One-click PlayerbotV2 companions: add a bot of any class and role, call, dismiss and command your bots.
+## Author: Karrz (based on agatho's PlayerbotV2)
+## Version: 0.2.0
+## SavedVariables: ForeverBotsDB
+
+ForeverBots.lua
