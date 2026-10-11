@@ -1,0 +1,1058 @@
+###############################################################################
+# Playerbot V2 — configuration
+#
+# Full schema documented in v2/CONFIG.md. Each key tagged HR-yes (hot-reload via
+# `.playerbot reload`) or HR-no (requires restart).
+#
+# Bootstrap: only the keys load-bearing for the bootstrap commit are listed
+# here. Additional keys land as their subsystems are implemented.
+###############################################################################
+
+# TrinityCore's ConfigMgr::LoadAdditionalFile iterates the first INI section,
+# so this file MUST start with a section header — without it, boost's parser
+# puts keys at the tree root and the merge loop iterates an empty children
+# list, silently dropping every value. The section name itself is not used.
+[playerbot]
+
+#-----------------------------------------------------------------------------
+# Database
+#-----------------------------------------------------------------------------
+
+# Name of the shared playerbot database schema. The module stores all of its
+# bot metadata (names pool, personalities, population targets, talent builds,
+# guild metadata, etc.) here, separate from TrinityCore's character database.
+# Create this schema and apply the SQL under sql/playerbot_v2/ before first
+# boot (see the module README / INSTALL.md). Must match the schema you created.
+Playerbot.SharedDatabase = "playerbot"
+
+#-----------------------------------------------------------------------------
+# Core / threading
+#-----------------------------------------------------------------------------
+
+# Number of AI worker threads. 0 = auto (min(8, hardware_concurrency)).
+# HR-no
+Playerbot.AiWorkerThreads = 0
+
+# Run a separate fleet thread (population, LFG mediator, BG filler, neighborhood
+# populator). When false, fleet logic runs on the world thread.
+# HR-no
+Playerbot.FleetThreadEnabled = 1
+
+# World tick budget for V2, in milliseconds. Bots skip ticks if exceeded.
+# HR-yes
+Playerbot.TickBudgetMs = 10
+
+# #5 Phase 4: parallelize BotSnapshotBuilder::Build across a fixed worker pool,
+# partitioned by Map* (each map's bots build on one worker; tier/group/publish
+# stay world-thread post-barrier). Cuts the snapshot-build wall-clock at scale
+# (skew-limited: a fleet clustered on one continent/BG sees less benefit). This
+# is the operator KILL-SWITCH — set to 0 to fall back to the exact serial path
+# instantly if anything looks wrong at scale. Read every tick (live-flippable
+# via config reload). HR-yes.
+# DEFAULT 1 (ENABLED). The earlier crashes were ABI skew (stale playerbot .obj
+# vs an uncommitted BotAI.h layout change), fixed by a clean recompile; the
+# genuine concurrent-Registry().ai() risk was fixed by pre-resolving the BotAI*.
+# On top of the Cruise tier (~135ms->~70ms), this parallelizes build across Map*.
+PlayerbotV2.ParallelSnapshotBuild = 1
+# Worker count for the snapshot-build pool. 0 = auto (cores-2, clamped [1,24]);
+# the world thread also participates, so effective parallelism is this + 1.
+# Pool is sized once at first use (not hot-reloadable). HR-no.
+PlayerbotV2.SnapshotBuildThreads = 0
+
+#-----------------------------------------------------------------------------
+# Population (defaults; override per realm)
+#-----------------------------------------------------------------------------
+
+# Target concurrent bot count (ambient "world" bots, spread over level bands
+# 10..cap and placed at level-appropriate towns).
+#   0 = OFF: owner bots only (`.bot add` companions). Also turns off the
+#       ambient BG / arena seeding and the BG / LFG queue fill, which
+#       JIT-create bots of their own.
+# Classic 1.60 (Forever) deployment default: 0. World bots on vanilla data
+# are groundwork: they spawn as vanilla races/classes at levels 10-60, get
+# their trained spells, weapon skills, talents, gear, riding at 40/60 and a
+# town in a vanilla zone of their level on Eastern Kingdoms / Kalimdor, but
+# questing / travel on vanilla quest data is not verified yet. To try a
+# small world, use 20-50, and keep Playerbot.Bg.AutoSeed.Matches = 0 unless
+# you want BG rosters (each seeded match creates and logs in a full one).
+# Owner bots (companions) never count toward this target.
+# (Retail fleets ran 2000.)
+# HR-yes
+Playerbot.Population.TotalTarget = 0
+
+# Faction balance: percentage of bots that are Horde.
+# HR-yes
+Playerbot.Population.HordePct = 50
+
+# Distribution shape across level brackets. Drives BotPopulationManager:
+#   MaxHeavy - large fraction at level cap, pyramid below (default; retail-like)
+#   Pyramid  - heavy at low levels, fewer at cap (early-game heavy)
+#   Bell     - gaussian centred at mid-level
+#   Flat     - equal per bracket
+# HR-yes
+Playerbot.Population.Shape = MaxHeavy
+
+# For Shape=MaxHeavy: fraction of total bots that sit at level cap (0..1).
+# HR-yes
+Playerbot.Population.MaxHeavyFactor = 0.40
+
+#-----------------------------------------------------------------------------
+# World bots around real players (proximity spawner, Fleet/WorldBotSpawner)
+#-----------------------------------------------------------------------------
+# Ambient bots that live around the real players, like ike3 / mod-playerbots random bots: they log in near a
+# player at a level that suits the player's zone, quest and fight on their own, and log out again once the
+# player has moved away (or no real player is online). Exclusive with Playerbot.Population.TotalTarget: leave
+# that at 0 to use this mode. Bots below level 10 are not spawned (the starter zones have no navmesh).
+# To test a big population in one place raise MaxBots, BotsPerPlayer, ActivityRadius and SpawnRingMax together.
+# HR-yes (all keys below, re-read every 15 s)
+
+# 0 = off.
+Playerbot.World.Enable = 0
+# Ambient bots online at once, over all players.
+Playerbot.World.MaxBots = 100
+# Target number of bots within ActivityRadius of each real player.
+Playerbot.World.BotsPerPlayer = 25
+# A bot this close (yards, same map) to a real player counts toward that player's target.
+Playerbot.World.ActivityRadius = 300
+
+# Bubble size by where the player is (0 = use BotsPerPlayer): CityBots in a capital or town, ZoneBots in a leveling
+# zone. Bots are placed at quest hubs within ActivityRadius, so a bigger radius spreads a zone crowd over the zone.
+Playerbot.World.CityBots = 0
+Playerbot.World.ZoneBots = 0
+
+# Spawn rate (bots per spawner tick) while the player is in a capital; 0 = SpawnPerTick. Fills a city faster.
+Playerbot.World.CitySpawnPerTick = 0
+# Seconds the bots around a spot stay after the player left it (instance, battleground, hearth, far jump), so a quick
+# trip does not log out and rebuild the whole crowd. 0 = off.
+Playerbot.World.ZoneGraceSec = 300
+# Persistent residents. 0 = off (a bot is created and placed when a player arrives). > 0: the pool is a fixed roster; a bot
+# that no player is near is logged out and sleeps at its saved spot (offline, no memory, no AI). When a player comes
+# within this many yards, sleeping bots standing there (60 y or farther from him) log in where they are. Where nobody
+# sleeps yet, new residents are placed as before and stay when logged out. Keep it near or below DespawnRadius.
+# The [world] log line reports roster/sleeping/awake, process CPU and RAM per awake bot.
+Playerbot.World.WakeRadius = 0
+# A bot farther than this from every real player is logged out (once placed for PlacedGraceSec, out of combat,
+# not grouped, not in an instance or battleground). Never below 1.1 x ActivityRadius.
+# Default: 1.5 x ActivityRadius.
+# Playerbot.World.DespawnRadius = 450
+# New bots are placed this far (yards) from the player, out of sight when a spot can be found.
+# SpawnRingMax is capped at 0.9 x ActivityRadius.
+Playerbot.World.SpawnRingMin = 110
+Playerbot.World.SpawnRingMax = 200
+# How often the spawner runs (ms), bots logged in per run, bots logged out per run.
+Playerbot.World.TickMs = 1000
+Playerbot.World.SpawnPerTick = 2
+Playerbot.World.DespawnPerTick = 5
+# A freshly placed bot is not logged out for this long (s).
+Playerbot.World.PlacedGraceSec = 30
+# Share (%) of bots placed in a town (capital) that stay there for 20-40 min, using trainers, AH, bank and vendors.
+Playerbot.World.TownPct = 70
+# World-wide filler: 1 = the MaxBots budget not needed for the bubble around players is filled with bots all over
+# the world (pool bots log in where they last were; new ones are set up and sent to a leveling town of their
+# level). Far bots run on the cheap activity tiers. They are only logged out (farthest first) to make room for the
+# bubble around a player. 0 = bots exist only near players. Needs Enable = 1.
+Playerbot.World.GlobalFill = 0
+# Filler bots logged in or created per run.
+Playerbot.World.GlobalPerTick = 3
+# 1 = the filler only logs in pool bots that were saved inside a quest hub or town, so bots share grids and map memory
+# instead of loading a corner of the world each. New filler bots are sent to leveling towns by the setup pipeline anyway.
+Playerbot.World.FillerHubOnly = 1
+# Process memory budget (MB). Over it the world-wide filler stops adding bots (logged once); 15% over it the bubble
+# around players waits too. Bots already online stay. 0 = no limit. Stage B/C: 12000 on a 31 GB PC that also runs a client.
+Playerbot.World.RssBudgetMb = 0
+# Bot level limits.
+Playerbot.World.MinLevel = 10
+Playerbot.World.MaxLevel = 60
+# Percentage of bots of the player's own faction (the rest is the opposing faction).
+Playerbot.World.FriendlyPct = 80
+# Ambient characters allowed to exist (online or offline). Offline ones are reused before new ones are created.
+# Default: the larger of 4 x MaxBots and 200.
+# Playerbot.World.PoolMax = 200
+# The roster of sleeping residents is built up to PoolMax without waiting for a player to walk somewhere. 1 = seed: one new
+# resident at a time (level spread, both factions) is created, geared by the setup pipeline, sent to a zone hub for its level,
+# and logged out there, so it sleeps at its saved position until WakeRadius brings it in. Stops at PoolMax. 0 = residents
+# are only created where a player arrives.
+Playerbot.World.SeedRoster = 0
+# Seeded residents being set up at the same time.
+Playerbot.World.SeedInFlight = 8
+# Classic 1.60 (Skyborne): share of the seeded residents (SeedRoster = 1) that are level 1-9 Skyborne who sleep on Zephras Isle, the
+# Skyborne start, so a player who arrives there finds quests being done. Around a player on Zephras the spawner always keeps
+# Skyborne bots of level 1-9 (MinLevel does not apply there); a Skyborne bot that reaches level 10 on the island is moved to a
+# leveling town of the vanilla world, because the island has no exit. 0 = no seeded islanders.
+Playerbot.World.SkyborneSeedPct = 5
+
+#-----------------------------------------------------------------------------
+# Player interaction
+#-----------------------------------------------------------------------------
+
+# Auto-accept invites: none | friends_or_higher | guild_or_higher | anyone
+# HR-yes
+Playerbot.Interact.AutoAcceptInvites = friends_or_higher
+
+# Bot relinquishes leadership on player join.
+# HR-yes
+Playerbot.Interact.AutoLeaderHandover = 1
+
+# Whisper command prefix.
+# HR-yes
+Playerbot.Interact.CommandPrefix = !
+
+#-----------------------------------------------------------------------------
+# BG / Arena auto-seed and coordination
+#-----------------------------------------------------------------------------
+
+# Battleground policy (Karrz, 2026-10-07): bots never queue or fight bot-vs-bot on their own. Bots join a
+# battleground only when a real player queues for it: the queue fill supplies both sides so the match starts,
+# tops it up while the player is in it, and the bots go back to the pool when it ends. The two switches below
+# (AutoSeed.Matches, AutoJoin) are therefore off; they remain for bot-only test matches.
+
+# Number of bot-only Battleground matches to keep seeded so queues pop without
+# real players. 0 disables autonomous BG seeding.
+Playerbot.Bg.AutoSeed.Matches = 0
+
+# Also auto-seed Arena matches (bot-only). 0 = off.
+Playerbot.Bg.AutoSeed.Arena = 0
+
+# Force a specific Arena bracket type for auto-seeding (0 = let the system
+# choose; otherwise an arena type id, e.g. 2 = 2v2, 3 = 3v3).
+Playerbot.Bg.AutoSeed.ForceType = 0
+
+# Ambient BG auto-join: free, ungrouped, level-eligible bots queue for battlegrounds on
+# their own, like players do ([bg_queue] log lines). Each eligible bot rolls
+# Chance percent per minute; the whole fleet never has more than MaxQueued ambient bots
+# queued, queues are balanced between the factions per BG type, and a bot waits
+# CooldownMin after a match before queueing again. It queues only: matches form when both
+# sides reach the BG minimum, so a tiny fleet simply sits in the queue (a bot never leaves
+# the world for it until the invite pops). Owner / companion bots, grouped bots, bots in
+# instances, dead, in combat or deserting never auto-join. Read live (HR-yes).
+Playerbot.Bg.AutoJoin = 0
+Playerbot.Bg.AutoJoin.Chance = 3
+Playerbot.Bg.AutoJoin.MaxQueued = 24
+Playerbot.Bg.AutoJoin.MaxPerTick = 2
+Playerbot.Bg.AutoJoin.CooldownMin = 20
+Playerbot.Bg.AutoJoin.QueueTimeoutMin = 25
+Playerbot.Bg.AutoJoin.MinLevel = 10
+# Comma list of BattlemasterList ids the ambient bots may queue for (empty = the
+# same set the auto-seed rotates: 2,3,1 = WSG, AB, AV).
+Playerbot.Bg.AutoJoin.Types =
+
+# When a real player is queued and the matching running battleground is full on the player's
+# team, the lowest-scoring bot of that team (never a flag carrier, never in combat) leaves
+# to make room, so humans never wait behind bots ([bg_queue] MakeRoom log lines).
+Playerbot.Bg.MakeRoomForPlayers = 1
+
+# Needs Playerbot.Population.TotalTarget > 0 or Playerbot.World.Enable = 1 (BG seed and queue fill).
+# Comma-separated BattlemasterList ids the seeder rotates through. Empty =
+# built-in order (Forever: 2 WSG, 3 AB, 1 AV); ids with
+# no battleground_template row are skipped.
+Playerbot.Bg.AutoSeed.Types =
+
+# Enable the BG team coordinator (objective assignment: caps/defense/escort).
+Playerbot.Bg.Coordinator.Enable = 1
+
+# Enable the PvE group coordinator (tank/heal/kick/soak duty planning in
+# dungeons and raids).
+Playerbot.Pve.Coordinator.Enable = 1
+
+# Enable the raid brain (encounter rules for Molten Core, Onyxia, Blackwing
+# Lair, AQ40 and Naxxramas: tank assignment, positioning, dispels, mechanics).
+# 0 leaves bots in raids on their generic group behaviour.
+Playerbot.Raid.Enable = 1
+
+# A resurrection a bot casts on you is accepted for you after 3 s without an answer (the 70205 client shows no accept popup).
+Playerbot.Raid.AutoAcceptOwnerRez = 1
+
+# Threat multiplier for companion tank bots: a grouped bot owned by a player
+# whose current duty is tank (PvE coordinator tank duty in dungeons/raids,
+# else its role, incl. a /setrole override) generates this many times the
+# normal threat, so the owner and DPS bots rarely pull aggro off it. Applies
+# to the bot's own generated threat only (not its pet's); taunts, scripted
+# threat and threat reductions are unchanged. Clamped to [1.0, 10.0];
+# 1.0 disables. Read every bot tick (HR-yes).
+Playerbot.TankThreatMultiplier = 3.0
+
+# Bot pacing: how fast bots cast, by situation. Values are PERCENT of the normal cast
+# time and global cooldown (100 = normal, 80 = 25% faster, 115 = 15% slower). Applied
+# core-side to the bot only (no aura, invisible to the client); a cast never drops
+# below 250 ms and the GCD never below 750 ms. Context is picked per bot, highest
+# priority first: Battleground (incl. arena) > WorldPvp (the bot is in combat with a
+# hostile player outside a BG, or is under attack by one) > Raid map > Dungeon map >
+# World. Each bot also gets a constant skill offset of +-PerBotVariancePct derived from
+# its guid, so the same priest is always a touch slower than the warlock. The final
+# value is clamped to [MinPct, MaxPct]. Changes are logged as [cast_speed].
+#   Enable  0 (default) = all bots cast at normal speed (any multiplier already set is reset to 1.0)
+Playerbot.Cast.Enable = 0
+Playerbot.Cast.RaidSpeedPct = 80
+Playerbot.Cast.DungeonSpeedPct = 90
+Playerbot.Cast.WorldSpeedPct = 100
+Playerbot.Cast.BgSpeedPct = 115
+Playerbot.Cast.WorldPvpSpeedPct = 115
+# (PerBotVariancePct only applies when Enable = 1)
+Playerbot.Cast.PerBotVariancePct = 8
+Playerbot.Cast.MinPct = 70
+Playerbot.Cast.MaxPct = 140
+
+# Decision pacing (Karrz's VMaNGOS model: GlobalCooldown 600 + PvpReactionDelay 1500, no
+# cast-time or haste change).
+#   DecisionDelayMs      Ceiling on how long a bot waits to decide again after a cast
+#                        (100..5000). The shipped AI tick periods are already faster
+#                        (Combat 100 ms, casting bots Active 150 ms; the server GCD is the
+#                        real limiter), so nothing is slowed and this key has no effect today.
+#   PvpReactionDelayMs   Floor on a bot's AI tick / snapshot period while it is in PvP: a
+#                        battleground or arena, an active duel, or in combat with players.
+#                        0..3000, 0 = off. Never applied to raid/dungeon/world PvE. Dead or
+#                        ghost bots and bots under 35% HP bypass it (healing, defensives, ress).
+#                        Replaces the old Playerbot.Reaction.* StartAttack holds, now removed.
+Playerbot.Pacing.DecisionDelayMs = 600
+Playerbot.Pacing.PvpReactionDelayMs = 700
+
+# Threat of non-tank bots grouped with a human, inside a dungeon or raid (not battlegrounds),
+# 0.3..1.5; 1.0 = off. Karrz's VMaNGOS value is 0.8 (tank 1.6; see Playerbot.TankThreatMultiplier).
+Playerbot.DpsThreatMultiplier = 1.0
+
+# Classic raids: once a boss of a resistance instance is engaged (Molten Core,
+# Blackwing Lair, Onyxia: fire), bots that carry a Greater Fire Protection
+# Potion drink it (read by the PvE coordinator). 0 = off.
+Playerbot.Raid.ResistPotions = 0
+
+# Behaviour switches. 1 = on (the current behaviour), 0 = that behaviour falls back to the
+# previous simple path. Read when the config is loaded (a reload picks them up); each can be
+# turned off without a rebuild if a behaviour misbehaves.
+#
+#   OwnerFollowHold   the owner's "follow" order suspends the dungeon autopilot until he hands
+#                     the fight back, and a companion party (not a raid group) in a raid map
+#                     never runs the raid autopilot. Off: only the 30 s manual-mode window.
+#   Fallback          the "fallback" / "fall back" / "back" and "rally here" orders (run to the
+#                     rally point, re-form). Off: they are not recognised as orders.
+#   PullBack          the "pull back" / "pullback" / "pull and back" order: the main tank opens on
+#                     the selected (or skull) mob from range, runs back to the rally point (else
+#                     where it stood) with the mob following, and tanks it there. Off: not an order.
+#   Formation         the owner's "formation circle|arrow|line|none" and "spacing tight|close|spread"
+#                     orders: bots follow a slot around the owner out of combat, and the spacing
+#                     preset scales the raid ranged / pre-pull arc spacing. Off: plain follow, the
+#                     default (close) spacing.
+#   OwnerMainTank     the owner's "set main tank <name>" order (sets the raid's Main Tank flag).
+#   HealClaims        healers' in-flight heal dedupe, HoT claims and preheal rules. Off: each
+#                     healer picks its target from current health only.
+#   CastFacing        casters turn to face their target before a facing-required cast (core
+#                     side: read once at first use, needs a restart). Off: the old facing call.
+#   GroundSnap        move_to destinations get their ground height searched from a few yards above
+#                     the computed Z (core side: read once, needs a restart), so a formation / spread
+#                     slot beside a rock or ledge does not put the bot inside the collision mesh.
+#                     Off: the old snap from the hint. Logs '[ground] <bot> <where> z hint=.. ground=..'.
+#   ReFace            a standing bot in combat turns back to its victim when the victim moved
+#                     or the bot was walked off-bearing (melee swing needs +-60 degrees, casts +-90),
+#                     at most every 250 ms, at once after a move ends. Never turns a moving, casting
+#                     or controlled bot. Off: only the cast / attack call turns it.
+#   AvoidCircles      raid avoid circles / stay-near areas from the raid plan steer movement.
+#   PackStop          the dungeon tank stops at an unpulled pack, takes the pull spot / pulls
+#                     from range, and raid stand points avoid an idle pack's aggro reach.
+#   RaidSpacing       raid pre-pull / converge ranged spacing arcs and the rocks floor logic.
+#   SpreadOut         melee DPS stand on their own spot round the back / sides of the victim and ranged / healers
+#                     get a stable per-bot bearing / distance jitter, so a raid does not pile on one spot.
+#   LooseMobHold      DPS bots hold fire on a raid elite that is loose on a party member.
+#   RaidBuffHold      the tank's 30 s group-buff hold and the 120 s hold for members still
+#                     outside the instance, before a pull / advance. Off: neither holds.
+#   DungeonLoot       loot-roll votes and corpse looting between pulls of a dungeon run.
+#   WarriorStanceDance  protection warrior Battle Stance dance (Mocking Blow, Thunder Clap).
+#   DungeonTactics    Classic dungeons: the generated mob tables (Bot/Dungeon/Tactics, from VMaNGOS data) add their kill order, mandatory
+#                     interrupts, crowd control targets and dispel priorities to the dungeon advice. Off: only the hand-written scripts.
+#   DistanceOrder     the owner's "distance <1..20>" / "follow distance <n>" order (/fb Distance stepper): sets how far
+#                     bots follow him and the formation spacing yards, together. Off: the order is ignored.
+#   TankMarkers       the owner's "tank <name> <marker>" orders (/fb tank panel): a tank assigned a raid marker
+#                     holds the mob carrying it, overriding the automatic per-tank split. Off: the orders are
+#                     ignored and the plan splits mobs automatically.
+Playerbot.Behavior.OwnerFollowHold = 1
+Playerbot.Behavior.Fallback = 1
+Playerbot.Behavior.PullBack = 1
+#   TankRangedWeapon  warriors and rogues (the only vanilla melee classes with a ranged attack) are kept in a thrown
+#                     weapon of their level in the ranged slot, with a stack of it (thrown weapons are their own ammo),
+#                     so the pull-back opener (Throw) lands instead of failing NO_AMMO. On regear, companion add and
+#                     the periodic gear pass. Off: the generator's normal ranged pick (bow/gun/thrown) stands.
+Playerbot.Behavior.TankRangedWeapon = 1
+#   RaidGear          a bot at the level cap (60) is geared for raiding: pre-raid best-in-slot style rare and epic
+#                     pieces (required level 50+, item level up to 71, never PvP) picked by role stat weights (tank:
+#                     armor / stamina / defense; healer: healing power / mp5; caster: spell damage / hit / crit; melee:
+#                     attack power / strength / agility / hit / crit), varied per bot among the best few. `.bot regear`
+#                     and the gear pass also upgrade worn pieces that score 10%+ higher. Off: the level-scaled
+#                     generic pick (item level 63 target) stands.
+Playerbot.Behavior.RaidGear = 1
+#   AcceptOwnerTrade  a companion accepts a trade its OWNER opens (gear, money gifts) once the owner has accepted; the bot
+#                     never offers anything, so an owner cannot take items back through the trade window. Items that are
+#                     upgrades for its role are worn by the auto-equip rules, the rest stays in the bags. Anyone else's
+#                     trade is still declined. Off: every trade is declined.
+Playerbot.Behavior.AcceptOwnerTrade = 1
+
+#   Playerbot.Gear.MaxTier       the best raid tier RaidGear may pick, as an effective item level ceiling (approximate
+#                                Classic boundaries): 0 = pre-raid / dungeon gear only (item level 63: Dire Maul, BRS,
+#                                Scholomance, Stratholme, UBRS), 1 = Molten Core / Onyxia (76), 2 = Blackwing Lair (83),
+#                                2.5 = Ahn'Qiraj 40 (88), 3 = Naxxramas (92). Default 1. Approximate, not read from item data.
+#                                Required level 50+ and rare / epic quality still apply; never PvP items.
+#   Playerbot.Gear.RaidIlvlCap   explicit item level ceiling; when set above 0 it overrides MaxTier. Default 0 (use MaxTier).
+Playerbot.Gear.MaxTier = 1
+Playerbot.Gear.RaidIlvlCap = 0
+#   Playerbot.World.Gear.MaxTier world / ambient / BG-fill bots (the ones nobody owns): the same tier scale as Gear.MaxTier,
+#                                default 1 (item level 76). Owned and raid bots keep Playerbot.Gear.MaxTier. A world bot wearing
+#                                a piece above this cap is re-geared down to it the next time the gear pass runs for it.
+#   Playerbot.World.Gear.EpicPercent  the share (0-100) of a world bot's gear slots that may hold an epic, decided per bot and
+#                                slot; the rest is blue (rare) or lower, like the players of the era. Default 15.
+Playerbot.World.Gear.MaxTier = 1
+Playerbot.World.Gear.EpicPercent = 15
+#   Playerbot.Gear.Owned.Enable      companions (bots a player owns) below the level cap wear the best quest and dungeon gear for their
+#                                level: green and blue pieces up to Owned.IlvlBand item levels above the bot's level, ranked by role
+#                                stat weights (tank: armor / stamina / defense; healer: healing / intellect / spirit; melee: strength /
+#                                agility; caster: spell power / intellect), a blue counting a little more. They are regeared on level-up and when
+#                                they enter an instance, and a worn piece is replaced only by a clear (10%) upgrade. Default 1.
+#   Playerbot.Gear.Owned.IlvlBand    default 12.
+#   Playerbot.Gear.Owned.MatchOwner  a companion at the level cap never wears gear above its owner's: the item level ceiling is the
+#                                owner's average equipped item level + Owned.OwnerSlack, at least pre-raid gear (63), at most the
+#                                Playerbot.Gear.MaxTier ceiling. Owner offline or unknown: the MaxTier ceiling. Default 1.
+#   Playerbot.Gear.Owned.OwnerSlack  default 6.
+#                                World, ambient and battleground bots are not affected: they keep Playerbot.World.Gear.*.
+Playerbot.Gear.Owned.Enable = 1
+Playerbot.Gear.Owned.IlvlBand = 12
+Playerbot.Gear.Owned.MatchOwner = 1
+Playerbot.Gear.Owned.OwnerSlack = 6
+#   Playerbot.OwnedGear.AllowedModes  the gear modes players may choose for the companions they own (whisper / group word "gear t3",
+#                                `.bot gear t3`): a comma separated list of match, best, bis, t1, t2, t3. Default (empty): all.
+#                                match  the default: best green / blue for the bot's level; at 60 up to the owner's own gear level.
+#                                bis    at 60: best in slot, the highest scoring raid piece for the role per slot up to Naxxramas item level.
+#                                best   at 60: the full Playerbot.Gear.MaxTier ceiling whatever the owner wears.
+#                                t1 / t2 / t3  at 60: the class tier set (Molten Core / Blackwing Lair / Naxxramas) plus raid pieces up
+#                                to that tier's item level for the other slots. Below 60 they act as match.
+#                                A mode not listed is refused ("this server does not allow gear mode t3"); match is always allowed.
+#                                The choice is kept per owner account (table playerbot_v2_owner_gear). World and battleground bots
+#                                ignore it. Example for a server that keeps raid tiers to be earned: AllowedModes = "match,best"
+Playerbot.OwnedGear.AllowedModes = ""
+#   Scenario.DummyEntry   the creature the damage_parity scenarios hit (`.playerbot scenario run damage_parity_<class>`, finisher_sweep_<class>,
+#                         talent_audit_<class>): a creature_template entry that can be attacked and does nothing; the runner makes it level 63,
+#                         3731 armor, 2 billion health. 0 (default): the first "Training Dummy" / "Target Dummy" template without a script.
+Playerbot.Scenario.DummyEntry = 0
+#   AmmoSupply        a bot with a bow, crossbow or gun equipped (hunters; warriors / rogues if the generator gives
+#                     them one) is handed the best arrows / bullets its level allows, up to 1000, and the ammo slot
+#                     is pointed at them, whenever the stock drops under 30% (1000 = 300). Out of combat, bots only,
+#                     5 min between tries. Hunter pet food is untouched. Off: nothing restocks ammo.
+Playerbot.Behavior.AmmoSupply = 1
+Playerbot.Behavior.Formation = 1
+Playerbot.Behavior.DistanceOrder = 1
+Playerbot.Behavior.OwnerMainTank = 1
+Playerbot.Behavior.HealClaims = 1
+Playerbot.Behavior.CastFacing = 1
+Playerbot.Behavior.GroundSnap = 1
+Playerbot.Behavior.ReFace = 1
+Playerbot.Behavior.AvoidCircles = 1
+Playerbot.Behavior.PackStop = 1
+Playerbot.Behavior.RaidSpacing = 1
+Playerbot.Behavior.SpreadOut = 1
+Playerbot.Behavior.LooseMobHold = 1
+Playerbot.Behavior.RaidBuffHold = 1
+Playerbot.Behavior.DungeonLoot = 1
+Playerbot.Behavior.WarriorStanceDance = 1
+Playerbot.Behavior.DungeonTactics = 1
+#   BotWhisperable    name-query / realm fields of a bot are filled like a real login's, the whisper reply path
+#                     answers any player, and a '[namequery]' line logs bnet id, realm address and guid for the bot.
+#   WorldBotSayReply  world bots (not companions) sometimes answer a real player's /say or /yell greeting, short
+#                     question or their name: within 25 yd, 60 s per bot, 8 s global, 1-4 s delay, '[say_reply]' log.
+Playerbot.Behavior.BotWhisperable = 1
+Playerbot.Behavior.WorldBotSayReply = 1
+#   InstanceGroupCap  OFF by default (an owner may have as many companions out as they like, up to the 40-man raid
+#                     group limit; Karrz 2026-10-08). Set 1 to cap: inside an instance `.bot add`, `.bot call` and the addon buttons stop once the owner has
+#                     as many companions out as the map holds, or the group (human included) is full (5 dungeon,
+#                     10/20/40 raid, from the map data; fallback 5 / 40). The owner is warned once when a larger
+#                     group enters a smaller instance. Outside an instance the OpenWorldGroupCap below applies.
+Playerbot.Behavior.InstanceGroupCap = 0
+#   OpenWorldGroupCap outside an instance (open world) an owner has at most this many of their own companions out
+#                     (`.bot add`, `.bot call`, saved roster, addon buttons, relog). Default 5. More bots only by
+#                     inviting world bots, which are not counted; the group becomes a raid when it needs to. A
+#                     companion above the cap (called inside an instance) is dismissed 10 s after the owner stands
+#                     outside: grouped ones are kept first. Needs InstanceGroupCap = 1. Battleground and arena maps
+#                     are not capped by this. Range 1-40.
+Playerbot.Behavior.OpenWorldGroupCap = 5
+#   BgHumanPriority   a human queueing for a battleground never opens a second instance while a running one can
+#                     make room: a bot leaves it for the human, and a bots-only battleground keeps playing to its
+#                     normal end after the last human leaves ([bg_queue] log lines).
+Playerbot.Behavior.BgHumanPriority = 1
+Playerbot.Behavior.TankMarkers = 1
+#   (TankMarkers also covers the owner's raid icons on bots: an icon on a tank bot = it tanks the mob with the same
+#   icon, on a DPS bot = it kills that mob first; chat "rti <icons>" sets the same per bot. With no icons the raid
+#   kills the main tank's target.)
+#   MarkCc            an icon on a caster bot (mage, warlock, priest, hunter, rogue, druid, paladin) and the same icon on a
+#                     mob of a type its crowd control holds: the bot crowd-controls the mob (recasts when it breaks) until
+#                     the owner turns the mob's icon to skull. "rti cc <icons>" sets the icon list per bot.
+Playerbot.Behavior.MarkCc = 1
+#   DungeonFlow       5-man pull discipline: a non-tank bot never opens on a mob nobody fights yet while a living tank
+#                     is in the group (the pull is the tank's / the owner's call); the dungeon tank waits (no advance,
+#                     no pull) while a human group member is lagging more than 70 y behind it; a healer in a
+#                     5-man stays out of melee like a raid healer. Off: the old behaviour.
+Playerbot.Behavior.DungeonFlow = 1
+#   DungeonAutopilot  (needs DungeonFlow) 1 = the dungeon autopilot (tank advance / pull / boss navigation) runs on its own only
+#                     in a group without a human leader. While a human leads a 5-man (alive, same map, within 80 y; 30 s of
+#                     grace after he is lost) the bots follow him and hold; each owner order (attack / pull / assist / tank /
+#                     resume / run / go) and his own fights open a short window (15 s / 10 s) in which the tank pulls and
+#                     advances. 0 = the autopilot always runs, with a human too (the old behaviour).
+Playerbot.Behavior.DungeonAutopilot = 1
+#   MarksNeedOrder    raid icons only PLAN: putting an icon on a mob (or an icon on a bot) never starts a fight. Bots
+#                     engage a marked mob that nobody fights yet only after the owner orders it (attack / pull /
+#                     pull back / pull rti / focus); then the tank pulls its mob, crowd-control bots control theirs and
+#                     the DPS wait for the skull as usual. A marked mob already in combat with the group is handled
+#                     as before. Off: a human leader's skull / cross (and an icon-driven crowd control) starts the pull.
+Playerbot.Behavior.MarksNeedOrder = 1
+#   PullRecover       between pulls of a grouped instance every mana user (not only healers) drinks below 85% mana;
+#                     the tank's pull gate waits for it, at most 60 s per hold (a bot with no drink never freezes
+#                     the raid). Off: only healers drink for the pull.
+#   LootPolicy        loot etiquette with a human in the group: pass bind-on-pickup the human could use, greed at
+#                     most bind-on-equip the human could use, need only a real upgrade. Off: bots roll on their own.
+#   WipeReleaseWait   raid bots wait a per-bot random 10-40 s for a resurrect (only while a living healer is in
+#                     reach) before releasing, and may say a wipe line when 80% of the raid is dead.
+#   ReadyCheckInfo    a bot answers a ready check with real information (low health / mana / broken gear = not
+#                     ready, with a chat line saying why). Off: always ready.
+Playerbot.Behavior.PullRecover = 1
+Playerbot.Behavior.LootPolicy = 1
+Playerbot.Behavior.WipeReleaseWait = 1
+Playerbot.Behavior.ReadyCheckInfo = 1
+#   PurgeDuty         in a dungeon / raid group one elected bot (a shaman with Purge, else a priest with Dispel Magic;
+#                     a healing priest only outside an emergency) strips Magic buffs from an elite / boss engaged with
+#                     the group. Off: nobody purges.
+#   RangedSlow        a hunter whose mob is chasing it (not a boss) slows it with Concussive Shot, and a mage with Cold
+#                     Snap resets a spent Ice Block when low. Off: neither.
+Playerbot.Behavior.PurgeDuty = 1
+Playerbot.Behavior.RangedSlow = 1
+#   Ike3Commands      the owner's ike3-style chat commands: "@skull|@star|... <order>" (only the bots holding that icon or
+#                     targeting the marked mob), "@tank|@healer|@dps|@ranged|@melee|@<class> <order>", "pull rti",
+#                     "max dps" (cooldowns on every fight, no mana saving), "save mana" (healers keep to efficient heals),
+#                     "normal" (clears both), "rti raid" (roster / mark report). Off: none of these are parsed.
+Playerbot.Behavior.Ike3Commands = 1
+#   OwnerCommands     the owner's plain-language order set, by whisper to one bot or as a bare party / raid line: "quests",
+#                     "accept [all]", "drop <quest>", "turn in", "share", "loot" / "loot all", "help", "who", "gear",
+#                     "sell grey", "repair", "summon" (with its combat / instance refusals), "passive" / "aggressive" /
+#                     "defensive". Off: none of these new words is parsed (the older verbs keep working).
+Playerbot.Behavior.OwnerCommands = 1
+#   Fidget            a bot standing idle out of combat (not mounted, nothing hostile near, no group fight) occasionally
+#                     fidgets like a person: a jump, a short emote, a dance or a sit, every 20-90 s (random per bot).
+#                     Off: bots stand perfectly still.
+Playerbot.Behavior.Fidget = 1
+#   SoloFlee          a solo open-world bot (no group, not in an instance or battleground) losing a fight (HP under 30%,
+#                     35% for casters / hunters / rogues, 25% for melee; the mob not nearly dead) uses its escape tools
+#                     (Disengage, Frost Nova + Blink, Fade / Psychic Scream, Death Coil, Vanish / Sprint, Intimidating
+#                     Shout, Barkskin) and runs from the attackers toward a town NPC, quest hub or away from them, then
+#                     rests once they lose it. Off: a bot fights to the death.
+Playerbot.Behavior.SoloFlee = 1
+#   DruidHealForm     a Restoration druid in a shapeshift form (Cat / Bear / Dire Bear / Moonkin / Travel / Aquatic)
+#                     cancels it in combat or when a party member needs a heal, so the next tick's heal lands instead
+#                     of failing NOT_SHAPESHIFT; feral druids in a wrong form (Cat spec in Bear, Travel ...) cancel it
+#                     before casting their own. Off: a druid never cancels a form in combat.
+Playerbot.Behavior.DruidHealForm = 1
+#   PullDiscipline    an open-world bot looking for a mob to grind pulls ONE isolated mob at a time when one exists (no
+#                     other hostile within 12 yd of it), and a mana user does not start a new pull below 35% mana.
+#                     Off: nearest mob, any mana.
+Playerbot.Behavior.PullDiscipline = 1
+#   PartyBanter       companions (a bot grouped with its owner) now and then say a short lowercase line in party chat on
+#                     a ready check they pass ("ready"), a dungeon wipe ("my bad", "wp"), being resurrected ("ty"), their
+#                     own death ("ouch") and a boss kill ("gg"): one bot per 90 s, one line per group per 20 s, about 1
+#                     trigger in 3. Never in a group over 15, with Playerbot.Chatter.Enabled = 0 or a Silent / Terse bot.
+#   SocialEmotes      the same boss kill makes a nearby companion bow or cheer, a level-up makes the bot cheer, and a
+#                     world bot waves back when a player within 12 yd says hi / hello (60 s per bot).
+#   PoliteWorldBots   a world bot (no owner) answers a real player's interaction like a person: a trade request is
+#                     cancelled with "sorry, nothing to trade", a group invite is declined with a short whisper unless the
+#                     bot is free to group, a duel from a stranger is accepted about one time in three when the levels
+#                     are within 5 and nothing is fighting, otherwise declined with a whisper. Off: silent decline.
+Playerbot.Behavior.PartyBanter = 1
+Playerbot.Behavior.SocialEmotes = 1
+Playerbot.Behavior.PoliteWorldBots = 1
+#   QuestAccept       a companion (a bot grouped with its owner) quests with him like a party member: it accepts a quest
+#                     its group shares with it, and when its owner takes a quest from an NPC beside it, it walks up to the
+#                     same NPC and takes the quest too. Off: shared quests are not auto-accepted, no follow-the-owner accept.
+#   QuestShare        a companion shares its own open quests with the party once (3 at most per pass, 90 s apart), only
+#                     ones its owner does not have and could take. Off: no auto-share.
+#   QuestTurnIn       a companion with a completed quest turns it in at the NPC its owner is standing at (reward picked by
+#                     the class item scorer). Off: only the owner's "turn in" order hands a quest in.
+#   QuestLoot         a companion clicks quest chests / props / nodes its own open quest objectives need while they lie
+#                     near its owner (never a long detour, never one its owner is about to click himself).
+Playerbot.Behavior.QuestAccept = 1
+Playerbot.Behavior.QuestShare = 1
+Playerbot.Behavior.QuestTurnIn = 1
+Playerbot.Behavior.QuestLoot = 1
+
+#-----------------------------------------------------------------------------
+# Housing
+#-----------------------------------------------------------------------------
+
+# Master switch for bot housing participation.
+# HR-yes
+Playerbot.Housing.Enabled = 1
+
+# Per-neighborhood bot residency target percent of capacity.
+# HR-yes
+Playerbot.Housing.NeighborhoodTargetOccupancy = 60
+
+# Plot purchase eligibility: strict | lenient (DEV ONLY).
+# Production must be `strict` per REQUIREMENTS.md §1.1 #7.
+# HR-no
+Playerbot.Housing.PlotPurchaseEligibilityCheck = strict
+
+#-----------------------------------------------------------------------------
+# Diagnostics
+#-----------------------------------------------------------------------------
+
+# TCP port for health endpoint. 0 = disabled.
+# HR-no
+Playerbot.Diag.HealthEndpointPort = 0
+
+# Outgoing packet accounting for human (non-bot) sessions. Every 10 s each
+# logged-in player gets one INFO line on the playerbot.v2 logger:
+#   [netstat] <name> 10s: total N pkts / B bytes (R pkt/s); top: SMSG_X xN (B bytes), ...;
+#   update-values K objs / B bytes, top: <source> xN (B bytes), ...
+# (top 10 opcodes by count, top 5 SMSG_UPDATE_OBJECT value-update sources by bytes).
+# Read once when a session is created; costs two relaxed atomic adds per packet.
+# HR-no
+Playerbot.NetStat.Enable = 1
+
+# Logging level: error | warn | info | debug | trace
+# HR-yes
+Playerbot.Log.Level = info
+
+#-----------------------------------------------------------------------------
+# V2 lifecycle
+#-----------------------------------------------------------------------------
+
+# When enabled, on the first world tick after Module::Init the BotSessionMgr
+# submits a headless login for every marked-as-bot character not already
+# in-world. Default off so a shared dev server doesn't surprise-spawn N bots
+# on every restart. Useful for "headless test farm" setups.
+# HR-no
+Playerbot.V2.AutoResumeOnBoot = 0
+
+# Cap on the auto-resume batch (also the default cap used by `.playerbot
+# loginall` when no count argument is given). Bounds the in-flight login
+# query holders to avoid flooding the character DB async pool on boot.
+# HR-no
+Playerbot.V2.AutoResumeCap = 100
+
+# Auto-spawn-on-boot target. If the marked-bot count is below this number
+# after AutoResume runs, the module batch-creates the shortfall via
+# BotComposition (Blizzlike random race/class/gender/name) on a pool of
+# PBV2_NNNN bot accounts (10 chars/account, auto-created by BotAccountMgr).
+# Hard cap 200 per boot — to grow a bigger fleet, repeat `.playerbot spawn`.
+# Default 0 = disabled (the test workflow stays purely GM-driven).
+# HR-no
+Playerbot.V2.AutoSpawnOnBoot = 0
+
+# Per-bot personality variance. When 1, each bot's Aggression / RiskTolerance
+# / Verbosity / etc are picked deterministically from a per-bot seed
+# (RandomPersonality(SeedForBot(id))) so a fleet looks like a Blizzlike player
+# population — most Normal across the board, with a long tail of Passive /
+# Aggressive / Cautious / Reckless / Roleplay etc. Same bot ID always rolls
+# the same personality across server restarts.
+#
+# When 0, every bot uses DefaultPersonality (all Normal). Set to 0 for
+# predictable testing where personality variance would confound results
+# (e.g. when measuring engage / wander timing for a single bot).
+#
+# Per-bot inspection: /personality whisper to a bot dumps its current values.
+# HR-no
+Playerbot.V2.RandomPersonality = 1
+
+# Per-bot ARCHETYPE assignment (#4A). Personality is HOW a bot plays;
+# Archetype is WHAT it does + WHEN it intends to be online. When 1, each bot
+# is given a deterministic weighted-random play archetype on login —
+# CasualSolo / HardcoreRaider / SocialGuildie / GathererFlipper / PvPer /
+# AltoholicExplorer — drawn from a per-bot seed so it's stable across
+# restarts. The archetype_id persists to playerbot_v2_character, drives the
+# snapshot's archetype projection (so idle rules can bias by activity / econ
+# emphasis), and lets the population rebalancer prefer high-role-affinity
+# bots when respeccing into starved tank/healer slots. The result is a
+# heterogeneous, believable living server (economy + role variety).
+#
+# When 0, every bot reads as CasualSolo (id 0) for uniform, predictable
+# testing. Inspect a bot's archetype via `.playerbot inspect <name>`.
+# HR-no
+PlayerbotV2.Archetype.Enabled = 1
+
+#-----------------------------------------------------------------------------
+# Economy: auction-house buy side (#4B-1 Part 2)
+#-----------------------------------------------------------------------------
+
+# Master switch for the AH BUY-side rule (idle:ah_buy_reagents). When 1
+# (default), a bot parked at an auctioneer may buy out the cheapest current
+# listing for any profession reagent it is short on for its known, still-
+# skillable recipes — and, if its econ archetype is Reseller, also cheap
+# flippable trade goods to relist at a markup. The bot only buys what it can
+# afford while keeping a gold reserve for repairs/reagents (see the rule's
+# budget gate), and biases purchase aggressiveness by econ profile
+# (Hoarder = minimal, Balanced = needs only, Reseller = aggressive).
+#
+# GOLD-SINK NOTE: this does NOT inflate the economy. The buy moves gold from
+# the buyer to the seller (both bots), but every AH SALE pays a deposit on
+# listing plus an auction-house CUT on a successful sale — both destroyed by
+# the server. So the post -> buy -> repost loop is a net gold SINK over time;
+# the more the bots trade, the more gold leaves circulation through the cut.
+# The sell side (idle:ah_post_surplus + dynamic relist pricing) always runs;
+# this toggle only governs whether bots also consume from the AH.
+#
+# Set to 0 to make bots sellers-only (one-directional AH supply) — useful when
+# measuring listing/pricing behavior in isolation, or on a realm where you
+# don't want bot gold flowing into buyouts. HR-yes.
+PlayerbotV2.Economy.BuyEnabled = 1
+
+# PlayerbotV2.Economy.BotAuctions
+#   0 (default) = bots never use the auction house on their own (no posting, undercut
+#                 cancels, reagent buying or AH trips). The core AuctionHouseBot
+#                 (AuctionHouseBot.* in worldserver.conf) is the single AH actor.
+#   1           = also run the per-bot AH rules; BuyEnabled above still governs the buy side.
+PlayerbotV2.Economy.BotAuctions = 0
+
+# PlayerbotV2.Classic.ClassSupplies
+#   Classic 1.60: bots get their class tools and reagents for free, topped up
+#   out of combat: shaman totems and Ankhs, rogue Instant/Deadly Poison and
+#   Flash Powder, Symbol of Kings, prayer candles, Arcane Powder, druid
+#   berries and Rebirth seeds, soul shards. Without them bots can't drop
+#   totems, poison weapons or cast the group buffs. 0 = bots must find them.
+#   Default 1.
+PlayerbotV2.Classic.ClassSupplies = 1
+
+# PlayerbotV2.Economy.MaxReagentVendorMultiple
+#   #4B-1(b) reagent buy-side PRICE-PUMP guard. The snapshot builder computes a
+#   per-unit FAIR-VALUE CEILING for every buyable reagent =
+#       vendor SellPrice * MaxReagentVendorMultiple
+#   (or a quality-based flat ceiling when the item has no vendor SellPrice). The
+#   idle:ah_buy_reagents rule then REFUSES any listing or commodity whose
+#   per-unit price exceeds that ceiling. Without it, the buy loop bought the
+#   cheapest listing gated only by a gold reserve + per-buy budget fraction, so a
+#   human could post a single absurdly-priced reagent the bots "need" and bleed
+#   their gold one over-priced buyout at a time. A typical healthy AH price for
+#   trade goods sits a single-digit multiple over vendor sell; the default 15x
+#   leaves generous headroom for legitimately scarce reagents while still capping
+#   the obvious exploit. Lower it to tighten the cap (e.g. on a realm with stable
+#   prices), raise it to allow pricier reagent buys. Default 15.
+PlayerbotV2.Economy.MaxReagentVendorMultiple = 15
+
+#-----------------------------------------------------------------------------
+# Session rhythm: human-like login/logout churn (#5 living-server realism)
+#-----------------------------------------------------------------------------
+# Bots log off after their archetype's intended play-session length, so the
+# online roster CHURNS like a real playerbase instead of every bot staying
+# online forever (the single most visible non-human tell). The population
+# manager re-logs other offline bots to hold TotalTarget, so the headcount is
+# stable while WHO is online rotates over time. Bots in a group, dungeon/raid,
+# BG/arena, BG/LFG queue, or owned by a real player are never session-kicked
+# (a human finishes their activity first).
+#
+# PlayerbotV2.SessionRhythm.Enabled
+#   Master switch. 1 = on (default), 0 = bots never auto-logout on session length.
+PlayerbotV2.SessionRhythm.Enabled = 1
+
+# PlayerbotV2.SessionRhythm.Multiplier
+#   Global scale on every archetype's target_session_minutes. 1.0 = use the
+#   archetype value as-is. Set BELOW 1 to shorten sessions (e.g. 0.1 to watch a
+#   full churn cycle in minutes during a soak test), ABOVE 1 to lengthen.
+#   <= 0 disables the layer (same as Enabled = 0). Default 1.0.
+PlayerbotV2.SessionRhythm.Multiplier = 1.0
+
+# PlayerbotV2.SessionRhythm.MaxLogoutsPerCycle
+#   Cap on session-expiry logouts per 60s reconcile cycle, so the roster
+#   rotates smoothly instead of a mass exodus when a login cohort expires
+#   together. Roughly matches the login refill rate (25/min) so headcount stays
+#   near target. Default 25.
+PlayerbotV2.SessionRhythm.MaxLogoutsPerCycle = 25
+
+#-----------------------------------------------------------------------------
+# V2 account pool
+#-----------------------------------------------------------------------------
+
+# BotAccountMgr maintains a pool of dedicated accounts ("PBV2_NNNN") that
+# hold bot characters separately from the operator's own account. Each pool
+# account is capped at 10 chars (Trinity's char-select limit). New accounts
+# are auto-created via sAccountMgr->CreateAccount as the existing pool fills,
+# with throwaway 16-char alphanumeric passwords (bots never log in via
+# client; the password only satisfies SRP6 derivation).
+#
+# `.playerbot count` and `.playerbot status` show the current pool size,
+# total chars across the pool, and how many free slots remain before the
+# next auto-creation. There is no kill-switch: the pool is required to
+# avoid putting bot chars on the operator's GM account, where they'd
+# trigger the existing "one online char per account" assumption in the
+# Trinity character-select / online-status code paths.
+
+#-----------------------------------------------------------------------------
+# Player-facing alt summon (Wave E)
+#-----------------------------------------------------------------------------
+
+# `.playerbot summon <alt_name>` lets a normal player turn one of their OWN
+# characters (same account) into an AI-controlled bot that follows / fights
+# / quests alongside their main. Account-wide synergy: alts gain XP from
+# group-completed content while the player drives their main.
+#
+# This cap is per-account (NOT per-character), counting alts CURRENTLY
+# active as bots. Default 5 fills a regular 5-man dungeon group
+# (tank + healer + 3 dps); a player wanting more either logs an alt out
+# (`.playerbot self off` or `/w <alt> logout`) before summoning another,
+# or runs into the cap and gets a clean refusal message.
+#
+# 0 disables the player-facing summon entirely without removing the command
+# (useful for shared dev realms where you want only GM-driven bots).
+PlayerbotV2.MaxAltsAsBots = 5
+
+#-----------------------------------------------------------------------------
+# Fleet self-police: wedge watchdog (#1B) + vitals alerting (#1C)
+#-----------------------------------------------------------------------------
+
+# WedgeWatchdog (#1B): ms of sustained no-progress before a stuck ("wedged")
+# bot is classified + reported. The watchdog walks the registry on a 7s
+# cadence; any bot wedged longer than this threshold appears in
+# `.playerbot wedges`, emits exactly ONE structured [wedge] log line per
+# episode, and bumps the per-category PerfCounters tally. Lower for a chatty
+# wedge log on a test farm; raise to silence transient navmesh flukes.
+# Default 90s. HR-no.
+PlayerbotV2.WedgeWatchdog.ThresholdMs = 90000
+
+# WedgeWatchdog displacement gate (#1B calibration, 2026-06-15). A bot is only
+# reported wedged when it has stayed within MinDisplacementYards of its position
+# for >= the threshold AND its own stuck signal agrees — physical displacement
+# is the authoritative gate (a bot travelling a winding route moves hundreds of
+# yards while its straight-line goal distance barely changes; the old goal-
+# progress gate flagged ~28% of moving bots). CombatThresholdMs is a longer gate
+# for CombatLoop wedges because combat legitimately holds position. HR-no.
+PlayerbotV2.WedgeWatchdog.MinDisplacementYards = 20
+PlayerbotV2.WedgeWatchdog.CombatThresholdMs = 180000
+
+# Self-remediation (#7): when the watchdog has classified a bot as
+# GoalUnreachable or CombatLoop and it stays wedged for RemediationMs, the
+# watchdog ABANDONS the bot's stuck objective (blacklists it 5 min) so the
+# snapshot picker swaps to a reachable objective and, once same-map work is
+# exhausted, surfaces the cross-map travel breadcrumb — the player-like "give
+# up on a quest I can't reach" move. No teleport, no combat manipulation; just
+# a repick. RemediationMs is intentionally ABOVE ThresholdMs (90s) so the bot's
+# own Tier-3 stuck recovery gets first crack; default 180s. Set
+# RemediationEnabled = 0 to revert to report-only (classify but never act). HR-yes.
+PlayerbotV2.WedgeWatchdog.RemediationEnabled = 1
+PlayerbotV2.WedgeWatchdog.RemediationMs = 180000
+
+# Generic no-progress watchdog: independent of the wedge classifier above, a bot
+# that stays within NoProgressRadiusYards of where it was NoProgressMs ago (while
+# not in combat) is treated as making no progress and nudged into recovery.
+# NoProgressEnabled = 0 disables this generic check (the classifier still runs).
+PlayerbotV2.WedgeWatchdog.NoProgressEnabled = 1
+PlayerbotV2.WedgeWatchdog.NoProgressMs = 900000
+PlayerbotV2.WedgeWatchdog.NoProgressRadiusYards = 150.0
+
+# Group-level no-progress watchdog (nav-robustness). The per-bot watchdog above
+# exempts in-instance bots, so a dungeon GROUP that stops progressing has no
+# safety net. This watchdog classifies a wedged dungeon group (stranded / split /
+# cohered-idle / false-combat) and logs a [group_wedge] line on the 'playerbot.v2'
+# channel. It is READ-ONLY (diagnostic) — it changes no behavior.
+PlayerbotV2.GroupWedge.Enabled = 1
+# Seconds-equivalent (ms) of no forward progress (group centroid moved less than
+# MoveYards) AND no real combat before the group is reported wedged.
+PlayerbotV2.GroupWedge.WindowMs = 20000
+# Group centroid must move more than this (yards) to count as forward progress.
+PlayerbotV2.GroupWedge.MoveYards = 12.0
+# Max member-to-centroid distance under which the group counts as "cohered".
+PlayerbotV2.GroupWedge.CohereYards = 30.0
+# Tank-to-body (or straggler) separation that classifies a "split".
+PlayerbotV2.GroupWedge.SplitYards = 45.0
+# A member beyond this from the body is probed for a path; NoPath => "stranded".
+PlayerbotV2.GroupWedge.FarYards = 45.0
+
+# Fleet-vitals alerting (#1C): a 60s vitals bucket that breaches one of these
+# thresholds fires a throttled [fleet_alert] TC_LOG_ERROR on the
+# 'playerbot.v2' channel naming the metric + value + threshold. Set any
+# threshold to 0 to disable that specific alert without losing the others.
+#
+#   WedgedBots       max acceptable concurrently-wedged bot count.
+#   TickP99Us        max acceptable world-tick p99 latency (microseconds).
+#   IntentDropPerMin max acceptable IntentQueue drops per 60s window
+#                    (sustained drops = an AI worker outrunning the drain).
+#   PathFailPerMin   max acceptable path-validation failures per minute.
+#   ThrottleMs       per-metric re-emit suppression window (a sustained
+#                    breach logs once per window, not once per 60s sample).
+#
+# Defaults tuned for a ~2000-bot dev fleet. HR-yes (re-read on .reload config).
+PlayerbotV2.Alert.WedgedBots = 5
+PlayerbotV2.Alert.TickP99Us = 200000
+PlayerbotV2.Alert.IntentDropPerMin = 600
+PlayerbotV2.Alert.PathFailPerMin = 300
+PlayerbotV2.Alert.ThrottleMs = 300000
+
+#-----------------------------------------------------------------------------
+# Guilds (bot-founded guilds: charter FSM, recruitment, scheduled events)
+#-----------------------------------------------------------------------------
+
+# Master switch for the bot guild system (founding, recruiting, membership).
+PlayerbotV2.Guilds.Enabled = 1
+
+# Enable scheduled bot guild events (group activities, social cadence).
+PlayerbotV2.Guilds.EventsEnabled = 1
+
+# Enable the bot guild recruitment channel behavior.
+PlayerbotV2.Guilds.RecruitmentChannelEnabled = 1
+
+# Target number of bot-founded guilds to maintain per faction.
+PlayerbotV2.Guilds.TargetCountPerFaction = 6
+
+# Soft cap on members per bot-founded guild.
+PlayerbotV2.Guilds.MaxMembersPerGuild = 75
+
+#-----------------------------------------------------------------------------
+# Ranged-pull discipline / tank detour commitment (SFK-wedge fixes)
+#-----------------------------------------------------------------------------
+
+# Gate pre-combat DPS assists on the tank's walk cost to the target
+# (path/beeline ratio). Diagnosed 2026-07-02: SFK courtyard = 139.7yd path
+# for a 20yd beeline, navmesh connected.
+# NOTE (final-review fix, 2026-07-03): MaxDetourRatio/MinExtraYards are not
+# scoped to Enabled/this pre-combat gate alone — DisengageEnabled's in-combat
+# drop and the TankCommit START threshold both reuse these same two knobs, so
+# they stay LIVE even with Enabled=0.
+PlayerbotV2.PullGate.Enabled            = 1
+PlayerbotV2.PullGate.MaxDetourRatio     = 3.0
+PlayerbotV2.PullGate.MinExtraYards      = 40
+# Drop a DPS's combat lock when the tank cannot cheaply reach its victim
+# and has no fight of its own (mob-initiated aggro variant).
+PlayerbotV2.PullGate.DisengageEnabled   = 1
+# Tank commits to a long-but-valid corridor instead of oscillating; gives
+# up loudly after this many ms and shields the target.
+PlayerbotV2.PullGate.TankCommitEnabled  = 1
+PlayerbotV2.PullGate.TankCommitMaxMs    = 45000
+
+# Hold (do not re-issue) a dungeon advance/route step while the movement spline
+# toward ~that step is already in flight — re-issuing restarts the spline and
+# caused the WC/SFK stutter-in-place stalls (2026-07-03). The same switch also
+# arbitrates BETWEEN competing dungeon movement objectives (e.g. a route step
+# vs. converge-to-fight aiming at genuinely different targets): the first
+# emitter to move owns the spline for a short window (~2.5s) and competing
+# rules hold instead of re-aiming, rather than alternating every tick.
+PlayerbotV2.Move.StepHoldEnabled        = 1
+
+# One step source for the in-combat boss-advance family: when the dungeon has
+# route_waypoints and the OOC route cursor is armed for the current map, step
+# toward the SAME route crumb the route follower owns instead of computing a
+# separate direct-to-boss step. Fixes the WC crumb-14 wedge where the two step
+# sources diverged and alternately re-aimed the movement spline forever
+# (2026-07-03).
+PlayerbotV2.Move.RouteAwareCombatAdvance = 1
+
+# Do not chase/gap-close unfightable attackers: untargetable/pacified/dead
+# flags, or the mob's OWN chase generator reports it cannot path to us
+# (Creature::CanNotReachTarget — the aggro-but-unreachable window). Such a
+# pack otherwise steals movement ownership from dungeon navigation every
+# combat frame; WC corridor freeze 2026-07-03 (z-disconnected ledge pack).
+PlayerbotV2.Combat.SkipUnfightable       = 1
+
+# Group threat discipline (port of Karrz's wow-1.12 GroupPveRestraint /
+# MCRaidHoldDamage). Applies only to non-tank bots in a group that has a tank
+# (main-tank flag, LFG tank role or tank spec) - never to solo bots, BGs or
+# a mob already hitting a non-tank member (self-defence). Holding = the bot
+# stops attacking that mob (pet called back) but keeps healing / buffing.
+#   HoldEnabled        master switch
+#   HoldInOpenWorld    0 = dungeons/raids only (Karrz: open-world groups just
+#                      fight); 1 = also hold in the open world
+#   MaxRatio           stay below this fraction of the tank's threat on the
+#                      target; over it, damage stops (and Fade / Feign Death /
+#                      Feint / Cower are used when ready)
+#   OpeningLead*       threat the tank must have on a mob before DPS open
+#                      (level-60 values, scaled down by bot level, min 15%)
+#   OpeningWait*Ms     the opening hold gives up after this long (half when
+#                      the tank has no threat at all) so an idle tank can
+#                      never freeze the group
+PlayerbotV2.Threat.HoldEnabled        = 1
+# Playerbot.Raid.DpsWaitForAttack  raid DPS/ranged bots wait for the owner's Attack
+#   order (focus / attack release) after a Pull; tanks pull alone. A mob that
+#   hits the bot or its pet still gets answered.
+Playerbot.Raid.DpsWaitForAttack       = 1
+# Playerbot.Raid.ProvideConsumables  inside a raid instance, out of combat, each bot drinks its role's flask and
+#   elixirs and eats stat food (tank: Flask of the Titans, Superior Defense, Fortitude, Tender Wolf Steak; melee and
+#   hunters: Mongoose, Giants and a food; casters: Supreme Power, Greater Arcane; healers: Distilled Wisdom, Mageblood,
+#   Nightfin Soup). Bots always use ones they carry; with this on, the bags are stocked for them first (free, like
+#   the potion and reagent stock). Default 0; the server's make-configs set 1.
+Playerbot.Raid.ProvideConsumables     = 0
+# Playerbot.Consumables.PvE / Playerbot.Consumables.PvP  server choice, separately for PvE (open world, dungeons,
+#   raids) and PvP (battlegrounds and arenas): whether bots use flasks, elixirs, buff food, combat healing and mana
+#   potions, healthstones and resistance potions on that kind of map. Off also stops ProvideConsumables stocking.
+#   Plain eating and drinking to recover, bandages and the rest of the class upkeep are not affected. Defaults:
+#   PvE 1, PvP 0.
+Playerbot.Consumables.PvE             = 1
+Playerbot.Consumables.PvP             = 0
+# Playerbot.Raid.DpsWaitTimeoutMs  with DpsWaitForAttack: after the tanks have fought this long without the owner's
+#   Attack, the DPS go anyway (a forgotten Attack no longer wipes the raid). 0 = never (the owner's Attack is always
+#   needed). Default 10000 (Karrz chose a 10 s fallback, 2026-10-08).
+Playerbot.Raid.DpsWaitTimeoutMs       = 10000
+PlayerbotV2.Threat.HoldInOpenWorld    = 0
+PlayerbotV2.Threat.MaxRatio           = 0.9
+PlayerbotV2.Threat.OpeningLeadBoss    = 900
+PlayerbotV2.Threat.OpeningLeadTrash   = 250
+PlayerbotV2.Threat.OpeningWaitBossMs  = 6000
+PlayerbotV2.Threat.OpeningWaitTrashMs = 2000
+
+# Bot speech, carried over from the ike3 playerbot texts (shared DB table
+# playerbot_v2_bot_text, migration 0019). Covers greetings on joining a group,
+# the goodbye on `.bot dismiss`, ike3 replies to whispers / being named in party
+# chat, answers to emotes aimed at a bot, and companions' party-chat remarks on
+# loot, quests, kills and level-ups.
+#   Enabled          0 = all of the above off (the keyword reactions stay).
+#   ChanceScale      multiplies every per-key chance in playerbot_v2_bot_text_chance
+#                    (0.5 = half as chatty, 2.0 = twice; 0 = no chance-gated lines).
+#   Conversation     1 = bots answer small talk (how are you, where from, level, class, what they are doing, quest help,
+#                    directions to cities and zones, professions, guild, groups, jokes, goodbyes) from their own state with
+#                    several phrasings and a per-bot writing style. 0 = the older keyword replies only.
+#   GroupCooldownMs  minimum gap between two loot/quest/kill remarks in one group.
+#   BotCooldownMs    minimum gap between two such remarks from the same bot.
+Playerbot.Chatter.Enabled         = 1
+Playerbot.Chatter.ChanceScale     = 1.0
+Playerbot.Chatter.Conversation    = 1
+Playerbot.Chatter.GroupCooldownMs = 20000
+Playerbot.Chatter.BotCooldownMs   = 60000
+
+# Speech no game event announces (also off with Playerbot.Chatter.Enabled = 0):
+#   Callouts.*   a companion (owner in its group) speaks ike3's combat lines: "Heal me!" when it
+#                drops under 20% health, a heal request under 50%, "OOM" under 15% mana, a hunter's
+#                out-of-ammo / low-ammo line (party chat); a tank's taunt line at a mob loose on the
+#                group (/say) and the "so many mobs" line on a big pull (party chat). Each fires when
+#                the value crosses into the worse band, not while it stays there.
+#     KeyCooldownMs    one bot repeats the same kind of callout at most this often.
+#     GroupCooldownMs  gap between two callouts in one group; heal / mana / ammo requests skip it.
+#   Suggest.*    solo world bots (no owner, out of instances) post ike3's "what to do" lines in their
+#                zone's General channel, or the city Trade channel for selling / farming talk:
+#                dungeon groups, quests from their log, materials, reputation, items for sale, chatter.
+#     BotCooldownMs      one bot posts at most once per this long (min 60000).
+#     ChannelCooldownMs  one line per zone General (or per faction's Trade) per this long.
+#     GlobalCooldownMs   realm-wide gap between two channel lines (jittered up to 2x).
+#   GlobalMaxPerMinute   realm-wide cap on the callouts and suggestions together (0 = no cap).
+Playerbot.Chatter.Callouts.Enabled           = 1
+Playerbot.Chatter.Callouts.KeyCooldownMs     = 60000
+Playerbot.Chatter.Callouts.GroupCooldownMs   = 8000
+Playerbot.Chatter.Suggest.Enabled            = 1
+Playerbot.Chatter.Suggest.BotCooldownMs      = 1800000
+Playerbot.Chatter.Suggest.ChannelCooldownMs  = 180000
+Playerbot.Chatter.Suggest.GlobalCooldownMs   = 10000
+Playerbot.Chatter.GlobalMaxPerMinute         = 60
+
+# Activity tiers: bots near a player, in a group, a raid or a battleground tick at full rate (Combat/Active) and are never
+# held back. Everything else is light (travelling) or parked (idle) and shares a per-frame time budget in ms for rebuilding
+# its view of the world; the parked tier stops at half of it, so the light tiers slow down first when the server is busy and
+# no bot waits longer than four of its normal periods. 0 = no time budget (count cap only).
+Playerbot.Perf.TickBudgetMs = 0
+
+###################################################################################################
+# Diagnostics
+#
+# Playerbot.Diag.Probes
+#   Per-packet probes on the playerbot.v2 logger: [whisper_probe], [invite_probe], [inspect_probe], [cmd_probe], [raid_icon],
+#   [party_update] and [chat_opcode] (name, size and first bytes of every chat-related client packet). They write a line per chat
+#   message, invite or party update, so they are off in a normal run. Switch on for a test session; `.reload config` applies it
+#   within a few seconds. The startup self-check ([startup] diagnostics) shows the value in force.
+#   0 = off, 1 = on
+Playerbot.Diag.Probes = 0
+
+# Load test: one CSV row per minute (tick time average/p50/p99/max, the slowest [slow_call], memory, CPU, bots by kind) with a
+# PASS or FAIL against the limits below. Run the same scenario (a 40-bot raid, a full battleground, sleeping world bots) on every
+# build and compare the rows. 0 = off.
+Playerbot.LoadTest.Enable = 0
+# Free text written to every row (e.g. "mc40+wsg+3000sleep") so a file holding several scenarios stays readable.
+Playerbot.LoadTest.Label = ""
+Playerbot.LoadTest.CsvPath = "playerbot_loadtest.csv"
+# A row fails when the 99th-percentile tick is over MaxP99Ms, the average tick over MaxAvgMs, memory over MaxRssMb or any one
+# slow call over MaxSlowCallMs.
+Playerbot.LoadTest.MaxP99Ms = 100
+Playerbot.LoadTest.MaxAvgMs = 40
+Playerbot.LoadTest.MaxRssMb = 9000
+Playerbot.LoadTest.MaxSlowCallMs = 250

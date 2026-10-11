@@ -1,0 +1,60 @@
+// IdleWatch - a world bot that has not moved for a long time with no reason to stand there is given a new activity, wherever it is
+// in the world and whichever rule is holding it. The rule cascade has many places that end a tick without moving (a yield to an
+// offer it cannot take, a settled sit, a blocked goal, a wait that never ends); instead of finding each, the bot's own position
+// is watched. Pure decision logic, tested in tests/game/ClassicIdleWatch.cpp.
+
+#pragma once
+
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+
+namespace Playerbot::V2 {
+
+struct IdleWatch
+{
+    float x = 0.f, y = 0.f;               // where the bot stood when the window opened
+    std::uint32_t since_ms = 0;           // since when it has stood there
+    std::uint32_t strikes = 0;            // times in a row it was found standing; picks which new activity to try
+    std::uint32_t forced_until_ms = 0;    // the new activity runs until then
+    float tx = 0.f, ty = 0.f, tz = 0.f;   // the place it was sent to
+    bool has_target = false;
+};
+
+constexpr float kIdleMoveYards = 3.0f;               // less than this is still standing
+constexpr float kIdleResetStrikesYards = 20.0f;      // really went somewhere: the next stall starts from the first activity
+constexpr std::uint32_t kIdleStuckMs = 45000u;       // standing this long with no reason is stuck
+constexpr std::uint32_t kIdleForcedMs = 90000u;      // a new activity is followed this long
+constexpr float kIdleMinHubYards = 60.0f;            // a hub the bot is not already standing in
+constexpr float kIdleMaxHubYards = 2500.0f;
+constexpr std::size_t kIdleHubChoices = 6;           // the nearest few; strikes and the bot id pick among them
+
+// Call every tick. `exempt` = a good reason to stand (fighting, casting, resting at low health, grouped, owned, in an instance,
+// riding). Returns true once when the bot has stood still for kIdleStuckMs without a reason.
+inline bool IdleStuck(IdleWatch& w, float x, float y, std::uint32_t now_ms, bool exempt)
+{
+    float const dx = x - w.x, dy = y - w.y;
+    float const moved2 = dx * dx + dy * dy;
+    if (exempt || w.since_ms == 0 || moved2 >= kIdleMoveYards * kIdleMoveYards)
+    {
+        if (moved2 >= kIdleResetStrikesYards * kIdleResetStrikesYards) w.strikes = 0;
+        w.x = x; w.y = y; w.since_ms = now_ms ? now_ms : 1u;
+        return false;
+    }
+    if (now_ms - w.since_ms >= kIdleStuckMs)
+    {
+        w.since_ms = now_ms;
+        ++w.strikes;
+        return true;
+    }
+    return false;
+}
+
+// Which of the `count` candidate hubs (nearest first) a stuck bot is sent to: a different one at each strike, a different one per bot.
+inline std::size_t IdlePickHub(std::size_t count, std::uint32_t strikes, std::uint32_t bot_id)
+{
+    std::size_t const n = count < kIdleHubChoices ? count : kIdleHubChoices;
+    return n ? (std::size_t(strikes) + bot_id) % n : 0;
+}
+
+} // namespace Playerbot::V2
