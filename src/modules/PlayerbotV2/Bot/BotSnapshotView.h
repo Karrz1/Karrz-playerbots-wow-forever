@@ -35,6 +35,10 @@ public:
     bool   is_stunned()   const { return s_->vitals.is_stunned; }
     bool   is_silenced()  const { return s_->vitals.is_silenced; }
     bool   is_rooted()    const { return s_->vitals.is_rooted; }
+    bool   is_feared()    const { return s_->vitals.is_feared; }
+    bool   is_confused()  const { return s_->vitals.is_confused; }
+    // A heal is refused (PREVENTED_BY_MECHANIC) while stunned, feared, confused or silenced.
+    bool   cannot_heal()  const { return s_->vitals.is_stunned || s_->vitals.is_feared || s_->vitals.is_confused || s_->vitals.is_silenced; }
     bool   is_pvp()       const { return s_->vitals.is_pvp; }
     // True when any state would block cast attempts (stun + silence + active
     // cast). Caller should still check spell-specific gates (CD, resource).
@@ -365,7 +369,7 @@ public:
     // threat-grab behavior. Returns nullptr if every nearby enemy is on us.
     NearbyUnit const* untaunted_enemy(float range = 30.f) const;
 
-    // ---- Threat discipline (port of Karrz's wow-1.12 group threat rules) ----
+    // ---- Threat discipline (port of Karrz's ike3-based bots group threat rules) ----
     // The attacker / nearby-enemy record for `guid` (attackers first), or null.
     NearbyUnit const* hostile_unit(ObjectGuid guid) const;
     // Group's tank as resolved by the builder (may be this bot). Empty when
@@ -1052,6 +1056,9 @@ public:
     // that already includes SpellMgr.h. View is header-only otherwise so
     // we declare here and define in BotSnapshotView.cpp.
     bool has_reagents(uint32 spell_id) const;
+    // The mana the spell costs (flat, or percent of base mana), untalented like the rage/energy check in is_ready:
+    // a discounted cast waits a little longer than the core needs, never fires early. 0 for a spell with no mana cost.
+    int32 mana_cost(uint32 spell_id) const;
     std::vector<uint32>                       const& known_spells()    const { return s_->spellbook.known_spells; }
     std::vector<uint32>                       const& known_recipes()   const { return s_->spellbook.known_recipes; }
     std::vector<BotSnapshot::SkillEntry>      const& skills()          const { return s_->progression.skills; }

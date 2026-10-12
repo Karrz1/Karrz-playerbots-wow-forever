@@ -1,6 +1,6 @@
 // Warsong Gulch lanes, hand-recorded waypoint chains.
 //
-// Source: Karrz's earlier VMaNGOS bot tree (wow-1.12) branch raid10-revamp, commit bcc8b9fe70c42a8fa5d50fa83a472da9e9d19546, src/game/PlayerBots/playerbot/
+// Source: the ike3-based playerbot code branch raid10-revamp, commit bcc8b9fe70c42a8fa5d50fa83a472da9e9d19546, src/game/PlayerBots/playerbot/
 // strategy/actions/BattleGroundTactics.cpp, BGTactics::wsgPaths() ("old wsg waypoints", the ike3 / cmangos playerbots lineage, GPL).
 // Map 489 coordinates, the same map as BgWaypointData.inc. Only the points are taken; the choice among them is ours (per-bot lanes).
 // Checked offline against the recorded graph (BgWaypointData.inc): all but the two south mid-field points lie within ~20 y of a

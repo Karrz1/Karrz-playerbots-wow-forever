@@ -180,9 +180,9 @@ Player::Player(WorldSession* session) : Unit(true), m_sceneMgr(this)
 
     m_session = session;
 
-    m_modMeleeHitChance = 7.5f;
-    m_modRangedHitChance = 7.5f;
-    m_modSpellHitChance = 15.0f;
+    m_modMeleeHitChance = 0.0f;                             // Classic 1.60: no innate hit bonus (Player::UpdateMeleeHitChances)
+    m_modRangedHitChance = 0.0f;
+    m_modSpellHitChance = 0.0f;
 
     m_ingametime = 0;
     m_sharedQuestId = 0;
@@ -196,6 +196,7 @@ Player::Player(WorldSession* session) : Unit(true), m_sceneMgr(this)
         SetAcceptWhispers(true);
 
     m_regenInterruptTimestamp = GameTime::Now();
+    m_manaSpentTimestamp = GameTime::Now();
     m_regenTimer = 0;
     m_regenTimerCount = 0;
     m_weaponChangeTimer = 0;
@@ -931,8 +932,8 @@ void Player::UpdateInvisibilityDrunkDetect()
 
 void Player::SetComboTarget(ObjectGuid const& guid)
 {
-    if (*m_unitData->ComboTarget != guid)
-        SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::ComboTarget), guid);
+    if (*m_unitData->ClassicComboTarget != guid)
+        SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::ClassicComboTarget), guid);
 }
 
 void Player::GainComboPointsOn(Unit const* victim)
@@ -1002,6 +1003,7 @@ void Player::Update(uint32 p_time)
     CheckDuelDistance(now);
 
     UpdateAfkReport(now);
+    UpdateTradeState();
 
     if (GetCombatManager().HasPvPCombat())
         if (Aura* aura = GetAura(SPELL_PVP_RULES_ENABLED))
@@ -1793,6 +1795,8 @@ void Player::InterruptPowerRegen(Powers power)
         return;
 
     m_regenInterruptTimestamp = GameTime::Now();
+    if (power == POWER_MANA)
+        m_manaSpentTimestamp = m_regenInterruptTimestamp;
     m_powerFraction[powerIndex] = 0.0f;
     SendDirectMessage(WorldPackets::Combat::InterruptPowerRegen(power).Write());
 }
@@ -2412,25 +2416,8 @@ void Player::UpdateClassicLegacyUnlock()
     if (earnedLegacyPoints > renown)
         ModifyCurrency(LegacyRenownCurrencyID, earnedLegacyPoints - renown);
 
-    // Legacy reward track (RenownRewards group 48): reaching a reward's level puts its "Legacy Reward" quest in the log, complete;
-    // it is turned in at Innkeeper Wiley in Ratchet (official 70338: the quest was ready at Wiley, the reward says "Visit Innkeeper
-    // Wiley in Ratchet to claim your reward"). Wiley also offers it again if it was abandoned (world 2026_10_10_05).
-    static constexpr std::pair<int32, uint32> LegacyRewardQuests[] =
-    {
-        { 15, 96339 },  // Replica Ironforge Air Rifle
-        { 25, 96340 },  // Spectral Bear Cub
-        { 40, 96341 },  // Spectral Bear Tabard
-        { 55, 96342 },  // Reins of the Spectral Bear
-    };
-    for (auto const& [points, questId] : LegacyRewardQuests)
-    {
-        if (earnedLegacyPoints < points || GetQuestStatus(questId) != QUEST_STATUS_NONE)
-            continue;
-
-        if (Quest const* quest = sObjectMgr->GetQuestTemplate(questId))
-            if (CanAddQuest(quest, false))
-                AddQuestAndCheckCompletion(quest, nullptr);
-    }
+    // Legacy reward track (RenownRewards group 48): the Legacy Reward quests 96339-96342 are not put in the log; Innkeeper Wiley in
+    // Ratchet offers each one once its renown level is reached (conditions on the quest, world 2026_10_10_05), as on the official realm.
 
     if (!earnedLegacyPoints && GetLevel() < LegacyUnlockLevel)
         return;
@@ -2482,6 +2469,39 @@ void Player::UpdateClassicProfessionTitles()
                     SetTitle(title);
         }
     } while (result->NextRow());
+}
+
+// Classic 1.60 Legacy perks: most are dummy auras whose amount (scaled by rank through TraitDefinitionEffectPoints) the server applies.
+int32 Player::GetClassicLegacyPerkAmount(uint32 spellId, SpellEffIndex effIndex) const
+{
+    AuraEffect const* perk = GetAuraEffect(spellId, effIndex);
+    return perk ? perk->GetAmount() : 0;
+}
+
+// Aura 620 (not named in this core): percent change of a gold price, misc value = price type. Bartering 1225459: 0 = vendor items,
+// Frequent Flier 1225490: 4 = flight paths.
+uint64 Player::ApplyClassicLegacyPriceMod(uint64 price, int32 priceType) const
+{
+    int32 pct = GetTotalAuraModifierByMiscValue(SPELL_AURA_620, priceType);
+    if (!pct || !price)
+        return price;
+
+    int64 changed = int64(price) + int64(price) * pct / 100;
+    return uint64(std::max<int64>(1, changed));
+}
+
+// The Quick and the Dead 1225500: helpful spells cost nothing for 2 min after being resurrected or until entering combat.
+bool Player::HasClassicFreeHelpfulSpells() const
+{
+    if (_classicFreeHelpfulSpellsUntil == TimePoint())
+        return false;
+
+    if (IsInCombat() || GameTime::Now() >= _classicFreeHelpfulSpellsUntil)
+    {
+        _classicFreeHelpfulSpellsUntil = TimePoint();
+        return false;
+    }
+    return true;
 }
 
 bool Player::IsMaxLevel() const
@@ -4633,6 +4653,10 @@ void Player::ResurrectPlayer(float restore_percent, bool applySickness)
 
     setDeathState(ALIVE);
 
+    // Classic 1.60 Legacy perk The Quick and the Dead 1225500: helpful spells cost no resources for a while (EFFECT_1, ms)
+    if (int32 freeSpellsMs = GetClassicLegacyPerkAmount(1225500, EFFECT_1); freeSpellsMs > 0)
+        SetClassicFreeHelpfulSpellsUntil(GameTime::Now() + Milliseconds(freeSpellsMs));
+
     // add the flag to make sure opcode is always sent
     AddUnitMovementFlag(MOVEMENTFLAG_WATERWALKING);
     SetWaterWalking(false);
@@ -4834,7 +4858,8 @@ void Player::DurabilityLoss(Item* item, double percent)
     if (!pMaxDurability)
         return;
 
-    percent /= GetTotalAuraMultiplier(SPELL_AURA_MOD_DURABILITY_LOSS);
+    // amounts are percent changes of the loss (Classic Legacy talent Reinforce 1225497: -20 per rank = less loss)
+    percent *= GetTotalAuraMultiplier(SPELL_AURA_MOD_DURABILITY_LOSS);
 
     uint32 pDurabilityLoss = uint32(pMaxDurability*percent);
 
@@ -5332,14 +5357,17 @@ void Player::UpdateDamageDoneMods(WeaponAttackType attackType, int32 skipEnchant
 
         for (uint8 i = 0; i < MAX_ITEM_ENCHANTMENT_EFFECTS; ++i)
         {
+            // Classic 1.60: the client data keeps the value in EffectPointsMin with no scaling points (Superior Striking +5,
+            // sharpening stones, weightstones, scopes, Rockbiter); retail scaled enchants use EffectScalingPoints
+            float points = enchantmentEntry->EffectScalingPoints[i] != 0.0f ? enchantmentEntry->EffectScalingPoints[i] : float(enchantmentEntry->EffectPointsMin[i]);
             switch (enchantmentEntry->Effect[i])
             {
                 case ITEM_ENCHANTMENT_TYPE_DAMAGE:
-                    amount += enchantmentEntry->EffectScalingPoints[i];
+                    amount += points;
                     break;
                 case ITEM_ENCHANTMENT_TYPE_TOTEM:
                     if (GetClass() == CLASS_SHAMAN)
-                        amount += enchantmentEntry->EffectScalingPoints[i] * item->GetTemplate()->GetDelay() / 1000.0f;
+                        amount += points * item->GetTemplate()->GetDelay() / 1000.0f;
                     break;
                 default:
                     break;
@@ -5832,10 +5860,11 @@ bool Player::UpdateGatherSkill(uint32 skillId, uint32 skillValue, uint32 redLeve
 
     uint32 gatheringSkillGain = sWorld->getIntConfig(CONFIG_SKILL_GAIN_GATHERING);
 
-    uint32 baseSkillLevelStep = 30;
-    uint32 yellowLevel = redLevel + baseSkillLevelStep;
-    uint32 greenLevel = yellowLevel + baseSkillLevelStep;
-    uint32 grayLevel = greenLevel + baseSkillLevelStep;
+    // Classic 1.60 (vanilla, VMaNGOS UpdateGatherSkill): yellow 25, green 50, gray 100 points above the required skill
+    // (retail 30 / 60 / 90)
+    uint32 yellowLevel = redLevel + 25;
+    uint32 greenLevel = redLevel + 50;
+    uint32 grayLevel = redLevel + 100;
 
     if (GameObject const* go = Object::ToGameObject(object))
     {
@@ -5893,18 +5922,11 @@ bool Player::UpdateFishingSkill(int32 expansion)
     if (skillValue >= GetMaxSkillValue(fishingSkill))
         return false;
 
-    uint8 stepsNeededToLevelUp = GetFishingStepsNeededToLevelUp(skillValue);
-    ++m_fishingSteps;
-
-    if (m_fishingSteps >= stepsNeededToLevelUp)
-    {
-        m_fishingSteps = 0;
-
-        uint32 gatheringSkillGain = sWorld->getIntConfig(CONFIG_SKILL_GAIN_GATHERING);
-        return UpdateSkillPro(fishingSkill, 100*10, gatheringSkillGain);
-    }
-
-    return false;
+    // Classic 1.60 (vanilla, VMaNGOS UpdateFishingSkill): called on a catch only; 100% below 75 skill, then 2500 / (skill - 50)%
+    (void)GetFishingStepsNeededToLevelUp;
+    int32 chance = skillValue < 75 ? 100 : int32(2500 / (skillValue - 50));
+    uint32 gatheringSkillGain = sWorld->getIntConfig(CONFIG_SKILL_GAIN_GATHERING);
+    return UpdateSkillPro(fishingSkill, chance * 10, gatheringSkillGain);
 }
 
 // Classic 1.60: retail has no weapon / defense skill gains; vanilla rules (as in MaNGOS / TrinityCore 3.3.5)
@@ -5991,6 +6013,19 @@ bool Player::UpdateSkillPro(uint16 skillId, int32 chance, uint32 step)
         GetName(), GetGUID().ToString(), skillId, chance / 10.0f);
     if (!skillId)
         return false;
+
+    // Classic 1.60 Legacy perk Working Overtime 1225451: higher chance of a skill increase from any primary, secondary or class-based
+    // tradeskill (aura 657, percent of the chance)
+    if (chance > 0 && chance < 1000)
+    {
+        if (int32 bonusPct = GetTotalAuraModifier(SPELL_AURA_657))
+        {
+            SkillLineEntry const* skillLine = sSkillLineStore.LookupEntry(skillId);
+            if (skillLine && (skillLine->CategoryID == SKILL_CATEGORY_PROFESSION || skillLine->CategoryID == SKILL_CATEGORY_SECONDARY
+                || skillId == 40 /* Poisons */ || skillId == 633 /* Lockpicking */))
+                chance = std::min(1000, chance + chance * bonusPct / 100);
+        }
+    }
 
     if (chance <= 0)                                         // speedup in 0 chance case
     {
@@ -7311,6 +7346,8 @@ bool Player::RewardHonor(Unit* victim, uint32 groupsize, int32 honor, HonorGainS
         // apply honor multiplier from aura (not stacking-get highest)
         AddPct(honor_f, GetMaxPositiveAuraModifierByMiscMask(SPELL_AURA_MOD_HONOR_GAIN_PCT_FROM_SOURCE, 1 << AsUnderlyingType(source)));
         AddPct(honor_f, GetMaxPositiveAuraModifier(SPELL_AURA_MOD_HONOR_GAIN_PCT));
+        // Classic 1.60 Legacy perk For Great Honor 1225501: currency gain aura on Honor (1792); honor is not credited as that currency here
+        AddPct(honor_f, GetTotalAuraModifierByMiscValue(SPELL_AURA_MOD_CURRENCY_GAIN, 1792));
         honor_f += _restMgr->GetRestBonusFor(REST_TYPE_HONOR, honor_f);
     }
 
@@ -9274,7 +9311,7 @@ void Player::CastItemCombatSpell(DamageInfo const& damageInfo)
                                 slot = EQUIPMENT_SLOT_OFFHAND;
                                 break;
                             case RANGED_ATTACK:
-                                slot = EQUIPMENT_SLOT_MAINHAND;
+                                slot = EQUIPMENT_SLOT_RANGED;   // Classic: ranged attacks proc the ranged weapon, not the main hand
                                 break;
                             default:
                                 slot = EQUIPMENT_SLOT_END;
@@ -9325,8 +9362,8 @@ void Player::CastItemCombatSpell(DamageInfo const& damageInfo, Item* item, ItemT
                     uint32 WeaponSpeed = GetBaseAttackTime(damageInfo.GetAttackType());
                     chance = GetPPMProcChance(WeaponSpeed, proto->SpellPPMRate, spellInfo);
                 }
-                else if (chance > 100.0f)
-                    chance = GetWeaponProcChance();
+                else if (chance > 100.0f || chance <= 0.0f)
+                    chance = GetWeaponProcChance();         // Classic 1.60: chance-on-hit spells with no chance in the data (Jang'thraze, Digmaster 5000, ...) use the weapon speed rate like vanilla
 
                 if (roll_chance(chance) && sScriptMgr->OnCastItemCombatSpell(this, damageInfo.GetVictim(), spellInfo, item))
                     CastSpell(damageInfo.GetVictim(), spellInfo->Id, item);
@@ -10259,7 +10296,10 @@ bool Player::SetAmmo(uint32 itemId)
         if (!proto || proto->GetClass() != ITEM_CLASS_PROJECTILE || !HasItemCount(itemId) || CanUseItem(proto) != EQUIP_ERR_OK)
             return false;
     }
+    bool changed = GetAmmoId() != itemId;
     SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::PvpMedals), itemId);
+    if (changed)
+        UpdateDamagePhysical(RANGED_ATTACK);                // the ammo's damage per second is part of ranged weapon damage
     return true;
 }
 
@@ -13956,6 +13996,8 @@ void Player::TradeCancel(bool sendback, TradeStatus status /*= TRADE_STATUS_CANC
     if (m_trade)
     {
         Player* trader = m_trade->GetTrader();
+        if (GetSession()->IsBot() || trader->GetSession()->IsBot())
+            TC_LOG_INFO("playerbot.v2", "[trade] cancel {} <-> {} (status {})", GetName(), trader->GetName(), uint32(status));
 
         if (sendback)
             GetSession()->SendCancelTrade(status);
@@ -13967,6 +14009,36 @@ void Player::TradeCancel(bool sendback, TradeStatus status /*= TRADE_STATUS_CANC
         m_trade = nullptr;
         delete trader->m_trade;
         trader->m_trade = nullptr;
+    }
+}
+
+void Player::UpdateTradeState()
+{
+    if (!m_trade)
+        return;
+    Player* trader = m_trade->GetTrader();
+    TradeStatus why = TRADE_STATUS_CANCELLED;
+    char const* reason = nullptr;
+    if (!trader || !trader->IsInWorld() || !IsInWorld())
+        reason = "partner gone";
+    else if (!trader->m_trade || trader->m_trade->GetTrader() != this)
+        reason = "partner is not in this trade";
+    else if (!IsWithinDistInMap(trader, TRADE_DISTANCE, false))
+    {
+        reason = "out of range";
+        why = TRADE_STATUS_TOO_FAR_AWAY;
+    }
+    if (!reason)
+        return;
+    TC_LOG_INFO("playerbot.v2", "[trade] closing {}'s trade with {}: {}", GetName(), trader ? trader->GetName() : std::string("?"), reason);
+    if (trader && trader->m_trade && trader->m_trade->GetTrader() == this)
+        TradeCancel(true, why);
+    else
+    {
+        // The partner's side is gone or unrelated: drop only ours.
+        GetSession()->SendCancelTrade(why);
+        delete m_trade;
+        m_trade = nullptr;
     }
 }
 
@@ -15418,6 +15490,17 @@ bool Player::CanRewardQuest(Quest const* quest, bool msg) const
     if (GetQuestRewardStatus(quest->GetQuestId()))
         return false;
 
+    // Classic 1.60: vanilla quests that cost money (VMaNGOS negative RewOrReqMoney)
+    if (uint32 cost = quest->GetClassicRequiredMoney())
+    {
+        if (!HasEnoughMoney(uint64(cost)))
+        {
+            if (msg)
+                SendEquipError(EQUIP_ERR_NOT_ENOUGH_MONEY, nullptr, nullptr);
+            return false;
+        }
+    }
+
     // prevent receive reward with quest items in bank
     if (quest->HasQuestObjectiveType(QUEST_OBJECTIVE_ITEM))
     {
@@ -15993,8 +16076,19 @@ void Player::RewardQuest(Quest const* quest, LootItemType rewardType, uint32 rew
     }
 
     for (uint8 i = 0; i < QUEST_REWARD_CURRENCY_COUNT; ++i)
-        if (quest->RewardCurrencyId[i])
-            AddCurrency(quest->RewardCurrencyId[i], quest->RewardCurrencyCount[i], currencyGainSource);
+    {
+        if (!quest->RewardCurrencyId[i])
+            continue;
+
+        int32 count = quest->RewardCurrencyCount[i];
+        // Classic 1.60 Legacy perk Performance Bonus 1225456: a chance of 100% more Merchant's Favor (3402) for a crate turn-in
+        static constexpr uint32 CurrencyMerchantsFavor = 3402;
+        if (quest->RewardCurrencyId[i] == CurrencyMerchantsFavor)
+            if (int32 chance = GetClassicLegacyPerkAmount(1225456, EFFECT_0); chance > 0 && roll_chance(chance))
+                count *= 2;
+
+        AddCurrency(quest->RewardCurrencyId[i], count, currencyGainSource);
+    }
 
     if (uint32 skill = quest->GetRewardSkillId())
         UpdateSkillPro(skill, 1000, quest->GetRewardSkillPoints());
@@ -16008,6 +16102,7 @@ void Player::RewardQuest(Quest const* quest, LootItemType rewardType, uint32 rew
         moneyRew = int32(quest->GetRewMoneyMaxLevel() * sWorld->getRate(RATE_DROP_MONEY));
 
     moneyRew += GetQuestMoneyReward(quest);
+    moneyRew -= int32(quest->GetClassicRequiredMoney());    // Classic 1.60: vanilla quests that cost money
 
     if (moneyRew)
     {
@@ -20869,7 +20964,10 @@ void Player::SendRaidInfo()
         lockInfos.Extended = instanceLock->IsExtended();
     }
 
-    SendDirectMessage(instanceInfo.Write());
+    WorldPacket const* data = instanceInfo.Write();
+    TC_LOG_INFO("instance.lock", "[raid_info] sending {} lock(s) to {} ({} bytes)", instanceInfo.LockList.size(), GetName(), data->size());
+
+    SendDirectMessage(data);
 }
 
 bool Player::Satisfy(AccessRequirement const* ar, uint32 target_map, TransferAbortParams* params, bool report)
@@ -20915,19 +21013,23 @@ bool Player::Satisfy(AccessRequirement const* ar, uint32 target_map, TransferAbo
                     LevelMax = ar->levelMax;
             }
 
-            if (ar->item)
+            // Instance.IgnoreAttunement: the attunement item and quest of the instance are not required (optional server option)
+            if (!sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_ATTUNEMENT))
             {
-                if (!HasItemCount(ar->item) &&
-                    (!ar->item2 || !HasItemCount(ar->item2)))
-                    missingItem = ar->item;
-            }
-            else if (ar->item2 && !HasItemCount(ar->item2))
-                missingItem = ar->item2;
+                if (ar->item)
+                {
+                    if (!HasItemCount(ar->item) &&
+                        (!ar->item2 || !HasItemCount(ar->item2)))
+                        missingItem = ar->item;
+                }
+                else if (ar->item2 && !HasItemCount(ar->item2))
+                    missingItem = ar->item2;
 
-            if (GetTeam() == ALLIANCE && ar->quest_A && !GetQuestRewardStatus(ar->quest_A))
-                missingQuest = ar->quest_A;
-            else if (GetTeam() == HORDE && ar->quest_H && !GetQuestRewardStatus(ar->quest_H))
-                missingQuest = ar->quest_H;
+                if (GetTeam() == ALLIANCE && ar->quest_A && !GetQuestRewardStatus(ar->quest_A))
+                    missingQuest = ar->quest_A;
+                else if (GetTeam() == HORDE && ar->quest_H && !GetQuestRewardStatus(ar->quest_H))
+                    missingQuest = ar->quest_H;
+            }
 
             Player* leader = this;
             ObjectGuid leaderGuid = group ? group->GetLeaderGUID() : GetGUID();
@@ -24143,8 +24245,13 @@ bool Player::ActivateTaxiPathTo(std::vector<uint32> const& nodes, Creature* npc 
         firstcost = uint32(ceil(firstcost * discount));
         m_taxi.SetFlightMasterFactionTemplateId(npc->GetFaction());
     }
+
     else
         m_taxi.SetFlightMasterFactionTemplateId(0);
+
+    // Legacy perk Frequent Flier: discount on flight paths
+    totalcost = uint32(ApplyClassicLegacyPriceMod(totalcost, 4));
+    firstcost = uint32(ApplyClassicLegacyPriceMod(firstcost, 4));
 
     if (money < totalcost)
     {
@@ -24738,6 +24845,8 @@ bool Player::BuyItemFromVendorSlot(ObjectGuid vendorguid, uint32 vendorslot, uin
 
         if (float priceMod = GetTotalAuraModifier(SPELL_AURA_MOD_VENDOR_ITEMS_PRICES))
             price -= CalculatePct(price, priceMod);
+
+        price = ApplyClassicLegacyPriceMod(price, 0);   // Legacy perk Bartering
 
         if (!HasEnoughMoney(price))
         {
@@ -25934,6 +26043,9 @@ void Player::SendInitialPacketsAfterAddToMap()
     UpdateZone(newzone, newarea);                            // also call SendInitWorldStates();
 
     GetSession()->SendLoadCUFProfiles();
+
+    // saved raid locks; the Classic client does not ask for them on its own
+    SendRaidInfo();
 
     // Skip LOGINEFFECT for bots - visual effect requires client rendering
     // Bots don't send CMSG_CAST_SPELL ACKs, causing m_spellModTakingSpell assertion failures (Spell.cpp:603)
@@ -27139,6 +27251,24 @@ bool Player::CanNoReagentCast(SpellInfo const* spellInfo) const
         HasUnitFlag(UNIT_FLAG_PREPARATION))
         return true;
 
+    // Classic 1.60 Legacy perk Reagent Economy 1225503 (aura 215, its arena preparation effect is prevented by
+    // classic_spell_legacy_reagent_economy): class abilities no longer require reagents purchasable from vendors
+    if (spellInfo->SpellFamilyName != SPELLFAMILY_GENERIC && HasAura(1225503))
+    {
+        bool anyReagent = false;
+        bool allFromVendors = true;
+        for (uint32 i = 0; i < MAX_SPELL_REAGENTS; ++i)
+        {
+            if (spellInfo->Reagent[i] <= 0)
+                continue;
+            anyReagent = true;
+            if (!sObjectMgr->IsItemSoldByVendorForGold(spellInfo->Reagent[i]))
+                allFromVendors = false;
+        }
+        if (anyReagent && allFromVendors)
+            return true;
+    }
+
     // Check no reagent use mask
     flag128 noReagentMask;
     noReagentMask[0] = m_activePlayerData->NoReagentCostMask[0];
@@ -27412,6 +27542,26 @@ void Player::UpdateAreaDependentAuras(uint32 newArea)
             RemoveOwnedAura(iter, AURA_REMOVE_BY_INTERRUPT);
         else
             ++iter;
+    }
+
+    // Classic 1.60: equip spells limited to some zones (Forsaken Weapons 1309369 of the Ruins of Lordaeron rewards: +2% speed in
+    // Silverpine Forest and Hillsbrad Foothills) are removed above when leaving them; put them back when entering them
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+    {
+        Item* item = m_items[slot];
+        if (!item || item->IsBroken())
+            continue;
+
+        for (ItemEffectEntry const* effect : item->GetEffects())
+        {
+            if (effect->TriggerType != ITEM_SPELLTRIGGER_ON_EQUIP)
+                continue;
+
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(effect->SpellID, DIFFICULTY_NONE);
+            if (spellInfo && spellInfo->RequiredAreasID > 0 && !HasAura(spellInfo->Id)
+                && spellInfo->CheckLocation(GetMapId(), m_zoneUpdateId, newArea, this) == SPELL_CAST_OK)
+                ApplyEquipSpell(spellInfo, item, true);
+        }
     }
 
     // some auras applied at subzone enter
@@ -32550,6 +32700,12 @@ int32 TraitMgr::PlayerDataAccessor::GetCurrencyQuantity(int32 currencyId) const
 int32 TraitMgr::PlayerDataAccessor::GetLevel() const
 {
     return _player->GetLevel();
+}
+
+int32 TraitMgr::PlayerDataAccessor::GetClassicTalentedStartLevel() const
+{
+    // Classic 1.60 Legacy perk Talented 1225474: talent points every level starting at this level instead of 10
+    return _player->GetClassicLegacyPerkAmount(1225474, EFFECT_0);
 }
 
 bool TraitMgr::PlayerDataAccessor::IsQuestRewarded(int32 questId) const

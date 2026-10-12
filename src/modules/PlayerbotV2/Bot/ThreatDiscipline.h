@@ -1,5 +1,5 @@
 // ThreatDiscipline.h - shared group threat rules for non-tank damage, AoE and
-// healing (port of Karrz's wow-1.12 GroupPveRestraint / MCRaidHoldDamage,
+// healing (port of Karrz's ike3-based bots GroupPveRestraint / MCRaidHoldDamage,
 // generalised to any group with a tank).
 //
 // Pure functions of the bot's snapshot (NearbyUnit my_threat / tank_threat /

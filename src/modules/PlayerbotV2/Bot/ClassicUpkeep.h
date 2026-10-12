@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include "InstanceSchools.h"
 #include "BotTypes.h"
 #include "ObjectGuid.h"
 #include <vector>
@@ -73,8 +74,11 @@ CastPick PickBlessing(BotSnapshotView const& s, GroupSnapshotView const& g, bool
 // Resistance an instance calls for (paladin aura, shaman totem):
 // Molten Core / Blackwing Lair / Onyxia = fire, Naxxramas = frost,
 // Ahn'Qiraj = nature.
-enum class Resist : uint8 { None, Fire, Frost, Shadow, Nature };
 Resist InstanceResistance(uint32 map_id);
+
+// Do the bosses of this map deal `school`? (InstanceSchools.h)
+bool InstanceDealsSchool(uint32 map_id, Resist school);
+
 
 // Bosses that fear the raid (per instance map): Molten Core Magmadar (Panic),
 // Blackwing Lair Nefarian and Onyxia (Bellowing Roar). A shaman drops Tremor
@@ -210,8 +214,15 @@ MissingBuff MissingGroupBuff(BotSnapshotView const& s, GroupSnapshotView const& 
                              float x, float y, float z, float range);
 
 // Rate-limited INFO summary of raid support work (one line per minute).
-enum class RaidSupportKind : uint8 { Buff, Blessing, Aura, Dispel, Soulstone, Count };
-void NoteRaidSupport(RaidSupportKind kind);
+// Tranq: a Tranquilizing Shot cast at an enraged mob. Decurse: a curse removed by a mage / druid cast. FormationGiveUp: a bot gave up a
+// raid formation slot walk that made no progress ([formation_stuck]). The last three are not in the minute line; the scenario runner reads
+// their per-map totals (RaidSupportTotal) to judge a run.
+enum class RaidSupportKind : uint8 { Buff, Blessing, Aura, Dispel, Soulstone, Tranq, Decurse, FormationGiveUp, Count };
+void NoteRaidSupport(RaidSupportKind kind, uint32 map_id = 0);
+// Events of `kind` noted on `map_id` since the process started (a monotonic count: a scenario compares two readings).
+uint32 RaidSupportTotal(RaidSupportKind kind, uint32 map_id);
+// True when `spell` is a friendly dispel that removes curses (Remove Lesser Curse, Remove Curse), by its dispel effect.
+bool IsCurseDispelSpell(uint32 spell);
 
 // Shaman: the weapon imbue to (re)apply to the main hand.
 CastPick PickImbue(BotSnapshotView const& s, bool in_combat);

@@ -4,10 +4,12 @@
 // Pure: tick(snapshot, group, events, emit) — no global mutation, no I/O.
 
 #pragma once
+#include "ClassicBuffLedger.h"
 
 #include "IdleWatch.h"
 #include "BotTypes.h"
 #include "BotSnapshot.h"  // CurrencyEntry — cached_currencies_ member needs full type
+#include "Battleground/BgTactics.h"          // BgTactics::StallWatch (bg_stall_ member)
 #include "Battleground/BattlegroundScript.h"  // BattlegroundAdvice — bg_advice_cache_ member needs full type
 #include "Formation.h"
 #include "BotPersonality.h"
@@ -622,6 +624,10 @@ public:
     }
 
     uint32     last_owner_command_ms() const { return last_owner_command_ms_; }
+    // The owner's "attack" word reached this bot (whether or not the bot may open on the target): PveGroupCoordinator releases the raid's
+    // marks and DPS wait for it. A Pull never sets it. 0 = never.
+    void       note_owner_attack(uint32 now_ms) { owner_attack_ms_ = now_ms ? now_ms : 1u; }
+    uint32     owner_attack_ms() const { return owner_attack_ms_; }
     void       set_last_owner_name(std::string name) { last_owner_name_ = std::move(name); }
     std::string const& last_owner_name() const { return last_owner_name_; }
 
@@ -1226,6 +1232,19 @@ public:
     // window self-heals any staleness across an LFG teleport.
     uint32     dungeon_earliest_boss_seen_ms() const { return dungeon_earliest_boss_seen_ms_; }
     void       set_dungeon_earliest_boss_seen(uint32 now_ms) { dungeon_earliest_boss_seen_ms_ = now_ms; }
+    // ---- owed-boss waiver ----
+    // The boss we owe (bosses[bosses_done_count]) can be absent from the scan for good: killed in a dungeon whose instance
+    // script keeps no per-boss encounter state (Deadmines: bosses_done_count stays 0), or evaded away. Once the tank has stood
+    // at that boss's authored waypoint for a while without sighting it, the boss is waived and the next one becomes the owed
+    // one. The waiver is keyed to the bosses_done_count it was granted at and the map, so a counted kill or a new dungeon
+    // drops it. `reach_since` is when the tank arrived at the waypoint (0 = not there).
+    uint32     dungeon_owed_floor(uint32 map_id, uint32 done_count) const
+    { return (dungeon_owed_floor_map_ == map_id && dungeon_owed_floor_key_ == done_count) ? dungeon_owed_floor_ : 0u; }
+    void       set_dungeon_owed_floor(uint32 map_id, uint32 done_count, uint32 floor)
+    { dungeon_owed_floor_map_ = map_id; dungeon_owed_floor_key_ = done_count; dungeon_owed_floor_ = floor; dungeon_owed_reach_ms_ = 0; }
+    uint32     dungeon_owed_reach_ms() const { return dungeon_owed_reach_ms_; }
+    void       set_dungeon_owed_reach_ms(uint32 now_ms) { dungeon_owed_reach_ms_ = now_ms; }
+
 
     // ---- route-aware combat-advance reached-crumb latch (2026-07-03, 1b) ----
     // Hysteresis for DungeonAdvanceTarget's 8y arrive boundary. INVARIANT: once
@@ -2100,6 +2119,7 @@ public:
     // fleet-wide so anything tighter would drown the log.
     uint32 last_wander_diag_ms() const { return last_wander_diag_ms_; }
     ::Playerbot::V2::IdleWatch& idle_watch() { return idle_watch_; }
+    ::Playerbot::BgTactics::StallWatch& bg_stall() { return bg_stall_; }
     void   set_last_wander_diag_ms(uint32 ms) { last_wander_diag_ms_ = ms; }
 
     // Per-reagent retry cooldown. The reagent-buy rule emits
@@ -2792,6 +2812,13 @@ public:
         if (it == action_retry_until_ms_.end()) return false;
         return now_ms < it->second;
     }
+    // Raid buffs this bot cast itself (ClassicBuffLedger.h): a buff the group snapshot cannot see is not recast for a part of its length.
+    void note_buff_cast(uint64 key, uint32 now_ms) { buff_cast_ms_[key] = now_ms ? now_ms : 1u; }
+    bool buff_cast_trusted(uint64 key, uint32 now_ms) const
+    {
+        auto const it = buff_cast_ms_.find(key);
+        return it != buff_cast_ms_.end() && Classic::BuffCastTrusted(key, it->second, now_ms);
+    }
     void prune_action_retry_cache(uint32 now_ms)
     {
         for (auto it = action_retry_until_ms_.begin(); it != action_retry_until_ms_.end();)
@@ -3275,6 +3302,7 @@ private:
     ObjectGuid     owner_target_;
     uint32         manual_mode_until_ms_  = 0;
     uint32         last_owner_command_ms_ = 0;
+    uint32         owner_attack_ms_       = 0;
     std::string    last_owner_name_;
     uint8          formation_slot_        = 0;
     FormationType  formation_type_        = FormationType::Free;
@@ -3413,7 +3441,10 @@ private:
     std::string  last_whisper_target_;
     uint64_t     last_whisper_hash_       = 0;
     uint32       last_whisper_ms_         = 0;
+    uint32       last_bag_room_ms_        = 0;   // when idle:make_bag_room last fired
 public:
+    uint32 last_bag_room_ms() const { return last_bag_room_ms_; }
+    void   note_bag_room(uint32 now_ms) { last_bag_room_ms_ = now_ms; }
     // Returns true if (target, text) is OK to whisper now, false if
     // it would be a duplicate of the last emit within 500ms. Updates
     // the gate state on accept. Skipped (always returns true) when
@@ -3647,6 +3678,10 @@ private:
     int32_t        dungeon_route_wp_ = -1;
     uint32         dungeon_route_wp_map_ = 0;
     uint32         dungeon_earliest_boss_seen_ms_ = 0;  // boss-target hysteresis
+    uint32         dungeon_owed_floor_ = 0;       // owed-boss waiver (see dungeon_owed_floor())
+    uint32         dungeon_owed_floor_key_ = 0;
+    uint32         dungeon_owed_floor_map_ = 0;
+    uint32         dungeon_owed_reach_ms_ = 0;
     int32_t        dungeon_route_epoch_ = -1;  // bosses_done_count the cursor was built for
     // Route-aware combat-advance reached-crumb latch + its map (self-
     // invalidates on map change). See adv_route_reached_idx() above.
@@ -3951,6 +3986,7 @@ private:
     // Throttle for the `[wander_reason]` diagnostic — 1 line per bot
     // per 60s. Wander fires ~1000+/min fleet-wide.
     uint32 last_wander_diag_ms_ = 0;
+    ::Playerbot::BgTactics::StallWatch bg_stall_;   // battleground stand-still watchdog (State_Idle bg_stall)
     ::Playerbot::V2::IdleWatch idle_watch_;   // world-wide standing-still detector (DispatchIdle)
     // Cached corpse → graveyard distance. Recomputing every snapshot tick
     // walks `WorldSafeLocsEntry` against `sConditionMgr` for every nearby
@@ -4715,6 +4751,7 @@ private:
     std::unordered_map<uint64, uint32> chest_loot_until_ms_;
     // Generic action retry cooldown — see ActionKind / kActionRetryLockoutMs.
     std::unordered_map<uint64, uint32> action_retry_until_ms_;
+    std::unordered_map<uint64, uint32> buff_cast_ms_;   // note_buff_cast
     // #4B-1 Part 2: per-item AH sell-price memory — see SellPriceMemo above.
     // Keyed by item_entry. Bounded naturally by the bot's distinct sellable
     // inventory; the AhPostItem 5-min retry lockout limits churn so this map

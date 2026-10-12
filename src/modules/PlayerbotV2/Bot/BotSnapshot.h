@@ -449,7 +449,7 @@ struct NearbyUnit
     float      melee_swing = 0.f;
 
     // ---- Threat discipline (port of Karrz's GroupPveRestraint /
-    // MCRaidHoldDamage / LooseAttackers, wow-1.12 ike3 playerbot). Read by the
+    // MCRaidHoldDamage / LooseAttackers, ike3-based bots ike3 playerbot). Read by the
     // builder from the unit's ThreatManager on the build thread; consumed by
     // BotSnapshotView::threat_hold() and loose_attacker(). Zero / false on
     // units without a threat list (players, threatless creatures).
@@ -768,6 +768,7 @@ struct VitalsState
     int32 max_hp = 0;
     std::array<int32, 26> power{};
     std::array<int32, 26> max_power{};
+    int32 base_mana = 0;   // Unit::GetCreateMana: the base a percent-of-base-mana spell cost is taken from
 
     bool in_combat = false;
     // Milliseconds elapsed since combat started (0 when out of combat).
@@ -784,6 +785,8 @@ struct VitalsState
     bool is_stunned   = false;
     bool is_silenced  = false;
     bool is_rooted    = false;
+    bool is_feared    = false;   // fleeing (fear): every spell but the fear-breaking few is refused
+    bool is_confused  = false;
 
     // PvP context flags.
     bool is_pvp        = false;

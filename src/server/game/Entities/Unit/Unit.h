@@ -1220,6 +1220,8 @@ class TC_GAME_API Unit : public WorldObject
         void SetCritterGUID(ObjectGuid guid) { SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::Critter), guid); }
         ObjectGuid GetBattlePetCompanionGUID() const { return m_unitData->BattlePetCompanionGUID; }
         void SetBattlePetCompanionGUID(ObjectGuid guid) { SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::BattlePetCompanionGUID), guid); }
+        ObjectGuid GetClassicComboTarget() const { return m_unitData->ClassicComboTarget; }
+        void SetClassicComboTarget(ObjectGuid guid) { SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::ClassicComboTarget), guid); }
         ObjectGuid GetDemonCreatorGUID() const { return m_unitData->DemonCreator; }
         void SetDemonCreatorGUID(ObjectGuid guid) { SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::DemonCreator), guid); }
         Unit* GetDemonCreator() const;

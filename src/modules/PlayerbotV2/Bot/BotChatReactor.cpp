@@ -10,6 +10,9 @@
 #include "BotPersonality.h"
 #include "BotRegistry.h"
 #include "BotTextMgr.h"
+#include "TradeTalk.h"
+#include "BotTradeShop.h"
+#include "BotTrade.h"
 #include "BotTypes.h"
 #include "../Services.h"
 #include "../Threading/IntentQueue.h"
@@ -477,13 +480,14 @@ std::string BuildLocationReply(Player* bot, uint32 sel, Politeness pol)
 // Small talk answered from the bot's real data through BotConversation (how are you, where from, level, class, what doing,
 // group, quest help, directions, professions, guild, jokes, goodbye, ...). Returns false when the line is none of those (the
 // usual reply pools then apply) or when Playerbot.Chatter.Conversation is off.
-V2::ConversationContext MakeConvContext(Player* bot, BotAI* ai, std::string const& sender_name)
+V2::ConversationContext MakeConvContext(Player* bot, BotAI* ai, Player* sender)
 {
     static constexpr char const* kClass[] = { "", "warrior", "paladin", "hunter", "rogue", "priest", "death knight", "shaman",
                                                "mage", "warlock", "monk", "druid", "demon hunter", "evoker" };
     V2::ConversationContext ctx;
     ctx.self_name   = bot->GetName();
-    ctx.sender_name = sender_name;
+    ctx.sender_name = sender->GetName();
+    ctx.knows_sender = bot->GetGroup() && bot->GetGroup()->IsMember(sender->GetGUID());
     uint8 const cls = bot->GetClass();
     ctx.class_name  = cls < sizeof(kClass) / sizeof(kClass[0]) && kClass[cls][0] ? kClass[cls] : "adventurer";
     ctx.level       = bot->GetLevel();
@@ -532,12 +536,12 @@ V2::ConversationContext MakeConvContext(Player* bot, BotAI* ai, std::string cons
     return ctx;
 }
 
-bool BuildSmallTalkReply(Player* bot, BotAI* ai, std::string const& msg, std::string const& sender_name, uint32 sel, bool addressed,
+bool BuildSmallTalkReply(Player* bot, BotAI* ai, std::string const& msg, Player* sender, uint32 sel, bool addressed,
                          std::string& out)
 {
     if (!Services::Config().chatter_conversation())
         return false;
-    return V2::ConvReply(MakeConvContext(bot, ai, sender_name), V2::ConvNormalize(msg), msg, sel, addressed, out);
+    return V2::ConvReply(MakeConvContext(bot, ai, sender), V2::ConvNormalize(msg), msg, sel, addressed, out);
 }
 
 // True when the message carries a pause cue ("wait"/"hold"/"stop"/"back"/
@@ -800,7 +804,7 @@ void BotChatReactor::React(Player* sender, Group* group, std::string const& msg)
         // the bot's zone (shared BuildLocationReply), instead of returning
         // silent because PickReply has no LocationQuery case.
         std::string reply_str;
-        if (BuildSmallTalkReply(c.bot, c.ai, msg, sender->GetName(), sel, c.addressed, reply_str))
+        if (BuildSmallTalkReply(c.bot, c.ai, msg, sender, sel, c.addressed, reply_str))
         {
         }
         else if (c.kind == ReactKind::LocationQuery)
@@ -889,6 +893,69 @@ bool IsCompanionBot(Player* bot, Player* sender, bool& sender_in_group)
 
 } // namespace
 
+// Trading by whisper: "what do you have" lists what the bot sells, "buy 2" / "buy <item>" orders from that list, and the order is
+// filled in the trade window (API::trade_with). Returns true when the line was trade talk and has been answered.
+static bool ReplyTradeTalk(Player* sender, Player* bot, BotAI* ai, std::string const& norm, uint32 now_ms)
+{
+    namespace TT = V2::TradeTalk;
+    bool const ask = TT::IsInventoryQuestion(norm);
+    TT::Order const order = ask ? TT::Order{} : TT::ParseOrder(norm);
+    if (!ask && !order.is_order) return false;
+
+    std::vector<std::string> lines;
+    if (ask)
+    {
+        std::vector<TradeShop::Offer> offers = TradeShop::BuildOffers(bot);
+        TradeShop::StoreList(bot, sender, offers);
+        if (offers.empty())
+            lines.push_back("sorry, i've got nothing to sell right now");
+        else
+        {
+            lines.push_back("here's what i can sell:");
+            for (std::string& l : TradeShop::Describe(offers)) lines.push_back(std::move(l));
+            lines.push_back("whisper me \"buy 1\" (the number), then open a trade and put the gold in");
+        }
+    }
+    else
+    {
+        std::vector<TradeShop::Offer> list;
+        if (!TradeShop::GetList(bot, sender, list)) return false;   // no list shown yet: not about trading
+        std::vector<TT::ListedItem> names;
+        for (TradeShop::Offer const& o : list)
+        {
+            std::string n = o.name;
+            std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            names.push_back({ std::move(n) });
+        }
+        int const idx = TT::ResolveOrder(order, names);
+        if (idx < 0)
+        {
+            if (!order.buy_verb) return false;
+            lines.push_back("i don't have that, ask me \"what do you have\" for my list");
+        }
+        else
+        {
+            TradeShop::Offer o;
+            if (!TradeShop::PlaceOrder(bot, sender, size_t(idx), o) || !bot->GetItemByGuid(o.item))
+                lines.push_back("sorry, i no longer have that one");
+            else
+                lines.push_back(o.name + (o.count > 1 ? " x" + std::to_string(o.count) : std::string()) + " is " + BotTrade::FormatMoney(o.price) +
+                                ", open a trade and put that in");
+        }
+    }
+    uint32 delay = ComputeReplyDeferMs(now_ms, ai->personality(), norm.size(), lines.front().size(), uint32(bot->GetGUID().GetCounter()));
+    for (std::string& l : lines)
+    {
+        Intent it{};
+        it.bot_id = bot->GetGUID().GetCounter();
+        it.body   = ChatIntent{WhisperIntent{sender->GetName(), std::move(l)}};
+        it.defer_until_ms = delay;
+        Services::Intents(it.bot_id).push(std::move(it));
+        delay += 1100u;
+    }
+    return true;
+}
+
 void BotChatReactor::ReactWhisper(Player* sender, Player* bot, std::string const& msg)
 {
     if (!sender || !bot || msg.empty()) return;
@@ -937,6 +1004,7 @@ void BotChatReactor::ReactWhisper(Player* sender, Player* bot, std::string const
     }
     const std::string norm = Normalize(msg);
     if (norm.size() < 2) return;
+    if (ReplyTradeTalk(sender, bot, ai, norm, GameTime::GetGameTimeMS())) return;
     const std::string first_name = FirstNameLower(bot->GetName());
     ReactKind kind = ClassifyMessage(norm, first_name);
     // A whisper is always addressed to the bot, so a line the keyword table does not recognise
@@ -1000,10 +1068,10 @@ void BotChatReactor::ReactWhisper(Player* sender, Player* bot, std::string const
     char const* source = "conversation";
     if (repeat > 0 && Services::Config().chatter_conversation())
     {
-        reply_str = V2::ConvRepeatReply(MakeConvContext(bot, ai, sender->GetName()), sel, repeat);
+        reply_str = V2::ConvRepeatReply(MakeConvContext(bot, ai, sender), sel, repeat);
         source = "repeat";
     }
-    else if (BuildSmallTalkReply(bot, ai, msg, sender->GetName(), sel, /*addressed=*/true, reply_str))
+    else if (BuildSmallTalkReply(bot, ai, msg, sender, sel, /*addressed=*/true, reply_str))
     {
     }
     else if (kind == ReactKind::LocationQuery)
@@ -1373,7 +1441,7 @@ void ReactSpoken(Player* sender, std::string const& msg, bool is_yell,
     const Politeness pol = chosen->ai ? chosen->ai->personality().politeness
                                       : Politeness::Neutral;
     std::string reply_str;
-    if (BuildSmallTalkReply(chosen->bot, chosen->ai, msg, sender->GetName(), sel, chosen->addressed, reply_str))
+    if (BuildSmallTalkReply(chosen->bot, chosen->ai, msg, sender, sel, chosen->addressed, reply_str))
     {
     }
     else if (chosen->kind == ReactKind::LocationQuery)

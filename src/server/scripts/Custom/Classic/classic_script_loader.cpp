@@ -169,6 +169,9 @@ void AddSC_classic_instance_shadowfang_keep();
 void AddSC_classic_boss_mr_smite();
 void AddSC_classic_deadmines();
 void AddSC_classic_instance_deadmines();
+void AddSC_classic_instance_ragefire_chasm();
+void AddSC_classic_instance_ruins_of_lordaeron();
+void AddSC_classic_instance_the_stockade();
 void AddSC_classic_moonglade();
 void AddSC_classic_feralas();
 void AddSC_classic_felwood();
@@ -194,6 +197,10 @@ void AddSC_classic_world_event_wareffort();
 void AddSC_classic_npcs_special();
 void AddSC_classic_go_scripts();
 void AddSC_classic_spell_scripts();
+void AddSC_classic_talents_mage_shaman();
+void AddSC_classic_talents_warrior_rogue_hunter();
+void AddSC_classic_talents_priest_paladin();
+void AddSC_classic_talents_warlock_druid();
 void AddSC_classic_armory_commands();
 void AddSC_classic_legacy_commands();
 void AddSC_classic_discord_commands();
@@ -208,8 +215,6 @@ void AddSC_classic_silverpine_forest();
 void AddSC_classic_searing_gorge();
 void AddSC_classic_loch_modan();
 void AddSC_classic_hinterlands();
-void AddSC_classic_battleground_warsong_gulch();
-void AddSC_classic_battleground_arathi_basin();
 void AddSC_classic_battleground_alterac_valley();
 
 void AddClassicScripts()
@@ -365,6 +370,9 @@ void AddClassicScripts()
     AddSC_classic_boss_mr_smite();
     AddSC_classic_deadmines();
     AddSC_classic_instance_deadmines();
+    AddSC_classic_instance_ragefire_chasm();
+    AddSC_classic_instance_ruins_of_lordaeron();
+    AddSC_classic_instance_the_stockade();
     AddSC_classic_moonglade();
     AddSC_classic_feralas();
     AddSC_classic_felwood();
@@ -390,6 +398,10 @@ void AddClassicScripts()
     AddSC_classic_npcs_special();
     AddSC_classic_go_scripts();
     AddSC_classic_spell_scripts();
+    AddSC_classic_talents_mage_shaman();
+    AddSC_classic_talents_warrior_rogue_hunter();
+    AddSC_classic_talents_priest_paladin();
+    AddSC_classic_talents_warlock_druid();
     AddSC_classic_armory_commands();
     AddSC_classic_legacy_commands();
     AddSC_classic_discord_commands();
@@ -404,7 +416,5 @@ void AddClassicScripts()
     AddSC_classic_searing_gorge();
     AddSC_classic_loch_modan();
     AddSC_classic_hinterlands();
-    AddSC_classic_battleground_warsong_gulch();
-    AddSC_classic_battleground_arathi_basin();
     AddSC_classic_battleground_alterac_valley();
 }

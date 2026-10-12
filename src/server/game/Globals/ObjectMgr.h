@@ -1044,6 +1044,8 @@ class TC_GAME_API ObjectMgr
         CreatureModelInfo const* GetCreatureModelRandomGender(CreatureModel* model, CreatureTemplate const* creatureTemplate) const;
         CreatureSummonedData const* GetCreatureSummonedData(uint32 entryId) const;
         std::pair<uint8, uint8> const* GetCreatureClassicLevel(uint32 entry) const;
+        ClassicCreatureStats const* GetCreatureClassicStats(uint32 entry) const;
+        ClassicCreatureClassLevelStats const* GetCreatureClassicClassLevelStats(uint8 level, uint8 unitClass) const;
         void LoadItemClassicBlock();
         uint32 GetItemClassicBlock(uint32 entry) const;
         static CreatureModel const* ChooseDisplayId(CreatureTemplate const* cinfo, CreatureData const* data = nullptr);
@@ -1222,6 +1224,16 @@ class TC_GAME_API ObjectMgr
         void LoadCreatureLocales();
         void LoadCreatureTemplates();
         void LoadCreatureClassicLevels();
+        void LoadCreatureClassicMelee();
+        // Classic 1.60: vanilla (VMaNGOS) melee hit and swing time of a creature, nullptr when it has none
+        struct CreatureClassicMelee
+        {
+            float DamageMin = 0.0f;     // per hit, VMaNGOS dmg_min x dmg_multiplier
+            float DamageMax = 0.0f;
+            uint32 AttackMs = 0;        // base_attack_time, 0 = keep the template's
+            uint32 RangedAttackMs = 0;
+        };
+        CreatureClassicMelee const* GetCreatureClassicMelee(uint32 entry) const;
         void LoadCreatureTemplateAddons();
         void LoadCreatureTemplateSparring();
         void LoadCreatureTemplate(Field* fields);
@@ -1567,6 +1579,8 @@ class TC_GAME_API ObjectMgr
         }
         uint32 GetCreatureTrainerForGossipOption(uint32 creatureId, uint32 gossipMenuId, uint32 gossipOptionId) const;
 
+        bool IsItemSoldByVendorForGold(uint32 itemId) const { return _goldVendorItems.contains(itemId); }
+
         VendorItemData const* GetNpcVendorItemList(uint32 entry) const
         {
             CacheVendorItemContainer::const_iterator iter = _cacheVendorItemStore.find(entry);
@@ -1802,6 +1816,7 @@ class TC_GAME_API ObjectMgr
         void BuildPlayerLevelInfo(uint8 race, uint8 class_, uint8 level, PlayerLevelInfo* plinfo) const;
 
         std::unordered_map<std::pair<Races, Classes>, std::unique_ptr<PlayerInfo>> _playerInfo;
+        std::unordered_map<uint32, uint32> _classicBaseMana;   // Classic 1.60: (class << 8 | level) -> VMaNGOS base mana
 
         typedef std::vector<uint32> PlayerXPperLevel;       // [level]
         PlayerXPperLevel _playerXPperLevel;
@@ -1822,6 +1837,9 @@ class TC_GAME_API ObjectMgr
         CreatureDataContainer _creatureDataStore;
         CreatureTemplateContainer _creatureTemplateStore;
         std::unordered_map<uint32, std::pair<uint8, uint8>> _creatureClassicLevelStore;
+        std::unordered_map<uint32, ClassicCreatureStats> _creatureClassicStatsStore;
+        std::unordered_map<uint16, ClassicCreatureClassLevelStats> _creatureClassicClassLevelStatsStore;
+        std::unordered_map<uint32, CreatureClassicMelee> _creatureClassicMeleeStore;
         std::unordered_map<uint32, uint32> _itemClassicBlockStore;
         CreatureModelContainer _creatureModelStore;
         std::unordered_map<uint32, CreatureSummonedData> _creatureSummonedDataStore;
@@ -1868,6 +1886,7 @@ class TC_GAME_API ObjectMgr
         TrinityStringContainer _trinityStringStore;
 
         CacheVendorItemContainer _cacheVendorItemStore;
+        std::unordered_set<uint32> _goldVendorItems;
         std::unordered_map<uint32, Trainer::Trainer> _trainers;
         std::map<std::tuple<uint32, uint32, uint32>, uint32> _creatureDefaultTrainers;
 

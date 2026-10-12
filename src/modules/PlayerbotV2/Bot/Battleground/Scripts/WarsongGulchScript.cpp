@@ -41,7 +41,7 @@ public:
             BgRole::FlagCarrier,
             BgRole::FCEscort,
             BgRole::Defender,     // flag room guards: two, each at its own post beside the stand (not on it: Karrz, two bots camped on
-            BgRole::Defender,     // the stand). Ported from the ike3 bots' two defender posts (Karrz's earlier VMaNGOS bot tree (wow-1.12) raid10-revamp bcc8b9f)
+            BgRole::Defender,     // the stand). Ported from the ike3 bots' two defender posts (the ike3-based playerbot code)
             BgRole::Roamer,
             BgRole::Roamer,
             BgRole::Attacker,
@@ -64,7 +64,7 @@ public:
         a.fc_class_preference     = { 4u, 11u };
         // Modern WSG (map 2106): flag pedestals are NEW_FLAG (36), a
         // dropped flag is NEW_FLAG_DROP (37). Classic WSG (map 489,
-        // classic_battleground_warsong_gulch.cpp) has the 1.12 objects:
+        // battleground_warsong_gulch.cpp) has the 1.12 objects:
         // FLAGSTAND (24) on the stands (179830/179831) and FLAGDROP (26)
         // on the ground (179785/179786). Each map spawns only its own
         // pair; the own-stand skip in BgTryUseObjectiveGo covers 24 the

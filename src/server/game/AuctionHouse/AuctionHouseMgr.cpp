@@ -441,17 +441,18 @@ Item* AuctionHouseMgr::GetAItem(ObjectGuid itemGuid)
     return Trinity::Containers::MapGetValuePtr(_itemsByGuid, itemGuid);
 }
 
-uint64 AuctionHouseMgr::GetCommodityAuctionDeposit(ItemTemplate const* item, Minutes time, uint32 quantity)
+uint64 AuctionHouseMgr::GetCommodityAuctionDeposit(ItemTemplate const* item, Minutes time, uint32 quantity, uint32 depositRate /*= 5*/)
 {
     uint32 sellPrice = item->GetSellPrice();
-    // Classic 1.60: deposit 5% of the vendor price per 2 hours (AuctionHouse.db2 DepositRate 5), at least 1 copper, no silver rounding
-    return uint64(std::max(1.0, std::floor(0.05 * quantity * sellPrice))) * (time.count() / (MIN_AUCTION_TIME / MINUTE));
+    // Classic 1.60: deposit DepositRate% of the vendor price per 2 hours (AuctionHouse.db2: 5 at the faction houses, 25 at the
+    // neutral goblin house, like vanilla), at least 1 copper, no silver rounding
+    return uint64(std::max(1.0, std::floor(depositRate / 100.0 * quantity * sellPrice))) * (time.count() / (MIN_AUCTION_TIME / MINUTE));
 }
 
-uint64 AuctionHouseMgr::GetItemAuctionDeposit(Player const* player, Item const* item, Minutes time)
+uint64 AuctionHouseMgr::GetItemAuctionDeposit(Player const* player, Item const* item, Minutes time, uint32 depositRate /*= 5*/)
 {
     uint32 sellPrice = item->GetSellPrice(player);
-    return uint64(std::max(1.0, std::floor(sellPrice * 0.05))) * (time.count() / (MIN_AUCTION_TIME / MINUTE));
+    return uint64(std::max(1.0, std::floor(sellPrice * (depositRate / 100.0)))) * (time.count() / (MIN_AUCTION_TIME / MINUTE));
 }
 
 std::string AuctionHouseMgr::BuildItemAuctionMailSubject(AuctionMailType type, AuctionPosting const* auction)
@@ -1677,7 +1678,7 @@ bool AuctionHouseObject::BuyCommodity(CharacterDatabaseTransaction trans, Player
 
         uint64 auctionHouseCut = CalculateAuctionHouseCut(auction->BuyoutOrUnitPrice * boughtFromAuction);
         uint64 depositPart = AuctionHouseMgr::GetCommodityAuctionDeposit(items[0].Items[0]->GetTemplate(), std::chrono::duration_cast<Minutes>(auction->EndTime - auction->StartTime),
-            boughtFromAuction);
+            boughtFromAuction, _auctionHouse->DepositRate);
         uint64 profit = auction->BuyoutOrUnitPrice * boughtFromAuction + depositPart - auctionHouseCut;
 
         if (Player* owner = ObjectAccessor::FindConnectedPlayer(auction->Owner))

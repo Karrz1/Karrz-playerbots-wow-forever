@@ -2,7 +2,7 @@
 // rotations (Apl_Classic_Priest / Druid / Paladin / Shaman) and the
 // out-of-combat top-up (State_Idle MaintainOocHeal).
 //
-// Port of Karrz's ike3 vanilla healer (wow-1.12 PlayerBots):
+// Port of Karrz's ike3 vanilla healer (ike3-based bots PlayerBots):
 //   - PickPatient: values/PartyMemberToHeal.cpp Calculate + MCRaidPolicy
 //     HealScore. Candidates within heal range on the bot's map; members out
 //     of line of sight are skipped unless they are a tank or below 35% (the
@@ -61,10 +61,12 @@
 #include "Bot/ClassTables.h"
 #include "Bot/ClassicUpkeep.h"
 #include "Bot/RezClaims.h"      // IsRezSpell, rez cast refusals
+#include "Bot/RezRule.h"        // RezRank, RezFightLive
 #include "Bot/ThreatDiscipline.h"
 #include "Bot/Raid/RaidHealStats.h"
 #include "Bot/ClassicHealScope.h"
 #include "Bot/ClassicHealCover.h"
+#include "HealClaimStore.h"
 #include "Group/GroupSnapshot.h"
 #include "Services.h"
 #include "Log.h"
@@ -329,32 +331,6 @@ inline uint64 HealLogKey(BotSnapshotView const& s, HealLogKind k)
 // kHealCriticalCover times the deficit in flight; a healer's own tank under half
 // health kHealTankTroubleCover times it: the tank's healers are not exempt, only
 // asked for a margin).
-constexpr uint32 kHealClaimGraceMs   = 600;
-constexpr uint32 kHealClaimMaxAgeMs  = 10000;
-constexpr int32  kHealCriticalLandMs = 500;
-
-struct HealClaim
-{
-    ObjectGuid patient;
-    uint32     spell    = 0;      // exact rank cast
-    float      amount   = 0.0f;   // ExpectedHeal of that rank
-    uint32     start_ms = 0;      // claimant's published_at_ms at emit
-    uint32     land_ms  = 0;      // start + base cast time
-};
-using HealClaims = std::vector<std::pair<uint64, HealClaim>>;   // healer guid counter -> claim
-
-template <typename F>
-auto WithHealClaims(uint32 now, F&& f)
-{
-    static std::mutex mu;
-    static std::unordered_map<uint64, HealClaim> claims;
-    std::lock_guard<std::mutex> lock(mu);
-    if (claims.size() > 64)
-        for (auto it = claims.begin(); it != claims.end();)
-            it = int32(now - it->second.start_ms) > int32(kHealClaimMaxAgeMs) ? claims.erase(it) : std::next(it);
-    return f(claims);
-}
-
 // Copy of the live claims for one PickPatient pass (one lock, not one per candidate).
 inline HealClaims CopyHealClaims(uint32 now)
 {
@@ -455,8 +431,7 @@ void ApplyInFlight(BotSnapshotView const& s, GroupSnapshotView const& g, Patient
 inline int64 HealDeficit(Patient const& p) { return HealDeficitOf(p.max_hp, p.hp, p.incoming); }
 inline bool CoveredByInFlight(BotSnapshotView const& s, Patient const& p, float margin = 1.0f)
 {
-    (void)s;
-    return CoveredByHealsInFlight(p.max_hp, p.hp, p.incoming, p.inflight, p.actual_pct, margin);
+    return CoveredByHealsInFlight(p.max_hp, p.hp, p.incoming, p.inflight, p.actual_pct, margin, s.in_combat());
 }
 
 inline void NoteCoveredSkip(BotSnapshotView const& s, Patient const& p, char const* where)
@@ -830,6 +805,47 @@ inline void NoteHotCast(BotSnapshotView const& s, ObjectGuid target, uint32 spel
     });
 }
 
+// Power Word: Shield claims (ClassicHealCover.h ShieldClaimFresh): the cast time of the last shield any priest started on a patient.
+inline bool ShieldClaimedByOther(BotSnapshotView const& s, ObjectGuid target)
+{
+    if (!RaidHealing(s) || !HealClaimsOn() || target.IsEmpty())
+        return false;
+    uint32 const now = s.published_at_ms();
+    uint64 const self = s.guid().GetCounter();
+    uint64 const key = (uint64(target.GetCounter()) << 24) ^ 0x5348ull;   // "SH"
+    return WithHotClaims([&](auto& claims)
+    {
+        auto const it = claims.find(key);
+        return it != claims.end() && it->second.caster != self && ShieldClaimFresh(it->second.ms, now);
+    });
+}
+
+inline void NoteShieldCast(BotSnapshotView const& s, ObjectGuid target)
+{
+    if (!RaidHealing(s) || !HealClaimsOn() || target.IsEmpty())
+        return;
+    uint64 const key = (uint64(target.GetCounter()) << 24) ^ 0x5348ull;
+    uint64 const self = s.guid().GetCounter();
+    uint32 const now = s.published_at_ms();
+    WithHotClaims([&](auto& claims)
+    {
+        claims[key] = { self, now ? now : 1u };
+        return 0;
+    });
+}
+
+// A HoT on a raid member is worth its mana (ClassicHealCover.h HotWorthCasting).
+inline bool HotWorthIt(BotSnapshotView const& s, GroupSnapshotView const& g, ObjectGuid target)
+{
+    Patient p = PatientFor(s, g, target);
+    if (!p.valid)
+        return true;
+    bool const raid = RaidHealing(s);
+    if (raid && HealClaimsOn())
+        ApplyInFlight(s, g, p, CopyHealClaims(s.published_at_ms()));
+    return HotWorthCasting(raid, p.actual_pct, HealDeficit(p), p.inflight);
+}
+
 struct HealPlan
 {
     uint32 rank = 0;      // 0 = cast the highest known rank
@@ -1120,8 +1136,7 @@ ObjectGuid RezTarget(BotSnapshotView const& s, GroupSnapshotView const& g, float
         ++rezzers;
         if (m.guid < s.guid()) ++index;
     }
-    int const turn = int((s.published_at_ms() / 3000u) % uint32(rezzers));
-    int const rank = (index + rezzers - turn) % rezzers;
+    int const rank = V2::RezRank(index, rezzers, s.published_at_ms());
     if (rank >= n) return ObjectGuid::Empty;
     return cand[rank]->guid;
 }
@@ -1146,9 +1161,26 @@ inline bool RezManaOk(BotSnapshotView const& s)
 
 // Vanilla out-of-combat rez (Resurrection / Ancestral Spirit / Redemption;
 // druids have none) and the druids' Rebirth: the corpse this bot takes.
+// True while the group's fight is on (a tank in combat, or three or more members): the out-of-combat rezzes wait for it to end
+// (V2::RezFightLive). The rotations of priest / paladin / shaman reach OocRezTarget with a healer that is itself out of combat, and
+// raised the owner in the middle of the encounter; Rebirth does not come through here.
+inline bool RaidFightLive(GroupSnapshotView const& g, uint32 map_id)
+{
+    auto const* members = g.members();
+    if (!members) return false;
+    int tanks = 0, fighting = 0;
+    for (GroupMemberSummary const& m : *members)
+    {
+        if (!m.online || !m.is_alive || !m.in_combat || m.map_id != map_id) continue;
+        ++fighting;
+        if (m.role == Role::Tank) ++tanks;
+    }
+    return V2::RezFightLive(tanks, fighting);
+}
+
 inline ObjectGuid OocRezTarget(BotSnapshotView const& s, GroupSnapshotView const& g)
 {
-    if (!RezManaOk(s))
+    if (!RezManaOk(s) || RaidFightLive(g, s.map_id()))
         return ObjectGuid::Empty;
     return RezTarget(s, g, 28.0f, [](GroupMemberSummary const& m)
     {
@@ -1237,7 +1269,11 @@ inline void DoAssignedDispel(ApPredicateContext const& ctx, BotIntentEmitter& e)
 {
     Classic::CastPick const d = Classic::PickDispel(ctx.bot, ctx.group);
     if (d.spell && e.cast(d.spell, d.target))
-        Classic::NoteRaidSupport(Classic::RaidSupportKind::Dispel);
+    {
+        Classic::NoteRaidSupport(Classic::RaidSupportKind::Dispel, ctx.bot.map_id());
+        if (Classic::IsCurseDispelSpell(d.spell))
+            Classic::NoteRaidSupport(Classic::RaidSupportKind::Decurse, ctx.bot.map_id());
+    }
 }
 
 // [raid_heal] spell / rank change: the exact rank this bot casts differs from
@@ -1309,6 +1345,10 @@ inline bool EmitHeal(BotSnapshotView const& s, GroupSnapshotView const& g, BotIn
 {
     if (!p.valid)
         return false;
+    // Feared, stunned, confused or silenced: the core refuses the cast, so nothing is picked, logged or claimed (MC Magmadar
+    // 2026-10-10: feared healers stepped up the ranks on every refused cast).
+    if (s.cannot_heal())
+        return false;
     ObjectGuid const target = p.guid.IsEmpty() ? s.guid() : p.guid;
     if (!RaidHealing(s) || !HealClaimsOn())
     {
@@ -1378,7 +1418,7 @@ inline bool EmitHeal(BotSnapshotView const& s, GroupSnapshotView const& g, BotIn
 // healer's claim, so the other healers' in-flight counts see it.
 inline void NoteHealClaim(BotSnapshotView const& s, ObjectGuid target, uint32 spell, float amount)
 {
-    if (!RaidHealing(s) || !HealClaimsOn() || target.IsEmpty() || !spell)
+    if (!RaidHealing(s) || !HealClaimsOn() || target.IsEmpty() || !spell || s.cannot_heal())
         return;
     uint32 const now = s.published_at_ms();
     SpellInfo const* si = sSpellMgr->GetSpellInfo(spell, DIFFICULTY_NONE);

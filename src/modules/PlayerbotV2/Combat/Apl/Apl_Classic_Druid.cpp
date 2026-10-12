@@ -21,7 +21,7 @@
 // are handled by the idle-state buff maintenance), Omen of Clarity, Cat
 // bail-out to heal.
 //
-// Priorities follow Karrz's ike3 vanilla strategies (Karrz's earlier VMaNGOS bot tree (wow-1.12)
+// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
 // raid10-revamp, playerbot/strategy/druid/*Strategy.cpp, MANGOSBOT_ZERO).
 
 #include "../ApRegistry.h"
@@ -706,6 +706,7 @@ bool ShouldRejuvenation(ApPredicateContext const& ctx)
     if (!CasterReady(ctx, REJUVENATION)) return false;
     HealTarget const t = LowestFriendOrSelf(ctx);
     return t.hp_pct <= 85 && !TargetHasMyAura(ctx, REJUVENATION, t.guid) && ClassicHeal::HotAllowed(ctx.bot, ctx.group, t.guid)
+        && ClassicHeal::HotWorthIt(ctx.bot, ctx.group, t.guid)
         && !ClassicHeal::HotClaimedByOther(ctx.bot, ctx.group, t.guid, REJUVENATION);
 }
 void DoRejuvenation(ApPredicateContext const& ctx, BotIntentEmitter& e)

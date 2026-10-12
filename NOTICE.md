@@ -1,9 +1,9 @@
-# Notice and credits: Karrz's Player Bots (this repository)
+# Notice and credits: WoW Forever Bots (this repository)
 
-"Karrz's Player Bots" by Karrz is the name of this bot system. Every upstream credit and license below stays in force.
+"WoW Forever Bots" by Karrz is the name of this bot system. Every upstream credit and license below stays in force.
 
 This module is part of a TrinityCore-based tree and is distributed under the GNU General
-Public License version 2 (`COPYING` in this folder), the same terms as TrinityCore.
+Public License version 2 (`COPYING`), the same terms as TrinityCore.
 
 - **PlayerbotV2** was written by agatho (https://github.com/agatho/TrinityCore, branch
   `playerbot-v2`), whose README states "GPL-2.0, same as TrinityCore". The core API, the
@@ -28,9 +28,10 @@ redistributing. Source files of the module do not carry per-file headers; this n
 
 ## This repository
 
-- This repository holds only the files of Karrz's Player Bots: the bot module and the files of advocaite's TrinityCore `forever`
-  branch (https://github.com/advocaite/TrinityCore, GPL-2.0, copyright the TrinityCore project and contributors) that the bots
-  needed changed. Those changed files are derived from TrinityCore and stay under its GPL-2.0.
+- This branch is advocaite's TrinityCore `forever` tree (https://github.com/advocaite/TrinityCore, GPL-2.0, copyright the TrinityCore
+  project and contributors) plus WoW Forever Bots. The files that were changed are derived from TrinityCore and stay under its GPL-2.0.
+- The 1.12 numbers (spell values, creature stats, ...) are read from the VMaNGOS database dump by `tools/classic_spell_values/`. The dump is
+  not part of this repository; it belongs to its authors.
 - Libraries under `dep/` keep their own licenses (see each folder).
 - mod-playerbots (AzerothCore) is AGPL-3.0: used only as a reference for ideas, no code copied. SimulationCraft is GPL-3.0: data used as reference.
 - World of Warcraft data, names and client files belong to Blizzard Entertainment and are not included.

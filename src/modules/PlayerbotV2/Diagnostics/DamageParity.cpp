@@ -8,8 +8,10 @@
 #include "../Threading/SnapshotPublisher.h"
 #include "../Threading/TickScheduler.h"
 
+#include "ClassicArmor.h"
 #include "Config.h"
 #include "Creature.h"
+#include "GameObject.h"
 #include "GameTime.h"
 #include "Item.h"
 #include "Log.h"
@@ -37,6 +39,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -214,7 +217,7 @@ constexpr TalentRef kTalents[] = {
     { 3, "Lethal Shots", 5 }, { 3, "Mortal Shots", 0 }, { 3, "Slaying", 0 }, { 3, "Barrage", 0 },
 };
 
-enum class Step : std::uint8_t { Prepare, Settle, Warm, Measure, SweepSetup, SweepCast, SweepWait, Econ, Incoming, Finished };
+enum class Step : std::uint8_t { Prepare, Settle, Warm, Measure, SweepSetup, SweepCast, SweepWait, Econ, Incoming, Trap, Finished };
 
 // The economy audit's progress: phase 0 regen out of combat, 1 regen in combat, 2 regen while casting, 3 heal sizes, 4 done.
 struct Econ
@@ -233,7 +236,14 @@ struct Econ
     std::vector<double> got;
     std::vector<std::uint32_t> auras_before;   // casting-regen window: the subject's aura ids at its start
     int cast_starts = 0;                       // casts that actually began (api.cast_spell can say Ok for one that never starts)
+    double spent = 0.0;                        // mana the accepted casts cost when they were issued (a free Clearcasting cast adds 0)
+    int cast_attempts = 0;                   // casting-regen window: cast_spell calls, accepted or not
+    int cast_gcd_ticks = 0;                    // ticks the window skipped a cast because the global cooldown (or a cast) was running
+    int last_result = -1;                      // Playerbot::Result of the last refused cast_spell
+    std::uint32_t last_fail = 0;               // its SpellCastResult (API::last_cast_fail)
     bool was_casting = false;
+    std::set<std::uint32_t> recov;             // food / drink auras seen in the current window
+    bool sat = false;
 };
 
 // The incoming damage scenario's progress: legs 0-2 are the dummy at bare / tier 1 / tier 3 armor, 3-5 the mobs.
@@ -243,8 +253,29 @@ struct Incoming
     std::uint32_t t = 0;
     bool setup = false;
     bool crush_logged = false;
+    std::uint32_t out_of_reach_s = 0;     // consecutive seconds the attacker has been out of melee range of the tank
+    std::uint32_t repositioned = 0;       // times the harness put it back next to the tank this leg
     struct Result { std::string label; double armor = 0.0; SpellAgg melee; std::map<std::uint32_t, SpellAgg> all; };
     std::vector<Result> results;
+};
+
+// The trap audit's progress: one entry per trap spell, each in four phases (0 cast, 1 find the object and walk the dummy onto it, 2 wait for it to
+// fire, 3 let the effect land and judge).
+struct TrapAudit
+{
+    std::size_t item = 0;
+    int phase = 0;
+    std::uint32_t t = 0;
+    std::uint32_t spell_id = 0;
+    ObjectGuid trap;
+    std::uint32_t trap_entry = 0;
+    std::uint32_t health_before = 0;
+    bool fired = false;
+    int attempt = 1;                   // a spell can miss the level 63 dummy: a trap is broken only when none of its attempts works
+    std::uint32_t effect_spell = 0;    // what the trap object casts when it fires (the object's template)
+    bool control_ran = false;          // the direct cast of the effect spell at the dummy has been done (then the trap itself is judged broken)
+    std::uint32_t control_lost = 0;
+    std::size_t control_auras = 0;
 };
 
 struct State
@@ -276,6 +307,7 @@ struct State
     bool audit_done = false;
     Econ econ;
     Incoming incoming;
+    TrapAudit trap;
     std::vector<std::string> table;     // markdown rows
     std::string dummy_name;
 };
@@ -623,8 +655,8 @@ void ReportLeg(Player* p)
     bool const reference = r.leg.sp == 0 && r.leg.ap == 0 && r.leg.armor == kDummyArmor;
     r.verdict = reference ? DpsVerdict(g.cls, tier, /*raid_buffs*/ false, r.dps, &r.range) : RangeVerdict::NoReference;
 
-    TC_LOG_INFO("playerbot.v2", "[dmg_parity] leg class={} leg={} gear={} tier_pieces={} armor={} secs={:.0f} dps={:.0f} pet_dps={:.0f} casting_s={} attacking_s={} idle_s={} mana_refills={} range={} verdict={}",
-                g.cls_name, r.leg.label, tier, TierPieces(p, tier), r.leg.armor, r.seconds, r.dps, pet_dps, g.casting_s, g.attacking_s, g.idle_s, g.mana_refills,
+    TC_LOG_INFO("playerbot.v2", "[dmg_parity] leg class={} leg={} gear={} tier_pieces={} armor={} secs={:.0f} dps={:.0f} dps_busy={:.0f} pet_dps={:.0f} casting_s={} attacking_s={} idle_s={} mana_refills={} range={} verdict={}",
+                g.cls_name, r.leg.label, tier, TierPieces(p, tier), r.leg.armor, r.seconds, r.dps, (g.casting_s + g.attacking_s) ? double(total + pet_total) / double(g.casting_s + g.attacking_s) : 0.0, pet_dps, g.casting_s, g.attacking_s, g.idle_s, g.mana_refills,
                 r.range.empty() ? "-" : r.range, ToString(r.verdict));
     TC_LOG_INFO("playerbot.v2", "[dmg_parity] gear leg={} {} -> {}", r.leg.label, g.gear_at_start, GearSummary(p));
     TC_LOG_INFO("playerbot.v2", "[dmg_parity] stats leg={} AP={:.0f} RAP={:.0f} SP[hol,fir,nat,fro,sha,arc]={:.0f},{:.0f},{:.0f},{:.0f},{:.0f},{:.0f} crit_melee={:.2f} crit_spell={:.2f} dummy_armor={:.0f} weapon_speed={:.2f} dual_wield={}",
@@ -819,12 +851,63 @@ bool SweepSetup(Player* p)
     return true;
 }
 
+// The raw core refusal behind a cast_spell result (API::last_cast_fail: a SpellCastResult, or one of the API's own gate codes).
+std::string CastFailText(std::uint32_t raw)
+{
+    switch (raw)
+    {
+        case SPELL_FAILED_OUT_OF_RANGE:      return "SPELL_FAILED_OUT_OF_RANGE";
+        case SPELL_FAILED_LINE_OF_SIGHT:     return "SPELL_FAILED_LINE_OF_SIGHT";
+        case SPELL_FAILED_UNIT_NOT_INFRONT:  return "SPELL_FAILED_UNIT_NOT_INFRONT";
+        case SPELL_FAILED_NOT_BEHIND:        return "SPELL_FAILED_NOT_BEHIND";
+        case SPELL_FAILED_ONLY_SHAPESHIFT:   return "SPELL_FAILED_ONLY_SHAPESHIFT";
+        case SPELL_FAILED_NO_POWER:          return "SPELL_FAILED_NO_POWER";
+        case SPELL_FAILED_NOT_READY:         return "SPELL_FAILED_NOT_READY";
+        case SPELL_FAILED_BAD_TARGETS:       return "SPELL_FAILED_BAD_TARGETS";
+        case SPELL_FAILED_MOVING:            return "SPELL_FAILED_MOVING";
+        case SPELL_FAILED_STUNNED:           return "SPELL_FAILED_STUNNED";
+        case SPELL_FAILED_AFFECTING_COMBAT:  return "SPELL_FAILED_AFFECTING_COMBAT";
+        default:                             return fmt::format("code {}", raw);
+    }
+}
+
+// A spell that needs a stance or form (Execute, Ferocious Bite, Rip, Maul) is cast from one the caster is not in: shift into a form that
+// satisfies it, as a player would. Triggered, so the shift costs nothing.
+void EnsureForm(Player* p, SpellInfo const* info)
+{
+    std::uint64_t const mask = info->Stances;
+    if (!mask)
+        return;
+    auto fits = [&](int form) { return form > 0 && form < 64 && (mask & (std::uint64_t(1) << (form - 1))); };
+    if (fits(int(p->GetShapeshiftForm())))
+        return;
+    for (auto const& [id, ps] : p->GetSpellMap())
+    {
+        if (ps.state == PLAYERSPELL_REMOVED || ps.disabled)
+            continue;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE);
+        if (!si || si->IsPassive())
+            continue;
+        for (SpellEffectInfo const& e : si->GetEffects())
+            if (e.ApplyAuraName == SPELL_AURA_MOD_SHAPESHIFT && fits(e.MiscValue))
+            {
+                p->CastSpell(p, id, true);
+                TC_LOG_INFO("playerbot.v2", "[dmg_parity] sweep class={} shifts with {} ({}) for {}", g.cls_name, SpellNameOf(id), id, SpellNameOf(info->Id));
+                return;
+            }
+    }
+    TC_LOG_INFO("playerbot.v2", "[dmg_parity] sweep class={} {} needs a form (mask 0x{:x}) and none of the known spells gives it", g.cls_name, SpellNameOf(info->Id), mask);
+}
+
 // One cast of the sweep. False when it was refused.
 bool SweepCastOnce(Player* p, Creature* d)
 {
     SweepItem const& it = g.items[g.item];
     int const pts = it.points[g.point];
+    SpellInfo const* info = sSpellMgr->GetSpellInfo(g.cast_spell_id, DIFFICULTY_NONE);
     p->GetSpellHistory()->ResetAllCooldowns();
+    if (info)
+        EnsureForm(p, info);
     TopUp(p);
     if (it.res == Res::Combo)
         p->SetPower(POWER_COMBO_POINTS, pts);
@@ -833,6 +916,15 @@ bool SweepCastOnce(Player* p, Creature* d)
     d->SetHealth(it.low_health ? d->GetMaxHealth() / 7 : d->GetMaxHealth());
     if (!it.watch_aura)   // a watched aura (the debuff a crit leaves on the dummy) has to survive from cast to cast
         d->RemoveAllAuras();
+    // The dummy stands where the spell reaches: between its minimum and maximum range (a melee finisher with a minimum range, or a bot that
+    // drifted, is out of range otherwise).
+    if (info)
+    {
+        float const lo = info->GetMinRange(false), hi = info->GetMaxRange(false, p);
+        float const want = std::clamp(3.0f, lo + 1.0f, std::max(lo + 1.0f, hi - 1.0f));
+        if (std::fabs(p->GetExactDist(d) - want) > 1.5f)
+            d->NearTeleportTo(p->GetNearPosition(want, 0.f));
+    }
     p->SetFacingToObject(d);
     {
         std::lock_guard<std::mutex> lock(g_mu);
@@ -845,7 +937,12 @@ bool SweepCastOnce(Player* p, Creature* d)
     if (r != ::Playerbot::Result::Ok)
     {
         ++g.cast_failures;
-        g.last_fail = fmt::format("result {}", int(r));
+        g.last_fail = fmt::format("result {} = {}", int(r), CastFailText(api.last_cast_fail()));
+        if (g.cast_failures == 1 || g.cast_failures == 8)
+            TC_LOG_INFO("playerbot.v2", "[dmg_parity] sweep refusal class={} spell=\"{}\" id={} api_result={} core={} dist={:.1f} range={:.1f}-{:.1f} los={} infront={} form={} combo={} rage={} energy={}",
+                        g.cls_name, it.spell, g.cast_spell_id, int(r), CastFailText(api.last_cast_fail()), p->GetExactDist(d), info ? info->GetMinRange(false) : 0.f,
+                        info ? info->GetMaxRange(false, p) : 0.f, p->IsWithinLOSInMap(d), p->HasInArc(float(M_PI), d), int(p->GetShapeshiftForm()),
+                        p->GetPower(POWER_COMBO_POINTS), p->GetPower(POWER_RAGE), p->GetPower(POWER_ENERGY));
         return false;
     }
     ++g.cast_ok;
@@ -862,6 +959,25 @@ void SweepSample(Player* p, Creature* d)
         auto const f = g_aggs.find(g.cast_spell_id);
         if (f != g_aggs.end())
             a = f->second;
+        // The damage can be dealt by another id than the one cast (a trigger spell, or a rank of the same name): take it by name.
+        if (!a.N(Outcome::Hit) && !a.ticks)
+        {
+            std::string const cast_name = SpellNameOf(g.cast_spell_id);
+            for (auto const& [key, agg] : g_aggs)
+                if (key && !(key & kPetFlag) && key != g.cast_spell_id && SpellNameOf(key) == cast_name && (agg.N(Outcome::Hit) || agg.ticks))
+                {
+                    a = agg;
+                    break;
+                }
+        }
+        if (it.measure == Measure::Damage && !a.N(Outcome::Hit) && !a.ticks && g.samples.empty())
+        {
+            std::string seen;
+            for (auto const& [key, agg] : g_aggs)
+                seen += fmt::format(" {}({}) attempts={} hits={}", key & ~kPetFlag, key & ~kPetFlag ? SpellNameOf(key & ~kPetFlag) : std::string("white swing"), agg.Attempts(), agg.N(Outcome::Hit));
+            TC_LOG_INFO("playerbot.v2", "[dmg_parity] sweep class={} spell=\"{}\" id={} point={} produced no damage sample; damage seen:{}", g.cls_name, it.spell, g.cast_spell_id,
+                        it.points[g.point], seen.empty() ? " none" : seen);
+        }
     }
     switch (it.measure)
     {
@@ -933,6 +1049,29 @@ double ManaCostOf(Player* p, SpellInfo const* i)
     return 0.0;
 }
 
+// The scenario measures regeneration, not reach: the dummy is summoned once, 18 y in front of where the bot happened to stand, and a bot
+// that was placed against a wall, a slope or a drop (runall 2026-10-11: priest, shaman and warlock "line of sight", druid beyond range)
+// has it behind geometry or too far. As the sweeps do (SweepCast), put the dummy where the spell reaches it: within the spell's range
+// and in line of sight, trying a few distances and directions. True when the dummy is reachable afterwards.
+bool PlaceDummyInReach(Player* p, Creature* d, SpellInfo const* info)
+{
+    float const range = std::max(5.0f, info->GetMaxRange(info->IsPositive(), p));
+    auto reachable = [&] { return p->GetExactDist(d) <= range - 1.0f && p->IsWithinLOSInMap(d); };
+    if (reachable())
+        return true;
+    float const base = std::min(18.0f, range - 2.0f);
+    for (float const distance : { base, 12.0f, 8.0f, 5.0f, 3.0f })
+        for (float const angle : { 0.0f, 1.5708f, -1.5708f, 3.1416f })
+        {
+            if (distance > range - 1.0f)
+                continue;
+            d->NearTeleportTo(p->GetNearPosition(distance, angle));
+            if (reachable())
+                return true;
+        }
+    return false;
+}
+
 char const* MainSpellFor(std::uint8_t cls)
 {
     switch (cls)
@@ -999,6 +1138,67 @@ void LogRegenAuras(Player* p)
                 g.cls_name, mp5, src85.empty() ? " none" : src85, interrupt, src134.empty() ? " none" : src134);
 }
 
+// Every modifier that touches the mana cost of a spell: the SPELLMOD_COST auras (flat and percent, by class mask or spell label) and the
+// school cost auras (72 percent, 73 flat), each with its source spell and value. This is what turns the client's raw cost into the final one.
+std::string CostModifiers(Player* p, SpellInfo const* i)
+{
+    std::string out;
+    struct Kind { AuraType type; char const* name; };
+    static constexpr Kind kSpellMods[] = {
+        { SPELL_AURA_ADD_FLAT_MODIFIER, "spellmod_flat" }, { SPELL_AURA_ADD_PCT_MODIFIER, "spellmod_pct" },
+        { SPELL_AURA_ADD_FLAT_MODIFIER_BY_SPELL_LABEL, "spellmod_flat_label" }, { SPELL_AURA_ADD_PCT_MODIFIER_BY_SPELL_LABEL, "spellmod_pct_label" } };
+    for (Kind const& k : kSpellMods)
+        for (AuraEffect const* a : p->GetAuraEffectsByType(k.type))
+            if (a->GetMiscValue() == int32(SpellModOp::PowerCost0) && a->IsAffectingSpell(i))
+                out += fmt::format(" {}:{}({})={:.0f}", k.name, a->GetId(), SpellNameOf(a->GetId()), static_cast<double>(a->GetAmount()));
+    for (AuraEffect const* a : p->GetAuraEffectsByType(SPELL_AURA_MOD_POWER_COST_SCHOOL_PCT))
+        if (a->GetMiscValue() & int32(i->GetSchoolMask()))
+            out += fmt::format(" school_cost_pct:{}({})={:.0f}", a->GetId(), SpellNameOf(a->GetId()), static_cast<double>(a->GetAmount()));
+    for (AuraEffect const* a : p->GetAuraEffectsByType(SPELL_AURA_MOD_POWER_COST_SCHOOL))
+        if (a->GetMiscValue() & int32(i->GetSchoolMask()))
+            out += fmt::format(" school_cost_flat:{}({})={:.0f}", a->GetId(), SpellNameOf(a->GetId()), static_cast<double>(a->GetAmount()));
+    return out.empty() ? std::string(" none") : out;
+}
+
+// Once per run: the pieces of the mana regeneration the stat system multiplies (Player::UpdatePowerRegen), so a ratio that is off can be
+// read against its factors.
+void LogRegenModel(Player* p)
+{
+    double const spirit_regen = double(p->OCTRegenMPPerSpirit());
+    double const aura379 = double(p->GetTotalAuraMultiplier(SPELL_AURA_MOD_MANA_REGEN_PCT));
+    double const flat_mp5 = double(p->GetTotalAuraModifierByMiscValue(SPELL_AURA_MOD_POWER_REGEN, POWER_MANA));
+    double const pct110 = double(p->GetTotalAuraMultiplierByMiscValue(SPELL_AURA_MOD_POWER_REGEN_PERCENT, POWER_MANA));
+    double const interrupt = std::min(100.0, double(p->GetTotalAuraModifier(SPELL_AURA_MOD_MANA_REGEN_INTERRUPT)));
+    TC_LOG_INFO("playerbot.v2",
+        "[econ] regen_model class={} spirit={:.0f} spirit_regen_per_s={:.3f} mod_mana_regen_pct_379_multiplier={:.3f} mp5_from_aura85={:.0f} (per s {:.3f}) power_regen_percent_110_multiplier={:.3f} "
+        "rate_power_mana={:.3f} regen_while_casting_pct_134={:.0f} => out_of_combat_per_s={:.3f} casting_per_s={:.3f} (the sheet value GetPowerRegen: {:.3f})",
+        g.cls_name, p->GetStat(STAT_SPIRIT), spirit_regen, aura379, flat_mp5, flat_mp5 / 5.0, pct110, double(sWorld->getRate(RATE_POWER_MANA)), interrupt,
+        (spirit_regen * aura379 * pct110 * double(sWorld->getRate(RATE_POWER_MANA))) + flat_mp5 / 5.0,
+        (spirit_regen * aura379 * interrupt / 100.0 * pct110 * double(sWorld->getRate(RATE_POWER_MANA))) + flat_mp5 / 5.0, double(p->GetPowerRegen(POWER_MANA)));
+    for (AuraType t : { SPELL_AURA_MOD_POWER_REGEN_PERCENT, SPELL_AURA_MOD_MANA_REGEN_PCT })
+        for (AuraEffect const* a : p->GetAuraEffectsByType(t))
+            TC_LOG_INFO("playerbot.v2", "[econ] regen_aura class={} type={} id={}({}) value={:.0f} misc={}", g.cls_name, int(t), a->GetId(), SpellNameOf(a->GetId()),
+                        static_cast<double>(a->GetAmount()), a->GetMiscValue());
+}
+
+// Food and drink are auras that break on standing; a sitting bot or any such aura inside a window means the bot ate or drank in it.
+void NoteRecovery(Player* p, std::set<std::uint32_t>& seen, bool& sat)
+{
+    for (auto const& kv : p->GetAppliedAuras())
+        if (kv.second->GetBase()->GetSpellInfo()->HasAuraInterruptFlag(SpellAuraInterruptFlags::Standing))
+            seen.insert(kv.first);
+    if (p->GetStandState() != UNIT_STAND_STATE_STAND)
+        sat = true;
+}
+
+std::string RecoveryText(std::set<std::uint32_t> const& seen, bool sat)
+{
+    std::string out = sat ? "sat" : "stood";
+    for (std::uint32_t id : seen)
+        out += fmt::format(" {}({})", id, SpellNameOf(id));
+    return out;
+}
+
 // The mana pool against the base the server's table holds, and what the main spells cost.
 void EconStatic(Player* p)
 {
@@ -1009,6 +1209,7 @@ void EconStatic(Player* p)
     double const implied_base = maxm - (20.0 + 15.0 * (int_ - 20.0));
     TC_LOG_INFO("playerbot.v2", "[econ] mana class={} level={} max_mana={:.0f} intellect={:.0f} spirit={:.0f} implied_base={:.0f} table_base={} (compare table_base with the VMaNGOS player_classlevelstats.basemana of this class and level)",
                 g.cls_name, uint32(p->GetLevel()), maxm, int_, spirit, implied_base, table_base);
+    LogRegenModel(p);
     if (std::fabs(implied_base - double(table_base)) > 0.02 * std::max(1.0, double(table_base)))
         g.failure += fmt::format("{} max mana {:.0f} with intellect {:.0f} implies a base of {:.0f}, the table says {}; ", g.cls_name, maxm, int_, implied_base, table_base);
     for (char const* name : kCostSpells)
@@ -1025,8 +1226,8 @@ void EconStatic(Player* p)
                 value = static_cast<double>(e.CalcValue(p));
                 break;
             }
-        TC_LOG_INFO("playerbot.v2", "[econ] cost spell=\"{}\" id={} rank={} rank_id={} mana_cost={:.0f} {} cast_ms={} base_value={:.0f} casts_from_full_mana={:.1f} (compare mana_cost with the VMaNGOS spell_template manaCost)",
-                    name, id, int(i->GetRank()), id, cost, RawManaCost(i), i->CalcCastTime(), value, cost > 0.0 ? maxm / cost : 0.0);
+        TC_LOG_INFO("playerbot.v2", "[econ] cost spell=\"{}\" id={} rank={} rank_id={} mana_cost={:.0f} {} cast_ms={} base_value={:.0f} casts_from_full_mana={:.1f} cost_modifiers:{} (compare mana_cost with the VMaNGOS spell_template manaCost)",
+                    name, id, int(i->GetRank()), id, cost, RawManaCost(i), i->CalcCastTime(), value, cost > 0.0 ? maxm / cost : 0.0, CostModifiers(p, i));
     }
     // One-off: the heals that are off against VMaNGOS (Flash of Light, Holy Light about 90% high; Healing Wave about 25% low).
     for (std::uint32_t const id : { 19943u, 10329u, 10396u })
@@ -1040,7 +1241,9 @@ bool EconStep(Player* p, Creature* d, std::string& failure)
     Powers const mana = POWER_MANA;
     double const cur = double(p->GetPower(mana));
     double const maxm = double(p->GetMaxPower(mana));
-    auto next = [&](int phase) { e.phase = phase; e.t = 0; e.cast_sent = false; };
+    auto next = [&](int phase) { e.phase = phase; e.t = 0; e.cast_sent = false; e.recov.clear(); e.sat = false; };
+    if (e.phase <= 2 && (e.phase == 2 || e.t >= 8))
+        NoteRecovery(p, e.recov, e.sat);
     switch (e.phase)
     {
         case 0:   // out of combat: 7 s for any five-second window to pass, then ten seconds counted
@@ -1054,7 +1257,7 @@ bool EconStep(Player* p, Creature* d, std::string& failure)
             if (e.t == 18)
             {
                 e.r_oc = cur - e.m0;
-                TC_LOG_INFO("playerbot.v2", "[econ] regen class={} state=out_of_combat mana_gained_10s={:.0f} (spirit {:.0f})", g.cls_name, e.r_oc, p->GetStat(STAT_SPIRIT));
+                TC_LOG_INFO("playerbot.v2", "[econ] regen class={} state=out_of_combat mana_gained_10s={:.0f} (spirit {:.0f}) ate_or_drank_in_window: {}", g.cls_name, e.r_oc, p->GetStat(STAT_SPIRIT), RecoveryText(e.recov, e.sat));
                 next(1);
             }
             return false;
@@ -1070,7 +1273,7 @@ bool EconStep(Player* p, Creature* d, std::string& failure)
             if (e.t == 18)
             {
                 e.r_ic = cur - e.m0;
-                TC_LOG_INFO("playerbot.v2", "[econ] regen class={} state=in_combat_idle mana_gained_10s={:.0f} seconds_in_combat={} of 10", g.cls_name, e.r_ic, e.ic_seconds_in_combat);
+                TC_LOG_INFO("playerbot.v2", "[econ] regen class={} state=in_combat_idle mana_gained_10s={:.0f} seconds_in_combat={} of 10 ate_or_drank_in_window: {}", g.cls_name, e.r_ic, e.ic_seconds_in_combat, RecoveryText(e.recov, e.sat));
                 p->AttackStop();
                 p->CombatStop(true);
                 next(2);
@@ -1090,6 +1293,11 @@ bool EconStep(Player* p, Creature* d, std::string& failure)
                 SpellInfo const* i = sSpellMgr->GetSpellInfo(e.main_spell, DIFFICULTY_NONE);
                 e.cost = ManaCostOf(p, i);
                 e.casts = 0;
+                e.spent = 0.0;
+                e.cast_attempts = 0;
+                e.cast_gcd_ticks = 0;
+                e.last_result = -1;
+                e.last_fail = 0;
                 p->SetPower(mana, std::uint32_t(maxm * 0.7));
                 e.m0 = double(p->GetPower(mana));
                 e.cast_starts = 0;
@@ -1116,18 +1324,54 @@ bool EconStep(Player* p, Creature* d, std::string& failure)
                 bool const casting = p->HasUnitState(UNIT_STATE_CASTING);
                 if (e.t < 16 && !casting && !p->GetSpellHistory()->HasGlobalCooldown(i))
                 {
+                    if (!i->IsPositive() && !PlaceDummyInReach(p, d, i))
+                        TC_LOG_INFO("playerbot.v2", "[econ] regen_window class={} t={} no reachable spot for the dummy: dist={:.1f} range={:.1f} los={} bot=({:.1f},{:.1f},{:.1f}) map={}",
+                                    g.cls_name, e.t, p->GetExactDist(d), i->GetMaxRange(false, p), p->IsWithinLOSInMap(d), p->GetPositionX(), p->GetPositionY(),
+                                    p->GetPositionZ(), p->GetMapId());
                     p->SetFacingToObject(d);
                     p->GetSpellHistory()->ResetAllCooldowns();
                     ::Playerbot::API api(p);
                     ObjectGuid const target = i->IsPositive() ? p->GetGUID() : d->GetGUID();
-                    if (api.cast_spell(e.main_spell, target) == ::Playerbot::Result::Ok)
+                    ++e.cast_attempts;
+                    // What this cast costs now (a Clearcasting proc makes it free); the window adds what was really paid back, not casts x the first cost.
+                    double const cost_now = ManaCostOf(p, i);
+                    ::Playerbot::Result const result = api.cast_spell(e.main_spell, target);
+                    if (result == ::Playerbot::Result::Ok)
+                    {
                         ++e.casts;
+                        e.spent += cost_now;
+                    }
+                    else
+                    {
+                        e.last_result = int(result);
+                        e.last_fail = api.last_cast_fail();
+                        TC_LOG_INFO("playerbot.v2", "[econ] regen_window class={} t={} cast of {} ({}) refused: result={} spell_cast_result={} dist_to_dummy={:.1f} dummy_alive={} mana={:.0f}/{:.0f} moving={} stand_state={}",
+                                    g.cls_name, e.t, e.main_spell, SpellNameOf(e.main_spell), e.last_result, e.last_fail, p->GetDistance(d), d->IsAlive(), cur, maxm,
+                                    p->isMoving(), int(p->GetStandState()));
+                    }
                 }
+                else if (e.t < 16)
+                    ++e.cast_gcd_ticks;
                 if (e.t >= 16 && !casting)
                 {
-                    e.r_cast = cur - e.m0 + double(e.casts) * e.cost;
-                    TC_LOG_INFO("playerbot.v2", "[econ] regen class={} state=casting spell=\"{}\" casts={} cost_each={:.0f} mana_gained_{}s={:.0f} (net change {:.0f} plus the {:.0f} spent)",
-                                g.cls_name, MainSpellFor(g.cls), e.casts, e.cost, e.t, e.r_cast, cur - e.m0, double(e.casts) * e.cost);
+                    // The window is longer than the ten seconds the other two states count: bring it to the same ten (m0 was read on tick 1).
+                    if (e.casts == 0)
+                    {
+                        // Nothing was cast, so the window measured an idle caster: that says nothing about the five second rule. Report the
+                        // missing casts (the refusals are logged above) and leave r_cast unset so the regen comparison is not made on it.
+                        g.failure += fmt::format("{} cast nothing in the casting-regen window ({} attempts, {} ticks skipped for the global cooldown or a running cast, last result {} / spell cast result {}); ",
+                                                 g.cls_name, e.cast_attempts, e.cast_gcd_ticks, e.last_result, e.last_fail);
+                        TC_LOG_INFO("playerbot.v2", "[econ] regen_window class={} spell=\"{}\" id={} no cast was made: attempts={} gcd_or_casting_ticks={} last_result={} spell_cast_result={}",
+                                    g.cls_name, MainSpellFor(g.cls), e.main_spell, e.cast_attempts, e.cast_gcd_ticks, e.last_result, e.last_fail);
+                        g_energy_on = false;
+                        next(3);
+                        return false;
+                    }
+                    double const window_s = double(std::max<std::uint32_t>(1, e.t - 1));
+                    double const gained_window = cur - e.m0 + e.spent;
+                    e.r_cast = gained_window * 10.0 / window_s;
+                    TC_LOG_INFO("playerbot.v2", "[econ] regen class={} state=casting spell=\"{}\" casts={} cost_each={:.0f} window_s={:.0f} mana_gained_window={:.0f} (net change {:.0f} plus the {:.0f} spent) mana_gained_10s={:.0f} ate_or_drank_in_window: {}",
+                                g.cls_name, MainSpellFor(g.cls), e.casts, e.cost, window_s, gained_window, cur - e.m0, e.spent, e.r_cast, RecoveryText(e.recov, e.sat));
                     g_energy_on = false;
                     // What else put mana in or fired in the window. The AI is detached, so anything listed here is a finding.
                     std::string energy;
@@ -1195,21 +1439,38 @@ bool EconStep(Player* p, Creature* d, std::string& failure)
             // Done with this heal: the smallest result is a normal (not critical) heal.
             double lo = e.got.front(), sum = 0.0;
             for (double v : e.got) { lo = std::min(lo, v); sum += v; }
-            double base = 0.0;
+            double base = 0.0, base_points = 0.0, data_coeff = 0.0;
             for (SpellEffectInfo const& ef : i->GetEffects())
                 if (ef.IsEffect() && ef.Effect == SPELL_EFFECT_HEAL)
                 {
                     base = static_cast<double>(ef.CalcValue(p));
+                    base_points = double(ef.BasePoints);
+                    data_coeff = double(ef.BonusCoefficient);
                     break;
                 }
             double const cast_s = std::min(double(i->CalcCastTime()) / 1000.0, 3.5);
-            double const hp = double(p->SpellBaseHealingBonusDone(i->GetSchoolMask()));
-            double const expected = base + cast_s / 3.5 * hp;
+            // The healing power the formula really sees: the healer's own (gear, auras) plus what the target's auras add (Blessing of Light and the like).
+            int32 const own_power = p->SpellBaseHealingBonusDone(i->GetSchoolMask());
+            double const target_power = double(p->GetTotalAuraModifierByMiscMask(SPELL_AURA_MOD_HEALING, i->GetSchoolMask()));
+            double const hp = double(own_power) + target_power;
+            double const done_mod = double(p->SpellHealingPctDone(p, i));
+            double const taken_mod = double(p->SpellHealingBonusTaken(p, i, 1000, HEAL)) / 1000.0;
+            float coeff_mod = float(data_coeff) * 100.0f;
+            p->ApplySpellMod(i, SpellModOp::BonusCoefficient, coeff_mod);
+            double const coeff_used = double(coeff_mod) / 100.0;
+            double const expected = (base + cast_s / 3.5 * hp) * done_mod * taken_mod;   // the vanilla coefficient (cast time / 3.5), the server's multipliers
+            double const server_formula = (base + hp * coeff_used) * done_mod * taken_mod;   // the coefficient the spell data holds
             double const cost = ManaCostOf(p, i);
             Verdict const v = CompareValue(lo, expected, 12.0);
-            TC_LOG_INFO("playerbot.v2", "[econ] heal spell=\"{}\" id={} rank={} min={:.0f} avg={:.0f} expected={:.0f} (base {:.0f} + {:.2f} x {:.0f} healing power) verdict={} mana_cost={:.0f} heal_per_mana={:.2f} casts_to_oom={:.1f}",
-                        SpellNameOf(id), id, int(i->GetRank()), lo, sum / double(e.got.size()), expected, base, cast_s / 3.5, hp, ToString(v), cost,
+            std::string results;
+            for (double r : e.got)
+                results += fmt::format(" {:.0f}{}", r, r > 1.3 * lo ? "(crit?)" : "");
+            TC_LOG_INFO("playerbot.v2", "[econ] heal spell=\"{}\" id={} rank={} min={:.0f} avg={:.0f} expected={:.0f} (base {:.0f} + {:.2f} x {:.0f} healing power, x {:.3f} done x {:.3f} taken) verdict={} mana_cost={:.0f} heal_per_mana={:.2f} casts_to_oom={:.1f}",
+                        SpellNameOf(id), id, int(i->GetRank()), lo, sum / double(e.got.size()), expected, base, cast_s / 3.5, hp, done_mod, taken_mod, ToString(v), cost,
                         cost > 0.0 ? lo / cost : 0.0, cost > 0.0 ? maxm / cost : 0.0);
+            TC_LOG_INFO("playerbot.v2", "[econ] heal_detail spell={} base_points={:.1f} base_roll={:.0f} healing_power_own={} healing_power_from_target_auras={:.0f} (DoneAdvertisedBenefit {:.0f}) data_coefficient={:.4f} coefficient_after_spellmods={:.4f} vanilla_coefficient={:.4f} "
+                        "DoneTotalMod={:.3f} TakenTotalMod={:.3f} server_formula_heal={:.0f} results:{}",
+                        id, base_points, base, own_power, target_power, hp, data_coeff, coeff_used, cast_s / 3.5, done_mod, taken_mod, server_formula, results);
             ++e.heal_i;
             e.rep = 0;
             e.got.clear();
@@ -1242,7 +1503,9 @@ bool EconStep(Player* p, Creature* d, std::string& failure)
 struct MobRow { std::uint32_t entry; char const* label; };
 constexpr MobRow kMobs[] = { { 12099, "Firesworn" }, { 11982, "Magmadar" }, { 598, "Defias Miner" } };
 constexpr int kIncomingDummyLegs = 3;
-constexpr std::uint32_t kIncomingSettleS = 3, kIncomingDummyS = 90, kIncomingMobS = 60;
+constexpr std::uint32_t kIncomingSettleS = 3, kIncomingDummyS = 90, kIncomingMobS = 120;
+constexpr std::uint32_t kIncomingReachWaitS = 4;     // seconds out of melee range before the harness puts the attacker back next to the tank
+constexpr std::uint32_t kIncomingMinSwings = 8;   // landed plain hits and crushing blows a leg needs before its mean says anything
 
 Creature* SpawnMob(Player* p, std::uint32_t entry, std::string& error)
 {
@@ -1351,7 +1614,7 @@ bool IncomingStep(Player* p, std::string& failure)
             for (int k = 1; k < kIncomingDummyLegs; ++k)
             {
                 auto const& r = in.results[k];
-                if (NormalSwings(bare.melee) < 15 || NormalSwings(r.melee) < 15)
+                if (NormalSwings(bare.melee) < kIncomingMinSwings || NormalSwings(r.melee) < kIncomingMinSwings)
                 {
                     g.failure += fmt::format("{} leg {}: too few normal hits ({} bare, {} here) to compare armor; ", g.cls_name, r.label,
                                              NormalSwings(bare.melee), NormalSwings(r.melee));
@@ -1412,6 +1675,8 @@ bool IncomingStep(Player* p, std::string& failure)
         p->SetFullHealth();
         p->CombatStop(true);
         in.setup = true;
+        in.out_of_reach_s = 0;
+        in.repositioned = 0;
         in.t = 0;
         std::lock_guard<std::mutex> lock(g_mu);
         g_subject = p->GetGUID();
@@ -1426,9 +1691,31 @@ bool IncomingStep(Player* p, std::string& failure)
     {
         if (mob->GetVictim() != p)
         {
+            mob->EngageWithTarget(p);   // threat and combat, so the creature's AI keeps the tank as its victim
             mob->Attack(p, true);
             mob->GetMotionMaster()->MoveChase(p);
         }
+        // The leg measures damage taken, not pathing: an attacker that stays out of melee range of the tank (paladin legs 2026-10-10: 8.2 y
+        // away, in combat, never closing) is put back next to it after kIncomingReachWaitS, with the movement state logged so the cause
+        // stays visible. Counted per leg and reported at its end.
+        if (mob->IsWithinMeleeRange(p))
+            in.out_of_reach_s = 0;
+        else if (++in.out_of_reach_s >= kIncomingReachWaitS)
+        {
+            ++in.repositioned;
+            TC_LOG_INFO("playerbot.v2", "[incoming] leg={} t={} {} out of melee range for {} s (dist {:.1f}, movement={} rooted={} stunned={} tank_moving={} tank_speed={:.1f}): placed next to the tank (#{})",
+                        in.leg, in.t, mob->GetName(), in.out_of_reach_s, mob->GetExactDist(p), int(mob->GetMotionMaster()->GetCurrentMovementGeneratorType()),
+                        mob->HasUnitState(UNIT_STATE_ROOT), mob->HasUnitState(UNIT_STATE_STUNNED), p->isMoving(), p->GetSpeed(MOVE_RUN), in.repositioned);
+            mob->NearTeleportTo(p->GetNearPosition(2.0f, 0.f));
+            mob->GetMotionMaster()->MoveChase(p);
+            in.out_of_reach_s = 0;
+        }
+        // Why a creature is not swinging, every 15 s of a leg.
+        if (in.t % 15 == 0)
+            TC_LOG_INFO("playerbot.v2", "[incoming] watch leg={} t={} mob={} victim={} in_combat={} dist={:.1f} melee_range={} can_attack_tank={} tank_alive={} tank_attackable={} cannot_autoattack={} react={} faction={}",
+                        in.leg, in.t, mob->GetName(), mob->GetVictim() ? mob->GetVictim()->GetName() : std::string("none"), mob->IsInCombat(), mob->GetExactDist(p),
+                        mob->IsWithinMeleeRange(p), mob->IsValidAttackTarget(p), p->IsAlive(), !p->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE), mob->HasUnitState(UNIT_STATE_CANNOT_AUTOATTACK),
+                        int(mob->GetReactState()), mob->GetFaction());
     }
     if (in.t == kIncomingSettleS)
     {
@@ -1491,15 +1778,33 @@ bool IncomingStep(Player* p, std::string& failure)
         double const reduction = VanillaArmorReduction(r.armor, std::max(1, mob_level));
         double const expected_mid = 0.5 * double(eff_lo + eff_hi) * (1.0 - reduction);
         double const seen = NormalEquivalent(m);
-        Verdict const dv = NormalSwings(m) >= 15 ? CompareValue(seen, expected_mid, 20.0) : Verdict::NoData;
-        TC_LOG_INFO("playerbot.v2", "[incoming] damage_range leg={} effective_range={:.0f}-{:.0f} armor_reduction={:.3f} expected_mean={:.0f} observed_mean={:.0f} (normal-equivalent over {} swings) min_seen={} max_seen={} verdict={}",
-                    r.label, eff_lo, eff_hi, reduction, expected_mid, seen, NormalSwings(m), m.min_hit, m.max_hit, ToString(dv));
+        // The tolerance follows the sample: 20 %, or three standard errors of the mean of a uniform range (the spread of the set range after
+        // armor over the landed swings), or one point of damage (hits are whole numbers), whichever is widest. A mob that hits for 8 has a
+        // mean that moves by more than 20 % between runs of a few dozen swings.
+        double const swings = double(std::max<std::uint32_t>(1u, NormalSwings(m)));
+        double const sd = double(eff_hi - eff_lo) * (1.0 - reduction) / std::sqrt(12.0);
+        double const slack = std::max(3.0 * sd / std::sqrt(swings), 1.0);
+        double const tol_pct = expected_mid > 0.0 ? std::max(20.0, 100.0 * slack / expected_mid) : 20.0;
+        Verdict const dv = NormalSwings(m) >= kIncomingMinSwings ? CompareValue(seen, expected_mid, tol_pct) : Verdict::NoData;
+        TC_LOG_INFO("playerbot.v2", "[incoming] damage_range leg={} effective_range={:.0f}-{:.0f} armor_reduction={:.3f} expected_mean={:.1f} observed_mean={:.1f} (normal-equivalent over {} swings) tolerance={:.0f}% min_seen={} max_seen={} verdict={}",
+                    r.label, eff_lo, eff_hi, reduction, expected_mid, seen, NormalSwings(m), tol_pct, m.min_hit, m.max_hit, ToString(dv));
+        // What the server's armor step reads at the end of the leg, against what the verdict assumed (armor at the start of the leg, the creature's own
+        // level): a tank near the 75% cap moves the expected mean a lot with a few hundred armor, and CalcArmorReducedDamage takes the level from
+        // GetLevelForTarget and the armor from GetArmor x the attacker-specific multiplier.
+        if (mob)
+        {
+            float const live_armor = float(p->GetArmor()) * p->GetArmorMultiplierForTarget(mob);
+            unsigned const live_level = unsigned(mob->GetLevelForTarget(p));
+            TC_LOG_INFO("playerbot.v2", "[incoming] armor_check leg={} armor_at_leg_start={:.0f} armor_now={} armor_x_multiplier_for_attacker={:.0f} mob_level={} level_for_target={} mitigation_assumed={:.3f} mitigation_server_now={:.3f} hits={} crush={} crit={}",
+                        r.label, r.armor, p->GetArmor(), live_armor, mob_level, live_level, reduction, ClassicArmor::Mitigation(live_armor, live_level),
+                        m.N(Outcome::Hit), m.N(Outcome::Crushing), m.N(Outcome::Crit));
+        }
         if (attempts == 0)
             g.failure += fmt::format("{} leg {}: the attacker never swung (hostile {}, victim {}); ", g.cls_name, r.label,
                                      mob ? (mob->IsHostileTo(p) ? "yes" : "no") : "no mob", mob && mob->GetVictim() ? mob->GetVictim()->GetName() : std::string("none"));
         else if (dv == Verdict::TooLow || dv == Verdict::TooHigh)
             g.failure += fmt::format("{} leg {}: observed mean damage {:.0f} against {:.0f} expected from the set range ({}); ", g.cls_name, r.label, seen, expected_mid, ToString(dv));
-        else if (dv == Verdict::NoData && NormalSwings(m) < 15)
+        else if (dv == Verdict::NoData && NormalSwings(m) < kIncomingMinSwings)
             g.failure += fmt::format("{} leg {}: only {} landed swings in {} s; ", g.cls_name, r.label, NormalSwings(m), measure_s);
     }
     for (auto const& [key, a] : r.all)
@@ -1583,6 +1888,183 @@ void NoteDamage(Unit* attacker, Unit* victim, std::int32_t amount, std::uint32_t
     t_pending.valid = false;
 }
 
+// The trap audit: the hunter sets each trap out of combat (the trap object needs no combat to arm), the dummy is moved onto the object, and the
+// object must fire and do what the trap does. The core's own [trap_cast] line (GameObject.cpp) gives the cast result and the spell's effect
+// targets; this adds the verdict: damage traps must hurt the dummy, Frost and Freezing Trap must leave an aura on it.
+struct TrapSpec { char const* spell; bool damages; };
+constexpr TrapSpec kTraps[] = { { "Explosive Trap", true }, { "Immolation Trap", true }, { "Frost Trap", false }, { "Freezing Trap", false } };
+constexpr std::size_t kTrapCount = sizeof(kTraps) / sizeof(kTraps[0]);
+
+bool TrapStep(Player* p, Creature* d, std::string& failure)
+{
+    TrapAudit& t = g.trap;
+    if (t.item >= kTrapCount)
+    {
+        failure = g.failure;
+        return true;
+    }
+    TrapSpec const& spec = kTraps[t.item];
+    ++t.t;
+    switch (t.phase)
+    {
+        case 0:
+        {
+            t.spell_id = FindKnownSpell(p, spec.spell);
+            if (!t.spell_id)
+            {
+                g.failure += fmt::format("{} does not know {}; ", g.cls_name, spec.spell);
+                TC_LOG_INFO("playerbot.v2", "[trap_audit] {} is not in the spellbook", spec.spell);
+                ++t.item;
+                t.t = 0;
+                return false;
+            }
+            p->CombatStop(true);
+            p->GetSpellHistory()->ResetAllCooldowns();
+            TopUp(p);
+            d->RemoveAllAuras();
+            d->SetFullHealth();
+            // The dummy stays away from the spot the trap goes down on until the object exists: a dummy left at the last trap's place would set
+            // the new one off at once. Recheck each second until it really is away.
+            if (p->GetExactDist(d) < 10.f)
+            {
+                d->NearTeleportTo(p->GetNearPosition(15.f, 0.f));
+                if (t.t < 6)
+                    return false;
+            }
+            ::Playerbot::API api(p);
+            ::Playerbot::Result const r = api.cast_spell(t.spell_id, p->GetGUID(), true);
+            if (r != ::Playerbot::Result::Ok)
+            {
+                g.failure += fmt::format("{} cast of {} ({}) refused: {}; ", g.cls_name, spec.spell, t.spell_id, CastFailText(api.last_cast_fail()));
+                TC_LOG_INFO("playerbot.v2", "[trap_audit] {} ({}) cast refused: {}", spec.spell, t.spell_id, CastFailText(api.last_cast_fail()));
+                ++t.item;
+                t.t = 0;
+                return false;
+            }
+            t.phase = 1;
+            t.t = 0;
+            return false;
+        }
+        case 1:
+        {
+            GameObject* go = p->GetGameObject(t.spell_id);
+            if (!go)
+                go = p->FindNearestGameObjectOfType(GAMEOBJECT_TYPE_TRAP, 10.f);
+            if (!go)
+            {
+                // The object is gone: it fired by itself before the dummy was moved onto it (the effect is judged below on what the dummy shows).
+                // A cast that made no object at all fails the same judgement, as nothing happens to the dummy.
+                if (t.t >= 3)
+                {
+                    TC_LOG_INFO("playerbot.v2", "[trap_audit] {} ({}) no trap object left after {} s: judged on the dummy", spec.spell, t.spell_id, t.t);
+                    t.fired = true;
+                    t.phase = 3;
+                    t.t = 0;
+                }
+                return false;
+            }
+            t.trap = go->GetGUID();
+            t.trap_entry = go->GetEntry();
+            t.effect_spell = go->GetGOInfo()->trap.spell;
+            t.health_before = d->GetHealth();
+            d->NearTeleportTo(go->GetPosition());
+            TC_LOG_INFO("playerbot.v2", "[trap_audit] {} ({}) object {} placed, dummy moved onto it", spec.spell, t.spell_id, t.trap_entry);
+            t.phase = 2;
+            t.t = 0;
+            return false;
+        }
+        case 2:
+        {
+            GameObject* go = ObjectAccessor::GetGameObject(*p, t.trap);
+            // Fired = the object is gone (a single charge trap despawns after it triggers).
+            if (!go || !go->IsInWorld() || go->getLootState() == GO_JUST_DEACTIVATED)
+            {
+                t.fired = true;
+                t.phase = 3;
+                t.t = 0;
+                return false;
+            }
+            if (t.t == 3)
+                d->NearTeleportTo(go->GetPosition());   // a dummy that was pushed off is put back
+            if (t.t >= 12)
+            {
+                t.fired = false;
+                t.phase = 3;
+                t.t = 0;
+            }
+            return false;
+        }
+        case 4:
+        {
+            if (t.t < 6)
+                return false;
+            std::uint32_t const lost = d->GetMaxHealth() > d->GetHealth() ? d->GetMaxHealth() - d->GetHealth() : 0u;
+            t.control_lost = lost;
+            t.control_auras = d->GetAppliedAuras().size();
+            TC_LOG_INFO("playerbot.v2", "[trap_audit] control cast of {} straight at the dummy: health lost {} auras {}", t.effect_spell, lost, d->GetAppliedAuras().size());
+            t.phase = 3;
+            t.t = 6;   // fall through to the verdict below on the next step
+            return false;
+        }
+        default:
+        {
+            if (t.t < 6)   // a periodic trap (Immolation) needs its ticks
+                return false;
+            std::uint32_t const lost = d->GetMaxHealth() > d->GetHealth() ? d->GetMaxHealth() - d->GetHealth() : 0u;
+            std::size_t const auras = d->GetAppliedAuras().size();
+            bool ok = t.fired && !t.control_ran && (spec.damages ? lost > 0 : auras > 0);   // a control run means the trap itself failed all attempts
+            TC_LOG_INFO("playerbot.v2", "[trap_audit] {} ({}) object {} effect spell {} attempt {} fired={} dummy_health_lost={} dummy_auras={} verdict={}", spec.spell, t.spell_id,
+                        t.trap_entry, t.effect_spell, t.attempt, t.fired, lost, auras, ok ? "ok" : "BROKEN");
+            if (!ok && t.attempt < 3)
+            {
+                ++t.attempt;   // try again: one miss against a level 63 target proves nothing
+                t.phase = 0;
+                t.t = 0;
+                return false;
+            }
+            if (!ok && t.fired && t.effect_spell && !t.control_ran)
+            {
+                // Control: the same effect spell cast by the hunter straight at the dummy, no trap object. If this lands, the trap's own path (a
+                // game object as the caster) is the fault; if it does not, the spell data or the dummy (an immunity) is.
+                if (SpellInfo const* es = sSpellMgr->GetSpellInfo(t.effect_spell, DIFFICULTY_NONE))
+                {
+                    std::string imm;
+                    for (SpellEffectInfo const& e : es->GetEffects())
+                        if (e.IsEffect())
+                            imm += fmt::format(" eff{}:immune={}", uint32(e.EffectIndex), d->IsImmunedToSpellEffect(es, e, p));
+                    int missed = 0;
+                    for (int i = 0; i < 40; ++i)
+                        if (p->SpellHitResult(d, es, false, true) != SPELL_MISS_NONE)
+                            ++missed;
+                    TC_LOG_INFO("playerbot.v2", "[trap_audit] control {} ({}) dummy entry {} school {} spell_immune={} missed {} of 40 rolls{}", spec.spell, t.effect_spell,
+                                d->GetEntry(), uint32(es->GetSchoolMask()), d->IsImmunedToSpell(es, MAX_EFFECT_MASK, p), missed, imm);
+                    d->RemoveAllAuras();
+                    d->SetFullHealth();
+                    p->CastSpell(d, t.effect_spell, true);
+                    t.control_ran = true;
+                    t.phase = 4;
+                    t.t = 0;
+                    return false;
+                }
+            }
+            AppendFile(fmt::format("| trap audit | {} ({}) | object {} | fired {} | health lost {} | auras {} | {} |", spec.spell, t.spell_id, t.trap_entry, t.fired, lost, auras,
+                                   ok ? "ok" : "broken"));
+            if (!ok)
+                g.failure += fmt::format("{} ({}): {} after {} attempts{}; ", spec.spell, t.spell_id,
+                                         !t.fired ? "the trap never fired" : spec.damages ? "it fired and the dummy lost no health" : "it fired and left no aura on the dummy", t.attempt,
+                                         t.control_ran ? fmt::format(" (the effect spell {} cast straight at the dummy: health lost {}, auras {})", t.effect_spell, t.control_lost, t.control_auras) : std::string());
+            ++t.item;
+            t.phase = 0;
+            t.t = 0;
+            t.attempt = 1;
+            t.control_ran = false;
+            t.control_lost = 0;
+            t.control_auras = 0;
+            return false;
+        }
+    }
+}
+
 // ---- The runner's calls ----
 
 bool Begin(Player* subject, Kind kind, std::uint32_t leg_seconds, std::string& error)
@@ -1623,6 +2105,11 @@ bool Begin(Player* subject, Kind kind, std::uint32_t leg_seconds, std::string& e
         g.step = Step::Prepare;
         AppendFile(fmt::format("\n## {} ({})\n\n{}", g.cls_name, "damage_parity", HeaderRow()));
     }
+    else if (kind == Kind::Trap)
+    {
+        g.step = Step::Trap;
+        AppendFile(fmt::format("\n## {} (trap audit)\n", g.cls_name));
+    }
     else if (kind == Kind::Incoming)
     {
         g.step = Step::Incoming;   // the legs set their own gear
@@ -1652,6 +2139,10 @@ bool Step(std::string& failure)
     if (!p || !p->IsInWorld() || !p->IsAlive())
     {
         failure = "the bot is gone or dead";
+        TC_LOG_INFO("playerbot.v2", "[dmg_parity] subject lost: class={} kind={} found={} in_world={} alive={} step={} leg={} step_s={} map={} pos=({:.1f},{:.1f},{:.1f}) in_combat={} last_attacker={}",
+                    g.cls_name, int(g.kind), p != nullptr, p && p->IsInWorld(), p && p->IsAlive(), int(g.step), g.leg, g.step_s, p ? p->GetMapId() : 0u,
+                    p ? p->GetPositionX() : 0.f, p ? p->GetPositionY() : 0.f, p ? p->GetPositionZ() : 0.f, p && p->IsInCombat(),
+                    p && p->getAttackers().size() ? (*p->getAttackers().begin())->GetName() : std::string("none"));
         End();
         return true;
     }
@@ -1834,6 +2325,13 @@ bool Step(std::string& failure)
                 return true;
             }
             return false;
+        case Step::Trap:
+            if (TrapStep(p, d, failure))
+            {
+                End();
+                return true;
+            }
+            return false;
         case Step::Incoming:   // handled above
         case Step::Finished:
             return true;
@@ -1873,6 +2371,8 @@ std::string Status()
         return fmt::format("damage_parity {}: leg {} of {} ({}), {} s", g.cls_name, std::min(g.leg + 1, kLegCount), kLegCount, kLegs[std::min(g.leg, kLegCount - 1)].label, g.step_s);
     if (g.kind == Kind::Economy)
         return fmt::format("economy_audit {}: phase {} of 4, {} s", g.cls_name, g.econ.phase, g.econ.t);
+    if (g.kind == Kind::Trap)
+        return fmt::format("trap_audit {}: trap {} of {}, phase {}, {} s", g.cls_name, std::min(g.trap.item + 1, kTrapCount), kTrapCount, g.trap.phase, g.trap.t);
     if (g.kind == Kind::Incoming)
         return fmt::format("incoming_damage {}: leg {} of 6, {} s", g.cls_name, g.incoming.leg + 1, g.incoming.t);
     return fmt::format("{} {}: item {} of {}", g.kind == Kind::Finisher ? "finisher_sweep" : "talent_audit", g.cls_name, std::min(g.item + 1, g.items.size()), g.items.size());

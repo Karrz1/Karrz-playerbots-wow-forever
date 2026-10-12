@@ -67,6 +67,7 @@ struct PlayerDataAccessor
     uint64 GetMoney() const;
     int32 GetCurrencyQuantity(int32 currencyId) const;
     int32 GetLevel() const;
+    int32 GetClassicTalentedStartLevel() const;
     bool IsQuestRewarded(int32 questId) const;
     bool HasAchieved(int32 achievementId) const;
     uint32 GetPrimarySpecialization() const;
@@ -90,6 +91,7 @@ void FillSpentCurrenciesMap(std::vector<WorldPackets::Traits::TraitEntry> const&
 std::vector<UF::TraitEntry> GetGrantedTraitEntriesForConfig(WorldPackets::Traits::TraitConfig const& traitConfig, PlayerDataAccessor player);
 bool IsValidEntry(WorldPackets::Traits::TraitEntry const& traitEntry);
 LearnResult ValidateConfig(WorldPackets::Traits::TraitConfig& traitConfig, PlayerDataAccessor player, bool requireSpendingAllCurrencies = false, bool removeInvalidEntries = false);
+LearnResult ValidateConfigForCommit(WorldPackets::Traits::TraitConfig& traitConfig, PlayerDataAccessor player);
 bool CanApplyTraitNode(UF::TraitConfig const& traitConfig, UF::TraitEntry const& traitEntry);
 std::vector<TraitDefinitionEffectPointsEntry const*> const* GetTraitDefinitionEffectPointModifiers(int32 traitDefinitionId);
 void InitializeStarterBuildTraitConfig(WorldPackets::Traits::TraitConfig& traitConfig, PlayerDataAccessor player);

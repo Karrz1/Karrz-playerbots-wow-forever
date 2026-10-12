@@ -7,7 +7,7 @@
 // as the last resort). Spell ids are vanilla rank 1 and resolve to the
 // highest known rank.
 //
-// Priorities follow Karrz's ike3 vanilla strategies (Karrz's earlier VMaNGOS bot tree (wow-1.12)
+// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
 // raid10-revamp, playerbot/strategy/mage/*Strategy.cpp, MANGOSBOT_ZERO):
 // armor + Arcane Intellect upkeep, Counterspell on casters, Ice Block /
 // Frost Nova to survive, Evocation at low mana, boss cooldowns, Arcane

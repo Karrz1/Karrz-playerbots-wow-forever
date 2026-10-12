@@ -677,7 +677,7 @@ void Pet::Update(uint32 diff)
                 }
             }
 
-            // Classic 1.60: hunter pets slowly lose happiness, twice as fast in combat
+            // Classic 1.60: hunter pets slowly lose happiness, 1.5 times as fast in combat (VMaNGOS Pet::LooseHappiness)
             if (HasHappiness())
             {
                 if (m_happinessTimer > diff)
@@ -685,7 +685,7 @@ void Pet::Update(uint32 diff)
                 else
                 {
                     m_happinessTimer = HAPPINESS_LOSS_INTERVAL;
-                    ModifyPower(POWER_HAPPINESS, -(IsInCombat() ? 2 * HAPPINESS_LOSS : HAPPINESS_LOSS));
+                    ModifyPower(POWER_HAPPINESS, -(IsInCombat() ? HAPPINESS_LOSS * 3 / 2 : HAPPINESS_LOSS));
                 }
             }
 
@@ -943,9 +943,12 @@ bool Guardian::InitStatsForLevel(uint8 petlevel)
 
     SetStatFlatModifier(UNIT_MOD_ARMOR, BASE_VALUE, float(petlevel * 50));
 
-    SetBaseAttackTime(BASE_ATTACK, BASE_ATTACK_TIME);
-    SetBaseAttackTime(OFF_ATTACK, BASE_ATTACK_TIME);
-    SetBaseAttackTime(RANGED_ATTACK, BASE_ATTACK_TIME);
+    // Classic 1.60 (vanilla): pets keep their creature's attack speed (a tamed beast keeps the speed it had in the wild);
+    // retail forced 2.0 sec
+    uint32 const attackTime = cinfo->BaseAttackTime ? cinfo->BaseAttackTime : BASE_ATTACK_TIME;
+    SetBaseAttackTime(BASE_ATTACK, attackTime);
+    SetBaseAttackTime(OFF_ATTACK, attackTime);
+    SetBaseAttackTime(RANGED_ATTACK, cinfo->RangeAttackTime ? cinfo->RangeAttackTime : BASE_ATTACK_TIME);
 
     //scale
     SetObjectScale(GetNativeObjectScale());
@@ -998,15 +1001,7 @@ bool Guardian::InitStatsForLevel(uint8 petlevel)
     {
         case SUMMON_PET:
         {
-            // the damage bonus used for pets is either fire or shadow damage, whatever is higher
-            int32 fire = GetOwner()->ToPlayer()->m_activePlayerData->ModDamageDonePos[SPELL_SCHOOL_FIRE];
-            int32 shadow = GetOwner()->ToPlayer()->m_activePlayerData->ModDamageDonePos[SPELL_SCHOOL_SHADOW];
-            int32 val = (fire > shadow) ? fire : shadow;
-            if (val < 0)
-                val = 0;
-
-            SetBonusDamage(val * 0.15f);
-
+            // Classic 1.60 (vanilla): no bonus damage from the warlock's fire or shadow damage (The Burning Crusade)
             SetBaseWeaponDamage(BASE_ATTACK, MINDAMAGE, float(petlevel - (petlevel / 4)));
             SetBaseWeaponDamage(BASE_ATTACK, MAXDAMAGE, float(petlevel + (petlevel / 4)));
 

@@ -629,11 +629,13 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "AllFlightPaths"sv, .DefaultValue = false, .Index = CONFIG_ALL_TAXI_PATHS },
         { .Name = "InstantFlightPaths"sv, .DefaultValue = false, .Index = CONFIG_INSTANT_TAXI },
         { .Name = "Instance.IgnoreLevel"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_IGNORE_LEVEL },
+        { .Name = "Instance.IgnoreAttunement"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_IGNORE_ATTUNEMENT },
+        { .Name = "Instance.AhnQirajGatesOpen"sv, .DefaultValue = false, .Index = CONFIG_AQ_GATES_OPEN },
         { .Name = "Instance.IgnoreRaid"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_IGNORE_RAID },
         { .Name = "Instance.BindOnEntry"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_BIND_ON_ENTRY },
         { .Name = "Instance.PersistRaidTrash"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_PERSIST_RAID_TRASH },
         { .Name = "Instance.MoltenCoreHoundsLinked"sv, .DefaultValue = false, .Index = CONFIG_MC_CORE_HOUNDS_LINKED },
-        { .Name = "Instance.MoltenCoreSkipRunes"sv, .DefaultValue = true, .Index = CONFIG_MC_SKIP_RUNES },
+        { .Name = "Instance.MoltenCoreSkipRunes"sv, .DefaultValue = false, .Index = CONFIG_MC_SKIP_RUNES },
         { .Name = "Instance.CombatResurrectionLimit"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_COMBAT_RES_LIMIT },
         { .Name = "CastUnstuck"sv, .DefaultValue = true, .Index = CONFIG_CAST_UNSTUCK },
         { .Name = "GM.AllowInvite"sv, .DefaultValue = false, .Index = CONFIG_ALLOW_GM_GROUP },
@@ -663,8 +665,6 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "Arena.QueueAnnouncer.Enable"sv, .DefaultValue = false, .Index = CONFIG_ARENA_QUEUE_ANNOUNCER_ENABLE },
         { .Name = "Arena.ArenaSeason.InProgress"sv, .DefaultValue = false, .Index = CONFIG_ARENA_SEASON_IN_PROGRESS },
         { .Name = "ArenaLog.ExtendedInfo"sv, .DefaultValue = false, .Index = CONFIG_ARENA_LOG_EXTENDED_INFO },
-        { .Name = "Classic.ArmorFormula"sv, .DefaultValue = false, .Index = CONFIG_CLASSIC_ARMOR_FORMULA },
-        { .Name = "Classic.FiveSecondRule"sv, .DefaultValue = false, .Index = CONFIG_CLASSIC_FIVE_SECOND_RULE },
         { .Name = "OffhandCheckAtSpellUnlearn"sv, .DefaultValue = true, .Index = CONFIG_OFFHAND_CHECK_AT_SPELL_UNLEARN },
         { .Name = "Respawn.DynamicEscortNPC"sv, .DefaultValue = false, .Index = CONFIG_RESPAWN_DYNAMIC_ESCORTNPC },
         { .Name = "mmap.enablePathFinding"sv, .DefaultValue = true, .Index = CONFIG_ENABLE_MMAPS },
@@ -1245,7 +1245,10 @@ void World::LoadConfigSettings(bool reload)
         { 157, 1 }, { 190, 0 }, { 162, 1 }, { 209, 1 }, { 89, 1 }, { 177, 1 }, { 197, 1 }, { 199, -5 }, { 63, 1 }, { 90, 1 },
         { 244, 1 }, { 33, 20 }, { 129, 0 }, { 228, 1 }, { 241, 1 }, { 243, 1 }, { 101, 1 }, { 237, 0 },
         // official 70205 and 70235 sniffs also send these (not in 70124); 242 / 247 are suspected to switch on the new Social window tabs
-        { 70, 1 }, { 242, 1 }, { 247, 1 } })
+        { 70, 1 }, { 242, 1 }, { 247, 1 },
+        // new in the official 70338 sniffs; without them the 70338 client fails ASSERTSAFE(isRuleActive) in
+        // PremadeGroupFinderStyleUtils.cpp (group finder) and crashed later in the same session
+        { 251, 1 }, { 252, 1 }, { 253, 0 } })
         _gameRules.push_back({ .Rule = ::GameRule(rule), .Value = value });
     _gameRules.push_back({ .Rule = ::GameRule(200), .Value = 0.5f });
 
@@ -1425,7 +1428,9 @@ bool World::SetInitialWorldSettings()
     sSpellMgr->LoadSpellInfoCorrections();
 
     TC_LOG_INFO("server.loading", "Loading classic spell values...");
+    sSpellMgr->LoadClassicSpellInfo();
     sSpellMgr->LoadClassicSpellValues();
+    sSpellMgr->LoadClassicSpellCosts();
 
     TC_LOG_INFO("server.loading", "Loading SkillLineAbilityMultiMap Data...");
     sSpellMgr->LoadSkillLineAbilityMap();
@@ -1564,6 +1569,7 @@ bool World::SetInitialWorldSettings()
 
     TC_LOG_INFO("server.loading", "Loading Classic creature levels...");
     sObjectMgr->LoadCreatureClassicLevels();
+    sObjectMgr->LoadCreatureClassicMelee();
     sObjectMgr->LoadItemClassicBlock();
 
     TC_LOG_INFO("server.loading", "Loading Equipment templates...");           // must be after LoadCreatureTemplates

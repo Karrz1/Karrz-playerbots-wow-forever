@@ -182,11 +182,16 @@ private:
     // Per-(instance,team) AV captain assault latch: set once enough of the team stood at the staging spot, cleared when the captain
     // dies. Without it the squad leaving the spot would drop the count below the threshold and send everyone back.
     std::unordered_map<uint64, uint32>  captain_go_;
+    // Per-(instance,team) match time at which the captain squad started waiting at the staging spot (BgAvPlan::kCaptainGatherMaxMs time cap).
+    std::unordered_map<uint64, uint32>  captain_wait_;
     // Per-(instance,team) AV brawl state: the match's random base share, the follow mode in force
     // (0 = base, 1 = a human fights in the valley, 2 = a human pushes the enemy bases) and when a
     // different mode was first wanted (kMidModeHoldMs hysteresis so bots do not flip-flop).
     struct MidState { float base = 0.4f; uint8 mode = 0; uint8 wanted = 0; uint32 wanted_since_ms = 0; };
     std::unordered_map<uint64, MidState> mid_state_;
+    // Per-(instance,team,node) match time at which the enemy's assault on a node was first seen: the contest age the defender picker
+    // uses (BgTactics::CanArriveBeforeFlip). Erased as soon as the node is no longer contested.
+    std::unordered_map<uint64, uint32> contest_since_;
     uint32 last_plan_ms_ = 0;
     std::string last_dump_;
 };

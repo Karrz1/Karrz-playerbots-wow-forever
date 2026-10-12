@@ -1,6 +1,7 @@
 ﻿#include "BotAI.h"
 #include "BotSnapshotView.h"
 #include "TradeRule.h"
+#include "BotTrade.h"
 #include "BotIntentEmitter.h"
 #include "BotActivityTier.h"
 #include "Group/GroupSnapshot.h"
@@ -806,31 +807,29 @@ void BotAI::dispatch_layers(BotSnapshotView s, GroupSnapshotView g,
                          s.raw().social_events.trade_partner_in_my_group))
     {
         // A gift trade from the owner or a player in the bot's own group or raid (gear, potions, money): accepted once he has
-        // accepted, see API::accept_owner_trade. The bot never offers anything. Items that are upgrades are worn by the
-        // auto-equip rules afterwards. Everyone else falls to the "busy" decline below.
+        // accepted, see API::trade_with. Gear that is an upgrade is a gift and worn by the auto-equip rules afterwards; anything
+        // else he puts in is bought at the fair price. Everyone else falls to the cases below.
         em.trade_accept_owner(s.raw().social_events.trade_partner_guid);
+    }
+    else if (s.has_trade_request() && s.trade_partner_is_real() && !s.has_owner_character() && !s.in_group())
+    {
+        // A free-roaming bot trades with anyone at the fair price: it buys what he puts in, and sells what it listed to him
+        // (whisper "what do you have", then "buy 2"). See BotTrade.h.
+        em.trade_bargain(s.raw().social_events.trade_partner_guid);
     }
     else if (s.has_trade_request())
     {
-        // Playerbot.Behavior.PoliteWorldBots: a real player who opened a trade with a world bot gets a short
-        // "sorry, nothing to trade" and the trade is cancelled a moment later (0-2 s, per bot, like a person
-        // reading the window). Everyone else is cancelled at once, silently.
-        if (Services::Config().behavior_polite_world_bots() && !s.has_owner_character() && !s.in_group() &&
-            s.trade_partner_is_real() && !s.trade_partner_name().empty())
-        {
-            const uint32 now_ms = s.published_at_ms();
-            if ((now_ms / 1000u + uint32(s.bot_id())) % 3u == 0u)
-            {
-                static constexpr char const* kTrade[] = {
-                    "sorry, nothing to trade", "sorry, i've got nothing to trade", "no thanks, nothing to trade here",
-                    "sorry, not trading right now",
-                };
-                em.whisper(s.trade_partner_name(), kTrade[((now_ms / 3000u) + uint32(s.bot_id())) % 4u]);
-                em.trade_decline();
-            }
-        }
-        else
-            em.trade_decline();
+        // A companion that belongs to someone else's group, or a trade with another bot: cancelled at once, silently.
+        em.trade_decline();
+    }
+
+    // Bag room: a bot that never leaves its group never reaches a vendor, so its bags only fill and it can neither take loot
+    // nor a trade. Clears bag rot when fewer than BotTrade::kKeepFreeSlots slots are free (at most every 30 s, out of combat).
+    if (!s.in_combat() && s.is_alive() && s.raw().bags.bag_free_slots < Playerbot::BotTrade::kKeepFreeSlots &&
+        s.published_at_ms() - last_bag_room_ms_ >= 30000u)
+    {
+        last_bag_room_ms_ = s.published_at_ms();
+        em.make_bag_room(Playerbot::BotTrade::kKeepFreeSlots);
     }
 
     if (s.in_group())

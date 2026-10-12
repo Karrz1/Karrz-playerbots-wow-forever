@@ -1,6 +1,6 @@
-# Notice and credits: Karrz's Player Bots
+# Notice and credits: WoW Forever Bots
 
-"Karrz's Player Bots" by Karrz is the name of this bot system. Every upstream credit and license below stays in force.
+"WoW Forever Bots" by Karrz is the name of this bot system. Every upstream credit and license below stays in force.
 
 This module is part of a TrinityCore-based tree and is distributed under the GNU General
 Public License version 2 (`COPYING` at the repository root), the same terms as TrinityCore.

@@ -17,7 +17,7 @@ Not built or run in the cloud (no full toolchain): first test is on the PC. Chec
 ## Seller names
 `AuctionHouseBot.Account` = an account id and `AuctionHouseBot.Sellers.Count` = N: at startup
 `AuctionHouseBotSellers.cpp` tops that account up to N named level-60 characters (bare `characters` rows, mixed
-Alliance/Horde races, never logged in) so listings show a real seller name. contrib/forever-bots/zz-forever-bots.conf uses account
+Alliance/Horde races, never logged in) so listings show a real seller name. make-configs.ps1 uses account
 2000000001 (no real account has it; must stay below 2^31) and 12 characters. Listings made before this change stay nameless.
 
 ## Buyer rules and commands

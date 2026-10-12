@@ -1,0 +1,101 @@
+// TradeTalk - what a player whispers a bot about buying from it: "what do you have", then "buy 2" or "buy linen cloth".
+// Pure text logic on a normalized line (lower case, punctuation folded to spaces). Tested in tests/game/ClassicBotTrade.cpp.
+
+#pragma once
+
+#include <cctype>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace Playerbot::V2::TradeTalk {
+
+inline bool Has(std::string const& hay, char const* needle)
+{
+    std::string const pad_h = " " + hay + " ";
+    std::string const pad_n = std::string(" ") + needle + " ";
+    return pad_h.find(pad_n) != std::string::npos;
+}
+
+// "what do you have", "what are you selling", "show me your wares", "trade list", "anything for sale".
+inline bool IsInventoryQuestion(std::string const& norm)
+{
+    static constexpr char const* kPhrases[] = {
+        "what do you have", "what have you got", "what you got", "what do you got", "what ya got", "what do you sell", "what are you selling",
+        "what you selling", "what can i buy", "anything for sale", "got anything for sale", "anything to sell", "what is for sale",
+        "whats for sale", "what's for sale", "show me your wares", "your wares", "trade list", "your goods", "what are you selling",
+        "what is in your bags", "whats in your bags", "what do you carry", "show me what you have", "list your items", "for sale",
+    };
+    for (char const* p : kPhrases)
+        if (Has(norm, p)) return true;
+    return false;
+}
+
+struct Order
+{
+    bool is_order = false;
+    bool buy_verb = false;   // said "buy" / "purchase": a line that is about trading whatever follows
+    int index = -1;          // 1-based position on the last list; -1 when named instead
+    std::string name;        // item name part, lower case; empty when numbered
+};
+
+// "buy 2", "buy #2", "i'll take 2", "i want 2", "buy linen cloth", "ill take the linen cloth".
+inline Order ParseOrder(std::string const& norm)
+{
+    Order o;
+    static constexpr char const* kVerbs[] = { "buy", "take", "want", "purchase" };
+    size_t pos = std::string::npos;
+    size_t vlen = 0;
+    for (char const* v : kVerbs)
+    {
+        std::string const needle = std::string(v) + " ";
+        size_t p = std::string::npos;
+        if (norm.compare(0, needle.size(), needle) == 0) p = 0;
+        else if (size_t q = norm.find(" " + needle); q != std::string::npos) p = q + 1;
+        if (p != std::string::npos && (pos == std::string::npos || p < pos)) { pos = p; vlen = needle.size(); }
+    }
+    if (pos == std::string::npos) return o;
+    o.buy_verb = norm.compare(pos, 3, "buy") == 0 || norm.compare(pos, 8, "purchase") == 0;
+    std::string rest = norm.substr(pos + vlen);
+    for (char const* filler : { "the ", "a ", "an ", "number ", "no ", "item ", "that ", "me " })
+    {
+        std::string f(filler);
+        if (rest.compare(0, f.size(), f) == 0) rest.erase(0, f.size());
+    }
+    while (!rest.empty() && rest.front() == ' ') rest.erase(0, 1);
+    while (!rest.empty() && rest.back() == ' ') rest.pop_back();
+    if (rest.empty()) return o;
+    bool digits = true;
+    for (char c : rest) if (!std::isdigit(static_cast<unsigned char>(c))) { digits = false; break; }
+    if (digits && rest.size() <= 2)
+    {
+        o.is_order = true;
+        o.index = std::stoi(rest);
+        return o;
+    }
+    // "# 2" folded to " 2" arrives as "2"; anything else is a name
+    o.is_order = true;
+    o.name = rest;
+    return o;
+}
+
+struct ListedItem
+{
+    std::string name;   // lower case
+};
+
+// Position (0-based) of the order on the list, -1 when it names nothing on it. A name matches by containing text, the shortest
+// name wins a tie so "linen cloth" does not pick "heavy linen cloth bolt".
+inline int ResolveOrder(Order const& o, std::vector<ListedItem> const& list)
+{
+    if (!o.is_order) return -1;
+    if (o.index >= 1 && static_cast<size_t>(o.index) <= list.size()) return o.index - 1;
+    if (o.name.empty()) return -1;
+    int best = -1;
+    for (size_t i = 0; i < list.size(); ++i)
+        if (list[i].name.find(o.name) != std::string::npos && (best < 0 || list[i].name.size() < list[static_cast<size_t>(best)].name.size()))
+            best = static_cast<int>(i);
+    return best;
+}
+
+} // namespace Playerbot::V2::TradeTalk

@@ -52,6 +52,11 @@ public:
     // dedup against in_flight_ is preserved.
     void schedule_ticks(std::span<BotId const> bots);
 
+    // Blocks until `bot` is neither queued nor executing (bounded wait; returns at once when the pool is
+    // stopped). Callers MUST stop scheduling the bot first (TickScheduler::unregister_bot does), then
+    // call this before destroying the bot's registry entry, which a worker holds raw pointers into.
+    void wait_not_in_flight(BotId bot);
+
     PerfStats stats() const { return stats_; }
     size_t    worker_count() const { return workers_.size(); }
 
@@ -63,6 +68,7 @@ private:
     std::vector<std::thread> workers_;
     mutable std::mutex      mtx_;
     std::condition_variable cv_;
+    std::condition_variable idle_cv_;   // signalled when a bot leaves in_flight_
     std::deque<BotId>       queue_;
     // Set of bots currently in queue OR being processed by a worker. Used to
     // dedup re-schedules: if a bot is still in flight from a previous tick,

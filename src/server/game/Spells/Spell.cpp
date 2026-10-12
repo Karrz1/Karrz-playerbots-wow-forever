@@ -5635,8 +5635,8 @@ void Spell::TakePower()
 
         unitCaster->ModifyPower(cost.Power, -cost.Amount);
 
-        // Classic.FiveSecondRule (vanilla): paying mana starts the five second rule (Player::GetPowerRegen, ClassicManaRegen.h)
-        if (cost.Power == POWER_MANA && cost.Amount > 0 && sWorld->getBoolConfig(CONFIG_CLASSIC_FIVE_SECOND_RULE))
+        // Classic 1.60 (vanilla): paying mana starts the five second rule (Player::GetPowerRegen, ClassicManaRegen.h)
+        if (cost.Power == POWER_MANA && cost.Amount > 0)
             if (Player* manaPlayer = unitCaster->ToPlayer())
                 manaPlayer->InterruptPowerRegen(POWER_MANA);
     }
@@ -7031,6 +7031,20 @@ SpellCastResult Spell::CheckCast(bool strict, int32* param1 /*= nullptr*/, int32
                             }
                             return SPELL_FAILED_ONLY_OUTDOORS;
                         }
+                        else if (WorldSession const* mountSession = unitCaster->ToPlayer()->GetSession(); mountSession && !mountSession->IsBot())
+                        {
+                            // A real player's mount is allowed here: log the terrain evidence for it (Karrz, WSG 2026-10-11: a mount was
+                            // allowed inside the Horde flag room). One line per 5 s.
+                            thread_local std::unordered_map<uint64, uint32> s_mountOkMs;
+                            uint32& lastOk = s_mountOkMs[unitCaster->GetGUID().GetCounter()];
+                            if (lastOk == 0 || getMSTime() - lastOk >= 5000u)
+                            {
+                                lastOk = getMSTime();
+                                TC_LOG_INFO("playerbot.v2", "[bg_mount_ok] {} mount allowed at ({:.0f},{:.0f},{:.0f}), bg status {}: {}", unitCaster->GetName(),
+                                            unitCaster->GetPositionX(), unitCaster->GetPositionY(), unitCaster->GetPositionZ(), uint32(bg->GetStatus()),
+                                            bg->DescribeIndoors(unitCaster->ToPlayer()));
+                            }
+                        }
                 break;
             }
             case SPELL_AURA_RANGED_ATTACK_POWER_ATTACKER_BONUS:
@@ -7497,6 +7511,12 @@ void Spell::CheckDst()
 
 SpellCastResult Spell::CheckRange(bool strict) const
 {
+    // A trap object picked its target by its own trigger radius (GameObject::Update). The effect spell's own range is 0 for the Explosive and Frost
+    // Trap effects (the effect is an area around the trap): checking it against the unit that walked in turned every hit that was not on the exact
+    // spot into SPELL_FAILED_OUT_OF_RANGE, and the trap despawned having done nothing.
+    if (GameObject const* trap = m_caster->ToGameObject(); trap && trap->GetGoType() == GAMEOBJECT_TYPE_TRAP)
+        return SPELL_CAST_OK;
+
     // Don't check for instant cast spells
     if (!strict && m_casttime == 0)
         return SPELL_CAST_OK;
@@ -9443,23 +9463,7 @@ void Spell::TriggerGlobalCooldown()
             gcd = Milliseconds(intGcd);
         }
 
-        bool isMeleeOrRangedSpell = m_spellInfo->DmgClass == SPELL_DAMAGE_CLASS_MELEE ||
-            m_spellInfo->DmgClass == SPELL_DAMAGE_CLASS_RANGED ||
-            m_spellInfo->HasAttribute(SPELL_ATTR0_USES_RANGED_SLOT) ||
-            m_spellInfo->HasAttribute(SPELL_ATTR0_IS_ABILITY);
-
-        // Apply haste rating
-        if (gcd > MinGCD && ((m_spellInfo->StartRecoveryCategory == 133 && !isMeleeOrRangedSpell)))
-        {
-            gcd = Milliseconds(int64(gcd.count() * m_caster->ToUnit()->m_unitData->ModSpellHaste));
-            RoundToInterval(gcd, MinGCD, MaxGCD);
-        }
-
-        if (gcd > MinGCD && m_caster->ToUnit()->HasAuraTypeWithAffectMask(SPELL_AURA_MOD_GLOBAL_COOLDOWN_BY_HASTE_REGEN, m_spellInfo))
-        {
-            gcd = Milliseconds(int64(gcd.count() * m_caster->ToUnit()->m_unitData->ModHasteRegen));
-            RoundToInterval(gcd, MinGCD, MaxGCD);
-        }
+        // Classic 1.60 (vanilla): the global cooldown is not shortened by spell haste or haste regen (retail scaled it down to 0.75 s)
 
         // PlayerbotV2 pacing multiplier (bots only): scales the GCD, floor 750 ms.
         if (m_caster->GetTypeId() == TYPEID_PLAYER)

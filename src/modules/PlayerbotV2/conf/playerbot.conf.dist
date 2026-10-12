@@ -1,5 +1,5 @@
 ###############################################################################
-# Playerbot V2 — configuration
+# WoW Forever Bots (Playerbot V2) — configuration
 #
 # Full schema documented in v2/CONFIG.md. Each key tagged HR-yes (hot-reload via
 # `.playerbot reload`) or HR-no (requires restart).
@@ -165,6 +165,14 @@ Playerbot.World.MinLevel = 10
 Playerbot.World.MaxLevel = 60
 # Percentage of bots of the player's own faction (the rest is the opposing faction).
 Playerbot.World.FriendlyPct = 80
+# World PvP mix by zone (Fleet/WorldFactionMix.h): contested zones (Plaguelands, Stranglethorn, Hillsbrad, Arathi, ...) hold a real share
+# of the opposing faction at the player's level; capitals and home zones stay mostly the player's own. Unlisted zones use FriendlyPct.
+# ZoneMix = 0 gives FriendlyPct everywhere.
+Playerbot.World.ZoneMix = 1
+Playerbot.World.CapitalFriendlyPct = 90
+Playerbot.World.HomeFriendlyPct = 90
+Playerbot.World.BorderFriendlyPct = 75
+Playerbot.World.ContestedFriendlyPct = 60
 # Ambient characters allowed to exist (online or offline). Offline ones are reused before new ones are created.
 # Default: the larger of 4 x MaxBots and 200.
 # Playerbot.World.PoolMax = 200
@@ -175,6 +183,11 @@ Playerbot.World.FriendlyPct = 80
 Playerbot.World.SeedRoster = 0
 # Seeded residents being set up at the same time.
 Playerbot.World.SeedInFlight = 8
+# Faction balance of the roster (Fleet/PoolBalance.h): with SeedRoster = 1 the seeder always creates the faction and level bracket
+# (10s, 50-60) that is furthest below this share of Horde, so the pool is balanced in every bracket and there are enough bots of
+# the opposing faction for world PvP and battleground queues. 5..95. PoolMax must leave room for the Horde characters a lopsided
+# pool still lacks.
+Playerbot.World.PoolHordePct = 50
 # Classic 1.60 (Skyborne): share of the seeded residents (SeedRoster = 1) that are level 1-9 Skyborne who sleep on Zephras Isle, the
 # Skyborne start, so a player who arrives there finds quests being done. Around a player on Zephras the spawner always keeps
 # Skyborne bots of level 1-9 (MinLevel does not apply there); a Skyborne bot that reaches level 10 on the island is moved to a
@@ -225,6 +238,14 @@ Playerbot.Bg.AutoSeed.ForceType = 0
 # sides reach the BG minimum, so a tiny fleet simply sits in the queue (a bot never leaves
 # the world for it until the invite pops). Owner / companion bots, grouped bots, bots in
 # instances, dead, in combat or deserting never auto-join. Read live (HR-yes).
+#
+#    Playerbot.Bg.Av.MinPlayersPerTeam
+#        Alterac Valley starts once this many players per side are queued (the client table's minimum is higher and the
+#        queue never popped); bots keep topping the match up to 40 a side while it runs. 0 = the table's value.
+#        Default: 20
+#
+Playerbot.Bg.Av.MinPlayersPerTeam = 20
+
 Playerbot.Bg.AutoJoin = 0
 Playerbot.Bg.AutoJoin.Chance = 3
 Playerbot.Bg.AutoJoin.MaxQueued = 24
@@ -258,6 +279,10 @@ Playerbot.Pve.Coordinator.Enable = 1
 # Lair, AQ40 and Naxxramas: tank assignment, positioning, dispels, mechanics).
 # 0 leaves bots in raids on their generic group behaviour.
 Playerbot.Raid.Enable = 1
+
+# On-screen boss warnings for the human players of a raid ("Magmadar: Panic - fear! in about 5 sec",
+# "Shazzrah is casting Arcane Explosion"), sent as a boss emote. Molten Core bosses. 0 turns them off.
+Playerbot.Raid.BossWarnings = 1
 
 # A resurrection a bot casts on you is accepted for you after 3 s without an answer (the 70205 client shows no accept popup).
 Playerbot.Raid.AutoAcceptOwnerRez = 1
@@ -605,7 +630,7 @@ Playerbot.Diag.HealthEndpointPort = 0
 # (top 10 opcodes by count, top 5 SMSG_UPDATE_OBJECT value-update sources by bytes).
 # Read once when a session is created; costs two relaxed atomic adds per packet.
 # HR-no
-Playerbot.NetStat.Enable = 1
+Playerbot.NetStat.Enable = 0
 
 # Logging level: error | warn | info | debug | trace
 # HR-yes
@@ -938,7 +963,7 @@ PlayerbotV2.Move.RouteAwareCombatAdvance = 1
 # combat frame; WC corridor freeze 2026-07-03 (z-disconnected ledge pack).
 PlayerbotV2.Combat.SkipUnfightable       = 1
 
-# Group threat discipline (port of Karrz's wow-1.12 GroupPveRestraint /
+# Group threat discipline (port of Karrz's ike3-based bots GroupPveRestraint /
 # MCRaidHoldDamage). Applies only to non-tank bots in a group that has a tank
 # (main-tank flag, LFG tank role or tank spec) - never to solo bots, BGs or
 # a mob already hitting a non-tank member (self-defence). Holding = the bot

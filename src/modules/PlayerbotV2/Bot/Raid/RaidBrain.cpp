@@ -476,6 +476,17 @@ void Remember(Player* bot, RaidOrder const& d, uint32_t now)
 struct BreathLatch { float x = 0, y = 0, o = 0; uint32_t until = 0, lockout = 0; };
 std::unordered_map<uint64_t, BreathLatch> g_breath;
 
+bool IsCasting(Unit* enemy, uint32_t spell)
+{
+    for (CurrentSpellTypes type : { CURRENT_GENERIC_SPELL, CURRENT_CHANNELED_SPELL })
+    {
+        Spell* cast = enemy->GetCurrentSpell(type);
+        if (cast && cast->GetSpellInfo() && cast->GetSpellInfo()->Id == spell)
+            return true;
+    }
+    return false;
+}
+
 bool BreathActive(Unit* enemy, uint32_t spell)
 {
     if (spell && enemy->HasAura(spell))
@@ -517,7 +528,9 @@ std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t no
     for (AvoidEnemyAura const& rule : rules.avoidEnemyAura)
         if (Matches(rule.who, self, plan.mainTank))
             for (Unit* enemy : plan.enemies)
-                if (enemy->GetEntry() == rule.enemy && enemy->HasAura(rule.aura))
+                // The aura, or the cast that applies it: the circle opens when the boss starts the spell, not a plan
+                // interval after it landed (MC Geddon 2026-10-11: 35 of 36 deaths in one Inferno, bots still inside).
+                if (enemy->GetEntry() == rule.enemy && (enemy->HasAura(rule.aura) || IsCasting(enemy, rule.aura)))
                     circles.push_back({ enemy->GetPositionX(), enemy->GetPositionY(), rule.radius });
     for (AvoidCarrier const& rule : rules.avoidCarrier)
         if (Matches(rule.who, self, plan.mainTank) && !bot->HasAura(rule.aura))
@@ -674,6 +687,44 @@ Brain::MoveContext BuildMoveContext(Plan const& plan, Member const& self, std::v
         ctx.stay_radius = radius;
     }
     return ctx;
+}
+
+// The axis of a FaceAway fight, locked when it first becomes known: the bearing from the boss to the tank's spot, i.e. from the raid's
+// centre through the boss (Magmadar 2026-10-10: re-reading the raid's centre every few seconds made the tank step round the boss 25
+// times, and each step turned the boss and sent the whole raid to a new "behind" spot, 1460 moves in one fight). It holds while the
+// boss stays within kAxisDrift of where it was locked and is used for a replacement tank too, so the formation outlives the main tank.
+struct FaceAxisLock { float bossX = 0, bossY = 0, bearing = 0; uint32_t seenMs = 0; };
+std::unordered_map<uint64_t, FaceAxisLock> g_faceAxis;
+constexpr float kAxisDrift = 8.0f;
+constexpr uint32_t kAxisStaleMs = 30000;
+
+bool FaceAxisFor(Plan const& plan, Unit* enemy, uint32_t now, float& axis)
+{
+    uint64_t const key = (plan.groupLow << 32) ^ enemy->GetEntry();
+    float const ex = enemy->GetPositionX(), ey = enemy->GetPositionY();
+    FaceAxisLock& lock = g_faceAxis[key];
+    if (lock.seenMs && now - lock.seenMs < kAxisStaleMs && geo::AxisHolds(lock.bossX, lock.bossY, ex, ey, kAxisDrift))
+    {
+        lock.seenMs = now;
+        axis = lock.bearing;
+        return true;
+    }
+    float sx = 0.0f, sy = 0.0f;
+    int n = 0;
+    for (Member const& m : plan.members)
+    {
+        if (m.tank || Dist2D(m.p->GetPositionX(), m.p->GetPositionY(), ex, ey) > 60.0f)
+            continue;
+        sx += m.p->GetPositionX(); sy += m.p->GetPositionY();
+        ++n;
+    }
+    if (n < 4)
+        return false;
+    lock = { ex, ey, geo::Bearing(sx / float(n), sy / float(n), ex, ey), now ? now : 1u };
+    axis = lock.bearing;
+    TC_LOG_INFO("playerbot.v2.raid", "[raid_face] axis for {} locked: raid centre {:.0f} yd out, {} raiders, bearing {:.0f} deg", enemy->GetName(),
+        Dist2D(sx / float(n), sy / float(n), ex, ey), n, axis * 180.0f / float(M_PI));
+    return true;
 }
 
 void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<Circle> const& circles, RaidOrder& out)
@@ -849,31 +900,43 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                     !InPhase(enemy, rule.hpMax, rule.hpMin))
                     continue;
                 float const ex = enemy->GetPositionX(), ey = enemy->GetPositionY();
-                float sx = 0.0f, sy = 0.0f;
-                int n = 0;
-                for (Member const& m : plan.members)
-                {
-                    if (m.tank || Dist2D(m.p->GetPositionX(), m.p->GetPositionY(), ex, ey) > 60.0f)
-                        continue;
-                    sx += m.p->GetPositionX(); sy += m.p->GetPositionY();
-                    ++n;
-                }
-                if (n < 2)
+                float axis;
+                if (!FaceAxisFor(plan, enemy, now, axis))
                     continue;
-                float const rx = sx / float(n), ry = sy / float(n);
-                if (geo::TankOpposesRaid(ex, ey, bot->GetPositionX(), bot->GetPositionY(), rx, ry, 30.0f * (float(M_PI) / 180.0f)))
+                if (geo::TankOnAxis(ex, ey, bot->GetPositionX(), bot->GetPositionY(), axis, 30.0f * (float(M_PI) / 180.0f)))
                     continue;
                 uint32_t& at = g_lastFaceAway[bot->GetGUID().GetCounter()];
                 if (now - at < 5000)
                     continue;
-                float px, py;
-                geo::FaceAwaySpot(ex, ey, rx, ry, 3.5f, px, py);
-                if (!circles.empty() && InsideAny(circles, px, py, 0.5f))
-                    continue;
-                float pz = 0.0f;
-                if (!Usable(bot, px, py, enemy->GetPositionZ(), pz))
-                    continue;
+                // The far side of the boss is usually the wall, where a spot 3.5 yards out may have no floor: try shorter reaches and a
+                // few degrees either side of the straight line (all within the 30 degrees the check above accepts). One bot, every
+                // 5 s, so the probes are urgent: the shared routine budget is spent by the raid's spread and role steps (a 40-man
+                // raid), and the tank then never found a spot.
+                bool found = false;
+                float px = 0.0f, py = 0.0f, pz = 0.0f;
+                for (float reach : { 3.5f, 2.8f, 2.2f })
+                {
+                    for (float turnDeg : { 0.0f, 15.0f, -15.0f, 28.0f, -28.0f })
+                    {
+                        geo::AxisSpot(ex, ey, axis, reach, turnDeg * (float(M_PI) / 180.0f), px, py);
+                        if (!circles.empty() && InsideAny(circles, px, py, 0.5f))
+                            continue;
+                        if (Usable(bot, px, py, enemy->GetPositionZ(), pz, /*urgent*/ true))
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found)
+                        break;
+                }
                 at = now;
+                if (!found)
+                {
+                    TC_LOG_INFO("playerbot.v2.raid", "[raid_face] {} found no spot on the axis behind {}", bot->GetName(), enemy->GetName());
+                    continue;
+                }
+                TC_LOG_INFO("playerbot.v2.raid", "[raid_face] {} steps behind {} to turn it away from the raid", bot->GetName(), enemy->GetName());
                 SetMove(out, px, py, pz, "face boss away");
                 return;
             }
@@ -888,7 +951,19 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
         {
             if (enemy->GetEntry() != rule.enemy || !enemy->IsAlive() || !InPhase(enemy, rule.hpMax, rule.hpMin))
                 continue;
-            float const ex = enemy->GetPositionX(), ey = enemy->GetPositionY(), eo = enemy->GetOrientation();
+            float const ex = enemy->GetPositionX(), ey = enemy->GetPositionY();
+            // The boss faces its tank, i.e. along the locked axis; its live facing swings with every tank step and every swing of its
+            // aim, which is what sent the DPS round the boss over and over.
+            float eo = enemy->GetOrientation();
+            if (!rules.faceAway.empty())
+                for (FaceAway const& fa : rules.faceAway)
+                    if (fa.enemy == rule.enemy)
+                    {
+                        float axis;
+                        if (FaceAxisFor(plan, enemy, now, axis))
+                            eo = axis;
+                        break;
+                    }
             float const half = rule.halfAngleDeg * (float(M_PI) / 180.0f);
             if (geo::InRearSector(ex, ey, eo, bot->GetPositionX(), bot->GetPositionY(), half, rule.minDist, rule.maxDist))
                 break;

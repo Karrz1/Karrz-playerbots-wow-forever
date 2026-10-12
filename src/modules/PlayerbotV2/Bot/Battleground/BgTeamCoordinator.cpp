@@ -16,6 +16,7 @@
 // where coordination beats greed and deliberately leaves the rest alone.
 
 #include "BgTeamCoordinator.h"
+#include "BgTactics.h"
 #include "BattlegroundScript.h"
 #include "../BotRegistry.h"
 #include "../BotSnapshotView.h"
@@ -318,7 +319,7 @@ void BgTeamCoordinator::PlanCtf(TeamPlanContext& ctx)
         for (int ri : runner_idx)
             escort_to(ctx.members[ri].x, ctx.members[ri].y, ctx.members[ri].z,
                       ObjectGuid::Create<HighGuid::Player>(ctx.members[ri].guid_low),
-                      /*count=*/1, squad_no++);
+                      BgTactics::RunnerEscortCount(int(ctx.members.size())), squad_no++);
 
     // -- EFC hunt squad (pure CTF only) --------------------------------------
     // Concentrated 3-bot intercept on the enemy carrier. On hybrid maps the
@@ -453,20 +454,31 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
     //   owner==us    && !contested -> held node: standing garrison.
     // Emergencies first, then garrisons sized to live enemy pressure.
     // All-in strips garrisons to a single sentry; turtle adds one.
-    struct Demand { float x, y, z; int quota; bool emergency; };
+    struct Demand { float x, y, z; int quota; bool emergency; uint32 contested_ms; };
     std::vector<Demand> defense;
     for (auto const& n : ctx.nodes)
     {
+        // How long the enemy has been capping this node (first plan that saw it contested); cleared when it stops being contested.
+        uint64 const cs_key = (uint64(ctx.instance_id) << 40) ^ (uint64(ctx.team) << 36) ^
+                              (uint64(uint32(int32(n.x * 4.f))) * 73856093ull) ^ (uint64(uint32(int32(n.y * 4.f))) * 19349663ull);
+        uint32 contested_ms = 0;
+        if (n.owner_team == enemy_team && n.is_contested)
+        {
+            auto it = contest_since_.emplace(cs_key, ctx.in_progress_ms).first;
+            contested_ms = ctx.in_progress_ms >= it->second ? ctx.in_progress_ms - it->second : 0u;
+        }
+        else
+            contest_since_.erase(cs_key);
         if (n.is_destroyed) continue;   // razed AV tower — nothing to hold
         if (n.owner_team == enemy_team && n.is_contested)
             defense.push_back({n.x, n.y, n.z,
                                std::max(2, std::min(enemy_near(n) + 1, 4)),
-                               true});
+                               true, contested_ms});
         else if (n.owner_team == ctx.team && !n.is_contested)
         {
             int quota = all_in ? 1 : std::clamp(enemy_near(n), 1, 3);
             if (turtle) ++quota;
-            defense.push_back({n.x, n.y, n.z, quota, false});
+            defense.push_back({n.x, n.y, n.z, quota, false, 0u});
         }
         else if (n.owner_team == ctx.team && n.is_contested)
         {
@@ -475,7 +487,7 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
             // moves on to the next node instead of standing on this one for
             // the whole timer.
             defense.push_back({n.x, n.y, n.z,
-                               std::clamp(enemy_near(n) + 1, 1, 3), false});
+                               std::clamp(enemy_near(n) + 1, 1, 3), false, 0u});
         }
     }
     std::stable_sort(defense.begin(), defense.end(),
@@ -494,7 +506,10 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
     for (auto const& m : ctx.members)
         if (m.alive && !m.is_carrier) ++alive_total;
     uint64 const mid_key = (uint64(ctx.instance_id) << 2) | uint64(ctx.team);
-    if (ctx.type_id == 1 && PosSet(ctx.fight_x, ctx.fight_y) && !all_in && !ctx.endgame_unconditional &&
+    // Karrz 2026-10-11: the valley brawl is OFF. Bots piled up idle in AV, and he asked to drop the fight in the middle in case it was the
+    // cause; AV bots now play the way ike3 / mod-playerbots do (towers, graveyards, captain, general, mines). Flip to true to bring it back.
+    constexpr bool kAvValleyBrawl = false;
+    if (kAvValleyBrawl && ctx.type_id == 1 && PosSet(ctx.fight_x, ctx.fight_y) && !all_in && !ctx.endgame_unconditional &&
         ctx.in_progress_ms < kMidMaxMs)
     {
         MidState& ms = mid_state_[mid_key];
@@ -552,8 +567,32 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
     const int garrison_budget  = std::max(1, int(float(alive_free) * 0.6f * (1.0f - 0.6f * mid_share)));
     const int emergency_budget = std::max(1, (alive_free * 3) / 4);
     int spent = 0;
+    // AV defender flip (mod-playerbots BGT 1919-1931): a bot already deep in the enemy half does not garrison; it keeps free for the attack.
+    // Chance 20 + 15 per own node razed, rolled per bot per minute (stable inside the minute). Emergencies still take whoever is nearest.
+    std::vector<int> flipped;
+    if (ctx.type_id == 1)
+    {
+        int own_razed = 0;
+        for (auto const& n : ctx.nodes)
+            if (n.is_destroyed && n.owner_team == ctx.team) ++own_razed;
+        for (int i = 0; i < int(ctx.members.size()); ++i)
+        {
+            Member const& m = ctx.members[i];
+            if (m.assigned || !m.alive || m.is_carrier || !BgAvPlan::DefenderPastLine(ctx.team, m.x)) continue;
+            uint32 const h = uint32((m.guid_low * 2654435761ull) ^ (uint64(ctx.in_progress_ms / 60000u) * 40503ull)) >> 8;
+            if (int(h % 100u) < BgAvPlan::DefenderFlipChance(own_razed)) flipped.push_back(i);
+        }
+    }
+    // Hide the flipped bots from the garrison picks; emergencies see them (and a pick stays assigned when the mask lifts).
+    std::vector<int> masked;
+    auto mask_flipped = [&](bool on)
+    {
+        if (on) { masked.clear(); for (int i : flipped) if (!ctx.members[i].assigned) { ctx.members[i].assigned = true; masked.push_back(i); } }
+        else    { for (int i : masked) ctx.members[i].assigned = false; masked.clear(); }
+    };
     for (auto const& d : defense)
     {
+        mask_flipped(!d.emergency);
         const int budget = d.emergency ? emergency_budget : garrison_budget;
         for (int q = 0; q < d.quota && spent < budget; ++q)
         {
@@ -562,11 +601,55 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
                                          d.x, d.y,
                                          /*healer_bias=*/d.emergency ? 0 : +1,
                                          /*allow_carrier=*/false);
-            if (pick < 0) return;   // out of bodies entirely
+            if (pick < 0) { mask_flipped(false); return; }   // out of bodies entirely
+            // Stop-the-cap only when the nearest bot can still get there before the node flips; the next plan sends the attack squad
+            // to retake it (mod-playerbots/ike3 send whoever rolled the node, however far).
+            if (d.emergency &&
+                !BgTactics::CanArriveBeforeFlip(std::sqrt(Dist2(ctx.members[pick].x, ctx.members[pick].y, d.x, d.y)),
+                                                BgTactics::CaptureWindowMs(ctx.type_id), d.contested_ms))
+                break;
             AssignOrder(ctx.members[pick].guid_low, BgOrder::DefendNode,
                         d.x, d.y, d.z);
             ctx.members[pick].assigned = true;
             ++spent;
+        }
+    }
+
+    mask_flipped(false);
+
+    // -- AB: all five nodes ours and nobody capping: camp the enemy graveyard --------------------------------------------------
+    // (mod-playerbots BattleGroundTactics: a team that owns everything camps the enemy graveyard.) Standing on banners that nobody
+    // is attacking wins nothing more; the camp keeps their respawns from walking back out and holds the node count. A few bots, not
+    // everyone: the garrisons above stay. Positions: the enemy side's spawn point from ArathiBasinScript (with z).
+    if (ctx.type_id == 3)
+    {
+        int owned = 0, contested = 0, total = 0;
+        for (auto const& n : ctx.nodes)
+        {
+            if (n.is_destroyed) continue;
+            ++total;
+            if (n.owner_team == ctx.team) ++owned;
+            if (n.is_contested) ++contested;
+        }
+        if (BgTactics::CampEnemyGraveyard(owned, total, contested))
+        {
+            // Alliance (team 1) camps the Horde side and the other way round.
+            float const gx = ctx.team == 1 ? 686.57f : 1285.96f;
+            float const gy = ctx.team == 1 ? 683.04f : 1281.62f;
+            float const gz = ctx.team == 1 ? -12.59f : -15.67f;
+            int free_fighters = 0;
+            for (auto const& m : ctx.members)
+                if (!m.assigned && m.alive && !m.healer && !m.is_carrier) ++free_fighters;
+            int const camp = free_fighters >= 5 ? std::max(2, free_fighters * 4 / 10) : 0;
+            for (int q = 0; q < camp; ++q)
+            {
+                int const pick = PickNearest(ctx.members, BgOrder::AttackNode, gx, gy, /*healer_bias=*/+1, /*allow_carrier=*/false);
+                if (pick < 0) break;
+                uint64 const g = ctx.members[pick].guid_low;
+                float const ox = float(int((g * 7u) % 15u) - 7), oy = float(int((g * 11u) % 15u) - 7);
+                AssignOrder(g, BgOrder::AttackNode, gx + ox, gy + oy, gz, ObjectGuid::Empty, /*squad=*/4, /*target_entry=*/0);
+                ctx.members[pick].assigned = true;
+            }
         }
     }
 
@@ -616,7 +699,7 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
     if (ctx.endgame_creature_entry == 0 || ctx.score_delta < -150)
         endgame_commit_.erase(commit_key);  // endgame done / team collapsing
     if (!ctx.captain_alive)
-        captain_go_.erase(commit_key);      // captain dead: the next assault starts from the staging spot again
+        { captain_go_.erase(commit_key); captain_wait_.erase(commit_key); }      // captain dead: the next assault starts from the staging spot again
     const bool sticky_push = committed && ctx.endgame_creature_entry != 0 &&
                              ctx.score_delta >= -150;
     const bool push_boss = all_in || ctx.endgame_unconditional || lead_push ||
@@ -629,7 +712,22 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
         for (auto const& n : ctx.nodes)
             if (!n.is_destroyed && n.owner_team == enemy_team && NodePriorityFor(ctx, n) == 2)
                 ++enemy_towers_up;
-    bool const general_ok = enemy_towers_up == 0;
+    // General rule: ike3 (all towers down) or mod-playerbots (two razed and the last graveyard held or 20 friends near the boss): BgAvPlan::GeneralPushOk.
+    int enemy_towers_razed = 0;
+    bool own_final_gy = false;
+    {
+        auto const fg = BgAvPlan::FinalGraveyard(ctx.team);
+        for (auto const& n : ctx.nodes)
+        {
+            if (n.is_destroyed && n.owner_team == enemy_team && NodePriorityFor(ctx, n) == 2) ++enemy_towers_razed;
+            if (!n.is_destroyed && n.owner_team == ctx.team && !n.is_contested && Dist2(n.x, n.y, fg.x, fg.y) < 30.f * 30.f) own_final_gy = true;
+        }
+    }
+    int friends_near_boss = 0;
+    if (PosSet(ctx.endgame_x, ctx.endgame_y))
+        for (auto const& m : ctx.members)
+            if (m.alive && Dist2(m.x, m.y, ctx.endgame_x, ctx.endgame_y) < 200.f * 200.f) ++friends_near_boss;
+    bool const general_ok = BgAvPlan::GeneralPushOk(enemy_towers_up, enemy_towers_razed, own_final_gy, friends_near_boss);
 
     // -- AV open-field brawl (Karrz 2026-10-08) -------------------------------
     // Send the brawlers (share decided above) to the fight zone as ordinary AttackNode orders. The brawl ends once
@@ -657,6 +755,28 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
         }
     }
 
+    // AV Snowfall Graveyard detail (ike3 "supporters", mod-playerbots Snowfall rule): while the neutral graveyard in the middle of the valley is
+    // not ours, a share of the free bots takes it. Not during the general push.
+    if (ctx.type_id == 1 && (!push_boss || push_held))
+        for (auto const& n : ctx.nodes)
+        {
+            float const sdx = n.x - BgAvPlan::kSnowfallX, sdy = n.y - BgAvPlan::kSnowfallY;
+            if (sdx * sdx + sdy * sdy > 30.0f * 30.0f) continue;
+            if (n.is_destroyed || n.owner_team == ctx.team || (n.owner_team == enemy_team && n.is_contested)) break;
+            int free_n = 0;
+            for (auto const& m : ctx.members)
+                if (!m.assigned && m.alive && !m.is_carrier) ++free_n;
+            int const k = BgAvPlan::SnowfallDetail(free_n, ctx.in_progress_ms);
+            for (int q = 0; q < k; ++q)
+            {
+                int const pick = PickNearest(ctx.members, BgOrder::AttackNode, n.x, n.y, /*healer_bias=*/+1, /*allow_carrier=*/false);
+                if (pick < 0) break;
+                AssignOrder(ctx.members[pick].guid_low, BgOrder::AttackNode, n.x, n.y, n.z, ObjectGuid::Empty, /*squad=*/2, /*target_entry=*/0);
+                ctx.members[pick].assigned = true;
+            }
+            break;
+        }
+
     // AV mine bosses (ike3 mine-boss objective): a few bots kill the boss of every mine the team does not own. Not during the push.
     if (!push_boss || push_held)
         for (auto const& kt : ctx.kill_targets)
@@ -668,7 +788,11 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
                 ctx.members[pick].assigned = true;
             }
 
-    if (push_boss && ctx.captain_alive && PosSet(ctx.captain_x, ctx.captain_y))
+    // ike3 / mod-playerbots: the captain comes first. Non-supporters (ike3 60-80 %) or 90 % of everyone (mod-playerbots) walk to the enemy
+    // captain while it lives, gathering at the staging spot first; the towers follow once it is down. So the captain squad starts without
+    // the lead / deficit trigger the general push needs.
+    bool const captain_first = ctx.type_id == 1 && ctx.captain_alive && PosSet(ctx.captain_x, ctx.captain_y);
+    if ((push_boss || captain_first) && ctx.captain_alive && PosSet(ctx.captain_x, ctx.captain_y))
     {
         // Captain: the squad gathers at the staging spot and goes in together once five of the team stand there (ike3: engage once 5
         // attackers are at the waiting spot). The decision latches until the captain is dead.
@@ -680,7 +804,9 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
                 int at_stage = 0;
                 for (auto const& m : ctx.members)
                     if (m.alive && Dist2(m.x, m.y, ctx.captain_stage_x, ctx.captain_stage_y) < 60.f * 60.f) ++at_stage;
-                if (BgAvPlan::CaptainGather(at_stage, false)) captain_go_[commit_key] = ctx.in_progress_ms;
+                uint32 const waited_since = captain_wait_.emplace(commit_key, ctx.in_progress_ms).first->second;
+                uint32 const waited = ctx.in_progress_ms >= waited_since ? ctx.in_progress_ms - waited_since : 0u;
+                if (BgAvPlan::CaptainGather(at_stage, false, waited)) captain_go_[commit_key] = ctx.in_progress_ms;
             }
             go = captain_go_.find(commit_key) != captain_go_.end();
         }
@@ -740,8 +866,23 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
         // squad plan below stays. The brawl share above and the garrisons are untouched.
         bool const av = ctx.type_id == 1;
         if (av)
-            split_cands.erase(std::remove_if(split_cands.begin(), split_cands.end(), [](SplitCand const& c) { return c.weight < 4; }),
-                              split_cands.end());
+        {
+            // ike3 / mod-playerbots: walk the enemy's node list in order (graveyards, bunkers, towers), the first two that are still worth
+            // attacking, one group each (BgAvPlan::PickAttackNodes). Replaces the cost-based towers-only pick, which never took a graveyard.
+            std::vector<BgAvPlan::AvNodeView> views;
+            views.reserve(ctx.nodes.size());
+            for (auto const& n : ctx.nodes)
+                views.push_back({ n.x, n.y, n.owner_team == ctx.team, n.is_destroyed, n.owner_team == enemy_team && n.is_contested });
+            split_cands.clear();
+            int rank = 0;
+            for (int idx : BgAvPlan::PickAttackNodes(ctx.team, views, 2))
+            {
+                BgNodeState const& n = ctx.nodes[idx];
+                split_cands.push_back({ float(rank), n.x, n.y, n.z, rank == 0 ? 5 : 3 });
+                if (rank == 0) { tx = n.x; ty = n.y; tz = n.z; best_cost = 0.f; }
+                ++rank;
+            }
+        }
         if (split_cands.size() >= 2 && ctx.nodes.size() >= 4)
         {
             // Variety (Karrz: no two matches alike): the focus rotates. Every 4 minutes of match time, per match, each candidate's
@@ -750,6 +891,7 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
             uint32 const var_epoch = ctx.in_progress_ms / (4u * 60u * 1000u) + ctx.instance_id * 7u;
             for (auto& c : split_cands)
             {
+                if (av) break;   // AV keeps the list order (BgAvPlan::PickAttackNodes)
                 uint32 h = uint32(int32(c.x)) * 2654435761u ^ uint32(int32(c.y)) * 40503u ^ (var_epoch + 1u) * 2246822519u;
                 h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
                 c.cost += float(h % 400u) / 100.0f - 2.0f;      // +-2, against the 8 / 2 / 0.05-per-yard cost terms
@@ -793,7 +935,7 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
             // Road skirmishers (Karrz: fights on the roads between the nodes, not only at the banners). About a fifth of the bots still
             // free go to a point midway between two of the contested nodes, picked by a hash that rotates every 3 minutes, and fight
             // whatever they meet on the way and there. Their orders are AttackNode at the road point; the 40 y engage does the rest.
-            if (split_cands.size() >= 2)
+            if (split_cands.size() >= 2 && !av)   // AV: no road skirmishers (ike3 / mod-playerbots have none; Karrz 2026-10-11)
             {
                 int left = 0;
                 for (auto const& m : ctx.members)
@@ -833,8 +975,19 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
         }
         if (!PosSet(tx, ty))
         {
-            // We own everything (or no takeable node) — turtle in place.
-            // Leave the remainder unordered; legacy roamers patrol well.
+            // We own everything (or no takeable node). AV (mod-playerbots AV_BOSS_WAIT): wait next to the enemy general, so the team is
+            // in place when the push opens. Elsewhere leave the remainder unordered; legacy roamers patrol well.
+            if (ctx.type_id == 1)
+            {
+                auto const bw = BgAvPlan::BossWait(ctx.team);
+                for (auto& m : ctx.members)
+                {
+                    if (m.assigned || !m.alive || m.is_carrier) continue;
+                    float const ox = float(int((m.guid_low * 7u) % 11u) - 5), oy = float(int((m.guid_low * 11u) % 11u) - 5);
+                    AssignOrder(m.guid_low, BgOrder::AttackNode, bw.x + ox, bw.y + oy, bw.z, ObjectGuid::Empty, /*squad=*/5, /*target_entry=*/0);
+                    m.assigned = true;
+                }
+            }
             return;
         }
     }

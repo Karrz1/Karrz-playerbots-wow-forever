@@ -1,13 +1,12 @@
-# Karrz's Player Bots
+# WoW Forever Bots
 
-**Karrz's Player Bots by Karrz**, for WoW Forever. Built on agatho's PlayerbotV2. If you reuse these bots, keep this name, the credits below and the license notices.
+**WoW Forever Bots by Karrz**, for WoW Forever. Built on agatho's PlayerbotV2. If you reuse these bots, keep this name, the credits below and the license notices.
 
-This is the bot system for advocaite's TrinityCore `forever` tree (this repository holds the bot files and the files of that tree they change; see the README for how to put them together): party companions you add with
+This is the bot system for advocaite's TrinityCore `forever` tree (this branch is his tree plus the bots): party companions you add with
 one click, raid / dungeon / battleground bots, an optional ambient population of bots around
-real players, and a vanilla-style auction house bot. It is shared as it stands, so you can read
-the code and the settings, try it, and take what is useful. Nothing here is a finished release.
+real players, and a vanilla-style auction house bot. Take what is useful.
 
-Base: `advocaite/TrinityCore` branch `forever` at `fb04ef10`. Copy this repository over a checkout of that commit.
+Base: `advocaite/TrinityCore` branch `forever` at `440d365e`. With `-DBUILD_PLAYERBOT_V2=0` (the default) the module is not built.
 
 ## What is in it
 
@@ -16,19 +15,23 @@ Base: `advocaite/TrinityCore` branch `forever` at `fb04ef10`. Copy this reposito
 | Bot module (AI, raid brain, BG scripts, world bots, fleet, travel) | `src/modules/PlayerbotV2/` |
 | Core side: a small API plus hooks | `src/server/game/Playerbot/`, `src/server/game/Modules/`, `src/server/scripts/Commands/cs_playerbot_v2.cpp`, hooks in login, group, chat, spell, threat, BG/LFG queue, map, session |
 | Bot database migrations and seed data | `sql/playerbot_v2/`, `sql/playerbot_shared/` |
-| Settings | `src/modules/PlayerbotV2/conf/playerbot.conf.dist` (every key documented), `contrib/forever-bots/zz-forever-bots.conf` (recommended values) |
-| In-game window (addon) | `contrib/forever-bots/addon/ForeverBots/` |
+| Settings | `src/modules/PlayerbotV2/conf/playerbot.conf.dist` (every key documented), `examples/zz-forever-bots.conf` (optional extras, off unless you copy it in) |
+| In-game window (addon) | `src/modules/PlayerbotV2/Addon/ForeverBots/` |
 | Everything players can type or click | `src/modules/PlayerbotV2/BOT_COMMANDS.md` |
 
 Besides the module, this tree carries Classic changes the bots depend on or were tested with:
 vanilla auction house seller (`src/server/game/AuctionHouseBot/`), road-aware pathing
 (`HandcraftedRoad*`, `dtQueryFilterTC`, `RoadOverrides`), Classic battleground scripts
-(`src/server/scripts/Custom/Classic/battlegrounds/`), vanilla spell values and some Classic
-data fixes (`sql/custom/world/2026_10_*`), and several smaller core fixes. Every file here that also exists in the `forever` tree carries the change. Behaviour changes that are a matter of taste are behind switches that default to off:
+(`src/server/scripts/Custom/Classic/battlegrounds/`), the code that uses vanilla (1.12) spell, creature and mana numbers, some Classic
+data fixes (`sql/custom/world/2026_10_*`), and several smaller core fixes.
 
-- `Classic.ArmorFormula = 0` (worldserver.conf): `1` uses the vanilla armor formula
-  `armor / (armor + 400 + 85 * attacker level)`, capped at 75%.
-- `Classic.FiveSecondRule = 0`: `1` uses the vanilla five second rule for mana regeneration.
+The vanilla numbers themselves are **not** in the repository: `tools/classic_spell_values/` builds them from the VMaNGOS database dump that you download
+yourself (`tools/classic_spell_values/README.md`). Without them the tables stay empty and the client's own values apply.
+
+Extras that are not Blizzlike are server switches, **all off in `worldserver.conf.dist`**: `Instance.IgnoreRaid`, `Instance.BindOnEntry`,
+`Instance.PersistRaidTrash`, `Instance.MoltenCoreSkipRunes`, `Instance.IgnoreAttunement`, `Instance.AhnQirajGatesOpen`,
+`Instance.MoltenCoreHoundsLinked` (Molten Core is Blizzlike except that the core hound packs are not linked). They are described in
+`doc/OptionalServerOptions.md`; `examples/zz-forever-bots.conf` turns them on if you copy it in.
 
 ## Build
 
@@ -40,10 +43,7 @@ cmake -S . -B build -DSERVERS=1 -DSCRIPTS=static -DBUILD_PLAYERBOT_V2=1
 cmake --build build --config RelWithDebInfo --target worldserver
 ```
 
-Status: this snapshot was assembled by applying our changes onto your current `forever` head
-and has not been compiled in that exact combination. Our own tree builds and passes its tests
-on Windows (Visual Studio 2022, MySQL 8.4). If it does not build for you, the error
-list is the most useful feedback we can get.
+Status: compile-checked on Linux (GCC 13, Ninja, Release, static scripts): `-DBUILD_PLAYERBOT_V2=1` and `-DBUILD_PLAYERBOT_V2=0` both build and link `worldserver` and the binaries start. Not compiled on Windows in exactly this combination; our own tree (the same code plus files left out here) builds and runs on Windows (Visual Studio 2022, MySQL 8.4) and was played on client 70338.
 
 ## Enable
 
@@ -54,16 +54,16 @@ list is the most useful feedback we can get.
    mysql -u<user> -p playerbot < sql/playerbot_shared/playerbot_shared_data.sql
    ```
 3. Rename the module config the build copies into `worldserver.conf.d` from
-   `playerbot.conf.dist` to `playerbot.conf`. Optionally copy `contrib/forever-bots/zz-forever-bots.conf`
-   there too (recommended values; it is read after `playerbot.conf`).
+   `playerbot.conf.dist` to `playerbot.conf`. Optionally copy `examples/zz-forever-bots.conf`
+   there too (optional extras and recommended values; it is read after `playerbot.conf`).
 4. Start worldserver. `sql/playerbot_v2/*.sql` migrations are applied on boot to the characters
    and `playerbot` databases (back up `characters` first). If the binary runs on a machine
    without the source tree, set `SourceDirectory` in `worldserver.conf`.
 5. Add `Logger.playerbot.v2=3` to see the module's log lines (written to `Playerbot.log`).
-6. Install the addon: copy `contrib/forever-bots/addon/ForeverBots` into `Interface/AddOns/`, and
+6. Install the addon: copy `src/modules/PlayerbotV2/Addon/ForeverBots` into `Interface/AddOns/`, and
    make your account a GM account for the `.bot` commands.
 
-The server prints "Karrz's Player Bots ..." at start-up, `.bot about` shows the same line, and the in-game addon (folder `ForeverBots`, slash command `/fb`) is titled "Karrz's Player Bots".
+The server prints "WoW Forever Bots ..." at start-up, `.bot about` shows the same line, and the in-game addon (folder `ForeverBots`, slash command `/fb`) is titled "WoW Forever Bots".
 
 Step by step: `INSTALL-BOTS.md`. More: `src/modules/PlayerbotV2/INSTALL.md`, `WORLD_BOTS.md`.
 
@@ -85,11 +85,11 @@ Without a player summoning bots nothing spawns, and with `World.Enable = 0` no a
 
 ## Credits
 
-- **Karrz (Karrz1)**, with Claude Code: Karrz's Player Bots, i.e. the Classic adaptation, raid, battleground, world
+- **Karrz (Karrz1)**, with Claude Code: WoW Forever Bots, i.e. the Classic adaptation, raid, battleground, world
   population and auction house work, and the Classic data and core fixes in this tree.
 - **agatho**: PlayerbotV2, the base of the module (https://github.com/agatho/TrinityCore, branch `playerbot-v2`).
 - **advocaite**: the Forever TrinityCore core this is built on.
-- **ike3 / cmangos playerbots**, **VMaNGOS** and **cMaNGOS**: behaviour and data that were ported (see `NOTICE.md`).
+- **ike3 / cmangos playerbots**, **VMaNGOS** and **cMaNGOS**: behaviour that was ported, and the 1.12 numbers the builder reads from the VMaNGOS database (see `NOTICE.md`).
 - **mod-playerbots (AzerothCore)**: read as a reference for behaviour ideas only; no code copied.
 - **SimulationCraft**: reference for rotation and talent data.
 
@@ -100,7 +100,7 @@ Without a player summoning bots nothing spawns, and with `World.Enable = 0` no a
 - mod-playerbots (AzerothCore): AGPL-3.0. Reference only; none of its code is in this tree.
 - SimulationCraft: GPL-3.0. Data and action lists used as reference (`sql/playerbot_v2/0004_simc_seed.sql`).
 - Third-party libraries under `dep/` keep their own licenses.
-- World of Warcraft data, names and client files belong to Blizzard Entertainment and are not
+- The VMaNGOS database dump is not included; it belongs to its authors. World of Warcraft data, names and client files belong to Blizzard Entertainment and are not
   included.
 
 See `src/modules/PlayerbotV2/NOTICE.md` for details.

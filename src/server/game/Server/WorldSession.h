@@ -1053,9 +1053,17 @@ class TC_GAME_API WorldSession
         uint32 GetClientBuild() const { return _clientBuild; }
         ClientBuild::VariantId const& GetClientBuildVariant() const { return _clientBuildVariant; }
 
+        // Battleground type of the last battlemaster list the player opened (see _lastBattlemasterBgType).
+        void SetLastBattlemasterBgType(uint32 bgType) { _lastBattlemasterBgType = bgType; }
+
 #if defined(TRINITY_PLAYERBOT_V2)
         bool IsBot() const { return _isBot; }
-        void SetLastBattlemasterBgType(uint32 bgType) { _lastBattlemasterBgType = bgType; }
+#else
+        // Bot module not built: no session is a bot.
+        constexpr bool IsBot() const { return false; }
+#endif
+
+#if defined(TRINITY_PLAYERBOT_V2)
 
         // [netstat] outgoing packet accounting for human (non-bot) sessions, gated by
         // Playerbot.NetStat.Enable (read once at session creation). Counters are relaxed
@@ -2115,11 +2123,13 @@ class TC_GAME_API WorldSession
 
         ConnectToKey _instanceConnectKey;
 
-#if defined(TRINITY_PLAYERBOT_V2)
-        bool _isBot;
         // Battleground type of the last battlemaster list the player opened: the 70205 client's join packets do not say which
         // battleground they are for, and the client has closed the battlemaster interaction by the time they arrive.
         uint32 _lastBattlemasterBgType = 0;
+
+#if defined(TRINITY_PLAYERBOT_V2)
+        bool _isBot;
+
 
         struct NetStatCounters;
         std::unique_ptr<NetStatCounters> _netStat;   // null for bot sessions or when disabled

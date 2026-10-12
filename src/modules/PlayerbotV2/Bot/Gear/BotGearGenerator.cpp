@@ -539,6 +539,8 @@ bool RaidEquipUpgrade(uint8 cls, uint16 spec, uint8 level, uint8 slot, uint32 ba
         ItemTemplate const* mh = cur_mainhand_entry ? sObjectMgr->GetItemTemplate(cur_mainhand_entry) : nullptr;
         if (mh && mh->GetInventoryType() == INVTYPE_2HWEAPON)
             return false;
+        if (::Playerbot::Gear::OffhandMustBeWeapon(cls, spec) && bag->GetClass() != ITEM_CLASS_WEAPON)   // dual-wielders and two-hand users never take a shield or a held item
+            return false;
     }
     int32 const bag_score = ::Playerbot::Gear::ScoreItemRaid(bag, cls, spec, level, slot);
     if (bag_score <= -100000)
@@ -830,6 +832,9 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
             // green that wears at ~20 — the under-gearing root (Varethon L16
             // ItemLevel 5, Loroyn L45 ItemLevel 15). dist is now in effective
             // units so the pick lands near what the bot actually wears.
+            // A rogue wields two weapons: a shield or a held-in-off-hand caster item (Royal Scepter of Vek'lor, the tier 3 damage_parity
+            // rogue 2026-10-11) leaves the off hand dead, dual_wield false and the rogue at a third of its damage. Whatever the gear mode.
+            if (slot == EQUIPMENT_SLOT_OFFHAND && ::Playerbot::Gear::OffhandMustBeWeapon(ctx.cls, ctx.spec) && tpl->GetClass() != ITEM_CLASS_WEAPON) continue;
             int32 ilvl = ::Playerbot::Gear::EffectiveItemLevelForLevel(tpl, ctx.level);
             int32 combined;
             if (raid)

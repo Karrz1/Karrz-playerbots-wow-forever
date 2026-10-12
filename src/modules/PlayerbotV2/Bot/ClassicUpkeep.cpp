@@ -19,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -1301,6 +1302,7 @@ struct ClassBuffDef
     bool    raid_only;
     uint32  caster_spec;   // talent buff: only casters of this spec are assigned (0 = any)
     uint32  skip_spec;     // casters of this spec are not assigned (Shadowform blocks Holy spells)
+    Resist  school = Resist::None;   // a resistance buff: kept up only where the instance deals this school (InstanceDealsSchool)
 };
 
 constexpr uint32 SPEC_PRIEST_DISC   = 256;
@@ -1313,7 +1315,7 @@ constexpr uint32 SPEC_PRIEST_SHADOW = 258;
 constexpr ClassBuffDef kClassBuffs[] = {
     { CLASS_PRIEST, 1243,  21562, BuffWho::Everyone,  false, 0,                SPEC_PRIEST_SHADOW },  // Power Word / Prayer of Fortitude
     { CLASS_PRIEST, 14752, 27681, BuffWho::ManaUsers, false, SPEC_PRIEST_DISC, SPEC_PRIEST_SHADOW },  // Divine / Prayer of Spirit
-    { CLASS_PRIEST, 976,   27683, BuffWho::Everyone,  true,  0,                0 },                   // (Prayer of) Shadow Protection
+    { CLASS_PRIEST, 976,   27683, BuffWho::Everyone,  true,  0,                0, Resist::Shadow },   // (Prayer of) Shadow Protection (only where shadow damage is dealt)
     { CLASS_MAGE,   1459,  23028, BuffWho::ManaUsers, false, 0,                0 },                   // Arcane Intellect / Brilliance
     { CLASS_DRUID,  1126,  21849, BuffWho::Everyone,  false, 0,                0 },                   // Mark / Gift of the Wild
     { CLASS_DRUID,  467,   0,     BuffWho::Tanks,     false, 0,                0 },                   // Thorns on the tanks
@@ -1605,24 +1607,20 @@ constexpr uint32 kSoulstoneItems[]  = { 5232, 16892, 16893, 16895, 16896 };
 
 std::atomic<uint32> g_raidSupportCounts[size_t(RaidSupportKind::Count)];
 std::atomic<uint32> g_raidSupportLastLogMs{0};
+// Monotonic per-map totals for the scenario runner (the minute counters above are reset by the summary line).
+std::mutex g_raidSupportTotalsMu;
+std::map<std::pair<uint32, uint8>, uint32> g_raidSupportTotals;
 
 } // namespace
 
 Resist InstanceResistance(uint32 map_id)
 {
-    switch (map_id)
-    {
-        case 409:   // Molten Core
-        case 469:   // Blackwing Lair
-        case 249:   // Onyxia's Lair
-            return Resist::Fire;
-        case 533:   // Naxxramas (Sapphiron, Kel'Thuzad)
-            return Resist::Frost;
-        case 531:   // Temple of Ahn'Qiraj (Huhuran, Viscidus)
-            return Resist::Nature;
-        default:
-            return Resist::None;
-    }
+    return InstanceMainSchool(kInstanceSchools, map_id);
+}
+
+bool InstanceDealsSchool(uint32 map_id, Resist school)
+{
+    return InstanceDealsSchool(kInstanceSchools, map_id, school);
 }
 
 bool BossFears(uint32 map_id, uint32 creature_entry)
@@ -1802,6 +1800,8 @@ MissingBuff MissingGroupBuff(BotSnapshotView const& s, GroupSnapshotView const& 
     {
         if (d.raid_only && !g.is_raid())
             continue;
+        if (!InstanceDealsSchool(s.map_id(), d.school))
+            continue;
         BuffCasters(s, *members, d, casters);
         if (casters.empty())
             continue;
@@ -1890,6 +1890,8 @@ CastPick ClassBuffPick(BotSnapshotView const& s, GroupSnapshotView const& g, Pic
         if (d.cls != s.cls() || !s.knows_spell(d.single))
             continue;
         if (d.raid_only && !g.is_raid())
+            continue;
+        if (!InstanceDealsSchool(s.map_id(), d.school))
             continue;
 
         if (!grouped)
@@ -2335,18 +2337,43 @@ SoulstonePick PickSoulstone(BotSnapshotView const& s, GroupSnapshotView const& g
     return {};
 }
 
-void NoteRaidSupport(RaidSupportKind kind)
+void NoteRaidSupport(RaidSupportKind kind, uint32 map_id)
 {
+    {
+        std::lock_guard<std::mutex> lk(g_raidSupportTotalsMu);
+        ++g_raidSupportTotals[{ map_id, uint8(kind) }];
+    }
+    // Tranq / Decurse / FormationGiveUp have their own log lines and a scenario tally; the minute line is the original five.
+    if (kind > RaidSupportKind::Soulstone)
+        return;
     g_raidSupportCounts[size_t(kind)].fetch_add(1, std::memory_order_relaxed);
     uint32 const now = GameTime::GetGameTimeMS();
     uint32 last = g_raidSupportLastLogMs.load(std::memory_order_relaxed);
     if (now - last < 60'000u || !g_raidSupportLastLogMs.compare_exchange_strong(last, now))
         return;
-    uint32 c[size_t(RaidSupportKind::Count)];
-    for (size_t i = 0; i < size_t(RaidSupportKind::Count); ++i)
+    uint32 c[size_t(RaidSupportKind::Soulstone) + 1];
+    for (size_t i = 0; i < std::size(c); ++i)
         c[i] = g_raidSupportCounts[i].exchange(0, std::memory_order_relaxed);
     TC_LOG_INFO("playerbot.v2", "[raid_support] last minute: buffs={} blessings={} auras={} dispels={} soulstones={}",
                 c[0], c[1], c[2], c[3], c[4]);
+}
+
+uint32 RaidSupportTotal(RaidSupportKind kind, uint32 map_id)
+{
+    std::lock_guard<std::mutex> lk(g_raidSupportTotalsMu);
+    auto const it = g_raidSupportTotals.find({ map_id, uint8(kind) });
+    return it == g_raidSupportTotals.end() ? 0u : it->second;
+}
+
+bool IsCurseDispelSpell(uint32 spell)
+{
+    SpellInfo const* si = spell ? sSpellMgr->GetSpellInfo(spell, DIFFICULTY_NONE) : nullptr;
+    if (!si)
+        return false;
+    for (SpellEffectInfo const& eff : si->GetEffects())
+        if (eff.IsEffect(SPELL_EFFECT_DISPEL) && eff.MiscValue == int32(DISPEL_CURSE))
+            return true;
+    return false;
 }
 
 } // namespace Playerbot::Classic

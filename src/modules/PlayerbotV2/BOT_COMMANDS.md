@@ -1,6 +1,6 @@
-# Bot commands: calling, ordering and troubleshooting your bots
+# WoW Forever Bots: calling, ordering and troubleshooting your bots
 
-This is the player-facing guide to PlayerbotV2 companions (and the bots that live in the world). Everything
+This is the player-facing guide to WoW Forever Bots companions (and the bots that live in the world). Everything
 here was checked against the source of this branch; lines marked **(unverified)** or **(not implemented)** say
 what could not be confirmed. Server operators: the config keys are in `conf/playerbot.conf.dist`.
 
@@ -297,6 +297,7 @@ Defaults are those of `conf/playerbot.conf.dist`. Behaviour switches are read wh
 | `Playerbot.Behavior.OpenWorldGroupCap` | 5 |
 | `Playerbot.Pve.Coordinator.Enable` | 1 |
 | `Playerbot.Raid.Enable` | 1 |
+| `Playerbot.Raid.BossWarnings` | 1 |
 | `Playerbot.Behavior.DungeonFlow` / `DungeonAutopilot` / `DungeonLoot` | 1 / 1 / 1 |
 | `Playerbot.Behavior.PullRecover` / `WipeReleaseWait` / `ReadyCheckInfo` | 1 / 1 / 1 |
 | `Playerbot.TankThreatMultiplier` | 3.0 |
@@ -394,3 +395,9 @@ In party or raid chat every addressed bot answers (`all:`, `tank:`, `<Name>:` pr
 `.playerbot bgjoin wsg|ab|av|<id>` queues you, plus your group's in-bracket bots, for a battleground without the battlemaster window (`wsg` Warsong Gulch, `ab` Arathi Basin, `av` Alterac Valley, or a battleground type id). The battlemaster's Join button now also works on client 70205. A real player who queues joins a running battleground (the weakest bot leaves to make room) instead of opening a new one.
 
 `.playerbot bgenter` accepts the pending battleground invite (use it if the Enter button does nothing). `.playerbot bgleave` leaves every battleground queue you are in.
+
+## Craft orders (owner and group)
+
+Whisper a bot of your group `craft <item link or name> [x5]` (or `craft list`). The bot makes it with the recipes and reagents it carries
+(one craft at a time, up to 20 items) and mails the result to you; missing reagents are whispered back, trade them to the bot and ask again.
+A bare `craft <spell id>` is the older owner command and still casts that recipe once. Idea and parser from Trixx34/ForeverBots (GPL-2.0).

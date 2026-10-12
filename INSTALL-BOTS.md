@@ -2,7 +2,7 @@
 
 You get: party companions you add with one click, raid/dungeon/battleground bots, bots roaming the
 world (about 300), an auction house that is stocked and trades, and the in-game `ForeverBots` window.
-Put this repository over a checkout of advocaite's `forever` at `fb04ef10` first (see README). Feedback and logs are welcome (see the end).
+This is advocaite's `forever` tree with the bots in it. Feedback and logs are welcome (see the end).
 
 Two ways to get a server with the bots. Both end with the same steps 3-6.
 
@@ -31,6 +31,9 @@ The bots are part of the server program, so you need a `worldserver.exe` that wa
 
 ## Steps for everyone
 
+Optional first: the vanilla (1.12) numbers. They are not in the repository; you build them from the VMaNGOS database dump you download yourself
+(`tools/classic_spell_values/README.md`, one command). Without them the bots and the server use the client's own values.
+
 3. **Create the shared bot database (once).** In a command prompt, from this folder
    (use your own MySQL user; `mysql.exe` is in your MySQL `bin` folder):
    ```
@@ -41,15 +44,16 @@ The bots are part of the server program, so you need a `worldserver.exe` that wa
    (`GRANT ALL ON playerbot.* TO '<your db user>'@'%';`). The server reads and writes it with the
    same login as your other databases. The files do not drop anything.
 4. **Settings.** In `worldserver.conf.d`, rename `playerbot.conf.dist` to `playerbot.conf`, and copy
-   `contrib\forever-bots\zz-forever-bots.conf` into the same folder. That file turns on:
-   bots in raids (`Instance.IgnoreRaid`, `Instance.BindOnEntry`, `Instance.PersistRaidTrash`), the
+   `examples\zz-forever-bots.conf` into the same folder. That file is optional and turns on
+   extras that are **not** Blizzlike: solo raid entry and saving on entry (`Instance.IgnoreRaid`, `Instance.BindOnEntry`), killed raid trash staying dead (`Instance.PersistRaidTrash`),
+   no Molten Core runes, no attunements, open Ahn'Qiraj gates (see `doc/OptionalServerOptions.md`), the
    auction house bot, faster raid casting, and world bots (stage A, 300 bots, `Playerbot.World.*`).
    Change a value and restart to tune; set `Playerbot.World.Enable = 0` for no roaming bots,
    `AuctionHouseBot.Seller.Enabled = 0` for no auction bot. Weak PC: set `Playerbot.World.MaxBots = 100`
    and `Playerbot.World.GlobalFill = 0`. Expect 4-6 GB of extra RAM at 300 bots.
 5. **Start the server** (bnetserver, then worldserver). The first start takes longer while the bot
    tables are created. Bot log lines go to `Playerbot.log` in your logs folder.
-6. **Install the addon.** Copy the folder `contrib\forever-bots\addon\ForeverBots` into
+6. **Install the addon.** Copy the folder `src\modules\PlayerbotV2\Addon\ForeverBots` into
    `<your WoW folder>\_classic_beta_\Interface\AddOns\` (so you have `...\AddOns\ForeverBots\ForeverBots.toc`).
    On the character screen open AddOns and tick "Load out of date AddOns" if it is greyed out.
 
@@ -70,9 +74,9 @@ console: `account set gmlevel <accountname> 3 -1`).
 
 ## Updating, removing, reporting problems
 
-- Update: replace `worldserver.exe`, the `contrib\forever-bots` files and the addon; new SQL is
+- Update: replace `worldserver.exe`, the `examples` file and the addon; new SQL is
   applied by the server at start. Back up `characters` first.
-- Remove: delete `playerbot.conf` and `zz-forever-bots.conf`, and use a worldserver built without the
+- Remove: delete `playerbot.conf` and `zz-forever-bots.conf` (if you used it), and use a worldserver built without the
   option. The extra tables are harmless.
 - Report a problem with: what you did, `Playerbot.log`, `Server.log`, and the time it happened. Useful
   lines are tagged `[raid_*]`, `[bot_death]`, `[cast_fail]`, `[world]`. Harmless messages:

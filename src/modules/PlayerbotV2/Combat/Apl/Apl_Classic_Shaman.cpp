@@ -6,7 +6,7 @@
 // 1 and resolve to the highest known rank in the snapshot view and
 // API::cast_spell.
 //
-// Priorities follow Karrz's ike3 vanilla strategies (Karrz's earlier VMaNGOS bot tree (wow-1.12)
+// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
 // raid10-revamp, playerbot/strategy/shaman/*Strategy.cpp, MANGOSBOT_ZERO).
 // Totems and weapon imbues come from Bot/ClassicUpkeep.cpp (one totem per
 // element by spec and party, Tremor / cleansing totems when the party needs

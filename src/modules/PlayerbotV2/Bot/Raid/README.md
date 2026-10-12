@@ -1,6 +1,6 @@
 # Raid layer (branch playerbot-v2-raid)
 
-Port of Karrz's raid10-revamp ike3 raid logic (Karrz's earlier VMaNGOS bot tree (wow-1.12), src/game/PlayerBots) onto PlayerbotV2.
+Port of Karrz's raid10-revamp ike3 raid logic (the ike3-based playerbot code, src/game/PlayerBots) onto PlayerbotV2.
 
 - `RaidEncounters.h/.cpp`: rule vocabulary and per-map registry (409 MC, 469 BWL, 249 Onyxia, 531 AQ40, 533 Naxx).
 - `RaidEncounterData_*.cpp`: data only. MC/BWL/Onyxia ported as-is (ids match Forever's Classic VMaNGOS ports);
@@ -70,3 +70,9 @@ whether a possessed creature follows MoveChase for a bot controller and whether 
   per changed bot decision.
 - To resume: merge playerbot-v2-trial into this branch, rebuild (cmake configure first when trial adds .cpp files) and
   send the head to the coordinator. Razuvious mind control is the most uncertain piece (see "Untested" above).
+
+- Boss warnings (`BossWarnings.h/.cpp`, data in `BossWarningData_MC.h`): human raid members get an on-screen boss emote when a
+  Molten Core boss starts a cast-bar spell ("Shazzrah is casting Arcane Explosion") or an instant ability is due ("Magmadar:
+  Panic - fear! Tremor Totem / Fear Ward in about 5 sec"). Instant abilities are predicted from the script timers (earliest time
+  minus lead) and re-anchored when the aura lands on the boss or the raid. Config: `Playerbot.Raid.BossWarnings` (default 1).
+  Add a boss by adding rows to the table; tests in tests/game/ClassicBossWarnings.cpp.

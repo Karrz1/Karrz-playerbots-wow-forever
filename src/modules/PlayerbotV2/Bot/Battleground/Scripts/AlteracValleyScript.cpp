@@ -85,7 +85,7 @@ public:
             a.endgame_target_z =    98.5f;
             a.endgame_creature_entry = 11946;  // DREKTHAR_ENTRY
         }
-        // Captain staging (ike3 BattleGroundTacticsAV.cpp, Karrz's earlier VMaNGOS bot tree (wow-1.12) raid10-revamp bcc8b9fe, named locations
+        // Captain staging (ike3 BattleGroundTacticsAV.cpp, the ike3-based playerbot code, named locations
         // AV_ICEBLOOD_GARRISON_WAITING_ALLIANCE / AV_STONEHEART_OUTPOST_WAITING_HORDE): the squad for the enemy captain gathers here and
         // goes in together (BgTeamCoordinator::PlanNodeRace), not one bot after another. The Alliance hunts Galvangar, the Horde Balinda.
         if (s.is_horde())

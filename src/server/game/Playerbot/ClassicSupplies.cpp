@@ -98,16 +98,16 @@ constexpr SupplyFamily kFamilies[] = {
 // Mageblood Potion 20007, Smoked Desert Dumplings 20452, Grilled Squid 13928, Runn Tum Tuber Surprise 18254,
 // Nightfin Soup 13931, Tender Wolf Steak 18045.
 constexpr RaidConsumable kTankKit[] = {
-    { 13510, false, 2 }, { 13445, false, 2 }, { 3825, false, 2 }, { 18045, true, 5 },
+    { 13510, false, 2, true }, { 13445, false, 2 }, { 3825, false, 2 }, { 18045, true, 5 },
 };
 constexpr RaidConsumable kMeleeKit[] = {
     { 13452, false, 2 }, { 9206, false, 2 }, { 20452, true, 5 },
 };
 constexpr RaidConsumable kCasterKit[] = {
-    { 13512, false, 2 }, { 13454, false, 2 }, { 18254, true, 5 },
+    { 13512, false, 2, true }, { 13454, false, 2 }, { 18254, true, 5 },
 };
 constexpr RaidConsumable kHealerKit[] = {
-    { 13511, false, 2 }, { 20007, false, 2 }, { 13931, true, 5 },
+    { 13511, false, 2, true }, { 20007, false, 2 }, { 13931, true, 5 },
 };
 constexpr RaidConsumable kHunterKit[] = {
     { 13452, false, 2 }, { 9206, false, 2 }, { 13928, true, 5 },

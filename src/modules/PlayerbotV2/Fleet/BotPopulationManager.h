@@ -159,6 +159,11 @@ public:
     // Returns the role pinned. World thread only.
     static Role ApplyCompanionRole(Player* bot, Role requested, char const* where);
 
+    // `.bot save`: stores the role the companion plays right now (its AI role, else what its talents say) when none is stored yet, so a
+    // call or relog brings it back as it was saved instead of re-reading talents that may have changed or not been bought. A role
+    // already stored (declared) is left as it is. Returns the role stored. World thread only.
+    static Role StoreCurrentRole(Player* bot);
+
     // `.bot delete`: the companion's character is deleted for good once it has left the world (the caller logs it
     // out first). Given up, with a log line, if it is still in the world a minute later. World thread only.
     void QueueCompanionDelete(BotId bot);
@@ -302,6 +307,13 @@ public:
     std::string StartBgStress(uint16 bg_type, uint32 cycles, uint32 hold_sec);
     std::string BgStressReport() const;
 
+    // `.bot bgsoak <bg_type> [max_minutes]`: plays ONE bot-only battleground of that type (1 = Alterac Valley, 2 = Warsong Gulch, 3 = Arathi Basin)
+    // from the fill to the end of the match, or for max_minutes (default 30) and then lets the bots leave. One [bgsoak] line a minute
+    // and a final "[bgsoak] done ... result=ended|timeout|never_started". scripts\run-bg-soak.ps1 drives it over SOAP and adds the
+    // server-side fault count (the Map::Update SEH lines of Server.log) and whether the worldserver is still up.
+    std::string StartBgSoak(uint16 bg_type, uint32 max_minutes);
+    std::string BgSoakReport() const;
+
     // Autonomous ARENA seeding. Same rationale as SeedBgMatches but for
     // arena skirmishes, which the BG matchmaker (BotQueueFiller) cannot
     // drive because arenas queue as a GROUP keyed by team size, not as
@@ -345,6 +357,15 @@ public:
 private:
     // state of the running `.bot bgstress` (see StartBgStress)
     void DriveBgStress(uint32 now_ms);
+    void DriveBgSoak(uint32 now_ms);
+    struct BgSoak
+    {
+        enum class Phase : uint8 { Idle, Running, Done } phase = Phase::Idle;
+        uint16 bg_type = 0;
+        uint32 started_ms = 0, deadline_ms = 0, last_log_ms = 0, last_poll_ms = 0, first_in_bg_ms = 0, peak_in_bg = 0;
+        uint8 last_status = 0;
+        std::string result;            // the final line once Done
+    } bg_soak_;
     struct BgStress { uint16 bg_type = 0; uint32 cycles_left = 0, cycle = 0, hold_ms = 60000, phase_end_ms = 0;
                       enum class Phase : uint8 { Idle, Hold, Rest } phase = Phase::Idle; uint32 peak_queued = 0, peak_in_bg = 0; } bg_stress_;
 
