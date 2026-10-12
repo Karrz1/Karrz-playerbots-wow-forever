@@ -45,7 +45,7 @@ from the VMaNGOS database dump that you download yourself; without them the serv
 - **The game client**: the WoW Forever (Classic beta) client, build **70338**, and advocaite's launcher that applies the server key: https://github.com/advocaite/foreverlauncher. Both come from advocaite's Forever project; we do not distribute client files.
 - **Vanilla (1.12) data**: the VMaNGOS project (https://github.com/vmangos/core) and its public database dump `world_full_14_june_2021` (https://github.com/brotalnia/database). You download it yourself; `tools/classic_spell_values/build_vanilla_data.py` turns it into the SQL files the server uses. Nothing from the dump is in this repository.
 - **Maps**: extracted from your own client with the tools in this repository (`tools/extract_client_data.sh` or `.ps1`).
-- **Ready-made Windows package (repack)**: https://github.com/Karrz1/Karrz-playerbots-wow-forever/releases - the same server we run, with an **Update** button (`Update-WoWForever.cmd`) that installs each new release and keeps your characters.
+- **Ready-made Windows package (repack)**: https://github.com/Karrz1/Karrz-playerbots-wow-forever/releases - the same server we run, with an **Update** button (`Update-WoWForever.cmd`) that installs each new release and keeps your characters. The repack also contains the vanilla data already built from the VMaNGOS database (credit: the VMaNGOS project, GPL-2.0; see [`NOTICE.md`](NOTICE.md)).
 - **The add-on**: `ForeverBots-addon.zip` in this repository, also inside the repack.
 
 ## Run it like Karrz's realm
