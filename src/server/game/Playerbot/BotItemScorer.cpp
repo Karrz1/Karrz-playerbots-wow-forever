@@ -642,16 +642,16 @@ int32 ScoreItemRaid(ItemTemplate const* tpl, uint8 cls, uint16 spec, uint8 level
     }
 
     // Weapon style. A two-hander carries the budget of both hands and leaves no offhand: right for the classes that
-    // fight with one (arms / fury, retribution, enhancement, feral and bear, hunter melee), wrong for the ones that
-    // carry a shield or a second weapon (rogue, protection, holy paladin).
+    // fight with one (arms, retribution, enhancement, feral and bear, hunter melee), wrong for the ones that
+    // carry a shield or a second weapon (rogue, fury, protection, holy paladin).
     if (slot == EQUIPMENT_SLOT_MAINHAND && tpl->GetClass() == ITEM_CLASS_WEAPON)
     {
         bool const two_hand = (inv == INVTYPE_2HWEAPON);
         bool const two_hand_style =
-            (cls == CLASS_WARRIOR && spec != 73) || (cls == CLASS_PALADIN && spec == 70) || (cls == CLASS_SHAMAN && spec == 263) ||
+            (cls == CLASS_WARRIOR && spec != 73 && spec != 72) || (cls == CLASS_PALADIN && spec == 70) || (cls == CLASS_SHAMAN && spec == 263) ||
             (cls == CLASS_DRUID && (spec == 103 || spec == 104)) || cls == CLASS_HUNTER;
         bool const one_hand_style =
-            cls == CLASS_ROGUE || (cls == CLASS_WARRIOR && spec == 73) || (cls == CLASS_PALADIN && (spec == 65 || spec == 66));
+            cls == CLASS_ROGUE || (cls == CLASS_WARRIOR && (spec == 73 || spec == 72)) || (cls == CLASS_PALADIN && (spec == 65 || spec == 66));
         if (two_hand && one_hand_style)
             total *= 0.5f;
         else if (!two_hand && two_hand_style)

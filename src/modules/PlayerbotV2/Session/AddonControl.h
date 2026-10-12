@@ -29,6 +29,7 @@ constexpr char const* kFleetTarget  = "PBCFLEET";
 constexpr size_t      kMaxChunkBytes  = 240;
 constexpr size_t      kMaxFrameBytes  = 4096;
 constexpr int         kReassemblyTtlSec = 5;
+constexpr uint32_t      kMaxReassemblyChunks = 64; // client-supplied chunk count cap (anti-DoS)
 
 // Called from the PlayerScript::OnChat (5-arg whisper overload) hook for
 // every addon whisper. Returns true when the message was a PBC frame and

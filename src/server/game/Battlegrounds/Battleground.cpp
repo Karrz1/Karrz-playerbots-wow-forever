@@ -601,7 +601,7 @@ char const* Battleground::GetMountRefusal(Player const* player) const
 {
     if (isArena())
         return nullptr;
-    if (GetStatus() == STATUS_WAIT_JOIN)
+    if (GetStatus() == STATUS_WAIT_JOIN && IsEnclosedStartArea(GetMapId()))
         return "the start doors are closed";
     // The client's own rule: the WMO group under the player decides (interior 0x2000 and not exterior 0x8). Not Player::IsOutdoors(): that
     // value takes the WMOAreaTable ForceIndoors override, and with 70205 vmaps under 70291 DB2 data (WSG 2026-10-09: exterior group 19307
@@ -766,6 +766,20 @@ void Battleground::EndBattleground(Team winner)
     //we must set it this way, because end time is sent in packet!
     SetRemainingTime(TIME_AUTOCLOSE_BATTLEGROUND);
 
+    // Classic 1.60: vanilla marks of honor (VMaNGOS battleground_template, patch 1.12) replace the retail random / holiday
+    // battleground completion honor on the classic maps
+    struct ClassicMarkSpells { uint32 MapId; uint32 Win; uint32 Lose; };
+    static constexpr ClassicMarkSpells ClassicMarks[] =
+    {
+        { 30,  24955, 24954 },                              // Alterac Valley Mark of Honor 20560
+        { 489, 24951, 24950 },                              // Warsong Gulch Mark of Honor 20558
+        { 529, 24953, 24952 }                               // Arathi Basin Mark of Honor 20559
+    };
+    ClassicMarkSpells const* classicMarks = nullptr;
+    for (ClassicMarkSpells const& marks : ClassicMarks)
+        if (marks.MapId == GetBgMap()->GetId())
+            classicMarks = &marks;
+
     WorldPackets::Battleground::PVPMatchComplete pvpMatchComplete;
     pvpMatchComplete.Winner = GetWinner();
     pvpMatchComplete.Duration = std::chrono::duration_cast<Seconds>(Milliseconds(std::max<int32>(0, (GetElapsedTime() - BG_START_DELAY_2M))));
@@ -823,10 +837,19 @@ void Battleground::EndBattleground(Team winner)
             CharacterDatabase.Execute(stmt);
         }
 
+        // Classic 1.60: winners get the win mark spell (3 marks), losers the lose spell (1 mark) after a 10 minute battle (1.8.4)
+        if (classicMarks && isBattleground())
+        {
+            if (team == winner)
+                player->CastSpell(player, classicMarks->Win, true);
+            else if (GetInProgressDuration() >= 10min)
+                player->CastSpell(player, classicMarks->Lose, true);
+        }
+
         // Reward winner team
         if (team == winner)
         {
-            if (BattlegroundPlayer const* bgPlayer = GetBattlegroundPlayerData(player->GetGUID()))
+            if (BattlegroundPlayer const* bgPlayer = classicMarks ? nullptr : GetBattlegroundPlayerData(player->GetGUID())) // Classic 1.60: no retail completion honor
             {
                 if (BattlegroundMgr::IsRandomBattleground(bgPlayer->queueTypeId.BattlemasterListId)
                     || BattlegroundMgr::IsBGWeekend(BattlegroundTypeId(bgPlayer->queueTypeId.BattlemasterListId)))
@@ -861,7 +884,7 @@ void Battleground::EndBattleground(Team winner)
         }
         else
         {
-            if (BattlegroundPlayer const* bgPlayer = GetBattlegroundPlayerData(player->GetGUID()))
+            if (BattlegroundPlayer const* bgPlayer = classicMarks ? nullptr : GetBattlegroundPlayerData(player->GetGUID())) // Classic 1.60: no retail completion honor
             {
                 if (BattlegroundMgr::IsRandomBattleground(bgPlayer->queueTypeId.BattlemasterListId)
                     || BattlegroundMgr::IsBGWeekend(BattlegroundTypeId(bgPlayer->queueTypeId.BattlemasterListId)))
@@ -877,9 +900,10 @@ void Battleground::EndBattleground(Team winner)
         player->SendDirectMessage(pvpMatchComplete.GetRawPacket());
 
         player->UpdateCriteria(CriteriaType::ParticipateInBattleground, player->GetMapId());
-
-        GetBgMap()->GetBattlegroundScript()->OnEnd(winner);
     }
+
+    // once per battle, not per player (AV end honor was paid once for every player in the battle)
+    GetBgMap()->GetBattlegroundScript()->OnEnd(winner);
 }
 
 uint32 Battleground::GetScriptId() const
@@ -1115,6 +1139,7 @@ void Battleground::AddPlayer(Player* player, BattlegroundQueueTypeId queueId)
     if (!isInBattleground)
     {
         UpdatePlayersCountByTeam(team, false);                  // +1 player
+        RaiseInvitedCountTo(team, GetPlayersCountByTeam(team));
         PlayerScores[player->GetGUID()] = new BattlegroundScore(player->GetGUID(), player->GetBGTeam(), _pvpStatIds);
     }
 
@@ -1305,7 +1330,9 @@ uint32 Battleground::GetFreeSlotsForTeam(Team team) const
 {
     // if BG is starting and CONFIG_BATTLEGROUND_INVITATION_TYPE == BG_QUEUE_INVITATION_TYPE_NO_BALANCE, invite anyone
     if (GetStatus() == STATUS_WAIT_JOIN && sWorld->getIntConfig(CONFIG_BATTLEGROUND_INVITATION_TYPE) == BG_QUEUE_INVITATION_TYPE_NO_BALANCE)
-        return (GetInvitedCount(team) < GetMaxPlayersPerTeam()) ? GetMaxPlayersPerTeam() - GetInvitedCount(team) : 0;
+        // players already inside count too: the invited counter only holds the pending invitations (WSG 2026-10-11: 12 Alliance inside a
+        // 10-a-side match, because 4 invited left 6 'free')
+        return PhysicalRoom(std::max(GetInvitedCount(team), GetPlayersCountByTeam(team)), GetMaxPlayersPerTeam());
 
     // if BG is already started or CONFIG_BATTLEGROUND_INVITATION_TYPE != BG_QUEUE_INVITATION_TYPE_NO_BALANCE, do not allow to join too much players of one faction
     uint32 otherTeamInvitedCount;
@@ -1328,6 +1355,19 @@ uint32 Battleground::GetFreeSlotsForTeam(Team team) const
         otherTeamPlayersCount = GetPlayersCountByTeam(ALLIANCE);
     }
     if (GetStatus() == STATUS_IN_PROGRESS || GetStatus() == STATUS_WAIT_JOIN)
+        return BalancedFreeSlots(thisTeamInvitedCount, otherTeamInvitedCount, thisTeamPlayersCount, otherTeamPlayersCount,
+            GetMaxPlayersPerTeam(), GetMinPlayersPerTeam());
+    return 0;
+}
+
+uint32 Battleground::BalancedFreeSlots(uint32 thisTeamInvitedCount, uint32 otherTeamInvitedCount, uint32 thisTeamPlayersCount, uint32 otherTeamPlayersCount,
+    uint32 maxPlayersPerTeam, uint32 minPlayersPerTeam)
+{
+    // A player already inside was invited once: the invited counter only counts queue invitations, so a player who arrived another way
+    // (the bots' direct ports, a claimed running match) was missing from it. AB 2026-10-11 had 10 Alliance and 4 Horde inside with invited
+    // counters of 1 and 0, so only one Horde bot at a time was allowed in. The players inside count as invited.
+    thisTeamInvitedCount  = std::max(thisTeamInvitedCount, thisTeamPlayersCount);
+    otherTeamInvitedCount = std::max(otherTeamInvitedCount, otherTeamPlayersCount);
     {
         // difference based on ppl invited (not necessarily entered battle)
         // default: allow 0
@@ -1341,7 +1381,7 @@ uint32 Battleground::GetFreeSlotsForTeam(Team team) const
             diff = otherTeamInvitedCount - thisTeamInvitedCount;
 
         // difference based on max players per team (don't allow inviting more)
-        uint32 diff2 = (thisTeamInvitedCount < GetMaxPlayersPerTeam()) ? GetMaxPlayersPerTeam() - thisTeamInvitedCount : 0;
+        uint32 diff2 = (thisTeamInvitedCount < maxPlayersPerTeam) ? maxPlayersPerTeam - thisTeamInvitedCount : 0;
 
         // difference based on players who already entered
         // default: allow 0
@@ -1353,8 +1393,8 @@ uint32 Battleground::GetFreeSlotsForTeam(Team team) const
         else if (otherTeamPlayersCount > thisTeamPlayersCount)
             diff3 = otherTeamPlayersCount - thisTeamPlayersCount;
         // or other side has less than minPlayersPerTeam
-        else if (thisTeamInvitedCount <= GetMinPlayersPerTeam())
-            diff3 = GetMinPlayersPerTeam() - thisTeamInvitedCount + 1;
+        else if (thisTeamInvitedCount <= minPlayersPerTeam)
+            diff3 = minPlayersPerTeam - thisTeamInvitedCount + 1;
 
         // return the minimum of the 3 differences
 
@@ -1363,7 +1403,6 @@ uint32 Battleground::GetFreeSlotsForTeam(Team team) const
         // min of diff, diff2 and diff3
         return std::min(diff, diff3);
     }
-    return 0;
 }
 
 bool Battleground::isArena() const

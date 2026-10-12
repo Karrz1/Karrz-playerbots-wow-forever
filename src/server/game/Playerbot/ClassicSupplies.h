@@ -89,6 +89,7 @@ struct RaidConsumable
     uint32 item;
     bool   food;     // buff is "Well Fed" (the eating spell triggers it) rather than the item's own spell
     uint8  stock;    // how many a bot is kept stocked with
+    bool   flask = false;   // a flask: it fills both elixir slots, so an elixir used on top of it removes it (MC Garr 2026-10-11: Mageblood took the +2000 mana of a Flask of Distilled Wisdom off five healers)
 };
 
 TC_GAME_API std::span<RaidConsumable const> RaidConsumablesFor(RaidConsumableRole role);
@@ -99,24 +100,37 @@ TC_GAME_API bool IsRaidConsumable(uint32 item);
 // The stock a bot is kept at for `item`, 0 when it is in no kit.
 TC_GAME_API uint8 RaidConsumableStock(uint32 item);
 
-// The first entry of the role's kit the bot should use now: in the bags and its buff not up. nullptr = none.
+// An elixir of the kit while a flask of the kit is up: the flask fills both elixir slots, so the elixir on top removes it.
+template <typename Buffed>
+bool ElixirOverFlask(RaidConsumableRole role, RaidConsumable const& c, Buffed buffed)
+{
+    if (c.food || c.flask)
+        return false;
+    for (RaidConsumable const& k : RaidConsumablesFor(role))
+        if (k.flask && buffed(k))
+            return true;
+    return false;
+}
+
+// The first entry of the role's kit the bot should use now: in the bags and its buff not up, and not an elixir that would
+// take a flask off. nullptr = none.
 // Plain function pointers keep the header free of <functional>.
 template <typename InBags, typename Buffed>
 RaidConsumable const* NextRaidConsumable(RaidConsumableRole role, InBags in_bags, Buffed buffed)
 {
     for (RaidConsumable const& c : RaidConsumablesFor(role))
-        if (!buffed(c) && in_bags(c.item))
+        if (!buffed(c) && in_bags(c.item) && !ElixirOverFlask(role, c, buffed))
             return &c;
     return nullptr;
 }
 
 // The first entry of the role's kit the bags hold fewer than `stock` of (count(item) -> held), skipping entries
-// whose buff is already up: the one to hand the bot. nullptr = stocked.
+// whose buff is already up and elixirs while a flask is up: the one to hand the bot. nullptr = stocked.
 template <typename Count, typename Buffed>
 RaidConsumable const* NextRaidConsumableToStock(RaidConsumableRole role, Count count, Buffed buffed)
 {
     for (RaidConsumable const& c : RaidConsumablesFor(role))
-        if (!buffed(c) && count(c.item) < c.stock)
+        if (!buffed(c) && count(c.item) < c.stock && !ElixirOverFlask(role, c, buffed))
             return &c;
     return nullptr;
 }

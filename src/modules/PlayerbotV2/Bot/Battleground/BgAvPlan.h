@@ -1,4 +1,4 @@
-// Alterac Valley objective rules imported from ike3's bots (Karrz's earlier VMaNGOS bot tree (wow-1.12) raid10-revamp bcc8b9fe70c42a8fa5d50fa83a472da9e9d19546,
+// Alterac Valley objective rules imported from ike3's bots (the ike3-based playerbot code,
 // BattleGroundTacticsAV.cpp): the mine-boss objective and the captain gathering threshold. Pure functions, no game state, so they can be
 // tested offline (tests/game/BgAvPlan.cpp). The mid-field fighting tactics are ours and do not live here.
 #pragma once
@@ -10,7 +10,13 @@ namespace Playerbot::BgAvPlan
 {
     // The captain squad goes in once this many of the team stand at the waiting spot (ike3: attackers near the waiting spot >= 5).
     constexpr int kCaptainGatherCount = 5;
-    constexpr bool CaptainGather(int at_stage, bool latched) { return latched || at_stage >= kCaptainGatherCount; }
+    // Time cap (Karrz, AV 2026-10-11: a pile of bots waited at the Stonehearth staging spot for a quorum): after kCaptainGatherMaxMs of waiting the squad
+    // goes with whoever is there (at least one), so bots arriving one at a time never park for good.
+    constexpr uint32_t kCaptainGatherMaxMs = 75000;
+    constexpr bool CaptainGather(int at_stage, bool latched, uint32_t waited_ms = 0)
+    {
+        return latched || at_stage >= kCaptainGatherCount || (at_stage >= 1 && waited_ms >= kCaptainGatherMaxMs);
+    }
 
     struct MineTarget { float x, y, z; uint32_t entry; char const* name; };
 
@@ -103,4 +109,84 @@ namespace Playerbot::BgAvPlan
             return { StepKind::UseMineGo, q.mine_south, q.go_south };
         return {};
     }
+
+    // ---- Attack order (ike3 BattleGroundTacticsAV.cpp attack lists; mod-playerbots AV_AttackObjectives_*: "first N non-owned, non-destroyed
+    // entries", N = 2 balanced) ----
+    // Both reference bots walk an ordered list of the enemy's nodes, graveyards INCLUDED: a graveyard held by the enemy sends every dead
+    // bot of the team back to the far end of the valley, so taking it early matters as much as a tower. We had only towers and bunkers.
+    struct AvListNode { float x, y; char const* name; };
+    // Horde: Stonehearth GY, Stonehearth Bunker, Icewing Bunker, Stormpike GY, Dun Baldar South, Dun Baldar North, Stormpike Aid Station.
+    inline std::vector<AvListNode> const& AttackList(uint8_t team)
+    {
+        static std::vector<AvListNode> const horde = {
+            { 73.7f, -426.0f, "Stonehearth GY" }, { -154.0f, -446.0f, "Stonehearth Bunker" }, { 203.0f, -361.0f, "Icewing Bunker" },
+            { 669.0f, -294.0f, "Stormpike GY" }, { 556.0f, -84.0f, "Dun Baldar South Bunker" }, { 678.0f, -139.0f, "Dun Baldar North Bunker" },
+            { 638.5f, -31.5f, "Stormpike Aid Station" } };
+        // Alliance: Iceblood GY, Iceblood Tower, Tower Point, Frostwolf GY, East / West Frostwolf Tower, Frostwolf Relief Hut.
+        static std::vector<AvListNode> const alliance = {
+            { -612.5f, -397.0f, "Iceblood GY" }, { -572.0f, -263.0f, "Iceblood Tower" }, { -768.0f, -363.0f, "Tower Point" },
+            { -1082.5f, -347.0f, "Frostwolf GY" }, { -1303.0f, -317.0f, "East Frostwolf Tower" }, { -1298.0f, -267.0f, "West Frostwolf Tower" },
+            { -1402.0f, -307.0f, "Frostwolf Relief Hut" } };
+        return team == 2 ? horde : alliance;
+    }
+
+    struct AvNodeView { float x, y; bool ours; bool destroyed; bool enemy_flipping; };
+
+    // Indices into `nodes` of the first `window` list entries that are still worth attacking: present, not razed, not ours, and not
+    // being flipped by the enemy (the defence pass owns those). Matches a list entry to a live node by position (30 yd).
+    inline std::vector<int> PickAttackNodes(uint8_t team, std::vector<AvNodeView> const& nodes, int window)
+    {
+        std::vector<int> out;
+        for (AvListNode const& e : AttackList(team))
+        {
+            if (int(out.size()) >= window) break;
+            for (int i = 0; i < int(nodes.size()); ++i)
+            {
+                float const dx = nodes[i].x - e.x, dy = nodes[i].y - e.y;
+                if (dx * dx + dy * dy > 30.0f * 30.0f) continue;
+                if (nodes[i].destroyed || nodes[i].ours || nodes[i].enemy_flipping) break;
+                out.push_back(i);
+                break;
+            }
+        }
+        return out;
+    }
+
+    // Snowfall Graveyard (the neutral one in the middle of the valley, -202.5,-113): ike3 sends its "supporters" there while it is not
+    // ours, 40 % of the team in the first ten minutes ("strife") and 20 % afterwards; mod-playerbots sends roles under 6 (Alliance) / 5
+    // (Horde) of 10. Returns how many of `free_bots` go.
+    constexpr float kSnowfallX = -202.5f, kSnowfallY = -113.0f;
+    inline int SnowfallDetail(int free_bots, uint32_t in_progress_ms)
+    {
+        if (free_bots < 3) return 0;
+        int const share = in_progress_ms < 10u * 60u * 1000u ? 40 : 20;
+        int const n = (free_bots * share) / 100;
+        return n < 1 ? 1 : n;
+    }
+
+    // ---- Rules from ike3 / mod-playerbots AV that the planner uses (the ike3-based playerbot code raid10-revamp BattleGroundTacticsAV.cpp, mod-playerbots
+    // BattleGroundTactics.cpp selectObjective) ----
+    // A defender already deep in the enemy half becomes an attacker: x >= -62 for the Horde, x <= -462 for the Alliance (AV runs from the
+    // Frostwolf end at x -1400 to Dun Baldar at x +700); with chance 20 + 15 per own node razed (mod-playerbots BGT 1919-1931).
+    constexpr bool DefenderPastLine(uint8_t team, float x) { return team == 2 ? x >= -62.0f : x <= -462.0f; }
+    constexpr int  DefenderFlipChance(int own_razed) { return 20 + 15 * own_razed; }
+
+    // The general (Drek'Thar / Vanndar). ike3: only once every enemy tower and bunker is down. mod-playerbots: two or more down, and either
+    // the team holds its last graveyard (Frostwolf Relief Hut / Stormpike Aid Station) or 20 or more of its players stand within 200 yd of
+    // the boss. Either one opens the push.
+    constexpr int kBossFriendsNeeded = 20;
+    constexpr bool GeneralPushOk(int enemy_towers_up, int enemy_towers_razed, bool own_final_gy, int friends_near_boss)
+    {
+        return enemy_towers_up == 0 || (enemy_towers_razed >= 2 && (own_final_gy || friends_near_boss >= kBossFriendsNeeded));
+    }
+    // Our last graveyard (the one an AV team keeps until the end).
+    struct AvPoint { float x, y, z; };
+    constexpr AvPoint FinalGraveyard(uint8_t team) { return team == 2 ? AvPoint{ -1402.0f, -307.0f, 89.0f } : AvPoint{ 638.5f, -31.5f, 46.0f }; }
+
+    // Nothing left to attack: wait next to the enemy general (mod-playerbots AV_BOSS_WAIT_H / AV_BOSS_WAIT_A).
+    constexpr AvPoint BossWait(uint8_t team) { return team == 2 ? AvPoint{ 689.21f, -20.173f, 50.62f } : AvPoint{ -1361.773f, -248.977f, 99.369f }; }
+
+    // How far an AV bot looks for a fight (ike3 EnemyPlayerValue::GetMaxAttackDistance): 40 yd during the first 20 minutes, 10 yd after, so
+    // late in the match the bots keep running to the objective instead of chasing every enemy in sight.
+    constexpr float AggroRange(uint32_t in_progress_ms) { return in_progress_ms < 20u * 60u * 1000u ? 40.0f : 10.0f; }
 }

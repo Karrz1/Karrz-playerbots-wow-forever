@@ -40,7 +40,7 @@ void DispatchAtMailbox  (BotAI&, BotSnapshotView, GroupSnapshotView, BotIntentEm
 void DispatchAtAh       (BotAI&, BotSnapshotView, GroupSnapshotView, BotIntentEmitter&);
 void DispatchDecorating (BotAI&, BotSnapshotView, GroupSnapshotView, BotIntentEmitter&);
 
-// Group threat discipline (State_InCombat.cpp; port of Karrz's wow-1.12
+// Group threat discipline (State_InCombat.cpp; port of Karrz's ike3-based bots
 // MCRaidHoldDamage). True while this NON-TANK grouped bot must not damage
 // `target`: the tank has not built its opening lead yet (bounded wait) or
 // the bot is at/over PlayerbotV2.Threat.MaxRatio of the tank's threat.

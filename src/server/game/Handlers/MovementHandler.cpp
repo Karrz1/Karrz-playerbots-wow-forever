@@ -359,11 +359,13 @@ void WorldSession::HandleMoveWorldportAck()
             {
                 raidInstanceMessage.Locked = !playerLock->IsExpired();
                 raidInstanceMessage.Extended = playerLock->IsExtended();
+                raidInstanceMessage.TimeLeft = int32(std::max<int64>(std::chrono::duration_cast<Seconds>(playerLock->GetEffectiveExpiryTime() - GameTime::GetSystemTime()).count(), 0));
             }
             else
             {
                 raidInstanceMessage.Locked = false;
                 raidInstanceMessage.Extended = false;
+                raidInstanceMessage.TimeLeft = int32(std::max<int64>(std::chrono::duration_cast<Seconds>(InstanceLockMgr::GetNextResetTime(entries) - GameTime::GetSystemTime()).count(), 0));
             }
             SendPacket(raidInstanceMessage.Write());
         }

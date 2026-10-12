@@ -558,6 +558,8 @@ void WorldSession::HandleAcceptTradeOpcode(WorldPackets::Trade::AcceptTrade& acc
         trader->SaveInventoryAndGoldToDB(trans);
         CharacterDatabase.CommitTransaction(trans);
 
+        if (_player->GetSession()->IsBot() || trader->GetSession()->IsBot())
+            TC_LOG_INFO("playerbot.v2", "[trade] complete {} <-> {}", _player->GetName(), trader->GetName());
         info.Status = TRADE_STATUS_COMPLETE;
         trader->GetSession()->SendTradeStatus(info);
         SendTradeStatus(info);
@@ -728,6 +730,8 @@ void WorldSession::HandleInitiateTradeOpcode(WorldPackets::Trade::InitiateTrade&
     }
 
     // OK start trade
+    if (IsBot() || pOther->GetSession()->IsBot())
+        TC_LOG_INFO("playerbot.v2", "[trade] {} proposes a trade to {}", _player->GetName(), pOther->GetName());
     _player->m_trade = new TradeData(_player, pOther);
     pOther->m_trade = new TradeData(pOther, _player);
 

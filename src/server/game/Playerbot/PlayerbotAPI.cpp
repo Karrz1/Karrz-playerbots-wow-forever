@@ -4,6 +4,7 @@
 
 #include <unordered_map>
 #include "PlayerbotAPI.h"
+#include "ClassicBotSkills.h"
 #include "ClassicSpec.h"
 #include "ClassicTalentBuilds.h"
 #include "ClassicSupplies.h"
@@ -42,6 +43,8 @@
 #include "NoMotionGuard.h"
 #include "TradeFlow.h"
 #include "JunkDrop.h"
+#include "BotTrade.h"
+#include "BotTradeShop.h"
 #include "SocialMgr.h"  // SOCIAL_FLAG_FRIEND/IGNORED for friend ops
 #include "CalendarMgr.h"  // sCalendarMgr for calendar_rsvp_all_pending
 #include "SpellAuraDefines.h"
@@ -3574,9 +3577,11 @@ Result API::release_corpse()
                 // The guide is searched map-wide (the graveyard a bot was sent to is not always within 20 y of a guide
                 // spawn). The queue itself needs no range here; the revive wave only reaches ghosts standing near the guide,
                 // so a ghost farther than the wave range walks to it.
+                // Only the bot's own team's spirit guide (13116 Alliance, 13117 Horde): the nearest guide of the OTHER team never
+                // resurrects it, and a Horde ghost asked the Alliance guide at the Farm graveyard for the rest of the match (AB 2026-10-11,
+                // ab-no-horde: all four Horde bots of the instance were ghosts there).
                 std::list<Creature*> guides;
-                p_->GetCreatureListWithEntryInGrid(guides, 13116, 600.0f);
-                p_->GetCreatureListWithEntryInGrid(guides, 13117, 600.0f);
+                p_->GetCreatureListWithEntryInGrid(guides, p_->GetTeam() == ALLIANCE ? 13116u : 13117u, 600.0f);
                 Creature* nearest = nullptr;
                 float best = std::numeric_limits<float>::max();
                 for (Creature* g : guides)
@@ -3941,13 +3946,18 @@ Result API::decline_trade()
     return Result::Ok;
 }
 
-// `owner` is the trade partner the AI decided to accept: the bot's owner or a real player in its own group or raid (Bot/TradeRule.h).
+// `owner` is the trade partner the AI decided to trade with. gift_ok: the bot's owner or a real player in its own group or raid (Bot/TradeRule.h), who may
+// hand over gear and gold as a gift; anyone else gets the fair-price bargain (BotTrade.h).
 Result API::accept_owner_trade(ObjectGuid owner)
 {
+    return trade_with(owner, true);
+}
+
+Result API::trade_with(ObjectGuid owner, bool gift_ok)
+{
     if (!p_) return Result::Other;
-    // Per bot: when the proposal was first seen and whether the window was opened.
-    struct TradeSeen { uint32 first_ms = 0; uint32 last_ms = 0; bool begun = false; };
-    static std::unordered_map<uint64, TradeSeen> s_trade_seen;
+    // Per bot: the window being answered and whether it was begun (Trade::Seen, keyed by the window's serial).
+    static std::unordered_map<uint64, Playerbot::Trade::Seen> s_trade_seen;
     uint64 const me = p_->GetGUID().GetCounter();
     TradeData* mine = p_->GetTradeData();
     if (!mine)
@@ -3963,15 +3973,12 @@ Result API::accept_owner_trade(ObjectGuid owner)
         p_->TradeCancel(true);
         return Result::ServerRefused;
     }
-    // The window opens only when the proposed side begins: without it the owner sees "You have requested to trade" and nothing, and
-    // asking again answers "already trading". Begin at once; close a window nobody finishes.
+    // The window opens only when the proposed side begins: without it the owner sees "You have requested to trade" and nothing.
+    // Begin at once; close a window nobody finishes.
     {
         uint32 const now_ms = GameTime::GetGameTimeMS();
-        TradeSeen& seen = s_trade_seen[me];
-        // Not asked for 5 s: that was an earlier trade that ended on its own; this is a new proposal.
-        if (seen.last_ms && now_ms - seen.last_ms > 5000u) seen = TradeSeen{};
-        seen.last_ms = now_ms;
-        if (!seen.first_ms) seen.first_ms = now_ms ? now_ms : 1u;
+        Playerbot::Trade::Seen& seen = s_trade_seen[me];
+        Playerbot::Trade::Adopt(seen, mine->GetSerial(), now_ms);
         switch (Playerbot::Trade::NextStep(seen.begun, now_ms - seen.first_ms))
         {
             case Playerbot::Trade::Step::Cancel:
@@ -3985,40 +3992,14 @@ Result API::accept_owner_trade(ObjectGuid owner)
                 begin.Read();
                 p_->GetSession()->HandleBeginTradeOpcode(begin);
                 seen.begun = true;
+                TC_LOG_INFO("playerbot.v2", "[trade] bot {} began the window with {} (window {})", p_->GetName(), trader->GetName(), seen.serial);
                 return Result::Locked;
             }
             case Playerbot::Trade::Step::Wait:
                 break;
         }
     }
-    // Nothing is ever given away: a bot side with an item or money in it is not a gift.
-    bool bot_side_empty = mine->GetMoney() == 0;
-    bool owner_gives = his->GetMoney() > 0;
-    for (uint8 i = 0; i < TRADE_SLOT_TRADED_COUNT; ++i)
-    {
-        if (mine->GetItem(TradeSlots(i))) bot_side_empty = false;
-        if (his->GetItem(TradeSlots(i))) owner_gives = true;
-    }
-    if (!bot_side_empty)
-    {
-        p_->TradeCancel(true);
-        return Result::ServerRefused;
-    }
-    if (!his->IsAccepted())
-        return Result::Locked;              // the owner is still choosing
-    if (!owner_gives)
-    {
-        p_->TradeCancel(true);              // accepted an empty window
-        return Result::ServerRefused;
-    }
-    if (mine->IsAccepted())
-        return Result::Locked;              // already accepted; waiting for the exchange to settle
-    WorldPacket data(CMSG_ACCEPT_TRADE);
-    data << uint32(his->GetServerStateIndex());
-    WorldPackets::Trade::AcceptTrade accept(std::move(data));
-    accept.Read();
-    p_->GetSession()->HandleAcceptTradeOpcode(accept);
-    return Result::Ok;
+    return TradeShop::Step(p_, mine, his, gift_ok);
 }
 
 Result API::accept_group_invite()
@@ -4934,6 +4915,66 @@ static bool BotShouldVendorBoeGreen(Player* p, Item* it, ItemTemplate const* tmp
     return true;
 }
 
+// Bag rot: what a bot sells at a vendor, and what it clears for room when no vendor is near (API::make_room).
+// Greys, trade goods for a profession the bot lacks, soulbound gear it cannot wear and, when bags are tight, outgrown BoE greens.
+static bool IsBagRot(Player* p, Item* it, ItemTemplate const* tmpl, bool bags_tight)
+{
+    if (!p || !it || !tmpl || it->IsNotEmptyBag()) return false;
+    const uint32 quality = tmpl->GetQuality();
+    if (quality == ITEM_QUALITY_POOR)
+    {
+        return true;
+    }
+    else if (quality == ITEM_QUALITY_NORMAL &&
+             tmpl->GetClass() == ITEM_CLASS_TRADE_GOODS &&
+             !BotWantsTradeGoodsSubclass(p, tmpl->GetSubClass()))
+    {
+        return true;
+    }
+    // Soulbound BoP weapons/armor the bot can't equip — bag rot.
+    // Quest rewards offer 2-3 slots, bot picks one, but loot rolls
+    // on BoP items the bot is ineligible for still accumulate (per
+    // ITEM_VENDOR_SYSTEM_PLAN.md). These can never be auctioned
+    // (soulbound) and can't be equipped (class/race/spec mismatch),
+    // so vendor is the only disposition. Capped at Rare so we don't
+    // accidentally sell an Epic legendary world-drop the bot might
+    // re-spec into. Player::CanUseItem returns non-EQUIP_ERR_OK for
+    // class/race/profession restrictions.
+    //
+    // Heirloom protection: items with ITEM_FLAG_HEIRLOOM (or quality
+    // ITEM_QUALITY_HEIRLOOM, equivalent in modern client) are
+    // account-bound and should be preserved for alts. If the bot
+    // can't use it now, mailing it to alts via the JIT mail system
+    // is the right disposition — never vendor. Audit 2026-05-22:
+    // current code would happily vendor a class-wrong heirloom
+    // because it passes the `IsSoulBound() && CanUseItem != OK`
+    // check.
+    else if ((quality == ITEM_QUALITY_UNCOMMON || quality == ITEM_QUALITY_RARE)
+             && it->IsSoulBound()
+             && (tmpl->GetClass() == ITEM_CLASS_WEAPON
+                 || tmpl->GetClass() == ITEM_CLASS_ARMOR)
+             && p->CanUseItem(tmpl) != EQUIP_ERR_OK
+             && quality != ITEM_QUALITY_HEIRLOOM
+             && tmpl->GetBonding() != BIND_BNET_ACCOUNT
+             && tmpl->GetBonding() != BIND_BNET_ACCOUNT_UNTIL_EQUIPPED
+             && tmpl->GetBonding() != BIND_WOW_ACCOUNT
+             && tmpl->GetBonding() != BIND_QUEST)
+    {
+        // Only sell ITEMS IN BAGS, never equipped slots — same gate
+        // the inventory iterator already implies (Inventory location)
+        // but explicit for clarity.
+        return true;
+    }
+    // (4) Bag-pressure BoE-green clearance. Only under pressure, and only
+    // for items BotShouldVendorBoeGreen clears (all upgrade / quest /
+    // heirloom / account-bound protections enforced inside).
+    else if (bags_tight && BotShouldVendorBoeGreen(p, it, tmpl))
+    {
+        return true;
+    }
+    return false;
+}
+
 Result API::sell_trash(ObjectGuid npc)
 {
     if (!p_) return Result::Other;
@@ -4974,60 +5015,7 @@ Result API::sell_trash(ObjectGuid npc)
     p_->ForEachItem(ItemSearchLocation::Inventory, [this, &to_sell, bags_tight](Item* it)
     {
         ItemTemplate const* tmpl = it ? it->GetTemplate() : nullptr;
-        if (!tmpl) return ItemSearchCallbackResult::Continue;
-        if (it->IsNotEmptyBag()) return ItemSearchCallbackResult::Continue;
-        const uint32 quality = tmpl->GetQuality();
-        if (quality == ITEM_QUALITY_POOR)
-        {
-            to_sell.push_back(it);
-        }
-        else if (quality == ITEM_QUALITY_NORMAL &&
-                 tmpl->GetClass() == ITEM_CLASS_TRADE_GOODS &&
-                 !BotWantsTradeGoodsSubclass(p_, tmpl->GetSubClass()))
-        {
-            to_sell.push_back(it);
-        }
-        // Soulbound BoP weapons/armor the bot can't equip — bag rot.
-        // Quest rewards offer 2-3 slots, bot picks one, but loot rolls
-        // on BoP items the bot is ineligible for still accumulate (per
-        // ITEM_VENDOR_SYSTEM_PLAN.md). These can never be auctioned
-        // (soulbound) and can't be equipped (class/race/spec mismatch),
-        // so vendor is the only disposition. Capped at Rare so we don't
-        // accidentally sell an Epic legendary world-drop the bot might
-        // re-spec into. Player::CanUseItem returns non-EQUIP_ERR_OK for
-        // class/race/profession restrictions.
-        //
-        // Heirloom protection: items with ITEM_FLAG_HEIRLOOM (or quality
-        // ITEM_QUALITY_HEIRLOOM, equivalent in modern client) are
-        // account-bound and should be preserved for alts. If the bot
-        // can't use it now, mailing it to alts via the JIT mail system
-        // is the right disposition — never vendor. Audit 2026-05-22:
-        // current code would happily vendor a class-wrong heirloom
-        // because it passes the `IsSoulBound() && CanUseItem != OK`
-        // check.
-        else if ((quality == ITEM_QUALITY_UNCOMMON || quality == ITEM_QUALITY_RARE)
-                 && it->IsSoulBound()
-                 && (tmpl->GetClass() == ITEM_CLASS_WEAPON
-                     || tmpl->GetClass() == ITEM_CLASS_ARMOR)
-                 && p_->CanUseItem(tmpl) != EQUIP_ERR_OK
-                 && quality != ITEM_QUALITY_HEIRLOOM
-                 && tmpl->GetBonding() != BIND_BNET_ACCOUNT
-                 && tmpl->GetBonding() != BIND_BNET_ACCOUNT_UNTIL_EQUIPPED
-                 && tmpl->GetBonding() != BIND_WOW_ACCOUNT
-                 && tmpl->GetBonding() != BIND_QUEST)
-        {
-            // Only sell ITEMS IN BAGS, never equipped slots — same gate
-            // the inventory iterator already implies (Inventory location)
-            // but explicit for clarity.
-            to_sell.push_back(it);
-        }
-        // (4) Bag-pressure BoE-green clearance. Only under pressure, and only
-        // for items BotShouldVendorBoeGreen clears (all upgrade / quest /
-        // heirloom / account-bound protections enforced inside).
-        else if (bags_tight && BotShouldVendorBoeGreen(p_, it, tmpl))
-        {
-            to_sell.push_back(it);
-        }
+        if (IsBagRot(p_, it, tmpl, bags_tight)) to_sell.push_back(it);
         return ItemSearchCallbackResult::Continue;
     });
 
@@ -5035,6 +5023,57 @@ Result API::sell_trash(ObjectGuid npc)
         p_->SellItemToVendor(it, it->GetCount());
 
     return to_sell.empty() ? Result::InvalidTarget : Result::Ok;
+}
+
+// Frees bag slots with no vendor in reach, the way a player running with a group does it: the cheapest bag rot goes first (see
+// IsBagRot) and the vendor price is paid out, as if sold at the next town. A bot in a raid never reaches a vendor, so without this its
+// bags only ever fill and it cannot take a trade or a drop. When rot alone does not make `min_free` slots, the bag contents are logged
+// by category so the cause is on record.
+bool MakeBagRoom(Player* bot, uint32 min_free)
+{
+    if (!bot) return false;
+    uint32 free_now = CountFreeBagSlots(bot);
+    uint32 const want = Playerbot::BotTrade::SlotsToClear(free_now, min_free);
+    if (!want) return true;
+
+    struct Rot { Item* item; uint64 value; };
+    std::vector<Rot> rot;
+    uint32 by_class[16] = {};
+    bot->ForEachItem(ItemSearchLocation::Inventory, [&](Item* it)
+    {
+        ItemTemplate const* t = it ? it->GetTemplate() : nullptr;
+        if (!t || it->IsNotEmptyBag()) return ItemSearchCallbackResult::Continue;
+        ++by_class[std::min<uint32>(t->GetClass(), 15u)];
+        if (IsBagRot(bot, it, t, /*bags_tight*/ true))
+            rot.push_back({ it, uint64(t->GetSellPrice()) * it->GetCount() });
+        return ItemSearchCallbackResult::Continue;
+    });
+    std::sort(rot.begin(), rot.end(), [](Rot const& a, Rot const& b) { return a.value < b.value; });
+
+    uint32 cleared = 0;
+    uint64 paid = 0;
+    for (Rot const& r : rot)
+    {
+        if (cleared >= want) break;
+        paid += r.value;
+        bot->DestroyItem(r.item->GetBagSlot(), r.item->GetSlot(), true);
+        ++cleared;
+    }
+    if (paid) bot->ModifyMoney(int64(paid), false);
+    TC_LOG_INFO("playerbot.v2", "[bag_room] bot={} free={} wanted={} cleared={} paid={}c rot_left={}", bot->GetGUID().GetCounter(), free_now,
+        min_free, cleared, paid, rot.size() - cleared);
+    if (cleared < want)
+        TC_LOG_INFO("playerbot.v2",
+            "[bag_full] bot={} free={} wanted={} nothing more to clear; slots by item class: consumable={} container={} weapon={} gem={} armor={} reagent={} projectile={} trade_goods={} recipe={} quiver={} quest={} key={} misc={}",
+            bot->GetGUID().GetCounter(), free_now + cleared, min_free, by_class[0], by_class[1], by_class[2], by_class[3], by_class[4], by_class[5],
+            by_class[6], by_class[7], by_class[9], by_class[11], by_class[12], by_class[13], by_class[15]);
+    return cleared >= want;
+}
+
+Result API::make_room(uint32 min_free)
+{
+    if (!p_) return Result::Other;
+    return MakeBagRoom(p_, min_free) ? Result::Ok : Result::Locked;
 }
 
 Result API::repair_all(ObjectGuid npc, bool from_guild_bank)
@@ -5693,6 +5732,18 @@ Result API::use_game_object(ObjectGuid go_guid)
     if (p_->IsMounted() && !obj->GetGOInfo()->IsUsableMounted())
         return Result::Locked;
 
+    // A battleground flag or banner is not used in a shapeshift form (a bear-form druid stood at the Lumber Mill banner doing nothing,
+    // Karrz AB 2026-10-11): leave the form first, the next click (the rule re-emits) goes through as a caster.
+    if (p_->InBattleground() && p_->GetShapeshiftForm() != FORM_NONE &&
+        (obj->GetGoType() == GAMEOBJECT_TYPE_BUTTON || obj->GetGoType() == GAMEOBJECT_TYPE_GOOBER || obj->GetGoType() == GAMEOBJECT_TYPE_FLAGSTAND ||
+         obj->GetGoType() == GAMEOBJECT_TYPE_FLAGDROP || obj->GetGoType() == GAMEOBJECT_TYPE_NEW_FLAG || obj->GetGoType() == GAMEOBJECT_TYPE_NEW_FLAG_DROP ||
+         obj->GetGoType() == GAMEOBJECT_TYPE_CAPTURE_POINT))
+    {
+        TC_LOG_INFO("playerbot.v2", "[bg_capture] {} leaves form {} before using entry={}", p_->GetName(), uint32(p_->GetShapeshiftForm()), obj->GetEntry());
+        p_->RemoveAurasByType(SPELL_AURA_MOD_SHAPESHIFT);
+        return Result::Locked;
+    }
+
     // Battleground node banners (AB / AV / Gilneas style BUTTON and GOOBER objects) are not instant for a player: the capture is
     // a channel of several seconds that movement or damage breaks. Calling Use() straight away let a whole squad flip the
     // Blacksmith and Lumber Mill Alliance/Horde/Alliance/Horde every second (Karrz, AB test 2026-10-08). The bot now "channels"
@@ -5701,7 +5752,7 @@ Result API::use_game_object(ObjectGuid go_guid)
     if (p_->InBattleground() &&
         (obj->GetGoType() == GAMEOBJECT_TYPE_BUTTON || obj->GetGoType() == GAMEOBJECT_TYPE_GOOBER))
     {
-        struct BannerCapture { ObjectGuid go; uint32 startMs = 0; Position pos; uint32 health = 0; uint32 lastDoneMs = 0; };
+        struct BannerCapture { ObjectGuid go; Position goPos; uint32 startMs = 0; Position pos; uint32 health = 0; uint32 lastDoneMs = 0; };
         static std::unordered_map<ObjectGuid, BannerCapture> s_bannerCapture;
         BannerCapture& cap = s_bannerCapture[p_->GetGUID()];
         uint32 const nowMs = GameTime::GetGameTimeMS();
@@ -5711,7 +5762,9 @@ Result API::use_game_object(ObjectGuid go_guid)
             return Result::Locked;
         if (cap.lastDoneMs && nowMs - cap.lastDoneMs < 15000u)
             return Result::Locked;
-        bool const sameGo = cap.go == go_guid && cap.startMs != 0;
+        // The same banner, or another banner standing at the same pole (a contested node keeps its neutral banner next to the faction
+        // one): the capture in progress continues instead of restarting.
+        bool const sameGo = cap.startMs != 0 && (cap.go == go_guid || cap.goPos.GetExactDist2d(obj) < 3.0f);
         bool const moved = sameGo && p_->GetExactDist2d(cap.pos) > 3.0f;
         bool const hurt = sameGo && p_->GetHealth() < cap.health;
         if (!sameGo || moved || hurt)
@@ -5720,6 +5773,7 @@ Result API::use_game_object(ObjectGuid go_guid)
                 TC_LOG_INFO("playerbot.v2", "[bg_capture] {} interrupt entry={} reason={}", p_->GetName(), obj->GetEntry(),
                     moved ? "moved" : "damaged");
             cap.go = go_guid;
+            cap.goPos = obj->GetPosition();
             cap.startMs = nowMs;
             cap.pos = p_->GetPosition();
             cap.health = uint32(p_->GetHealth());
@@ -7333,9 +7387,9 @@ Result API::bg_queue(ObjectGuid battlemaster, uint16 bg_type_id, uint8 arena_typ
     if (Group* grp = p_->GetGroup())
     {
         if (grp->GetLeaderGUID() != p_->GetGUID())
-        { TC_LOG_INFO("playerbot.v2", "[bg_queue] {} reject: grouped_not_leader", p_->GetName()); return Result::Locked; }
+        { TC_LOG_INFO("playerbot.v2", "[bg_queue] {} reject: grouped_not_leader (bg_type_id={} team={} lvl={})", p_->GetName(), bg_type_id, p_->GetTeam() == ALLIANCE ? "A" : "H", uint32(p_->GetLevel())); return Result::Locked; }
         if (p_->InBattleground())
-        { TC_LOG_INFO("playerbot.v2", "[bg_queue] {} reject: in_bg", p_->GetName()); return Result::Locked; }
+        { TC_LOG_INFO("playerbot.v2", "[bg_queue] {} reject: in_bg (bg_type_id={} team={} lvl={})", p_->GetName(), bg_type_id, p_->GetTeam() == ALLIANCE ? "A" : "H", uint32(p_->GetLevel())); return Result::Locked; }
         ObjectGuid errorGuid;
         // Arena path mirrors HandleBattlemasterJoinArena: Min/MaxPlayerCount
         // == arena_type (the exact team size), isRated=false (skirmish),
@@ -7396,7 +7450,7 @@ Result API::bg_queue(ObjectGuid battlemaster, uint16 bg_type_id, uint8 arena_typ
     if (is_arena)
     { TC_LOG_INFO("playerbot.v2", "[bg_queue] {} reject: arena_requires_group (arena_type={} bg_type_id={})", p_->GetName(), uint32(arena_type), bg_type_id); return Result::Locked; }
     if (p_->InBattleground())
-    { TC_LOG_INFO("playerbot.v2", "[bg_queue] {} reject: in_bg", p_->GetName()); return Result::Locked; }
+    { TC_LOG_INFO("playerbot.v2", "[bg_queue] {} reject: in_bg (bg_type_id={} team={} lvl={})", p_->GetName(), bg_type_id, p_->GetTeam() == ALLIANCE ? "A" : "H", uint32(p_->GetLevel())); return Result::Locked; }
     if (!p_->CanJoinToBattleground(bg_tmpl))
     { TC_LOG_INFO("playerbot.v2", "[bg_queue] {} reject: CanJoinToBattleground=false (bg_type_id={})", p_->GetName(), bg_type_id); return Result::Locked; }
     if (p_->IsDeserter())
@@ -8902,10 +8956,14 @@ API::StarterPetResult API::grant_starter_hunter_pet(uint32 entry)
 uint32 API::learn_weapon_skills_free()
 {
     if (!p_) return 0;
-    static constexpr std::array<uint32, 15> kWeaponSkills = {
+    // Defense and Unarmed are not weapon skills, but they are in the same table of the combat rules (crushing blows, glancing
+    // blows, dodge and parry, miss): a bot's Defense used to stay at whatever skill-ups gave it (181 for a levelled warrior,
+    // 52 for a paladin), so a level 63 boss crushed it on 80-95% of its swings (vanilla at 300 Defense: 15%).
+    static constexpr std::array<uint32, 17> kWeaponSkills = {
         SKILL_SWORDS, SKILL_TWO_HANDED_SWORDS, SKILL_AXES, SKILL_TWO_HANDED_AXES, SKILL_MACES, SKILL_TWO_HANDED_MACES,
         SKILL_POLEARMS, SKILL_STAVES, SKILL_DAGGERS, SKILL_FIST_WEAPONS, SKILL_BOWS, SKILL_GUNS, SKILL_CROSSBOWS,
-        176 /*Thrown*/, SKILL_WANDS };
+        176 /*Thrown*/, SKILL_WANDS, SKILL_UNARMED, SKILL_DEFENSE };
+    // Five per level, what a player who trained and used every skill has (the cap Player::UpdateSkillsForLevel sets).
     uint32 changed = 0;
     for (uint32 skill : kWeaponSkills)
     {
@@ -8919,8 +8977,9 @@ uint32 API::learn_weapon_skills_free()
                 continue;
             ++changed;
         }
-        uint16 const max = p_->GetPureMaxSkillValue(skill);
-        if (p_->GetPureSkillValue(skill) < max)
+        // The skill's own maximum can lag behind the level (it follows UpdateSkillsForLevel), so the target is the level's cap.
+        uint16 const max = ClassicBotSkills::Target(p_->GetLevel(), p_->GetPureMaxSkillValue(skill));
+        if (ClassicBotSkills::NeedsRaise(p_->GetPureSkillValue(skill), p_->GetPureMaxSkillValue(skill), max))
         {
             p_->SetSkill(skill, p_->GetSkillStep(skill), max, max);
             ++changed;

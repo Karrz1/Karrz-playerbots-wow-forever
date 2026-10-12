@@ -13,6 +13,7 @@
 #include "Timer.h"     // getMSTime for per-tick latency recording
 #include "GameTime.h"  // GameTime::GetGameTimeMS — same base as snapshot.published_at_ms
 #include <algorithm>
+#include <chrono>
 
 namespace Playerbot {
 
@@ -133,7 +134,17 @@ void AiWorkerPool::run_worker()
             std::lock_guard lk(mtx_);
             in_flight_.erase(bot);
         }
+        idle_cv_.notify_all();
     }
+}
+
+void AiWorkerPool::wait_not_in_flight(BotId bot)
+{
+    std::unique_lock lk(mtx_);
+    // Bounded: a tick is milliseconds; never wedge the world thread on a stuck worker.
+    idle_cv_.wait_for(lk, std::chrono::seconds(5), [&] {
+        return !running_.load(std::memory_order_acquire) || in_flight_.find(bot) == in_flight_.end();
+    });
 }
 
 void AiWorkerPool::run_one(BotId bot)

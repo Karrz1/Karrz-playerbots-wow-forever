@@ -15,7 +15,7 @@
 // Skipped: Feign Death, Scatter Shot, Viper Sting, aspect swapping
 // (Monkey / Cheetah / Viper) - Hawk is the only aspect maintained.
 //
-// Priorities follow Karrz's ike3 vanilla strategies (Karrz's earlier VMaNGOS bot tree (wow-1.12)
+// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
 // raid10-revamp, playerbot/strategy/hunter/*Strategy.cpp, MANGOSBOT_ZERO).
 
 #include "Bot/SpellFamily.h"
@@ -341,6 +341,7 @@ void DoTranqShot(ApPredicateContext const& ctx, BotIntentEmitter& e)
     NearbyUnit const* u = TranqTarget(ctx);
     if (!u || !e.cast(TRANQUILIZING_SHOT, u->guid)) return;
     BotSnapshotView const& s = ctx.bot;
+    Classic::NoteRaidSupport(Classic::RaidSupportKind::Tranq, s.map_id());
     if (s.is_in_raid() && RaidLogDue(RaidLogKey(s, RaidLogKind::Tranq), s.published_at_ms(), 3000u))
     {
         CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(u->entry);

@@ -16,6 +16,7 @@
 #include "PlayerbotMovement.h"   // SehSafeCalculatePath (tile-race guard)
 #include "dtQueryFilterTC.h"     // /roadstats reads RoadStats counters
 #include "../Fleet/OwnerRegistry.h"
+#include "../Fleet/PlayerCraftOrders.h"
 #include "BotAddressResolver.h"
 #include "../Diagnostics/BotInspector.h"
 #include "../Diagnostics/PerfCounters.h"
@@ -197,7 +198,7 @@ ParsedCommand SplitArgs(std::string const& line)
 //      production model.
 //   2. (Unowned bot) bot's group leader.
 //   3. (Unowned bot) any member of bot's group.
-//   4. (Unowned bot, no group) any sender — permissive solo testing.
+//   4. (Unowned bot, no group) GM senders only.
 bool IsAuthorized(Player const* sender, Player const* bot)
 {
     if (!sender || !bot) return false;
@@ -218,7 +219,10 @@ bool IsAuthorized(Player const* sender, Player const* bot)
 
     // Tier 2-4: legacy group / solo fallback for unowned bots.
     Group const* g = bot->GetGroup();
-    if (!g) return true;     // Solo — fall back to permissive
+    // Solo, unowned (resident world bots included): only a GM may command it. Anyone else could otherwise
+    // mail out its gold/items, teleport it or make it speak.
+    if (!g)
+        return sender->GetSession() && sender->GetSession()->GetSecurity() >= SEC_GAMEMASTER;
     if (g->IsLeader(sender->GetGUID())) return true;
     if (g->IsMember(sender->GetGUID())) return true;
     return false;
@@ -4109,6 +4113,10 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
                                     "Attack: select a target first."});
             return true;
         }
+        // The owner's Attack is the group's go whoever may open (live MC 2026-10-11: the marked mob was idle, only the main tank got the
+        // order, and the other 38 bots never saw an Attack): PveGroupCoordinator latches the raid's release from it.
+        if (BotAI* attack_ai = Services::Registry().ai(bot->GetGUID().GetCounter()))
+            attack_ai->note_owner_attack(GameTime::GetGameTimeMS());
         // Raid map, nobody fighting the unit yet: only the main tank opens (RaidPullGateAllows); the others wait for
         // the normal pull gate or assist once it is in combat.
         if (!RaidPullGateAllows(bot, target))
@@ -7894,6 +7902,12 @@ done_dispel:
                 meta->min_skill_line_rank, meta->trivial_low, meta->trivial_high,
                 v.has_reagents(spell_id) ? "ok" : "MISSING")});
         return true;
+    }
+    if (cmd == "craft" && !parsed.tail.empty() && parsed.tail.find_first_not_of("0123456789 ") != std::string::npos)
+    {
+        // craft <item link or name> [x5] | craft list: the bot makes it from its own reagents and mails it to the sender
+        // (Fleet/PlayerCraftOrders). A bare spell id keeps the owner's /craft <spell_id> below.
+        return ::Playerbot::V2::PlayerCraftOrders::Order(sender, bot, "craft " + parsed.tail);
     }
     if (cmd == "craft")
     {

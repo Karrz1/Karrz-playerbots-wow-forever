@@ -5,6 +5,7 @@
 #include "CompanionRole.h"
 #include "BotQueueFiller.h"
 #include "InstanceGroupCap.h"
+#include "RaidSubgroupPlan.h"
 #include "BotSetupPipeline.h"
 #include "WorldBotSpawner.h"
 #include "BotAccountMgr.h"
@@ -552,6 +553,7 @@ void BotPopulationManager::OnWorldTick(uint32 now_ms)
     { SLOW_CALL("BgGroupHygiene"); BgGroupHygiene(now_ms); }
     { SLOW_CALL("SeedBgMatches"); SeedBgMatches(now_ms); }
     { SLOW_CALL("DriveBgStress"); DriveBgStress(now_ms); }
+    { SLOW_CALL("DriveBgSoak"); DriveBgSoak(now_ms); }
     { SLOW_CALL("SeedArenaMatches"); SeedArenaMatches(now_ms); }
     { SLOW_CALL("BotQueueFiller::AutoJoinTick"); BotQueueFiller::AutoJoinTick(now_ms); }
     { SLOW_CALL("BotQueueFiller::MakeRoomForRealPlayers"); BotQueueFiller::MakeRoomForRealPlayers(now_ms); }
@@ -1259,6 +1261,18 @@ Role BotPopulationManager::ApplyCompanionRole(Player* bot, Role requested, char 
         }
     }
 
+    // The spec the owner saved the bot in, when it still fits the role it plays (a role changed since goes by the class default).
+    if (uint32 const saved = owners.StoredSpec(id); saved)
+    {
+        Role const saved_role = IsTankSpec(cls, uint16(saved)) ? Role::Tank : IsHealerSpec(cls, uint16(saved)) ? Role::Healer : Role::Dps;
+        uint32 const chosen = Fleet::ChooseCompanionSpec(spec, saved, saved_role, role, choice.store);
+        if (chosen != spec)
+        {
+            TC_LOG_INFO("playerbot.v2", "[roster_restore] {} spec {} -> {} (saved)", bot->GetName(), spec, chosen);
+            spec = chosen;
+        }
+    }
+
     BotAI* ai = Services::Registry().ai(id);
     bool const store = choice.store;
     bool const changed = (ai && ai->role_override() != role) || (store && owners.DeclaredRole(id) != role) ||
@@ -1275,6 +1289,28 @@ Role BotPopulationManager::ApplyCompanionRole(Player* bot, Role requested, char 
         TC_LOG_INFO("playerbot.v2", "[role] {} role={} source={} spec={} ({})", bot->GetName(),
                     role == Role::Tank ? "tank" : role == Role::Healer ? "healer" : "dps", source, spec, where);
     return role;
+}
+
+Role BotPopulationManager::StoreCurrentRole(Player* bot)
+{
+    BotId const id = bot->GetGUID().GetCounter();
+    uint8 const cls = bot->GetClass();
+    // The spec it plays now is stored whatever the role's state: the role alone cannot say Retribution from a second DPS spec.
+    uint32 const now_spec = ::Playerbot::Classic::EffectiveSpecId(bot);
+    Services::Owners().SetStoredSpec(id, now_spec);
+    TC_LOG_INFO("playerbot.v2", "[roster_save] {} spec {}", bot->GetName(), now_spec);
+    Role const declared = Services::Owners().DeclaredRole(id);
+    if (declared != Role::Unknown)
+        return declared;
+    Role role = Role::Unknown;
+    if (BotAI* ai = Services::Registry().ai(id))
+        role = ai->role_override();
+    if (role == Role::Unknown)
+    {
+        uint32 const spec = ::Playerbot::Classic::EffectiveSpecId(bot);
+        role = IsTankSpec(cls, uint16(spec)) ? Role::Tank : IsHealerSpec(cls, uint16(spec)) ? Role::Healer : Role::Dps;
+    }
+    return ApplyCompanionRole(bot, role, "save");
 }
 
 void BotPopulationManager::DrainCompanionSetups()
@@ -1356,6 +1392,58 @@ bool LeaveForeignGroups(Player* bot, Group const* ownerGroup)
     return (!bot->GetGroup() || bot->GetGroup() == ownerGroup) && (!bot->GetOriginalGroup() || bot->GetOriginalGroup() == ownerGroup);
 }
 
+// Puts the owner's companions back in the raid sub-groups they were stored in (RaidSubgroupPlan.h). Run after every join: a bot lands in
+// the first free sub-group, and the plan trades places with whoever stands in the way, so the layout converges as the roster logs in.
+void RestoreRaidSubgroups(Group* group, Player const* owner)
+{
+    if (!group || !group->isRaidGroup() || group->isBGGroup() || group->isBFGroup())
+        return;
+    uint32 const account = owner->GetSession() ? owner->GetSession()->GetAccountId() : 0;
+    std::vector<Fleet::SubgroupMember> members;
+    for (Group::MemberSlot const& slot : group->GetMemberSlots())
+    {
+        Fleet::SubgroupMember m;
+        m.guid = slot.guid.GetCounter();
+        m.group = slot.group;
+        BotId const id = slot.guid.GetCounter();
+        OwnerBinding const b = Services::Owners().GetOwner(id);
+        m.movable = b.account_id != 0 && b.account_id == account;
+        if (m.movable)
+            m.want = Services::Owners().StoredSubgroup(id);
+        members.push_back(m);
+    }
+    auto name_of = [&](uint64 low)
+    {
+        ObjectGuid const g = ObjectGuid::Create<HighGuid::Player>(low);
+        std::string n;
+        sCharacterCache->GetCharacterNameByGuid(g, n);
+        return n;
+    };
+    uint32 moves = 0, swaps = 0;
+    Fleet::SubgroupRestoreScope scope;
+    for (Fleet::SubgroupMove const& mv : Fleet::PlanSubgroupMoves(members))
+    {
+        ObjectGuid const a = ObjectGuid::Create<HighGuid::Player>(mv.guid);
+        if (mv.swap)
+        {
+            ObjectGuid const o = ObjectGuid::Create<HighGuid::Player>(mv.other);
+            TC_LOG_INFO("playerbot.v2", "[roster_restore] {} (group {}) swaps places with {} (group {})", name_of(mv.guid),
+                        uint32(group->GetMemberGroup(a)) + 1u, name_of(mv.other), uint32(group->GetMemberGroup(o)) + 1u);
+            group->SwapMembersGroups(a, o);
+            ++swaps;
+        }
+        else
+        {
+            TC_LOG_INFO("playerbot.v2", "[roster_restore] {} moves from raid group {} to {}", name_of(mv.guid),
+                        uint32(group->GetMemberGroup(a)) + 1u, uint32(mv.group) + 1u);
+            group->ChangeMembersGroup(a, mv.group);
+            ++moves;
+        }
+    }
+    if (moves || swaps)
+        TC_LOG_INFO("playerbot.v2", "[roster_restore] raid of {}: {} move(s), {} swap(s)", group->GetMembersCount(), moves, swaps);
+}
+
 // Joins the bot to the owner's group, creating it (a full party becomes a raid, whoever leads it). Empty string = joined.
 std::string JoinOwnerGroup(Player* owner, Player* bot)
 {
@@ -1364,7 +1452,10 @@ std::string JoinOwnerGroup(Player* owner, Player* bot)
 
     Group* ownerGroup = owner->GetGroup();
     if (ownerGroup && bot->GetGroup() == ownerGroup)
+    {
+        RestoreRaidSubgroups(ownerGroup, owner);   // `.bot call all` on a raid that came back jumbled
         return {};      // a companion called again is often in the group already
+    }
 
     if (!LeaveForeignGroups(bot, ownerGroup))
         return "it could not leave its other group";
@@ -1382,6 +1473,7 @@ std::string JoinOwnerGroup(Player* owner, Player* bot)
         return "your raid is full (" + std::to_string(group->GetMembersCount()) + " members)";
     if (!group->AddMember(bot))
         return "your raid has no free sub-group slot";
+    RestoreRaidSubgroups(group, owner);
     group->BroadcastGroupUpdate();
     return {};
 }
@@ -1651,7 +1743,10 @@ static uint32 RaidRegearPass(Player* p, bool& refused_any, bool only_over_cap = 
                 // A world bot's one-time re-roll: whatever it wears that differs from its own per-slot pick goes.
                 // A piece of the tier set the owner asked for goes on over whatever is worn, even a better scoring piece.
                 bool const tier_pick = Gear::IsTierSetPick(cls, ctx.gear_mode, g.item_entry);
-                bool const better = tier_pick || worn_pvp || worn_over || (reroll_all && ctx.world_bot()) || (cur_score <= 0 ? pick_score > cur_score
+                // An off hand that is not a weapon on a class that must have one (rogue, non-protection warrior, hunter, enhancement shaman) goes for any weapon pick.
+                bool const dead_offhand = ::Playerbot::Gear::OffhandMustBeWeapon(cls, ctx.spec) && g.slot == EQUIPMENT_SLOT_OFFHAND && cur->GetTemplate() &&
+                                          cur->GetTemplate()->GetClass() != ITEM_CLASS_WEAPON && gtpl->GetClass() == ITEM_CLASS_WEAPON;
+                bool const better = tier_pick || worn_pvp || dead_offhand || worn_over || (reroll_all && ctx.world_bot()) || (cur_score <= 0 ? pick_score > cur_score
                                                                 : float(pick_score) >= float(cur_score) * Gear::kRaidUpgradeRatio);
                 if (!better)
                     continue;
@@ -2944,10 +3039,24 @@ uint64 BotPopulationManager::SpawnNew(uint8 level, bool alliance, uint8 race_hin
             break;
         }
     }
+    // A failed creation is counted and explained at INFO once a minute: the world spawner's spawn_failed counter alone says
+    // nothing about which step fails (the per-failure DEBUG lines are off in a normal run).
+    static uint32 s_fail_n = 0, s_fail_last_ms = 0;
+    auto note_fail = [&](std::string const& why)
+    {
+        ++s_fail_n;
+        uint32 const now = getMSTime();
+        if (!s_fail_last_ms || getMSTimeDiff(s_fail_last_ms, now) >= 60000u)
+        {
+            TC_LOG_INFO("playerbot.v2", "[Population] spawn failed {} time(s) since the last line; latest ({} L{}): {}",
+                        s_fail_n, alliance ? "Alliance" : "Horde", uint32(level), why);
+            s_fail_n = 0;
+            s_fail_last_ms = now ? now : 1u;
+        }
+    };
     if (!pick.race)
     {
-        TC_LOG_DEBUG("playerbot.v2", "[Population] Roll produced no faction-matching pick (faction={})",
-                     alliance ? "A" : "H");
+        note_fail("no race of the wanted faction rolled in 8 tries (or Roll gave up)");
         return 0;
     }
 
@@ -2955,7 +3064,7 @@ uint64 BotPopulationManager::SpawnNew(uint8 level, bool alliance, uint8 race_hin
         pick.name, pick.race, pick.cls, pick.gender);
     if (!created.ok)
     {
-        TC_LOG_DEBUG("playerbot.v2", "[Population] spawn failed: {}", created.reason);
+        note_fail(created.reason);
         return 0;
     }
 
@@ -3921,6 +4030,114 @@ void BotPopulationManager::DriveBgStress(uint32 now_ms)
     st = BgStress{};
 }
 
+std::string BotPopulationManager::StartBgSoak(uint16 bg_type, uint32 max_minutes)
+{
+    if (bg_soak_.phase == BgSoak::Phase::Running)
+        return BgSoakReport();
+    if (!bg_type || !sBattlegroundMgr->GetBattlegroundTemplateByTypeId(BattlegroundTypeId(bg_type)))
+        return "usage: .bot bgsoak <bg_type_id> [max_minutes]  (1 = Alterac Valley, 2 = Warsong Gulch, 3 = Arathi Basin)";
+    bg_soak_ = BgSoak{};
+    bg_soak_.bg_type = bg_type;
+    bg_soak_.phase = BgSoak::Phase::Running;
+    bg_soak_.started_ms = 0;   // set by the first drive tick, which also does the fill
+    bg_soak_.deadline_ms = std::max(5u, max_minutes ? max_minutes : 30u) * 60u * 1000u;   // a length until started_ms is known
+    return fmt::format("[bgsoak] started: bg_type={} max={} min. Poll `.bot bgsoak`; the final line starts with \"[bgsoak] done\".", bg_type,
+                       bg_soak_.deadline_ms / 60000u);
+}
+
+std::string BotPopulationManager::BgSoakReport() const
+{
+    if (bg_soak_.phase == BgSoak::Phase::Idle)
+        return "[bgsoak] not started";
+    if (bg_soak_.phase == BgSoak::Phase::Done)
+        return bg_soak_.result;
+    return fmt::format("[bgsoak] running: bg_type={} peak_in_bg={} last_status={}", bg_soak_.bg_type, bg_soak_.peak_in_bg, uint32(bg_soak_.last_status));
+}
+
+void BotPopulationManager::DriveBgSoak(uint32 now_ms)
+{
+    BgSoak& st = bg_soak_;
+    if (st.phase != BgSoak::Phase::Running)
+        return;
+    if (!st.started_ms)
+    {
+        // First tick: one fill, the same path the queue hook, the seed and the stress test use.
+        st.started_ms = now_ms ? now_ms : 1u;
+        st.deadline_ms += st.started_ms;
+        st.last_log_ms = st.started_ms;
+        BotQueueFiller filler;
+        filler.Fill(BuildAmbientBgFill(st.bg_type));
+        TC_LOG_INFO("playerbot.v2", "[bgsoak] fill queued bg_type={}", st.bg_type);
+        return;
+    }
+
+    if (int32(now_ms - st.last_poll_ms) < 5000)   // a pass over every bot, every 5 s is enough
+        return;
+    st.last_poll_ms = now_ms;
+
+    // Who is inside a battleground of this type, and in which state it is.
+    uint32 in_bg = 0, queued = 0;
+    Battleground* bg = nullptr;
+    for (BotId id : Services::Lifecycle().snapshot_ids())
+    {
+        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
+        if (!bot || !bot->IsInWorld())
+            continue;
+        if (Battleground* b = bot->GetBattleground(); b && uint32(b->GetTypeID()) == st.bg_type)
+        {
+            ++in_bg;
+            if (!bg) bg = b;
+        }
+        else if (bot->InBattlegroundQueue())
+            ++queued;
+    }
+    st.peak_in_bg = std::max(st.peak_in_bg, in_bg);
+    if (in_bg && !st.first_in_bg_ms)
+        st.first_in_bg_ms = now_ms;
+    if (bg)
+        st.last_status = uint8(bg->GetStatus());
+
+    if (int32(now_ms - st.last_log_ms) >= 60000)
+    {
+        st.last_log_ms = now_ms;
+        TC_LOG_INFO("playerbot.v2", "[bgsoak] t={}s bg_type={} in_bg={} queued={} status={} peak_in_bg={} bots_online={} rss_mb={}",
+                    (now_ms - st.started_ms) / 1000u, st.bg_type, in_bg, queued, uint32(st.last_status), st.peak_in_bg,
+                    Services::Lifecycle().size(), WorldLoad().rss_mb);
+    }
+
+    char const* result = nullptr;
+    if (st.first_in_bg_ms && !in_bg)
+        result = "ended";                    // the match ran and the bots have all left it
+    else if (bg && bg->GetStatus() == STATUS_WAIT_LEAVE)
+        result = nullptr;                    // over, the bots are on their way out: the next tick sees the empty field
+    else if (!st.first_in_bg_ms && int32(now_ms - st.started_ms) >= 10 * 60 * 1000)
+        result = "never_started";            // ten minutes and no bot ever entered
+    else if (int32(now_ms - st.deadline_ms) >= 0)
+        result = "timeout";
+    if (!result)
+        return;
+
+    uint32 left = 0;
+    if (!std::strcmp(result, "timeout"))
+        for (BotId id : Services::Lifecycle().snapshot_ids())
+        {
+            Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
+            if (!bot || !bot->IsInWorld() || ::Playerbot::Pool::RoleOf(id) == ::Playerbot::Pool::BotRole::Owned)
+                continue;
+            if (!bot->InBattleground() && !bot->InBattlegroundQueue())
+                continue;
+            Intent leave{};
+            leave.bot_id = id;
+            leave.body   = QueueIntent{BgLeaveIntent{}};
+            Services::Intents(id).push(std::move(leave));
+            ++left;
+        }
+    st.result = fmt::format("[bgsoak] done bg_type={} result={} elapsed={}s peak_in_bg={} last_status={} asked_to_leave={}", st.bg_type, result,
+                            (now_ms - st.started_ms) / 1000u, st.peak_in_bg, uint32(st.last_status), left);
+    TC_LOG_INFO("playerbot.v2", "{}", st.result);
+    st.phase = BgSoak::Phase::Done;
+}
+
 BotQueueFiller::FillRequest BotPopulationManager::BuildAmbientBgFill(uint16 bg_type)
 {
     BotQueueFiller::FillRequest req{};
@@ -4315,14 +4532,14 @@ void BotPopulationManager::TopUpActiveBGs(uint32 now_ms)
             bool const is_prep    = (status == STATUS_WAIT_JOIN);
             bool const is_running = (status == STATUS_IN_PROGRESS);
             if (!is_prep && !is_running) continue;
-            // Only SUSTAIN a RUNNING battleground that has a human in it. A
-            // bot-only running BG (autonomous-seeded, or a human-BG the human
-            // left) must NOT be perpetually refilled — skipping its top-up lets
-            // it bleed out and end at its time limit instead of running forever
-            // as pure server load (owner directive 2026-06-17). PREP BGs are
-            // left ungated so a forming HUMAN BG still fills before its gates
-            // open (the human is invited but may not have entered m_Players yet).
-            if (is_running && !BgHasHumanPlayer(bg)) continue;
+            // Only SUSTAIN a RUNNING battleground that has a human in it. A bot-only running match is not refilled: it runs down and ends
+            // on its own, so few instances stay alive and real players are put into the ones that are (owner directive 2026-06-17, confirmed
+            // by Karrz 2026-10-11: as few instances as possible, as many real players in each). PREP BGs are left ungated so a forming
+            // human match still fills before its gates open (the human is invited but may not have entered m_Players yet).
+            bool const has_human = BgHasHumanPlayer(bg);
+            if (is_running && !has_human) continue;
+            // A bot just left this type's running match to make room for a waiting human: no top-up until the human has taken the place.
+            if (BotQueueFiller::RoomRecentlyMade(uint32(bg->GetTypeID()), now_ms)) continue;
             // Respect each phase's own cadence:
             // - Prep BGs only on prep_due ticks (every 5s)
             // - Running BGs only on running_due ticks (every 30s)
@@ -4369,13 +4586,13 @@ void BotPopulationManager::TopUpActiveBGs(uint32 now_ms)
             // never overshoots, and once full we naturally skip.
             // PREP used to be online_only: only bots that happened to be online and free filled it. With a 1/10 team and ~117 s of
             // countdown left (live 2026-10-08, 20:23: pool rejects grouped=66 combat=9, nothing queued) the room stayed empty. A prep BG
-            // may JIT-spawn the deficit too, but only once per 45 s per BG: JIT setups take a while to come online and queue, and the
+            // may JIT-spawn the deficit too, but only once per 20 s per BG (was 45 s: a 2 minute prep got two chances, AB 2026-10-11 started 6 v 2): JIT setups take a while to come online and queue, and the
             // filler cannot see setups in flight, so a fresh batch on every 5 s tick would overshoot the team size.
             bool prep_jit_due = false;
             if (is_prep)
             {
                 uint32& last_jit = prep_jit_ms_[bg->GetInstanceID()];
-                if (!last_jit || (now_ms - last_jit) >= 45000u)
+                if (!last_jit || (now_ms - last_jit) >= 20000u)
                 {
                     last_jit = now_ms ? now_ms : 1u;
                     prep_jit_due = true;
@@ -4393,7 +4610,7 @@ void BotPopulationManager::TopUpActiveBGs(uint32 now_ms)
             // had drifted from the actual cap-enforced view.
             uint32 const alli_free_tc  = bg->GetFreeSlotsForTeam(ALLIANCE);
             uint32 const horde_free_tc = bg->GetFreeSlotsForTeam(HORDE);
-            if (alli < max_per_team && alli_free_tc > 0)
+            if (alli < max_per_team && (alli_free_tc > 0 || horde < max_per_team))
             {
                 BotQueueFiller::FillRequest req{};
                 req.kind = BotQueueFiller::QueueKind::Bg;
@@ -4402,8 +4619,8 @@ void BotPopulationManager::TopUpActiveBGs(uint32 now_ms)
                 req.instance_id = uint32(bg->GetTypeID());
                 req.requesting_player = nullptr;
                 req.online_only = !allow_jit;
-                req.max_total_bots = uint8(std::min(uint32(max_per_team - alli),
-                                                     alli_free_tc));
+                req.max_total_bots = uint8(Battleground::TopUpRequest(alli, max_per_team));
+                req.single_faction = true;
                 if (target_level_for_bracket > 0)
                     req.target_level_override = target_level_for_bracket;
                 if (bracket_min > 0 && bracket_max > 0)
@@ -4413,7 +4630,7 @@ void BotPopulationManager::TopUpActiveBGs(uint32 now_ms)
                 }
                 filler.Fill(req);
             }
-            if (horde < max_per_team && horde_free_tc > 0)
+            if (horde < max_per_team && (horde_free_tc > 0 || alli < max_per_team))
             {
                 BotQueueFiller::FillRequest req{};
                 req.kind = BotQueueFiller::QueueKind::Bg;
@@ -4422,8 +4639,8 @@ void BotPopulationManager::TopUpActiveBGs(uint32 now_ms)
                 req.instance_id = uint32(bg->GetTypeID());
                 req.requesting_player = nullptr;
                 req.online_only = !allow_jit;
-                req.max_total_bots = uint8(std::min(uint32(max_per_team - horde),
-                                                     horde_free_tc));
+                req.max_total_bots = uint8(Battleground::TopUpRequest(horde, max_per_team));
+                req.single_faction = true;
                 if (target_level_for_bracket > 0)
                     req.target_level_override = target_level_for_bracket;
                 if (bracket_min > 0 && bracket_max > 0)
@@ -4436,17 +4653,23 @@ void BotPopulationManager::TopUpActiveBGs(uint32 now_ms)
             // Diagnostic: surface the team-balance state alongside the
             // top-up activity so an imbalanced BG is visible in the log.
             TC_LOG_INFO("playerbot.v2",
-                "[BgTopUp] free_slots alli={} horde={} (m_PlayersCount alli={} horde={}, "
-                "invited alli={} horde={})",
-                alli_free_tc, horde_free_tc, alli, horde,
-                bg->GetInvitedCount(ALLIANCE), bg->GetInvitedCount(HORDE));
+                "[BgTopUp] bg_inst={} bg_type={} free_slots alli={} horde={} (m_PlayersCount alli={} horde={}, "
+                "invited alli={} horde={}, waiting in queue alli={} horde={})",
+                bg->GetInstanceID(), uint32(bg->GetTypeID()), alli_free_tc, horde_free_tc, alli, horde,
+                bg->GetInvitedCount(ALLIANCE), bg->GetInvitedCount(HORDE),
+                sBattlegroundMgr->GetBattlegroundQueue(BattlegroundMgr::BGQueueTypeId(uint16(bg->GetTypeID()), BattlegroundQueueIdType::Battleground,
+                    false, 0)).GetQueuedPlayersCount(TEAM_ALLIANCE, BattlegroundBracketId(bracket)),
+                sBattlegroundMgr->GetBattlegroundQueue(BattlegroundMgr::BGQueueTypeId(uint16(bg->GetTypeID()), BattlegroundQueueIdType::Battleground,
+                    false, 0)).GetQueuedPlayersCount(TEAM_HORDE, BattlegroundBracketId(bracket)));
 
             TC_LOG_INFO("playerbot.v2",
-                "[BgTopUp] phase={} bg_type={} bracket={} alli={}/{} horde={}/{} delay={}ms",
-                is_running ? "RUNNING" : "PREP",
+                "[BgTopUp] bg_inst={} phase={} humans={} jit={} bg_type={} bracket={} alli={}/{} horde={}/{} delay={}ms asked alli={} horde={}",
+                bg->GetInstanceID(), is_running ? "RUNNING" : "PREP", has_human ? 1 : 0, allow_jit ? 1 : 0,
                 uint32(bg->GetTypeID()), uint32(bracket),
                 alli, max_per_team, horde, max_per_team,
-                bg->GetStartDelayTime());
+                bg->GetStartDelayTime(),
+                (alli < max_per_team && (alli_free_tc > 0 || horde < max_per_team)) ? Battleground::TopUpRequest(alli, max_per_team) : 0u,
+                (horde < max_per_team && (horde_free_tc > 0 || alli < max_per_team)) ? Battleground::TopUpRequest(horde, max_per_team) : 0u);
         }
     }
 }

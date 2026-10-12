@@ -29,7 +29,7 @@ struct RoutePath { char const* name; std::vector<RoutePoint> pts; };
 #include "BgWaypointData.inc"
 
 // A path that may only be walked first point to last: a jump / roof drop, and the start-room, cave and graveyard exits that the
-// original bots never walk backwards (vPaths_NoReverseAllowed, Karrz's earlier VMaNGOS bot tree (wow-1.12) raid10-revamp bcc8b9f BattleBotWaypoints.cpp).
+// original bots never walk backwards (vPaths_NoReverseAllowed, the ike3-based playerbot code BattleBotWaypoints.cpp).
 // Horde_Cave_to_Tower_Point_Crossroad is in their list but is NOT one-way here: our router also uses it backwards, it is the only
 // link by which a bot from the Alliance half reaches the Horde base (the test below fails when it is made one-way).
 inline bool IsOneWayPath(std::string_view nm)
@@ -52,7 +52,10 @@ inline bool IsOneWayPath(std::string_view nm)
 class Graph
 {
 public:
-    Graph(RoutePath const* paths, size_t count)
+    // junction_xy: recordings of one place that lie within this many yards (and 4 y in height) are the same place. AV needs 3.5: the
+    // Frostwolf graveyard flag was recorded twice 3.15 y apart ((-1081.3,-348.2) and (-1079.6,-345.5)), which cut the whole Horde half
+    // of the map (129 nodes) off from the valley, so no Horde bot had a route to any Alliance objective (av-stuck-2, 2026-10-11).
+    Graph(RoutePath const* paths, size_t count, float junction_xy = 2.5f)
     {
         for (size_t pi = 0; pi < count; ++pi)
         {
@@ -86,7 +89,7 @@ public:
                 RoutePoint const& pa = nodes_[a].p;
                 RoutePoint const& pb = nodes_[b].p;
                 float const dx = pa.x - pb.x, dy = pa.y - pb.y;
-                if (dx * dx + dy * dy <= 2.5f * 2.5f && std::fabs(pa.z - pb.z) <= 4.0f)
+                if (dx * dx + dy * dy <= junction_xy * junction_xy && std::fabs(pa.z - pb.z) <= 4.0f)
                 {
                     AddEdge(int(a), int(b));
                     AddEdge(int(b), int(a));
@@ -207,7 +210,7 @@ inline Graph const* GraphFor(uint16_t bg_type)
 {
     static Graph const wsg(kPathsWsg, sizeof(kPathsWsg) / sizeof(kPathsWsg[0]));
     static Graph const ab(kPathsAb, sizeof(kPathsAb) / sizeof(kPathsAb[0]));
-    static Graph const av(kPathsAv, sizeof(kPathsAv) / sizeof(kPathsAv[0]));
+    static Graph const av(kPathsAv, sizeof(kPathsAv) / sizeof(kPathsAv[0]), 3.5f);
     switch (bg_type)
     {
         case 1: return &av;
@@ -230,7 +233,20 @@ inline bool NextWaypoint(uint16_t bg_type, float bx, float by, float bz, float t
     float db = 0.f, dt = 0.f;
     int const from = g->Nearest(bx, by, bz, db);
     int const to = g->Nearest(tx, ty, tz, dt);
-    if (from < 0 || to < 0 || db > 120.0f || dt > 70.0f) return false;
+    if (from < 0 || to < 0 || dt > 70.0f) return false;
+    if (db > 120.0f)
+    {
+        // Feeder leg (AV 2026-10-11, av-stuck-2: ~20 Horde bots stood at the start (-1438,-610) for the whole match). The recorded
+        // paths start at the Frostwolf base, 295 y away; from the start the plain move to a goal 1300-1500 y off found only a partial
+        // path that went nowhere (move_blocked 20 on idle:bg_order_march). A bot off the graph but within kFeederMax of it walks to the
+        // nearest recorded node first, a goal Detour can path toward; the route takes over from there. AV only: the WSG / AB
+        // recordings already cover their start rooms. Only when that node reaches the goal on the graph.
+        constexpr float kFeederMax = 480.0f;
+        if (bg_type != 1 || db > kFeederMax || (from != to && g->NextToward(from, to, variant) < 0)) return false;
+        RoutePoint const& f = g->Point(from);
+        nx = f.x; ny = f.y; nz = f.z;
+        return true;
+    }
     int cur = from;
     int steps = 0;
     while (steps++ < 64)

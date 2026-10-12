@@ -27,6 +27,8 @@
 #include <string>
 
 #include "WorldLoadFacts.h"
+#include "WorldFactionMix.h"
+#include "PoolBalance.h"
 
 class Player;
 
@@ -73,7 +75,8 @@ private:
         uint32 placed_grace_ms  = 60000;   // a freshly placed bot is not despawned for this long
         uint32 min_level        = 10;      // starter zones have no navmesh: bots below 10 would stand still
         uint32 max_level        = 60;
-        uint32 friendly_pct     = 80;      // share of new bots of the anchor's faction
+        uint32 friendly_pct     = 80;      // share of new bots of the anchor's faction (zones not in the zone mix)
+        FactionMix mix;                    // per-zone share of the anchor's faction: contested zones get enemy bots (WorldFactionMix.h)
         bool   global_fill      = false;   // spread the rest of the MaxBots budget over the whole world, not only near players
         uint32 global_per_tick  = 8;
         bool   filler_hub_only  = true;    // world-wide filler reuses only pool bots saved inside a quest hub / town
@@ -82,6 +85,7 @@ private:
         bool   seed_roster      = false;   // build the sleeping roster up to PoolMax without waiting for a player to arrive
         uint32 seed_in_flight   = 8;       // seeded bots set up at the same time
         uint32 pool_max         = 400;     // ambient characters allowed to exist (online or not)
+        uint32 pool_horde_pct   = 50;      // share of the roster that should be Horde, in every level bracket (PoolBalance.h)
         uint32 skyborne_seed_pct = 5;      // share of the roster seeds that are level 1-9 Skyborne residents of Zephras Isle (Classic 1.60)
     };
 
@@ -158,6 +162,9 @@ private:
     uint32 query_started_ms_ = 0;
     int64  pool_count_ = -1;                        // ambient characters in the DB (-1 = not loaded yet)
     bool   pool_count_inflight_ = false;
+    PoolCounts pool_counts_;                        // the roster by faction and level bracket (levels 10+)
+    bool   pool_counts_inflight_ = false;
+    uint32 pool_counts_ms_ = 0;                     // when the census was last read
 
     // Counters since start, for Report().
     uint32 anchors_ = 0;

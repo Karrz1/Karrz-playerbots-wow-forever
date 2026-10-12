@@ -314,12 +314,59 @@ class TC_GAME_API Battleground
         void RemoveFromBGFreeSlotQueue();                   //this method could delete whole BG instance, if another free is available
         void RemoveFromBGFreeSlotQueueOnShutdown() { m_InBGFreeSlotQueue = false; }
 
-        void DecreaseInvitedCount(Team team)      { (team == ALLIANCE) ? --m_InvitedAlliance : --m_InvitedHorde; }
+        // never below zero: a player who came in without a queue invitation (a bot's direct port, a claimed running match) was never counted,
+        // and his leaving wrapped the counter to 4294967295 (AV 2026-10-11 'invA -1', WSG 'invA -7'), which closed the team for good
+        void DecreaseInvitedCount(Team team)      { uint32& n = (team == ALLIANCE) ? m_InvitedAlliance : m_InvitedHorde; n = AfterLeave(n); }
+        static constexpr uint32 AfterLeave(uint32 invited) { return invited ? invited - 1u : 0u; }
+        // a player who entered without being invited counts as invited from then on (his leaving decrements it)
+        void RaiseInvitedCountTo(Team team, uint32 n) { uint32& c = (team == ALLIANCE) ? m_InvitedAlliance : m_InvitedHorde; if (c < n) c = n; }
         void IncreaseInvitedCount(Team team)      { (team == ALLIANCE) ? ++m_InvitedAlliance : ++m_InvitedHorde; }
 
         uint32 GetInvitedCount(Team team) const   { return (team == ALLIANCE) ? m_InvitedAlliance : m_InvitedHorde; }
         bool HasFreeSlots() const;
         uint32 GetFreeSlotsForTeam(Team team) const;
+        // The level of a bot created on demand for a bracket: always inside [bracketMin, bracketMax] (capped at the realm's top level), spread
+        // over the bracket by `roll`, so a 10-19 queue is filled with level 10-19 bots, a twink queue as full as a level 60 one.
+        // Without a bracket range the fallback level is used.
+        static constexpr uint32 BracketLevelFor(uint32 bracketMin, uint32 bracketMax, uint32 realmCap, uint32 fallback, uint32 roll)
+        {
+            if (bracketMin == 0 || bracketMax < bracketMin) return fallback;
+            uint32 const hi = bracketMax < realmCap ? bracketMax : realmCap;
+            uint32 const lo = bracketMin < hi ? bracketMin : hi;
+            return lo + roll % (hi - lo + 1);
+        }
+        // Where a real player is put when several instances of a battleground are running: the instance with the most real players first,
+        // then the one with the most bots on the player's team (more bots to swap out). Fewer instances, more real players in each.
+        static constexpr bool PlacementBetter(uint32 humansA, uint32 teamBotsA, uint32 humansB, uint32 teamBotsB)
+        {
+            return humansA != humansB ? humansA > humansB : teamBotsA > teamBotsB;
+        }
+        // Order in which live instances of one battleground draw from the queue (more real players first, then the emptiest)
+        static constexpr bool FillsBefore(uint32 humansA, uint32 playersA, uint32 humansB, uint32 playersB)
+        {
+            return humansA != humansB ? humansA > humansB : playersA < playersB;
+        }
+        // The balance gate behind GetFreeSlotsForTeam: how many more of "this" team may join. Players already inside count as invited.
+        static uint32 BalancedFreeSlots(uint32 thisTeamInvitedCount, uint32 otherTeamInvitedCount, uint32 thisTeamPlayersCount, uint32 otherTeamPlayersCount,
+            uint32 maxPlayersPerTeam, uint32 minPlayersPerTeam);
+        // How many bots a running or preparing match asks for per top-up cycle for one team. The balance gate only lets one more join at a
+        // time when the sides are level, but the queue invites both sides in turn, so the whole shortfall is asked for. Nothing is asked
+        // for a team that is full.
+        // Places a team still has when the balance gate is ignored (a real player is waiting): team size minus those inside or invited.
+        static constexpr uint32 PhysicalRoom(uint32 insideOrInvited, uint32 maxPlayersPerTeam)
+        {
+            return insideOrInvited < maxPlayersPerTeam ? maxPlayersPerTeam - insideOrInvited : 0u;
+        }
+        // Bots that must leave so `need` real players fit: the shortfall, plus whatever the team is already over its size.
+        static constexpr uint32 PlacesToMake(uint32 taken, uint32 maxPlayersPerTeam, uint32 need)
+        {
+            return PhysicalRoom(taken, maxPlayersPerTeam) >= need ? 0u
+                 : need - PhysicalRoom(taken, maxPlayersPerTeam) + (taken > maxPlayersPerTeam ? taken - maxPlayersPerTeam : 0u);
+        }
+        static constexpr uint32 TopUpRequest(uint32 thisTeamPlayers, uint32 maxPlayersPerTeam)
+        {
+            return thisTeamPlayers < maxPlayersPerTeam ? maxPlayersPerTeam - thisTeamPlayers : 0u;
+        }
 
         bool isArena() const;
         bool isBattleground() const;
@@ -364,6 +411,9 @@ class TC_GAME_API Battleground
         // (the start doors are closed / the area is indoors). Spell.cpp and the playerbot API both ask this.
         char const* GetMountRefusal(Player const* player) const;
         // The client's indoor test on a WMO group's MOGP flags: interior (0x2000) and not exterior (0x8).
+        // Warsong Gulch's start area is the flag room behind the closed doors (no mounts there before the start). The Arathi Basin and
+        // Alterac Valley start areas are open ground where vanilla lets players mount during the preparation phase.
+        static constexpr bool IsEnclosedStartArea(uint32 mapId) { return mapId == 489; }
         static constexpr bool IsIndoorWmoGroup(uint32 mogpFlags) { return (mogpFlags & 0x2000) != 0 && (mogpFlags & 0x8) == 0; }
         // Why the terrain data says "indoors" at the player's position (wmo group flags, the WMOAreaTable row that applied, the
         // area flags): the evidence for a wrong indoor answer. Diagnostics only; not cheap, call from throttled logs.

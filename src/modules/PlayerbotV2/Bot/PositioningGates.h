@@ -2,7 +2,7 @@
 // Pure positioning decisions for melee-behind stepping, flee-angle memory and dungeon disperse / kite steps.
 //
 // Ideas from the generic layers of two other bot projects, rewritten against our snapshot (no code copied):
-//   * Karrz's VMaNGOS bots (Karrz's earlier VMaNGOS bot tree (wow-1.12), playerbot/values/StanceReposition.cpp, Stances.cpp): the melee "behind" step
+//   * Karrz's VMaNGOS bots (the ike3-based playerbot code, playerbot/values/StanceReposition.cpp, Stances.cpp): the melee "behind" step
 //     fires only for a mob a tank holds, inside a 135 degree front arc, never on the mob's own victim, never on Onyxia.
 //   * AzerothCore mod-playerbots (MovementActions.cpp CheckLastFlee / CombatFormationMoveAction): a flee step that reverses a
 //     recent flee is rejected, and ranged / melee keep 5 / 2 yards from the nearest member.

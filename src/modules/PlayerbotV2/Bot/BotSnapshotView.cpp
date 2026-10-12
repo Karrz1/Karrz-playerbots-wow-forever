@@ -7,6 +7,7 @@
 #include "SpellDefines.h"
 #include "World/WorldMetadata.h"
 #include "CastPacing.h"
+#include "ConjureGate.h"
 #include <algorithm>
 #include <atomic>
 #include <limits>
@@ -65,6 +66,21 @@ AuraEntry const* FindMyAura(std::vector<AuraEntry> const& list, uint32 spell_id,
 }
 
 } // anonymous
+
+int32 BotSnapshotView::mana_cost(uint32 spell_id) const
+{
+    SpellInfo const* si = sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE);
+    if (!si)
+        return 0;
+    int32 cost = 0;
+    for (SpellPowerEntry const* pw : si->PowerCosts)
+    {
+        if (!pw || pw->PowerType != POWER_MANA || pw->RequiredAuraSpellID)
+            continue;
+        cost += V2::ConjureManaCost(pw->ManaCost, pw->PowerCostPct, s_->vitals.base_mana);
+    }
+    return cost;
+}
 
 bool BotSnapshotView::has_reagents(uint32 spell_id) const
 {
@@ -823,6 +839,29 @@ NearbyUnit const* BotSnapshotView::assigned_tank_mob() const
 // 2026-10-10: pickups 25-30 y out moved the melee spot 50 y from the group in four pulls). A taunt does not move the tank and is
 // not leashed. The owner is read from the friend sweep; out of it (or no owner) there is no leash.
 static constexpr float kPickupLeashYd = 25.0f;
+
+// A loose mob nobody was assigned goes to ONE tank: the nearest idle one that this bot's friend sweep shows (a tank busy with a
+// mob of its own is no contender; ties go to the lower guid). Without it every tank without an assignment ran at the same mob and
+// they taunted it back and forth (MC 2026-10-11: [tank_loose] from several tanks on one Firewalker, "claimed by another tank 0").
+static bool OtherTankTakesLoose(BotSnapshot const& s, NearbyUnit const& mob)
+{
+    const float mdx = mob.x - s.position.x, mdy = mob.y - s.position.y;
+    const float mine = mdx * mdx + mdy * mdy;
+    for (NearbyUnit const& f : s.combat.nearby_friends)
+    {
+        if (f.role != Role::Tank || f.hp <= 0 || f.guid == s.guid) continue;
+        bool busy = false;
+        for (NearbyUnit const& e : s.combat.nearby_enemies)
+            if (e.hp > 0 && e.victim == f.guid) { busy = true; break; }
+        if (busy) continue;
+        const float dx = mob.x - f.x, dy = mob.y - f.y;
+        const float theirs = dx * dx + dy * dy;
+        if (theirs < mine || (theirs == mine && f.guid < s.guid))
+            return true;
+    }
+    return false;
+}
+
 static NearbyUnit const* UnclaimedLooseAttacker(BotSnapshot const& s, float range, bool target_reach = false, bool leash = false)
 {
     NearbyUnit const* best = nullptr;
@@ -837,6 +876,7 @@ static NearbyUnit const* UnclaimedLooseAttacker(BotSnapshot const& s, float rang
         if (e.hp <= 0 || e.is_player || e.untargetable || e.is_pacified) continue;
         if (ThreatVictim(e.victim_kind) != ThreatVictim::Member) continue;
         if (s.pve_order.active && s.pve_order.claimed_by_other_tank(e.guid)) continue;
+        if (OtherTankTakesLoose(s, e)) continue;
         if (owner_unit)
         {
             const float ox = e.x - owner_unit->x, oy = e.y - owner_unit->y;

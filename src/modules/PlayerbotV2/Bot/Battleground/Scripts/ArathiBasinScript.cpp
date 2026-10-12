@@ -41,7 +41,7 @@ public:
         // so it was an inert per-tick scan. (The old comment's 180087-180091
         // are legacy type-10 banners, not what spawns live.)
         a.auto_use_go_types = { 42 };
-        // Classic AB (map 529, classic_battleground_arathi_basin.cpp) has
+        // Classic AB (map 529, battleground_arathi_basin.cpp) has
         // the 1.12 banners instead: neutral 180087-180091 (GOOBER), the
         // Alliance/Horde banners 180058/180060 and their contested
         // versions 180059/180061 (BUTTON). Generic types, so by entry. A

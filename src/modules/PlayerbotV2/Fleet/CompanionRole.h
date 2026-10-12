@@ -59,4 +59,14 @@ inline CompanionRoleChoice ChooseCompanionRole(::Playerbot::Role requested, ::Pl
     return c;
 }
 
+// The spec a companion plays: the one stored by `.bot save` when it exists and still fits the role the companion plays now,
+// else the one the role rule picked. saved_role is the role the stored spec belongs to (tank, healer or dps spec of the class).
+// A role changed since the save (a paladin saved Retribution, now asked to heal) goes by the role rule, not the old spec.
+inline uint32 ChooseCompanionSpec(uint32 picked, uint32 saved, ::Playerbot::Role saved_role, ::Playerbot::Role role, bool role_stored)
+{
+    if (!role_stored || saved == 0 || saved_role != role)
+        return picked;
+    return saved;
+}
+
 }  // namespace Playerbot::V2::Fleet

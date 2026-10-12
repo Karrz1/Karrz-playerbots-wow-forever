@@ -18,11 +18,13 @@
 #include "BattlegroundMgr.h"
 #include "Arena.h"
 #include "BattlegroundPackets.h"
+#include "Config.h"
 #include "Containers.h"
 #include "DB2Stores.h"
 #include "DatabaseEnv.h"
 #include "DisableMgr.h"
 #include "GameEventMgr.h"
+#include "GameTime.h"
 #include "GossipDef.h"
 #include "Language.h"
 #include "Log.h"
@@ -41,6 +43,14 @@ bool BattlegroundTemplate::IsArena() const
 
 uint16 BattlegroundTemplate::GetMinPlayersPerTeam() const
 {
+    // Alterac Valley may start with fewer than the client table's minimum (AV 2026-10-11: 36 queued per side never popped); the bots keep
+    // topping the match up to 40 a side while it runs. Playerbot.Bg.Av.MinPlayersPerTeam, 0 = the table's value.
+    if (BattlemasterEntry->ID == BATTLEGROUND_AV)
+    {
+        uint32 const configured = uint32(sConfigMgr->GetIntDefault("Playerbot.Bg.Av.MinPlayersPerTeam", 20));
+        if (configured > 0 && configured < BattlemasterEntry->MinPlayers)
+            return uint16(configured);
+    }
     return BattlemasterEntry->MinPlayers;
 }
 
@@ -206,7 +216,10 @@ void BattlegroundMgr::BuildBattlegroundStatusQueued(WorldPackets::Battleground::
     battlefieldStatus->AsGroup = asGroup;
     battlefieldStatus->SuspendedQueue = false;
     battlefieldStatus->EligibleForMatchmaking = true;
-    battlefieldStatus->WaitTime = GetMSTimeDiffToNow(joinTime);
+    // joinTime is the player's queue join time in unix seconds (Player::AddBattlegroundQueueId): the wait in ms is the difference of two
+    // unix times. Taken as a getMSTime() tick it wrapped to 28 days 23 hours in the client's 'Time In Queue'.
+    time_t const now = GameTime::GetGameTime();
+    battlefieldStatus->WaitTime = (joinTime && time_t(joinTime) <= now) ? uint32(now - time_t(joinTime)) * 1000u : 0u;
 }
 
 void BattlegroundMgr::BuildBattlegroundStatusFailed(WorldPackets::Battleground::BattlefieldStatusFailed* battlefieldStatus, BattlegroundQueueTypeId queueId, Player const* player, uint32 ticketId, GroupJoinBattlegroundResult result, ObjectGuid const* errorGuid /*= nullptr*/)

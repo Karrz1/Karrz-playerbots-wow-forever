@@ -1,6 +1,6 @@
 // RaidEncounters — data-driven raid encounter rules for the bots.
 //
-// Ported from Karrz's raid10-revamp ike3 playerbots (Karrz's earlier VMaNGOS bot tree (wow-1.12),
+// Ported from Karrz's raid10-revamp ike3 playerbots (the ike3-based playerbot code,
 // src/game/PlayerBots/playerbot/strategy/generic/RaidEncounters.h). Forever's
 // raids run the Classic ports of the VMaNGOS scripts (scripts/Custom/Classic),
 // so the creature entries and spell ids carry over unchanged.

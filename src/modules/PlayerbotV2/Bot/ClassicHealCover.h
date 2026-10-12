@@ -22,12 +22,38 @@ inline int64_t HealDeficitOf(int64_t max_hp, int64_t hp, int64_t incoming)
 }
 
 // The heals in flight (`inflight`) cover the deficit times `margin` (a critical patient: at least kHealCriticalCover).
-inline bool CoveredByHealsInFlight(int64_t max_hp, int64_t hp, int64_t incoming, int64_t inflight, int32_t actual_pct, float margin)
+inline bool CoveredByHealsInFlight(int64_t max_hp, int64_t hp, int64_t incoming, int64_t inflight, int32_t actual_pct, float margin, bool in_fight = true)
 {
     if (inflight <= 0 || max_hp <= 0)
         return false;
-    float const need = float(HealDeficitOf(max_hp, hp, incoming)) * (actual_pct < kHealCriticalPct ? std::max(margin, kHealCriticalCover) : margin);
+    // The critical margin is for a fight: heals land after more swings and some miss their moment. With the fight over (a member rezzed
+    // afterwards) the deficit is exact, and three healers started a heal on a rezzed warlock at 14 % (MC Magmadar 2026-10-10: 3984 in
+    // flight for a deficit of about 2700, the third heal was pure mana).
+    bool const critical = actual_pct < kHealCriticalPct && in_fight;
+    float const need = float(HealDeficitOf(max_hp, hp, incoming)) * (critical ? std::max(margin, kHealCriticalCover) : margin);
     return float(inflight) >= need;
+}
+
+// Raid HoTs (Renew, Rejuvenation) on a member who is not a tank: only when the member is really hurt and the heals already on their way
+// do not cover it. Magmadar 2026-10-10: 56 Renews and 27 Rejuvenations in the first minute, most on members at 70-85 % that a single
+// direct heal, or nothing, would have covered. Outside a raid the old 85 % line stays.
+constexpr int32_t kRaidHotMaxPct    = 70;
+constexpr int32_t kPartyHotMaxPct   = 85;
+
+inline bool HotWorthCasting(bool raid, int32_t actual_pct, int64_t deficit, int64_t inflight)
+{
+    if (!raid)
+        return actual_pct <= kPartyHotMaxPct;
+    return actual_pct <= kRaidHotMaxPct && inflight < deficit;
+}
+
+// Power Word: Shield is claimed per patient: Weakened Soul keeps every other priest's shield off for 15 s, but the debuff is only seen
+// after the first shield lands, so several priests started one on the same tank in the same moment (43 shield casts in a minute).
+constexpr uint32_t kShieldClaimMs = 15000;
+
+inline bool ShieldClaimFresh(uint32_t claimed_at_ms, uint32_t now_ms)
+{
+    return claimed_at_ms != 0 && int32_t(now_ms - claimed_at_ms) < int32_t(kShieldClaimMs);
 }
 
 // A warlock's Life Tap is damage he did to himself on purpose: no heal for it until he is under kLifeTapHealCeilingPct, unless something
@@ -43,6 +69,15 @@ inline bool LifeTapSkip(bool is_warlock, bool tank, int32_t actual_pct, int64_t 
 inline bool HealGroupHas(uint16_t mask, uint8_t subgroup)
 {
     return subgroup < 16 && (mask & (1u << subgroup)) != 0;
+}
+
+// A refused cast releases its healer's claim only when that claim is from the same patient and this tick (a claim older than the
+// window is a heal still running, which an unrelated refused cast must not drop).
+constexpr uint32_t kClaimReleaseWindowMs = 1000;
+
+inline bool ClaimReleasable(bool any_patient, bool same_patient, uint32_t claim_start_ms, uint32_t now_ms)
+{
+    return (any_patient || same_patient) && uint32_t(now_ms - claim_start_ms) <= kClaimReleaseWindowMs;
 }
 
 }  // namespace Playerbot::Combat::ClassicHeal

@@ -1719,6 +1719,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
     // ---- Vitals ----
     snap->vitals.hp     = static_cast<int32>(p->GetHealth());
     snap->vitals.max_hp = static_cast<int32>(p->GetMaxHealth());
+    snap->vitals.base_mana = static_cast<int32>(p->GetCreateMana());
 
     // Power per type — bots may swap forms / shapeshift, so we mirror every
     // power slot the array can hold (POWER_MANA=0 through POWER_RUNE_UNHOLY=22).
@@ -2033,6 +2034,18 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 }
             }
             snap->travel.best_mount_spell = best_sid;
+            // [mount_pick] (Karrz, AV 2026-10-11: are the 60s on the 100% mount?). One line when the pick changes: the mount, the riding
+            // skill, and whether the bot holds the two mount-speed passives (86457 = 60%, 86458 = 100%) and its race's epic mount.
+            if (mt_ai && best_sid != mt_ai->cached_best_mount_spell() && p->GetLevel() >= 40)
+            {
+                uint32 race_normal = 0, race_swift = 0;
+                ::Playerbot::API::RaceMountSpells(p->GetRace(), race_normal, race_swift);
+                static uint32 s_pick_logged = 0;
+                if (s_pick_logged++ < 600)
+                    TC_LOG_INFO("playerbot.v2", "[mount_pick] {} L{} riding={} picked={} race_swift={} knows_swift={} passive60={} passive100={}",
+                                p->GetName(), uint32(p->GetLevel()), uint32(snap->travel.riding_skill), best_sid, race_swift,
+                                race_swift && p->HasSpell(race_swift), p->HasSpell(86457), p->HasSpell(86458));
+            }
             if (mt_ai)
             {
                 mt_ai->set_cached_best_mount_spell(best_sid);
@@ -2111,6 +2124,8 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
     // Silence is aura-driven; check the SILENCED unit-flag (Unit.h).
     snap->vitals.is_stunned  = p->HasUnitState(UNIT_STATE_STUNNED);
     snap->vitals.is_rooted   = p->HasUnitState(UNIT_STATE_ROOT);
+    snap->vitals.is_feared   = p->HasUnitState(UNIT_STATE_FLEEING);
+    snap->vitals.is_confused = p->HasUnitState(UNIT_STATE_CONFUSED);
     snap->vitals.is_silenced = p->HasAuraType(SPELL_AURA_MOD_SILENCE);
     snap->vitals.is_pvp       = p->IsPvP();
     snap->vitals.is_ffa_pvp   = p->IsFFAPvP();
@@ -3781,7 +3796,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         snap->cast.last_cast_spell_id = lc_ai->last_cast_spell_id();
 
     // ---- Threat discipline context ----
-    // Port of Karrz's group threat rules (wow-1.12 MCRaidHoldDamage /
+    // Port of Karrz's group threat rules (ike3-based bots MCRaidHoldDamage /
     // LooseAttackersTrigger). Resolve the group's live same-map members and
     // tanks once, then stamp every attacker / nearby enemy below with the
     // bot's threat, the best tank threat and who the mob is hitting, read
@@ -4024,7 +4039,11 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         // harbor) can neither jam a pull gate nor mis-fire AoE/panic. The raw
         // attackers vector keeps EVERY entry (the (0c) all-untargetable wedge
         // test + the ghost-heal both still need the untargetable records).
-        if (!u.untargetable && !u.is_pacified && u.hp > 0)
+        // A boss is pacified for the length of one of its own spells (Geddon's Inferno): still the fight, not a prop.
+        bool boss_pause = false;
+        if (Creature const* bc = a->ToCreature())
+            boss_pause = bc->IsDungeonBoss() || bc->isWorldBoss() || bc->GetCreatureClassification() == CreatureClassifications::Obsolete;
+        if (!u.untargetable && (!u.is_pacified || boss_pause) && u.hp > 0)
             ++snap->combat.fightable_attackers;
         fill_threat(u, a);
         snap->combat.attackers.push_back(u);
@@ -9135,7 +9154,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             }
             else if (bgMapId == 529)
             {
-                // Classic AB (classic_battleground_arathi_basin.cpp): the
+                // Classic AB (battleground_arathi_basin.cpp): the
                 // 1.12 banners are BUTTON/GOOBER objects with no worldState1.
                 // The map script keeps 1.12's per-node worldstates, each an
                 // exclusive 0/1: base = Alliance holds, +1 Horde holds,

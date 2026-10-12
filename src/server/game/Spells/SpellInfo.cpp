@@ -543,6 +543,7 @@ SpellEffectValue SpellEffectInfo::CalcValue(WorldObject const* caster /*= nullpt
     {
         basePointsPerLevel = vanilla->PointsPerLevel;
         scalingVariance = ClassicSpellValue::Variance(*vanilla);
+        comboDamage = vanilla->PointsPerCombo;      // vanilla points per combo point (the client's PointsPerResource differs for part of the finishers)
     }
 
     Unit const* casterUnit = nullptr;
@@ -595,9 +596,15 @@ SpellEffectValue SpellEffectInfo::CalcValue(WorldObject const* caster /*= nullpt
     }
     else if (vanilla || GetScalingExpectedStat() == ExpectedStatType::None || UsesClassicFlatBasePoints(caster))
     {
-        if (casterUnit && basePointsPerLevel != 0.0)
+        // Classic 1.60 (vanilla): spells cast by a player's object (hunter traps: Explosive Trap, Immolation Trap) scale with the
+        // owner's level
+        Unit const* levelUnit = casterUnit;
+        if (!levelUnit && caster && caster->IsGameObject())
+            levelUnit = caster->GetOwner();
+
+        if (levelUnit && basePointsPerLevel != 0.0)
         {
-            int32 level = int32(casterUnit->GetLevel());
+            int32 level = int32(levelUnit->GetLevel());
             if (level > int32(_spellInfo->MaxLevel) && _spellInfo->MaxLevel > 0)
                 level = int32(_spellInfo->MaxLevel);
 
@@ -1376,6 +1383,8 @@ static std::unordered_map<uint32, uint32> const ClassicSealJudgements =
     { 20166, 20186 }, { 20356, 20354 }, { 20357, 20355 },                           // Seal of Wisdom
     { 20375, 20425 }, { 20915, 20962 }, { 20918, 20961 }, { 20919, 20967 }, { 20920, 20968 }, // Seal of Command
     { 407798, 407803 },                                                             // Seal of Martyrdom
+    { 1311649, 1311650 }, { 1311656, 1311655 }, { 20163, 20183 }, { 20419, 20411 }, // Seal of Fury (Forever, effect 2 names the judgement)
+    { 20421, 20412 }, { 20422, 20413 }, { 20423, 20414 },
 };
 
 bool IsClassicPaladinSeal(uint32 spellId)
@@ -3093,6 +3102,74 @@ void SpellInfo::_LoadSpellDiminishInfo()
         if (HasAura(SPELL_AURA_MOD_TAUNT))
             return DIMINISHING_TAUNT;
 
+        // Classic 1.60 (vanilla, VMaNGOS SpellEntry::GetDiminishingReturnsGroup): a few explicit spells, everything else by mechanic
+        switch (Id)
+        {
+            case 408: case 8643:                                        // Kidney Shot
+                return DIMINISHING_KIDNEY_SHOT;
+            case 2094:                                                  // Blind
+                return DIMINISHING_NONE;
+            case 3355: case 14308: case 14309:                          // Freezing Trap Effect
+                return DIMINISHING_FREEZE;
+            case 5782: case 6213: case 6215:                            // Fear
+            case 5484: case 17928:                                      // Howl of Terror
+            case 6358:                                                  // Seduction
+                return DIMINISHING_WARLOCK_FEAR;
+            case 1715: case 7372: case 7373:                            // Hamstring: duration limit only
+                return DIMINISHING_LIMITONLY;
+            case 8056: case 8058: case 10472: case 10473:               // Frost Shock: counts as a root
+                return DIMINISHING_ROOT;
+            case 7922:                                                  // Charge Stun
+            case 20253: case 20614: case 20615:                         // Intercept Stun
+                return DIMINISHING_STUN;
+            case 12355:                                                 // Impact
+            case 18093:                                                 // Pyroclasm
+            case 5530:                                                  // Mace Stun Effect
+            case 12798:                                                 // Revenge Stun
+            case 19410:                                                 // Improved Concussive Shot
+            case 15269:                                                 // Blackout
+            case 16922:                                                 // Starfire Stun
+            case 15283:                                                 // Stunning Blow (weapon proc)
+            case 56:                                                    // Stun (weapon proc)
+                return DIMINISHING_TRIGGER_STUN;
+            case 12494:                                                 // Frostbite
+            case 23694:                                                 // Improved Hamstring
+            case 19229:                                                 // Improved Wing Clip
+            case 19185:                                                 // Entrapment
+                return DIMINISHING_TRIGGER_ROOT;
+            default:
+                break;
+        }
+
+        uint64 const mechanics = GetAllEffectsMechanicMask() | (Mechanic ? (UI64LIT(1) << Mechanic) : UI64LIT(0));
+        auto has = [mechanics](Mechanics m) { return (mechanics & (UI64LIT(1) << m)) != 0; };
+        if (has(MECHANIC_STUN))
+            return DIMINISHING_STUN;
+        if (has(MECHANIC_SLEEP))
+            return DIMINISHING_SLEEP;
+        if (has(MECHANIC_POLYMORPH))
+            return DIMINISHING_POLYMORPH;
+        if (has(MECHANIC_ROOT))
+            return DIMINISHING_ROOT;
+        if (has(MECHANIC_FEAR))
+            return DIMINISHING_FEAR;
+        if (has(MECHANIC_CHARM))
+            return DIMINISHING_CHARM;
+        if (has(MECHANIC_SILENCE))
+            return DIMINISHING_SILENCE;
+        if (has(MECHANIC_DISARM))
+            return DIMINISHING_DISARM;
+        if (has(MECHANIC_FREEZE))
+            return DIMINISHING_FREEZE;
+        if (has(MECHANIC_KNOCKOUT) || has(MECHANIC_SAPPED))
+            return DIMINISHING_KNOCKOUT;
+        if (has(MECHANIC_BANISH))
+            return DIMINISHING_BANISH;
+        if (has(MECHANIC_HORROR))
+            return DIMINISHING_HORROR;
+        return DIMINISHING_NONE;
+
+        // retail TrinityCore groups (not used in Classic)
         switch (Id)
         {
             case 20549:     // War Stomp (Racial - Tauren)
@@ -3467,6 +3544,8 @@ void SpellInfo::_LoadSpellDiminishInfo()
         {
             case DIMINISHING_TAUNT:
             case DIMINISHING_STUN:
+            case DIMINISHING_TRIGGER_STUN:              // Classic 1.60 (vanilla): every stun group also diminishes on creatures
+            case DIMINISHING_KIDNEY_SHOT:
                 return DRTYPE_ALL;
             case DIMINISHING_LIMITONLY:
             case DIMINISHING_NONE:
@@ -3491,6 +3570,10 @@ void SpellInfo::_LoadSpellDiminishInfo()
 
     auto diminishingLimitDurationCompute = [this]() -> int32
     {
+        // Classic 1.60 (vanilla, VMaNGOS): no PvP duration cap, only the diminishing steps
+        if (Id)
+            return 0;
+
         // Explicit diminishing duration
         switch (SpellFamilyName)
         {
@@ -4146,6 +4229,10 @@ Optional<SpellPowerCost> SpellInfo::CalcPowerCost(SpellPowerEntry const* power, 
     if (power->RequiredAuraSpellID && !unitCaster->HasAura(power->RequiredAuraSpellID))
         return {};
 
+    // Classic 1.60 Legacy perk The Quick and the Dead 1225500: helpful spells and abilities cost no resources after being resurrected
+    if (Player const* player = unitCaster->ToPlayer(); player && IsPositive() && player->HasClassicFreeHelpfulSpells())
+        return {};
+
     // Spell drain all exist power on cast (Only paladin lay of Hands)
     if (HasAttribute(SPELL_ATTR1_USE_ALL_MANA))
     {
@@ -4169,8 +4256,17 @@ Optional<SpellPowerCost> SpellInfo::CalcPowerCost(SpellPowerEntry const* power, 
     if (!optionalCost)
     {
         powerCost = power->ManaCost;
+        // Classic 1.60: the vanilla mana cost of a legacy spell (classic_spell_cost: flat plus percent of the base mana) replaces the
+        // client's; the cost modifiers below (talents, auras) still apply to it
+        bool usesVanillaCost = false;
+        if (power->PowerType == POWER_MANA && ClassicSpellValue::AppliesToSpell(Id))
+            if (ClassicSpellValue::Cost const* vanillaCost = sSpellMgr->GetClassicSpellCost(Id))
+            {
+                powerCost = ClassicSpellValue::ManaCost(*vanillaCost, int32(unitCaster->GetCreateMana()));
+                usesVanillaCost = true;
+            }
         // PCT cost from total amount
-        if (power->PowerCostPct)
+        if (power->PowerCostPct && !usesVanillaCost)
         {
             switch (power->PowerType)
             {

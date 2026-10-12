@@ -1,4 +1,4 @@
-# Karrz's Player Bots (folder `ForeverBots`)
+# WoW Forever Bots (folder `ForeverBots`)
 
 A small Classic 1.60 addon with buttons for the server's `.bot` commands. It only sends ordinary chat, so it
 does not depend on the addon-message protocol PlayerbotControl uses.

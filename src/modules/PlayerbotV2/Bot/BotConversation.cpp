@@ -229,6 +229,11 @@ ConvIntent ConvClassify(std::string const& norm, std::string* slot)
         (you || HasAny(norm, { "job", "bot", "player" })))
         return ConvIntent::Compliment;
 
+    // A short line that opens with a greeting ("hi", "hey Aron", "hello there"); a longer line is something else.
+    if (std::count(norm.begin(), norm.end(), ' ') < 3 &&
+        HasAny(norm, { "hi", "hey", "hello", "heya", "hiya", "howdy", "yo", "sup", "hallo", "moin", "hola", "bonjour", "morning" }))
+        return ConvIntent::Greeting;
+
     return ConvIntent::Unknown;
 }
 
@@ -324,6 +329,10 @@ Pools const& PoolsFor(ConvIntent intent, bool variant)
         { "bye", "later", "cya" },
         { "cya", "bye!", "see you around", "later" },
         { "bye, take care :)", "see you around!", "have a good one, bye!" } };
+    static Pools const greet_known = {
+        { "yo", "hey", "sup {sender}" },
+        { "hey {sender}", "hi {sender}!", "hey, what's up?", "hello {sender}" },
+        { "hi {sender}! good to see you :)", "hey {sender}, ready when you are", "hello {sender}, how can i help?" } };
     static Pools const dir_here = {
         { "this is it", "you're here", "here" },
         { "that's where i am right now", "you're already close, im here too" },
@@ -349,6 +358,7 @@ Pools const& PoolsFor(ConvIntent intent, bool variant)
         case ConvIntent::Insult: return insult;
         case ConvIntent::Compliment: return compliment;
         case ConvIntent::Goodbye: return bye;
+        case ConvIntent::Greeting: return greet_known;
         case ConvIntent::Directions: return variant ? dir_here : dir;
         default: break;
     }
@@ -475,6 +485,7 @@ char const* ConvIntentName(ConvIntent intent)
         case ConvIntent::Insult: return "insult";
         case ConvIntent::Compliment: return "compliment";
         case ConvIntent::Goodbye: return "goodbye";
+        case ConvIntent::Greeting: return "greeting";
         case ConvIntent::Unknown: break;
     }
     return "unknown";
@@ -524,6 +535,10 @@ bool ConvReply(ConversationContext const& ctx, std::string const& norm, std::str
         }
         return false;
     }
+
+    // A stranger's hello keeps the caller's own pools (ike3 "hi %s, do i know you?"); only someone the bot knows is greeted here.
+    if (intent == ConvIntent::Greeting && !ctx.knows_sender)
+        return false;
 
     // Mix the per-bot seed in so two bots asked the same thing do not answer alike.
     uint32_t const s = Mix(sel, ctx.bot_seed);

@@ -5,6 +5,7 @@
 #include "../BotAI.h"
 #include "../BotIntentEmitter.h"
 #include "../BotSnapshotView.h"
+#include "../ClassicUpkeep.h"
 #include "../IdleRule.h"
 
 #include <algorithm>
@@ -102,6 +103,8 @@ bool DispatchRaidOrder(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em
         }
         if (emit.cast(o.cast_spell, o.cast_target))
         {
+            if (o.cast_kind == RaidOrder::CastKind::Dispel && Classic::IsCurseDispelSpell(o.cast_spell))
+                Classic::NoteRaidSupport(Classic::RaidSupportKind::Decurse, s.map_id());
             ai.set_last_rule_fired(CastRuleName(o.cast_kind));
             return true;
         }

@@ -54,6 +54,7 @@
 #include "SpellAuras.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "StringFormat.h"
 #include "Transport.h"
 #include "Util.h"
 #include "Vignette.h"
@@ -972,6 +973,11 @@ void GameObject::AddToWorld()
         if (m_spawnId)
             GetMap()->GetGameObjectBySpawnIdStore().insert(std::make_pair(m_spawnId, this));
 
+        // Instance.AhnQirajGatesOpen: the Gate of Ahn'Qiraj stands open without the war effort and the Scarab Gong
+        // (176146 Doodad_Ahn_Qiraj_DoorPlug01, 176149 Gate of Ahn'Qiraj2)
+        if ((GetEntry() == 176146 || GetEntry() == 176149) && sWorld->getBoolConfig(CONFIG_AQ_GATES_OPEN))
+            SetGoState(GO_STATE_ACTIVE);
+
         // The state can be changed after GameObject::Create but before GameObject::AddToWorld
         bool toggledState = GetGoType() == GAMEOBJECT_TYPE_CHEST ? getLootState() == GO_READY : (GetGoState() == GO_STATE_READY || IsTransport());
         if (m_model)
@@ -1683,7 +1689,24 @@ void GameObject::Update(uint32 diff)
                         if (goInfo->trap.spell && goInfo->trap.playerCast)
                             target->CastSpell(target, goInfo->trap.spell, CastSpellExtraArgs(TRIGGERED_FULL_MASK));
                         else if (goInfo->trap.spell)
-                            CastSpell(target, goInfo->trap.spell, args);
+                        {
+                            SpellCastResult trapResult = CastSpell(target, goInfo->trap.spell, args);
+                            // Diagnostic [trap_cast]: a failed cast despawns the trap with no visible effect (hunter Explosive Trap report)
+                            if (SpellInfo const* trapSpellInfo = sSpellMgr->GetSpellInfo(goInfo->trap.spell, GetMap()->GetDifficultyID()))
+                            {
+                                std::string effects;
+                                for (SpellEffectInfo const& effectInfo : trapSpellInfo->GetEffects())
+                                    if (effectInfo.IsEffect())
+                                        effects += Trinity::StringFormat(" [eff{} effect={} aura={} targetA={} targetB={} radiusA={:.1f} radiusB={:.1f}]",
+                                            uint32(effectInfo.EffectIndex), uint32(effectInfo.Effect), uint32(effectInfo.ApplyAuraName),
+                                            uint32(effectInfo.TargetA.GetTarget()), uint32(effectInfo.TargetB.GetTarget()),
+                                            effectInfo.CalcRadius(this, SpellTargetIndex::TargetA).Max, effectInfo.CalcRadius(this, SpellTargetIndex::TargetB).Max);
+                                TC_LOG_INFO("playerbot.v2", "[trap_cast] trap {} spell {} result {} target {} owner {} goRadius {}{}",
+                                    GetEntry(), goInfo->trap.spell, uint32(trapResult), target->GetGUID(), GetOwnerGUID(), goInfo->trap.radius, effects);
+                            }
+                            else
+                                TC_LOG_INFO("playerbot.v2", "[trap_cast] trap {} spell {} result {} (no SpellInfo)", GetEntry(), goInfo->trap.spell, uint32(trapResult));
+                        }
 
                         // Template value or 4 seconds
                         m_cooldownTime = GameTime::GetGameTimeMS() + (goInfo->trap.cooldown ? goInfo->trap.cooldown : uint32(4)) * IN_MILLISECONDS;
@@ -1915,6 +1938,20 @@ Loot* GameObject::GetFishLoot(Player* lootOwner)
 
     if (fishLoot->isLooted())
         fishLoot->FillLoot(defaultzone, LootTemplates_Fishing, lootOwner, true, true, LOOT_MODE_DEFAULT, itemContext);
+
+    // Classic 1.60 Legacy perk Luremaster 1225455: while fishing with a lure active (temporary enchantment on the fishing pole),
+    // a chance to catch an extra fish
+    if (int32 extraFishChance = lootOwner->GetClassicLegacyPerkAmount(1225455, EFFECT_0); extraFishChance > 0 && !fishLoot->items.empty())
+    {
+        Item const* pole = lootOwner->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+        if (pole && pole->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT) && roll_chance(extraFishChance))
+        {
+            LootItem& fish = fishLoot->items.front();
+            ItemTemplate const* fishTemplate = sObjectMgr->GetItemTemplate(fish.itemid);
+            if (fish.type == LootItemType::Item && fishTemplate && fish.count < fishTemplate->GetMaxStackSize())
+                ++fish.count;
+        }
+    }
 
     return fishLoot;
 }
@@ -3043,31 +3080,28 @@ void GameObject::Use(Unit* user, bool ignoreCastInProgress /*= false*/)
                     ContentTuningEntry const* areaContentTuning = DB2Manager::GetContentTuningForArea(areaEntry);
                     int32 fishingExpansion = areaContentTuning ? areaContentTuning->ExpansionID : 0;
 
-                    player->UpdateFishingSkill(fishingExpansion);
-
                     // Send loot
                     int32 areaFishingLevel = sObjectMgr->GetFishingBaseSkillLevel(areaEntry);
 
                     uint32 playerFishingSkill = player->GetProfessionSkillForExp(SKILL_FISHING, fishingExpansion);
                     int32 playerFishingLevel = player->GetSkillValue(playerFishingSkill);
 
+                    // Classic 1.60 (vanilla, VMaNGOS): catch only with at least the zone skill, then (skill - zone skill + 5)%;
+                    // a fishing pool does not save a failed cast and a failed cast loses the fish (no junk); skill only rises
+                    // on a catch (Player::UpdateFishingSkill)
                     int32 roll = irand(1, 100);
-                    int32 chance = 100;
-                    if (playerFishingLevel < areaFishingLevel)
-                    {
-                        chance = int32(pow((double)playerFishingLevel / areaFishingLevel, 2) * 100);
-                        if (chance < 1)
-                            chance = 1;
-                    }
+                    int32 chance = playerFishingLevel - areaFishingLevel + 5;
+                    bool caught = playerFishingLevel >= areaFishingLevel && chance >= roll;
 
                     TC_LOG_DEBUG("misc", "Fishing check (skill {} level: {} area skill level: {} chance {} roll: {}", playerFishingSkill, playerFishingLevel, areaFishingLevel, chance, roll);
 
                     /// @todo find reasonable value for fishing hole search
-                    GameObject* fishingPool = LookupFishingHoleAround(20.0f + CONTACT_DISTANCE);
+                    GameObject* fishingPool = caught ? LookupFishingHoleAround(20.0f + CONTACT_DISTANCE) : nullptr;
 
-                    // If fishing skill is high enough, or if fishing on a pool, send correct loot.
-                    // Fishing pools have no skill requirement as of patch 3.3.0 (undocumented change).
-                    if (chance >= roll || fishingPool)
+                    if (caught)
+                        player->UpdateFishingSkill(fishingExpansion);
+
+                    if (caught)
                     {
                         /// @todo I do not understand this hack. Need some explanation.
                         // prevent removing GO at spell cancel
@@ -3086,10 +3120,10 @@ void GameObject::Use(Unit* user, bool ignoreCastInProgress /*= false*/)
                             player->SendLoot(*m_loot);
                         }
                     }
-                    else // If fishing skill is too low, send junk loot.
+                    else // vanilla: the fish escaped
                     {
-                        m_loot.reset(GetFishLootJunk(player));
-                        player->SendLoot(*m_loot);
+                        SetLootState(GO_JUST_DEACTIVATED);
+                        player->SendDirectMessage(WorldPackets::GameObject::FishEscaped().Write());
                     }
                     break;
                 }

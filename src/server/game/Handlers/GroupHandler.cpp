@@ -64,8 +64,19 @@ void WorldSession::SendPartyResult(PartyOperation operation, const std::string& 
 void WorldSession::HandlePartyInviteOpcode(WorldPackets::Party::PartyInviteClient& packet)
 {
     Player* invitingPlayer = GetPlayer();
-    Player* invitedPlayer = ObjectAccessor::FindPlayerByName(packet.TargetName);
-    PROBE_LOG("[invite_probe] {} invites '{}': {}", invitingPlayer ? invitingPlayer->GetName() : "?", packet.TargetName,
+    // The unit menu / portrait Invite can send the target by guid (empty name) or as "Name-Realm"; typed /invite sends the plain name.
+    Player* invitedPlayer = nullptr;
+    if (!packet.TargetGUID.IsEmpty() && packet.TargetGUID.IsPlayer())
+        invitedPlayer = ObjectAccessor::FindConnectedPlayer(packet.TargetGUID);
+    if (!invitedPlayer && !packet.TargetName.empty())
+    {
+        invitedPlayer = ObjectAccessor::FindPlayerByName(packet.TargetName);
+        if (!invitedPlayer)
+            if (size_t const dash = packet.TargetName.find('-'); dash != std::string::npos && dash > 0)
+                invitedPlayer = ObjectAccessor::FindPlayerByName(std::string_view(packet.TargetName).substr(0, dash));
+    }
+    PROBE_LOG("[invite_probe] {} invites name '{}' realm '{}' guid {}: {}", invitingPlayer ? invitingPlayer->GetName() : "?", packet.TargetName,
+                packet.TargetRealm, packet.TargetGUID.ToString(),
                 invitedPlayer ? (invitedPlayer->GetSession()->IsBot() ? "found, a bot" : "found, a player") : "NOT FOUND");
 
     // no player
@@ -611,6 +622,7 @@ void WorldSession::HandleRequestPartyMemberStatsOpcode(WorldPackets::Party::Requ
 void WorldSession::HandleRequestRaidInfoOpcode(WorldPackets::Party::RequestRaidInfo& /*packet*/)
 {
     // every time the player checks the character screen
+    TC_LOG_INFO("instance.lock", "[raid_info] client requested raid info ({})", _player->GetName());
     _player->SendRaidInfo();
 }
 

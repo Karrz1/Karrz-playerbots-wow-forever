@@ -686,6 +686,8 @@ void WorldSession::SendListInventory(ObjectGuid vendorGuid)
             if (float priceMod = _player->GetTotalAuraModifier(SPELL_AURA_MOD_VENDOR_ITEMS_PRICES))
                 price -= CalculatePct(price, priceMod);
 
+            price = _player->ApplyClassicLegacyPriceMod(price, 0);   // Legacy perk Bartering
+
             if (basePrice > 0)
                 price = std::max(uint64(1), price);
 

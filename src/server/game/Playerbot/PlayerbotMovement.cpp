@@ -423,7 +423,13 @@ bool SafeNearTeleport(Player* p, float x, float y, float z, float o, bool navmes
         ZLiquidStatus const st = p->GetMap()->GetLiquidStatus(
             p->GetPhaseShift(), px, py, pz,
             map_liquidHeaderTypeFlags::Magma | map_liquidHeaderTypeFlags::Slime, &ld);
-        return (st & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER)) != 0;
+        // A point ON the surface reads WATER_WALK (delta > -0.1) and one just above it ABOVE_WATER, and the bot falls in at
+        // once: the Molten Core entrance snap lands exactly on the lava surface (z 168.5, ground 165.2), so only IN / UNDER
+        // let Cornelia and Cassanny die there on arrival (2026-10-11, killer=self). Anything within a yard of the surface
+        // or below it is harmful; a bridge or ledge high above the lake is not.
+        if (st & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER))
+            return true;
+        return (st & (LIQUID_MAP_WATER_WALK | LIQUID_MAP_ABOVE_WATER)) != 0 && pz - ld.level < 1.0f;
     };
     if (inHarmfulLiquid(x, y, z))
     {

@@ -1022,9 +1022,9 @@ SkipCinematics = 0
 #        Description: Maximum level that can be reached by players.
 #        Important:   Levels beyond 110 are not recommended at all.
 #        Range:       1-255
-#        Default:     90
+#        Default:     60 (Classic 1.60 level cap)
 
-MaxPlayerLevel = 90
+MaxPlayerLevel = 60
 
 #
 #    MinDualSpecLevel
@@ -1207,6 +1207,26 @@ Instance.BindOnEntry = 0
 Instance.PersistRaidTrash = 0
 
 #
+#    Instance.IgnoreAttunement
+#        Description: Optional server-owner option. The attunement item and quest of an instance
+#                     (access_requirement item / quest columns: Molten Core, Onyxia, Blackwing Lair,
+#                     Naxxramas ...) are not required to enter. Level limits are Instance.IgnoreLevel.
+#        Default:     0 - (Disabled, Blizzlike)
+#                     1 - (Enabled)
+
+Instance.IgnoreAttunement = 0
+
+#
+#    Instance.AhnQirajGatesOpen
+#        Description: Optional server-owner option. The Gate of Ahn'Qiraj (door plug 176146 and gate
+#                     176149) stands open, so neither the war effort nor ringing the Scarab Gong is
+#                     needed to reach the two Ahn'Qiraj instances.
+#        Default:     0 - (Disabled, Blizzlike)
+#                     1 - (Enabled)
+
+Instance.AhnQirajGatesOpen = 0
+
+#
 #    Instance.MoltenCoreHoundsLinked
 #        Description: Molten Core Core Hounds as in 1.12: a hound that would die feigns death at 1 hp
 #                     and rises again at full health after 10 seconds unless every hound of the pack
@@ -1223,10 +1243,10 @@ Instance.MoltenCoreHoundsLinked = 0
 #                     (no Aqual Quintessence needed), Majordomo Executus stands in his hall, and
 #                     Ragnaros is in his lair ready to fight. A boss that is already killed in the
 #                     instance (raid lock) stays dead.
-#        Default:     1 - (Enabled)
-#                     0 - (Disabled, the 1.12 way: douse the runes, kill Majordomo, summon Ragnaros)
+#        Default:     0 - (Disabled, the 1.12 way: douse the runes, kill Majordomo, summon Ragnaros)
+#                     1 - (Enabled, optional shortcut for private servers)
 
-Instance.MoltenCoreSkipRunes = 1
+Instance.MoltenCoreSkipRunes = 0
 
 #
 #    Instance.CombatResurrectionLimit
@@ -4607,6 +4627,7 @@ Load.Locales = 1
 #    Recap.Enable
 #        Description: Record the last seconds around players and let anyone watch a death again
 #                     (".recap <number>", or click [Recap] with the ForeverRecap addon).
+#                     Hardcore realms only: ignored unless Classic.Hardcore = 1.
 #        Default:     1 - (Enabled)
 #                     0 - (Disabled)
 
@@ -4654,24 +4675,14 @@ Recap.Announce = 3
 
 Classic.GuildFinder = 0
 
-#
-#    Classic.ArmorFormula
-#        Description: Vanilla (1.12) physical damage reduction of armor: armor / (armor + 400 + 85 * attacker level),
-#                     at most 75%. 0 keeps the retail formula (expected-stat armor constant, at most 85%).
-#        Default:     0 - (Disabled)
-#                     1 - (Enabled)
+#    Classic.SharedEncounterLoot
+#        Description: Bosses (dungeon encounters) drop their whole loot table on one shared corpse under the group's
+#                     loot rules, like vanilla (Molten Core: 2-3 epics per boss). Off: retail personal loot, where each
+#                     table roll goes to one random player.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
 
-Classic.ArmorFormula = 0
-
-#
-#    Classic.FiveSecondRule
-#        Description: Vanilla five second rule for mana: spirit regeneration stops for 5 seconds after a mana spell is paid
-#                     (only the Meditation / Mage Armor style share keeps running), then runs at the full rate in or out of
-#                     combat. 0 keeps the retail behaviour.
-#        Default:     0 - (Disabled)
-#                     1 - (Enabled)
-
-Classic.FiveSecondRule = 0
+Classic.SharedEncounterLoot = 1
 
 #    Classic.ClientMainGroupInsertIndex
 #        Description: Client 70291+: 70291 index (decimal) of the message added to the main client group; the client messages

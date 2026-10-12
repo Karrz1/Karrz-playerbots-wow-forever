@@ -1,7 +1,7 @@
 -- Migration: 0019_bot_texts
 -- Date:    2026-10-05
 -- Purpose: The bots' speech, carried over from Karrz's ike3 playerbot build
---          (wow-1.12 src/game/PlayerBots/sql/world/ai_playerbot_texts.sql). Loaded once at startup by
+--          (ike3-based bots src/game/PlayerBots/sql/world/ai_playerbot_texts.sql). Loaded once at startup by
 --          Bot/BotTextMgr.cpp, which picks a random line per key and fills its placeholders.
 --
 --          playerbot_v2_bot_text

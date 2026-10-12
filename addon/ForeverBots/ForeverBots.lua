@@ -1,8 +1,8 @@
 --[[
 ForeverBots: buttons for the server's .bot commands (Classic 1.60 client).
 
-Everything goes through ordinary chat commands (".bot add priest healer", "follow", ...), so the addon needs no
-addon-message protocol and keeps working whatever the server's addon channel does. The server answers in the chat
+Commands go through ordinary chat (".bot add priest healer", ...); group orders ("follow", ...) go as addon messages
+under one prefix, with the party/raid chat line as the out-of-combat fallback. The server answers in the chat
 frame as it does for typed commands.
 
 /fb (or /foreverbots) toggles the window. /fb add <class> [tank|healer|dps] adds one bot without opening it.
@@ -42,7 +42,7 @@ local CLASSES = {
 local ROLE_LABEL = { tank = "Tank", healer = "Heal", dps = "DPS" }
 
 local function Print(msg)
-    DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffKarrz's Player Bots|r: " .. msg)
+    DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffWoW Forever Bots|r: " .. msg)
 end
 
 -- Diagnostic output that nobody asked for (group roster, battleground hints) goes through Debug: silent unless "/fb debug on",
@@ -60,15 +60,39 @@ end
 -- Stance toggle of the panel: false = the last order sent was passive (the default while you lead a dungeon group).
 local stanceAggressive = false
 
--- Bot orders go to party (or raid) chat, where every bot of the group listens.
+-- Bot orders go to the group as addon messages under a fixed prefix; the server reads them like party chat. SendChatMessage
+-- from addon code is blocked by this client in combat and in battlegrounds (taint), addon messages are not. Out of combat a
+-- refused or unavailable addon message falls back to the old party/raid chat line.
+local ORDER_PREFIX = "FBOTS"
+local prefixOk = false
+do
+    local reg = C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix or RegisterAddonMessagePrefix
+    if reg then
+        local ok, res = pcall(reg, ORDER_PREFIX)
+        prefixOk = ok and res ~= false
+    end
+end
+
 local function GroupOrder(text)
-    if IsInRaid and IsInRaid() then
-        SendChatMessage(text, "RAID")
-    elseif (IsInGroup and IsInGroup()) or (GetNumPartyMembers and GetNumPartyMembers() > 0) then
-        SendChatMessage(text, "PARTY")
+    local channel
+    if IsInRaid and IsInRaid() then channel = "RAID"
+    elseif (IsInGroup and IsInGroup()) or (GetNumPartyMembers and GetNumPartyMembers() > 0) then channel = "PARTY"
     else
         Print("you have no group yet: add a bot first.")
+        return
     end
+    if prefixOk then
+        local send = C_ChatInfo and C_ChatInfo.SendAddonMessage or SendAddonMessage
+        local ok, res = pcall(send, ORDER_PREFIX, text, channel)
+        -- Enum.SendAddonMessageResult.Success is 0; older clients return nothing, which counts as sent.
+        local sent = ok and (res == nil or res == true or res == 0 or (Enum and Enum.SendAddonMessageResult and res == Enum.SendAddonMessageResult.Success))
+        if sent then return end
+    end
+    if InCombatLockdown and InCombatLockdown() then
+        Print("the order could not be sent in combat.")
+        return
+    end
+    SendChatMessage(text, channel)
 end
 
 -- Raid markers the tank panel cycles through (the chat order words), and the one picked now.
@@ -98,6 +122,13 @@ local function SendDistance(silent)
     local d = ForeverBotsDB.distance
     if not d then return end
     if not InGroupQuiet() then return end
+    -- The silent re-send runs from a timer after a roster change, not from a click. Inside a battleground or arena the client
+    -- blocks anything an addon sends on its own ("Interface action failed because of an AddOn", seen when bots join the
+    -- group), and the bots there are not companions anyway.
+    if silent then
+        local okI, inInstance, kind = pcall(IsInInstance)
+        if okI and inInstance and (kind == "pvp" or kind == "arena") then return end
+    end
     if silent then distSilentUntil = Now() + 3 end
     distLastSend = Now()
     distDirtyAt = nil
@@ -447,7 +478,7 @@ local function BuildFrame()
 
     local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOP", 0, -14)
-    title:SetText("Karrz's Player Bots")
+    title:SetText("WoW Forever Bots")
 
     local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", -4, -4)
@@ -832,6 +863,8 @@ local botDist = nil                     -- yards shown for the current bot
 local botDistDirtyAt, botSentAt, botForced
 local knownBots = {}
 
+local OpenWhisperBox   -- defined below (the chat box helper); the panel and the invite button call it from a click
+
 local function BotPanelEnabled() return ForeverBotsDB.botPanel ~= false end
 
 local function SetBotStatus(text) if botStatusFS then botStatusFS:SetText(text or "") end end
@@ -841,6 +874,16 @@ local function InMyGroup(unit)
         return false
     end
     return (UnitInParty and UnitInParty(unit)) or (UnitInRaid and UnitInRaid(unit)) and true or false
+end
+
+-- The player's own invite: the call typed /invite makes (the client's portrait "Invite" sends nothing for a bot on 70338).
+local function InviteByName(name)
+    if C_PartyInfo and C_PartyInfo.InviteUnit then
+        local ok, err = pcall(C_PartyInfo.InviteUnit, name)
+        if ok then return end
+        Debug("invite: C_PartyInfo.InviteUnit failed: " .. tostring(err))
+    end
+    if SlashCmdList and SlashCmdList.INVITE then SlashCmdList.INVITE(name) else Print("type /invite " .. name) end
 end
 
 local function BotWhisper(text)
@@ -1035,7 +1078,7 @@ end)
 -- on client 70291 in a battleground every slash line errors inside Blizzard's HandleChatType, "table cannot be indexed with
 -- secret keys", Karrz 2026-10-09). Enter then sends an ordinary whisper packet. Opened a frame later because a typed "/w" runs
 -- from the chat box, which the client closes after the handler returns.
-local function OpenWhisperBox(name, text)
+function OpenWhisperBox(name, text, now)
     local function Open()
         if ForeverBotsDB.bgWhisper == "dot" or not (ChatEdit_ChooseBoxForSend and ChatEdit_ActivateChat and ChatEdit_UpdateHeader) then
             if ChatFrame_OpenChat then ChatFrame_OpenChat(".w " .. name .. " " .. (text or "")) end
@@ -1048,7 +1091,8 @@ local function OpenWhisperBox(name, text)
         ChatEdit_ActivateChat(eb)
         eb:SetText(text or "")
     end
-    if C_Timer and C_Timer.After then C_Timer.After(0.05, Open) else Open() end
+    -- now: called from a button click (the player's own action, so the box may be touched at once, also in a battleground)
+    if not now and C_Timer and C_Timer.After then C_Timer.After(0.05, Open) else Open() end
 end
 
 -- Clicking a name in chat, a name's right-click Whisper, the friends / who / LFG lists all end in ChatFrameUtil.SendTellWithMessage,
@@ -1059,73 +1103,164 @@ end
 -- from a player action in a battleground (a timer callback there failed with "Interface action failed because of an AddOn" and left
 -- "/cw Name" in the box, Karrz 2026-10-09). The client's own /w /whisper /t /tell are untouched.
 local function HookSendTell()
-    if not (ChatFrameUtil and ChatFrameUtil.SendTellWithMessage and hooksecurefunc) then return end
-    hooksecurefunc(ChatFrameUtil, "SendTellWithMessage", function(name, text)
-        name = SafeStr(name)
-        if not name then return end
-        local eb = ChatEdit_GetActiveWindow and ChatEdit_GetActiveWindow()
-        if not eb then return end
-        local ok, chatType = pcall(function() return eb:GetAttribute("chatType") end)
-        if ok and (chatType == "WHISPER" or chatType == "BN_WHISPER") then return end   -- the client already did it
+    if not hooksecurefunc then return end
+    local function ToWhisper(eb, name, text)
         local who = strtrim((strsplit("-", name)) or "")   -- "Name-Realm" -> "Name": a single realm
         if who == "" then return end
-        Debug("whisper click: box was " .. tostring(chatType) .. ", switching to whisper mode for " .. who)
+        Debug("whisper box: switching to whisper mode for " .. who)
         eb:SetAttribute("chatType", "WHISPER")
         eb:SetAttribute("tellTarget", who)
         if ChatEdit_UpdateHeader then ChatEdit_UpdateHeader(eb) end
         eb:SetText(SafeStr(text) or "")
-    end)
+    end
+    -- The client's own Whisper (portrait menu Interact, friends list, ...) can open the box with the dead "/cw Name" text
+    -- instead (SLASH_WHISPER1 is "/cw" on this client). Writing that global from here would taint every reader of it, so the
+    -- box is looked at after it opens instead: a box showing "/cw Name [text]" is turned into whisper mode for Name, like the
+    -- SendTellWithMessage hook above. Synchronous, inside the click that opened it (an addon may only touch the box from a player
+    -- action in a battleground).
+    local function FixCwBox()
+        pcall(function()
+            local eb = ChatEdit_GetActiveWindow and ChatEdit_GetActiveWindow()
+            if not eb then return end
+            local text = SafeStr(eb:GetText())
+            if not text then return end
+            local name, rest = strmatch(text, "^/[cC][wW]%s+(%S+)%s*(.-)$")
+            if name then ToWhisper(eb, name, rest) end
+        end)
+    end
+    if ChatFrameUtil and ChatFrameUtil.SendTellWithMessage then
+        hooksecurefunc(ChatFrameUtil, "SendTellWithMessage", function(name, text)
+            name = SafeStr(name)
+            if not name then return end
+            local eb = ChatEdit_GetActiveWindow and ChatEdit_GetActiveWindow()
+            if not eb then return end
+            local ok, chatType = pcall(function() return eb:GetAttribute("chatType") end)
+            if ok and (chatType == "WHISPER" or chatType == "BN_WHISPER") then
+                -- the client already switched to whisper mode but typed "/cw Name" into the box as well (Karrz 2026-10-11,
+                -- "Tell Name:" with "/cw Name" after it): keep the mode, clear that text
+                FixCwBox()
+                return
+            end
+            ToWhisper(eb, name, text)
+        end)
+    end
+    if ChatFrameUtil and ChatFrameUtil.OpenChat then pcall(hooksecurefunc, ChatFrameUtil, "OpenChat", FixCwBox) end
+    if ChatFrame_OpenChat then pcall(hooksecurefunc, "ChatFrame_OpenChat", FixCwBox) end
+    if ChatEdit_ActivateChat then pcall(hooksecurefunc, "ChatEdit_ActivateChat", FixCwBox) end
+    -- and the text itself: the client sets "/cw Name" with SetText after the box is open
+    for i = 1, (NUM_CHAT_WINDOWS or 10) do
+        local box = _G["ChatFrame" .. i .. "EditBox"]
+        if box and box.SetText then pcall(hooksecurefunc, box, "SetText", FixCwBox) end
+    end
 end
 
 local function AddPopupEntry()
     if not (Menu and Menu.ModifyMenu) then return end
+    -- Entries through the client's supported Menu.ModifyMenu only (no UnitPopup tables, no hooks). The client's own portrait
+    -- Invite sends nothing for a bot on 70338 (Karrz 2026-10-11: no CMSG_PARTY_INVITE from the menu, typed /invite works), so
+    -- "Whisper (Forever Bots)" is added for every friendly player, "Invite (Forever Bots)" for one outside my group, and the
+    -- bot-panel entry for a group member (world, party, raid and battleground menus alike).
+    -- Right-clicking the target frame crashed the client once with entries of ours in MENU_UNIT_PLAYER (Menu.lua:1103,
+    -- ldebug.c:747, 2026-10-11 16:10; cause not found), so an entry is added only after every value is checked to be a plain,
+    -- non-secret one, a unit that is not an enemy, and the whole callback runs under pcall: nothing is added for an enemy or
+    -- a unit whose name or token is secret (combat, battleground).
     local function modify(_, root, ctx)
-        local name = ctx and SafeStr(ctx.name)
-        if not name or name == SafeName("player") then return end
-        local unit = ctx.unit
-        if ctx.unit and UnitIsPlayer and not IsSecret(ctx.unit) then
-            local who = strtrim((strsplit("-", name)) or "")
-            if who ~= "" then
-                root:CreateDivider()
-                root:CreateButton("Whisper (Karrz's Player Bots)", function() OpenWhisperBox(who) end)
+        local ok = pcall(function()
+            if type(ctx) ~= "table" then return end
+            local name, unit = ctx.name, ctx.unit
+            if type(name) ~= "string" or IsSecret(name) or type(unit) ~= "string" or IsSecret(unit) then return end
+            if name == "" or name == SafeName("player") then return end
+            if not (UnitExists(unit) and UnitIsPlayer(unit) and UnitIsFriend("player", unit)) or UnitIsUnit(unit, "player") then return end
+            local who = strtrim((strsplit("-", name)))
+            if who == "" then return end
+            local grouped = (UnitInParty and UnitInParty(unit)) or (UnitInRaid and UnitInRaid(unit))
+            root:CreateDivider()
+            root:CreateButton("Whisper (Forever Bots)", function() OpenWhisperBox(who, nil, true) end)
+            if grouped then
+                root:CreateButton("WoW Forever Bots", function()
+                    local token = select(2, UnitClass(unit))
+                    botForced = { name = who, token = token }
+                    if not botPanel then BuildBotPanel() end
+                    UpdateBotPanel()
+                end)
+            else
+                root:CreateButton("Invite (Forever Bots)", function() InviteByName(who) end)
             end
-        end
-        if unit and not IsSecret(unit) then
-            local ok, mine = pcall(InMyGroup, unit)
-            if not ok or not mine then
-                -- not in my group: the client's own Invite entry sends nothing for a bot (Karrz 2026-10-08, right-click Invite on a
-                -- world bot; typed /invite works), so offer one that runs the typed command
-                if ctx.unit and UnitIsPlayer and not UnitIsUnit(ctx.unit, "player") then
-                    root:CreateDivider()
-                    root:CreateButton("Invite (Karrz's Player Bots)", function()
-                        local who = strsplit("-", name)
-                        who = strtrim(who or "")
-                        if who == "" then return end
-                        if SlashCmdList and SlashCmdList.INVITE then
-                            SlashCmdList.INVITE(who)
-                        elseif C_PartyInfo and C_PartyInfo.InviteUnit then
-                            C_PartyInfo.InviteUnit(who)
-                        end
-                    end)
-                end
-                return
-            end
-        end
-        if IsSecret(unit) then unit = nil end
-        root:CreateDivider()
-        root:CreateButton("Karrz's Player Bots", function()
-            local token = unit and select(2, UnitClass(unit)) or nil
-            botForced = { name = name, token = token }
-            if not botPanel then BuildBotPanel() end
-            UpdateBotPanel()
         end)
+        if not ok then Debug("unit menu entry skipped") end
     end
-    for _, tag in ipairs({ "MENU_UNIT_PARTY", "MENU_UNIT_RAID_PLAYER", "MENU_UNIT_PLAYER", "MENU_UNIT_TARGET" }) do
+    for _, tag in ipairs({ "MENU_UNIT_PARTY", "MENU_UNIT_RAID_PLAYER", "MENU_UNIT_RAID", "MENU_UNIT_PLAYER", "MENU_UNIT_TARGET", "MENU_UNIT_FOCUS" }) do
         pcall(Menu.ModifyMenu, tag, modify)
     end
 end
 
 ------------------------------------------------------------------------------------------------------------- slash
+
+-- Typed whispers: on this client "/w Name text" and the unit menu's "/cw Name text" do nothing (Karrz 2026-10-08: no packet
+-- reaches the server, no Lua error, also with every addon off), while SendChatMessage(text, "WHISPER", nil, name) works.
+-- So /w /t /tell /cw are defined here as a plain SendChatMessage whisper (the client's own /whisper and /r stay native: they work).
+-- Restored 2026-10-11: in a raid (Molten Core) typed "/w Cal hi" did nothing while "/whisper Cal hi" worked, and the box filled by
+-- clicking a name carries "/cw Name". The client's own SLASH_SMART_WHISPER1 /
+-- SLASH_WHISPER1 globals stay untouched (the unit menu's Whisper builds its "/cw Name " text from them; clearing them broke
+-- it with "bad argument #2 to 'format'"); they have no SlashCmdList handler, so they do not compete with ours. The native
+-- path has no handler in 70205, so the whisper is sent directly.
+do
+    local function InPvP()
+        local ok, inInstance, kind = pcall(IsInInstance)
+        return ok and inInstance and (kind == "pvp" or kind == "arena")
+    end
+
+    local function Whisper(msg)
+        msg = SafeStr(msg) or ""
+        -- the unit menu can leave non-breaking / zero-width blanks after the name (the plain-space trim does not see them)
+        msg = msg:gsub("\194\160", " "):gsub("\226\128[\128-\143]", "")
+        local name, text = strmatch(msg, "^%s*(%S+)%s+(.-)%s*$")
+        if not name then name = strmatch(msg, "^%s*(%S+)%s*$"); text = nil end
+        if not name then
+            Print("/w <name> <message> whispers a player")
+            return
+        end
+        name = strtrim((strsplit("-", name)))   -- "Name-Realm" -> "Name": a single realm
+        if name == "" then return end
+        -- Inside a battleground or arena the client blocks anything an addon sends itself (Karrz 2026-10-08, WSG: "Interface
+        -- action failed because of an AddOn", no packet). There the whisper is put in the chat box as the server command
+        -- ".w <name> <text>" and sent by the player's own Enter, which the client lets through.
+        if InPvP() then
+            -- The client's own /w and /whisper do nothing in a battleground (70338: the box stays in Say mode). The typed line is
+            -- sent as an addon whisper under the FBOTS prefix, which the server hands to the bot like a whisper (the bot answers
+            -- as usual); it needs no second step. If the client refuses it, the box opens in whisper mode with the text in it
+            -- and Enter sends it ("/fb bgw dot" falls back to the ".w <name> <text>" command).
+            if text and ForeverBotsDB.bgWhisper ~= "dot" and prefixOk then
+                local send = C_ChatInfo and C_ChatInfo.SendAddonMessage or SendAddonMessage
+                local ok, res = pcall(send, ORDER_PREFIX, text, "WHISPER", name)
+                if ok and (res == nil or res == true or res == 0 or (Enum and Enum.SendAddonMessageResult and res == Enum.SendAddonMessageResult.Success)) then
+                    DEFAULT_CHAT_FRAME:AddMessage("|cffff80ffTo " .. name .. ": " .. text .. "|r")
+                    if ChatEdit_SetLastToldTarget then pcall(ChatEdit_SetLastToldTarget, name, "WHISPER") end
+                    return
+                end
+            end
+            OpenWhisperBox(name, text)
+            Print("battleground: press Enter to whisper " .. name .. "; if the client blocks it, /fb bgw dot")
+            return
+        end
+        if not text then
+            if ChatFrame_OpenChat then ChatFrame_OpenChat("/w " .. name .. " ") else Print("/w <name> <message> whispers a player") end
+            return
+        end
+        -- Sent straight from the slash handler (no timer, no hook on SendChatMessage): the client's own /w never works in 70205.
+        local ok, err = pcall(SendChatMessage, text, "WHISPER", nil, name)
+        if not ok then
+            Print("whisper to " .. name .. " failed: " .. tostring(err))
+            return
+        end
+        if ChatEdit_SetLastToldTarget then pcall(ChatEdit_SetLastToldTarget, name, "WHISPER") end
+    end
+
+    for i, word in ipairs({ "/w", "/t", "/tell", "/cw", "/whisper" }) do
+        _G["SLASH_FOREVERBOTSW" .. i .. "1"] = word
+        SlashCmdList["FOREVERBOTSW" .. i] = Whisper
+    end
+end
 
 SLASH_FOREVERBOTS1 = "/fb"
 SLASH_FOREVERBOTS2 = "/foreverbots"

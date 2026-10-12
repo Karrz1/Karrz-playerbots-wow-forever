@@ -50,7 +50,7 @@ struct ScenarioSample
     std::string rule;                      // the rule the bot's AI fired last (BotAI::last_rule_fired); empty = none
 };
 
-enum class ScenarioFailKind : std::uint8_t { Idle, Stray, OutOfBounds, WrongMap, HealerOom, Death, GroupStalled, Wipe, Timeout, SetupFailed, GroupBroken, BossReset, DpsHold, HealerNoRest };
+enum class ScenarioFailKind : std::uint8_t { Idle, Stray, OutOfBounds, WrongMap, HealerOom, Death, GroupStalled, Wipe, Timeout, SetupFailed, GroupBroken, BossReset, DpsHold, HealerNoRest, SupportMissing };
 
 inline char const* ToString(ScenarioFailKind k)
 {
@@ -70,6 +70,7 @@ inline char const* ToString(ScenarioFailKind k)
         case ScenarioFailKind::GroupBroken:  return "group_broken";
         case ScenarioFailKind::BossReset:    return "boss_reset";
         case ScenarioFailKind::DpsHold:      return "dps_hold";
+        case ScenarioFailKind::SupportMissing: return "support_missing";
     }
     return "?";
 }
@@ -137,6 +138,10 @@ struct ScenarioLimits
     std::uint32_t dps_hold_ms = 0;
     // Raid: every tank dead is a wipe, whoever else lives.
     bool tanks_dead_is_wipe = false;
+    // Support the encounter calls for, as the least number of casts a run that killed the boss must have seen (0 = not checked): hunters'
+    // Tranquilizing Shots on an enrage, curse removals by mages / druids.
+    std::uint32_t min_tranq_shots = 0;
+    std::uint32_t min_decurses = 0;
 };
 
 class ScenarioMonitor
@@ -362,7 +367,12 @@ public:
             }
             else if (!stall_reported_ && now_ms - stall_since_ms_ >= limits_.stall_ms)
             {
-                Fail(ScenarioFailKind::GroupStalled, "", "nobody moved " + Trim(limits_.stall_yards) + " y or fought for " + std::to_string((now_ms - stall_since_ms_) / 1000u) + " s", now_ms, stall_reported_);
+                // Where everybody stands and what each AI last decided: the one line that says why a whole group waits.
+                std::string who;
+                for (ScenarioSample const& s : samples)
+                    who += (who.empty() ? "" : "; ") + s.name + (s.alive ? "" : " (dead)") + " at " + Trim(s.x) + "," + Trim(s.y) + "," + Trim(s.z) + " hp " + Trim(s.hp_pct) + "%" +
+                           (s.mana_pct >= 0.f ? " mana " + Trim(s.mana_pct) + "%" : std::string()) + " rule=" + (s.rule.empty() ? "-" : s.rule);
+                Fail(ScenarioFailKind::GroupStalled, "", "nobody moved " + Trim(limits_.stall_yards) + " y or fought for " + std::to_string((now_ms - stall_since_ms_) / 1000u) + " s: " + who, now_ms, stall_reported_);
                 terminal = true;
             }
         }
@@ -416,6 +426,10 @@ public:
 
     void NoteSetupFailure(std::uint32_t now_ms, std::string const& bot, std::string const& why) { Fail(ScenarioFailKind::SetupFailed, bot, why, now_ms); }
     void NoteTimeout(std::uint32_t now_ms, std::string const& what) { Fail(ScenarioFailKind::Timeout, "", what, now_ms); }
+    // A support job the content calls for (a Tranquilizing Shot on Magmadar's Frenzy, a curse removed in Lucifron's room) was never done.
+    void NoteSupportMissing(std::uint32_t now_ms, std::string const& what) { Fail(ScenarioFailKind::SupportMissing, "", what, now_ms); }
+    // A line for the result that is not a failure (counts the run measured).
+    void NoteInfo(std::string const& line) { tolerated_.push_back(line); }
 
     std::vector<ScenarioFailure> const& failures() const { return failures_; }
 

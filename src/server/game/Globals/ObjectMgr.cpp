@@ -641,11 +641,101 @@ void ObjectMgr::LoadCreatureClassicLevels()
     } while (result->NextRow());
 
     TC_LOG_INFO("server.loading", ">> Loaded {} classic creature levels in {} ms", _creatureClassicLevelStore.size(), GetMSTimeDiffToNow(oldMSTime));
+
+    // Classic 1.60: vanilla creature stats (VMaNGOS creature_classlevelstats and per creature multipliers)
+    oldMSTime = getMSTime();
+    _creatureClassicClassLevelStatsStore.clear();
+    _creatureClassicStatsStore.clear();
+
+    //                                     0      1      2       3     4      5             6
+    if (QueryResult cls = WorldDatabase.Query("SELECT class, level, health, mana, armor, melee_damage, ranged_damage FROM creature_classic_classlevelstats"))
+    {
+        do
+        {
+            Field* fields = cls->Fetch();
+            ClassicCreatureClassLevelStats& stats = _creatureClassicClassLevelStatsStore[MAKE_PAIR16(fields[1].GetUInt8(), fields[0].GetUInt8())];
+            stats.Health = fields[2].GetUInt32();
+            stats.Mana = fields[3].GetUInt32();
+            stats.Armor = fields[4].GetUInt32();
+            stats.MeleeDamage = fields[5].GetFloat();
+            stats.RangedDamage = fields[6].GetFloat();
+        } while (cls->NextRow());
+    }
+
+    //                                       0      1                  2                3                 4                  5
+    if (QueryResult stats = WorldDatabase.Query("SELECT entry, health_multiplier, mana_multiplier, armor_multiplier, damage_multiplier, damage_variance FROM creature_classic_stats"))
+    {
+        do
+        {
+            Field* fields = stats->Fetch();
+            uint32 entry = fields[0].GetUInt32();
+            if (!GetCreatureTemplate(entry))
+                continue;
+
+            ClassicCreatureStats& creatureStats = _creatureClassicStatsStore[entry];
+            creatureStats.HealthMultiplier = fields[1].GetFloat();
+            creatureStats.ManaMultiplier = fields[2].GetFloat();
+            creatureStats.ArmorMultiplier = fields[3].GetFloat();
+            creatureStats.DamageMultiplier = fields[4].GetFloat();
+            creatureStats.DamageVariance = fields[5].GetFloat();
+        } while (stats->NextRow());
+    }
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} classic creature class level stats and {} vanilla creature stats in {} ms",
+        _creatureClassicClassLevelStatsStore.size(), _creatureClassicStatsStore.size(), GetMSTimeDiffToNow(oldMSTime));
 }
 
 std::pair<uint8, uint8> const* ObjectMgr::GetCreatureClassicLevel(uint32 entry) const
 {
     return Trinity::Containers::MapGetValuePtr(_creatureClassicLevelStore, entry);
+}
+
+ClassicCreatureStats const* ObjectMgr::GetCreatureClassicStats(uint32 entry) const
+{
+    return Trinity::Containers::MapGetValuePtr(_creatureClassicStatsStore, entry);
+}
+
+// Classic 1.60: vanilla melee hit and swing time of every creature (imported from VMaNGOS)
+void ObjectMgr::LoadCreatureClassicMelee()
+{
+    uint32 oldMSTime = getMSTime();
+
+    _creatureClassicMeleeStore.clear();
+
+    //                                               0      1         2         3          4
+    QueryResult result = WorldDatabase.Query("SELECT entry, dmg_min, dmg_max, attack_ms, ranged_attack_ms FROM creature_classic_melee");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 classic creature melee rows. DB table `creature_classic_melee` is empty.");
+        return;
+    }
+
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 entry = fields[0].GetUInt32();
+        if (!GetCreatureTemplate(entry))
+            continue;
+
+        CreatureClassicMelee melee;
+        melee.DamageMin = fields[1].GetFloat();
+        melee.DamageMax = std::max(fields[2].GetFloat(), melee.DamageMin);
+        melee.AttackMs = fields[3].GetUInt32();
+        melee.RangedAttackMs = fields[4].GetUInt32();
+        _creatureClassicMeleeStore[entry] = melee;
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} classic creature melee rows in {} ms", _creatureClassicMeleeStore.size(), GetMSTimeDiffToNow(oldMSTime));
+}
+
+ObjectMgr::CreatureClassicMelee const* ObjectMgr::GetCreatureClassicMelee(uint32 entry) const
+{
+    return Trinity::Containers::MapGetValuePtr(_creatureClassicMeleeStore, entry);
+}
+
+ClassicCreatureClassLevelStats const* ObjectMgr::GetCreatureClassicClassLevelStats(uint8 level, uint8 unitClass) const
+{
+    return Trinity::Containers::MapGetValuePtr(_creatureClassicClassLevelStatsStore, MAKE_PAIR16(level, unitClass));
 }
 
 // Classic 1.60: vanilla block value of shields (the Classic client data has none), see Player::GetShieldBlockValue
@@ -4373,8 +4463,9 @@ void ObjectMgr::LoadPlayerInfo()
 
         } while (raceStatsResult->NextRow());
 
-        //                                                  0      1     2    3    4    5    6    7
-        QueryResult result  = WorldDatabase.Query("SELECT class, level, str, agi, sta, inte, spi, basehp FROM player_classlevelstats");
+        //                                                  0      1     2    3    4    5    6    7       8
+        QueryResult result  = WorldDatabase.Query("SELECT class, level, str, agi, sta, inte, spi, basehp, basemana FROM player_classlevelstats");
+        _classicBaseMana.clear();
 
         if (!result)
         {
@@ -4419,6 +4510,10 @@ void ObjectMgr::LoadPlayerInfo()
                     levelInfo.baseHealth = fields[7].GetUInt32();
                 }
             }
+
+            // Classic 1.60 (vanilla, VMaNGOS player_classlevelstats.basemana): 0 keeps the client's game table value
+            if (uint32 classicBaseMana = fields[8].GetUInt32())
+                _classicBaseMana[(current_class << 8) | current_level] = classicBaseMana;
 
             ++count;
         }
@@ -4514,6 +4609,13 @@ void ObjectMgr::GetPlayerClassLevelInfo(uint32 class_, uint8 level, uint32& base
 
     if (level > sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL))
         level = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+
+    // Classic 1.60 (vanilla): the base mana of the class at this level from VMaNGOS, base health was replaced the same way
+    if (uint32 const* classicBaseMana = Trinity::Containers::MapGetValuePtr(_classicBaseMana, (class_ << 8) | level))
+    {
+        baseMana = *classicBaseMana;
+        return;
+    }
 
     GtBaseMPEntry const* mp = sBaseMPGameTable.GetRow(level);
     if (!mp)
@@ -5457,6 +5559,22 @@ void ObjectMgr::LoadQuests()
             }
         } while (result->NextRow());
         TC_LOG_INFO("server.loading", ">> Loaded {} Classic quest levels", count);
+    }
+
+    // Classic 1.60: vanilla quest money (VMaNGOS RewOrReqMoney / RewMoneyMaxLevel) for quests not taken from a Forever sniff
+    if (QueryResult result = WorldDatabase.Query("SELECT ID, RewardMoney, RewardMoneyMaxLevel FROM quest_classic_money"))
+    {
+        uint32 count = 0;
+        do
+        {
+            Field* fields = result->Fetch();
+            if (Quest* quest = Trinity::Containers::MapGetValuePtr(_questTemplates, fields[0].GetUInt32()))
+            {
+                quest->SetClassicMoney(fields[1].GetInt32(), fields[2].GetUInt32());
+                ++count;
+            }
+        } while (result->NextRow());
+        TC_LOG_INFO("server.loading", ">> Loaded {} Classic quest money rewards", count);
     }
 
     // Classic 1.60: level range in which a quest is offered (vanilla data and the Forever quests)
@@ -9626,6 +9744,13 @@ void ObjectMgr::LoadVendors()
         }
     }
     while (result->NextRow());
+
+    // Classic 1.60 Legacy perk Reagent Economy: items any vendor sells for gold
+    _goldVendorItems.clear();
+    for (auto const& [vendorEntry, vendorItems] : _cacheVendorItemStore)
+        for (VendorItem const& vendorItem : vendorItems.m_items)
+            if (vendorItem.Type == ITEM_VENDOR_TYPE_ITEM && !vendorItem.ExtendedCost)
+                _goldVendorItems.insert(vendorItem.item);
 
     TC_LOG_INFO("server.loading", ">> Loaded {} Vendors in {} ms", count, GetMSTimeDiffToNow(oldMSTime));
 }

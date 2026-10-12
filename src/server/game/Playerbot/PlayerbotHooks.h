@@ -46,6 +46,11 @@ void OnWhisperReceived(Player* sender, Player* receiver, std::string const& msg)
 // like `;tank pull` apply to addressed bots without forcing per-bot
 // whispers. Non-prefix messages no-op.
 void OnPartyChat(Player* sender, Group* group, std::string const& msg);
+// An addon message to PARTY/RAID from the sender. V2 treats the ForeverBots order prefix like a party-chat order line
+// (the client blocks SendChatMessage from addon code in combat and in battlegrounds; addon messages are not blocked).
+void OnAddonMessage(Player* sender, Group* group, std::string const& prefix, std::string const& text);
+// An addon whisper to a player: V2 treats the ForeverBots prefix like an ordinary typed whisper (BG whisper to a bot).
+void OnAddonWhisper(Player* sender, Player* receiver, std::string const& prefix, std::string const& text);
 
 // Guild-chat hook (Phase C.3). Fired from HandleMessagechatOpcode for
 // every CHAT_MSG_GUILD / CHAT_MSG_OFFICER line. V2 routes this through
@@ -86,6 +91,10 @@ void OnItemLooted(Player* p, uint32 item_id);
 // the releasing owner's dead companions on the same map release with them: inside a dungeon or raid
 // RepopAtGraveyard revives the owner at the graveyard, so the owner never shows up as a ghost there.
 void OnSpiritReleased(Player* p);
+
+// Fired from Group::ChangeMembersGroup / SwapMembersGroups after a raid member's sub-group changed (the leader moved it, or the restore
+// did). V2 stores the sub-group of an owned companion so a relog or `.bot call all` puts it back (migration 0026).
+void OnRaidSubgroupChanged(Group* group, ObjectGuid member, uint8 subgroup);
 
 // SC-P2b: guild member-added hook. Fired from Guild::AddMember after the
 // member is committed. V2 routes to BotChatReactor::ReactGuildJoin so one
@@ -177,12 +186,15 @@ inline void OnGroupMemberJoined(Group*, Player*) {}
 inline void OnGroupMemberLeft(Group*, Player*) {}
 inline void OnWhisperReceived(Player*, Player*, std::string const&) {}
 inline void OnPartyChat(Player*, Group*, std::string const&) {}
+inline void OnAddonMessage(Player*, Group*, std::string const&, std::string const&) {}
+inline void OnAddonWhisper(Player*, Player*, std::string const&, std::string const&) {}
 inline void OnGuildChat(Player*, uint64, std::string const&) {}
 inline void OnSayChat(Player*, std::string const&) {}
 inline void OnYellChat(Player*, std::string const&) {}
 inline void OnTextEmote(Player*, uint32, uint32, ObjectGuid) {}
 inline void OnItemLooted(Player*, uint32) {}
 inline void OnSpiritReleased(Player*) {}
+inline void OnRaidSubgroupChanged(Group*, ObjectGuid, uint8) {}
 inline void OnGuildMemberAdded(uint64, ObjectGuid, std::string const&) {}
 inline void OnPlayerJoinedBgQueue(Player*, uint32, uint8) {}
 inline void OnPlayerJoinedLfg(Player*, uint32, uint8) {}

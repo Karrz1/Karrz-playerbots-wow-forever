@@ -85,6 +85,9 @@ void TickScheduler::register_bot(BotId id, ActivityTier initial)
 void TickScheduler::unregister_bot(BotId id)
 {
     bots_.erase(id);
+    // No new ticks can be scheduled now; let one already queued/running finish before the caller
+    // destroys the bot's registry entry (use-after-free otherwise).
+    pool_.wait_not_in_flight(id);
 }
 
 void TickScheduler::set_tier(BotId id, ActivityTier classified, Ms now)

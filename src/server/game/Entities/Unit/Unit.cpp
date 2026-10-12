@@ -54,6 +54,7 @@
 #include "KillRewarder.h"
 #include "ListUtils.h"
 #include "Log.h"
+#include "Config.h"
 #include "Loot.h"
 #include "LootMgr.h"
 #include "LootPackets.h"
@@ -1352,12 +1353,16 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
         WorldSession const* diagSession = ToPlayer()->GetSession();
         Player const* diagVictim = victim->ToPlayer();
         bool const humanInvolved = (diagSession && !diagSession->IsBot()) || (diagVictim && diagVictim->GetSession() && !diagVictim->GetSession()->IsBot());
-        if (s_mitigationDiagLines < 400 && humanInvolved)
+        if (s_mitigationDiagLines < 1500 && humanInvolved)
         {
             ++s_mitigationDiagLines;
-            TC_LOG_INFO("playerbot.v2", "[spell_dmg_post] caster={} spell={} in={} crit={} after_crit={} after_resilience={} resist={} absorb={} final={} (victim={} lvl={} school_mask={})",
+            // The resistance steps of the hit: the victim's school resistance, the caster's penetration (spell penetration gear and talents),
+            // and the average resisted share the roll in CalcSpellResistedDamage works from (level gap 8 per level included).
+            float const avgResist = Unit::CalculateAverageResistReduction(this, damageSchoolMask, victim, spellInfo);
+            TC_LOG_INFO("playerbot.v2", "[spell_dmg_post] caster={} spell={} in={} crit={} after_crit={} after_resilience={} resist={} absorb={} final={} (victim={} lvl={} caster_lvl={} school_mask={} victim_resistance={} avg_resist_pct={:.1f})",
                 GetName(), spellInfo->Id, diagInDamage, crit ? 1 : 0, diagAfterCrit, diagAfterResilience, damageInfo->resist, damageInfo->absorb,
-                damageInfo->damage, victim->GetName(), uint32(victim->GetLevel()), uint32(damageSchoolMask));
+                damageInfo->damage, victim->GetName(), uint32(victim->GetLevelForTarget(this)), uint32(GetLevelForTarget(victim)), uint32(damageSchoolMask),
+                victim->GetResistance(damageSchoolMask), avgResist * 100.0f);
         }
     }
 }
@@ -1823,44 +1828,12 @@ void Unit::HandleEmoteCommand(Emote emoteId, Player* target /*=nullptr*/, Trinit
     if (G3D::fuzzyLe(armor, 0.0f))
         return damage;
 
-    Classes attackerClass = CLASS_NONE;
-    Optional<float> attackerItemLevel;
     if (attacker)
-    {
         attackerLevel = attacker->GetLevelForTarget(victim);
-        if (Player const* ownerPlayer = attacker->GetCharmerOrOwnerPlayerOrPlayerItself())
-            attackerItemLevel = ownerPlayer->m_playerData->AvgItemLevel[AsUnderlyingType(AvgItemLevelCategory::EquippedBase)];
-        else
-            attackerClass = Classes(attacker->GetClass());
-    }
 
-    float mitigation;
-    if (sWorld->getBoolConfig(CONFIG_CLASSIC_ARMOR_FORMULA))
-    {
-        // Classic.ArmorFormula (vanilla, VMaNGOS SpellCaster::CalcArmorReducedDamage): armor / (armor + 400 + 85 * attacker level),
-        // at most 75%. The retail expected-stat armor constant and the retail 85% cap are not used.
-        mitigation = ClassicArmor::Mitigation(armor, attackerLevel);
-    }
-    else
-    {
-        // Expansion and ContentTuningID necessary? Does Player get a ContentTuningID too ?
-        float armorConstant = sDB2Manager.EvaluateExpectedStat(ExpectedStatType::ArmorConstant, attackerLevel, -2, 0, attackerClass, 0);
-        if (attackerItemLevel)
-        {
-            uint32 maxLevelForExpansion = GetMaxLevelForExpansion(sWorld->getIntConfig(CONFIG_EXPANSION));
-            if (attackerLevel == maxLevelForExpansion)
-            {
-                float itemLevelDelta = *attackerItemLevel - ASSERT_NOTNULL(sItemLevelByLevelTable.GetRow(maxLevelForExpansion))->ItemLevel;
-                if (uint32 curveId = sDB2Manager.GetGlobalCurveId(GlobalCurve::ArmorItemLevelDiminishing))
-                    armorConstant *= sDB2Manager.GetCurveValueAt(curveId, itemLevelDelta);
-            }
-        }
-
-        if (!(armor + armorConstant))
-            return damage;
-
-        mitigation = std::min(armor / (armor + armorConstant), 0.85f);
-    }
+    // Classic 1.60 (vanilla, VMaNGOS SpellCaster::CalcArmorReducedDamage): armor / (armor + 400 + 85 * attacker level), at most 75%.
+    // The client's retail expected-stat ArmorConstant and the retail 85% cap are not used.
+    float const mitigation = ClassicArmor::Mitigation(armor, attackerLevel);
     // Classic 1.60 (vanilla): rounded, and armor never takes a hit below 1 damage (retail truncated: 1 damage hits became 0)
     if (!damage)
         return 0;
@@ -1875,6 +1848,11 @@ void Unit::HandleEmoteCommand(Emote emoteId, Player* target /*=nullptr*/, Trinit
 
     // Npcs can have holy resistance
     if ((schoolMask & SPELL_SCHOOL_MASK_HOLY) && victim->GetTypeId() != TYPEID_UNIT)
+        return 0;
+
+    // Classic 1.60 (vanilla): binary spells (Frostbolt, Frost Nova, crowd control...) are resisted completely or not at all
+    // (WorldObject::MagicSpellHitResult), never partially
+    if (spellInfo && spellInfo->HasAttribute(SPELL_ATTR0_CU_BINARY_SPELL))
         return 0;
 
     float const averageResist = Unit::CalculateAverageResistReduction(attacker, schoolMask, victim, spellInfo);
@@ -3156,6 +3134,28 @@ void Unit::_UpdateAutoRepeatSpell()
         if (autoRepeatSpellInfo->Id != 75)
             InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
         return;
+    }
+
+    // The auto-repeat spell keeps its explicit target as a raw pointer that is refreshed from the GUID by Spell::update (through the spell's
+    // event). CheckCast below dereferences it: a battleground bot's Shoot / Auto Shot read a pointer that was no longer a live object
+    // (WorldObject::CanSeeOrDetect, read of 0xFFFFFFFFFFFFFFFF, WSG map 489, four times on 2026-10-11, each time the map update was lost for
+    // a tick). Resolve it again from the GUID here, exactly as Spell::update does, and stop the auto-repeat when the target is gone. The
+    // line says when the pointer had been stale, which is what finds where it goes stale.
+    if (Spell* repeat = m_currentSpells[CURRENT_AUTOREPEAT_SPELL]; repeat && repeat->getState() != SPELL_STATE_PREPARING)
+    {
+        ObjectGuid const targetGuid = repeat->m_targets.GetObjectTargetGUID();
+        WorldObject* const held = repeat->m_targets.GetObjectTarget();
+        bool const refreshed = repeat->UpdatePointers();
+        WorldObject* const resolved = repeat->m_targets.GetObjectTarget();
+        if (held != resolved)
+            TC_LOG_ERROR("spells", "Auto-repeat spell {} of {} held a stale target pointer {} for {} (resolves to {}), map {}",
+                repeat->m_spellInfo->Id, GetGUID().ToString(), static_cast<void const*>(held), targetGuid.ToString(),
+                static_cast<void const*>(resolved), GetMapId());
+        if (!refreshed || (!targetGuid.IsEmpty() && !resolved))
+        {
+            InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
+            return;
+        }
     }
 
     // castroutine
@@ -7006,16 +7006,37 @@ void Unit::SendEnergizeSpellLog(Unit* victim, uint32 spellID, int32 damage, int3
 
 void Unit::EnergizeBySpell(Unit* victim, SpellInfo const* spellInfo, int32 damage, Powers powerType)
 {
-    if (Player* player = victim->ToPlayer())
-        if (PowerTypeEntry const* powerTypeEntry = sDB2Manager.GetPowerTypeEntry(powerType))
-            if (powerTypeEntry->GetFlags().HasFlag(PowerTypeFlags::UseRegenInterrupt))
-                player->InterruptPowerRegen(powerType);
+    // Classic 1.60 (vanilla): only paying mana starts the five second rule (Spell::TakePower). Receiving mana does not (Judgement of
+    // Wisdom, Spiritual Attunement, Life Tap...): with such a gain every few seconds the window never ran out, which is the likely
+    // reason the paladin regenerated 38% of its out-of-combat mana while standing in combat. Other powers keep the retail rule.
+    if (powerType != POWER_MANA)
+        if (Player* player = victim->ToPlayer())
+            if (PowerTypeEntry const* powerTypeEntry = sDB2Manager.GetPowerTypeEntry(powerType))
+                if (powerTypeEntry->GetFlags().HasFlag(PowerTypeFlags::UseRegenInterrupt))
+                    player->InterruptPowerRegen(powerType);
 
     int32 gain = victim->ModifyPower(powerType, damage, false);
     int32 overEnergize = damage - gain;
     Playerbot::Hooks::OnEnergize(victim, spellInfo->Id, gain, powerType);
     victim->GetThreatManager().ForwardThreatForAssistingMe(this, float(damage) / 2, spellInfo, true);
     SendEnergizeSpellLog(victim, spellInfo->Id, gain, overEnergize, powerType);
+}
+
+// Classic 1.60: the VMaNGOS spell power / healing power factor of a legacy spell effect, when the vanilla table has one (classic_spell_value.bonus_coeff)
+static ClassicSpellValue::Value const* ClassicCoefficientRow(SpellInfo const* spellInfo, SpellEffectInfo const& effectInfo)
+{
+    if (!ClassicSpellValue::AppliesToSpell(spellInfo->Id))
+        return nullptr;
+    return sSpellMgr->GetClassicSpellValue(spellInfo->Id, uint32(effectInfo.EffectIndex));
+}
+
+// Classic 1.60 (vanilla, VMaNGOS SpellCaster::CalculateLevelPenalty): spells learned below level 20 get less from spell power,
+// 1 - (20 - spell level) * 3.75% (Fireball rank 1: 0.429 x 0.2875 = 0.123). The 1.60 client coefficients are the unpenalized ones.
+static float ClassicSpellLevelPenalty(SpellInfo const* spellInfo)
+{
+    if (!spellInfo || spellInfo->SpellLevel <= 0 || spellInfo->SpellLevel >= 20)
+        return 1.0f;
+    return 1.0f - (20.0f - float(spellInfo->SpellLevel)) * 0.0375f;
 }
 
 int32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, int32 pdamage, DamageEffectType damagetype, SpellEffectInfo const& spellEffectInfo, uint32 stack /*= 1*/, Spell* spell /*= nullptr*/, AuraEffect const* aurEff /*= nullptr*/) const
@@ -7102,7 +7123,7 @@ int32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, int3
     // Default calculation
     if (DoneAdvertisedBenefit)
     {
-        float coeff = spellEffectInfo.BonusCoefficient;
+        float coeff = ClassicSpellValue::BonusCoefficientOr(ClassicCoefficientRow(spellProto, spellEffectInfo), spellEffectInfo.BonusCoefficient) * ClassicSpellLevelPenalty(spellProto);
         if (Player* modOwner = GetSpellModOwner())
         {
             coeff *= 100.0f;
@@ -7116,6 +7137,7 @@ int32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, int3
     callDamageScript(pdamage, DoneTotal, DoneTotalMod);
 
     float tmpDamage = float(pdamage + DoneTotal) * DoneTotalMod;
+    float const diagBeforeSpellMod = tmpDamage;
 
     // apply spellmod to Done damage (flat and pct)
     if (Player* modOwner = GetSpellModOwner())
@@ -7129,12 +7151,18 @@ int32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, int3
         WorldSession const* diagSession = ToPlayer()->GetSession();
         Player const* diagVictim = victim->ToPlayer();
         bool const humanInvolved = (diagSession && !diagSession->IsBot()) || (diagVictim && diagVictim->GetSession() && !diagVictim->GetSession()->IsBot());
-        if (s_dmgDiagLines < 400 && humanInvolved)
+        if (s_dmgDiagLines < 1500 && humanInvolved)
         {
             ++s_dmgDiagLines;
-            TC_LOG_INFO("playerbot.v2","[spell_dmg] caster={} spell={} base={} power={} coeff={:.3f} stack={} pct_done={:.3f} -> {} (victim={} lvl={})",
+            // Which auras make up pct_done: the caster's "damage done %" auras that match the spell's school (spell id:amount), so a
+            // talent that is missing or holds a later-era value (Shadow Mastery, Demonic Sacrifice...) is visible by its id.
+            std::string pctAuras;
+            for (AuraEffect const* aurEff : GetAuraEffectsByType(SPELL_AURA_MOD_DAMAGE_PERCENT_DONE))
+                if (aurEff->GetMiscValue() & spellProto->GetSchoolMask())
+                    pctAuras += fmt::format("{}:{} ", aurEff->GetId(), aurEff->GetAmount());
+            TC_LOG_INFO("playerbot.v2","[spell_dmg] caster={} spell={} base={} power={} coeff={:.3f} stack={} pct_done={:.3f} before_spellmod={} -> {} pct_auras=[{}] (victim={} lvl={})",
                 GetName(), spellProto->Id, pdamage, DoneAdvertisedBenefit, spellEffectInfo.BonusCoefficient, stack, DoneTotalMod,
-                int32(std::max(tmpDamage, 0.0f)), victim->GetName(), uint32(victim->GetLevel()));
+                int32(std::max(diagBeforeSpellMod, 0.0f)), int32(std::max(tmpDamage, 0.0f)), pctAuras, victim->GetName(), uint32(victim->GetLevel()));
         }
     }
 
@@ -7561,7 +7589,8 @@ float Unit::SpellCritChanceTaken(Unit const* caster, Spell* spell, AuraEffect co
 /*static*/ uint32 Unit::SpellCriticalHealingBonus(Unit const* caster, SpellInfo const* spellProto, uint32 damage, Unit* /*victim*/)
 {
     // Calculate critical bonus
-    int32 crit_bonus = damage;
+    // Classic 1.60 (vanilla): a critical heal is 150% of the normal heal, like a critical spell (retail: 200%)
+    int32 crit_bonus = damage / 2;
 
     // adds additional damage to critBonus (from talents)
     if (caster)
@@ -7647,7 +7676,7 @@ int32 Unit::SpellHealingBonusDone(Unit* victim, SpellInfo const* spellProto, int
     // Default calculation
     if (DoneAdvertisedBenefit)
     {
-        float coeff = spellEffectInfo.BonusCoefficient;
+        float coeff = spellEffectInfo.BonusCoefficient * ClassicSpellLevelPenalty(spellProto);
         if (Player* modOwner = GetSpellModOwner())
         {
             coeff *= 100.0f;
@@ -7918,7 +7947,7 @@ int32 Unit::SpellAbsorbBonusDone(Unit* victim, SpellInfo const* spellProto, int3
 
     if (doneAdvertisedBenefit)
     {
-        float coeff = spellEffectInfo.BonusCoefficient;
+        float coeff = spellEffectInfo.BonusCoefficient * ClassicSpellLevelPenalty(spellProto);
 
         if (Player* modOwner = GetSpellModOwner())
         {
@@ -8535,7 +8564,8 @@ float Unit::GetPPMProcChance(uint32 WeaponSpeed, float PPM, SpellInfo const* spe
         if (Player* modOwner = GetSpellModOwner())
             modOwner->ApplySpellMod(spellProto, SpellModOp::ProcFrequency, PPM);
 
-    return std::floor((WeaponSpeed * PPM) / 600.0f);   // result is chance in percents (probability = Speed_in_sec * (PPM / 60))
+    // Classic 1.60 (vanilla): not rounded down (Crusader on a 1.5 s weapon is 2.5%, not 2%; low rates no longer become 0)
+    return (WeaponSpeed * PPM) / 600.0f;               // result is chance in percents (probability = Speed_in_sec * (PPM / 60))
 }
 
 void Unit::Mount(uint32 mount, uint32 VehicleId, uint32 creatureEntry)
@@ -9061,6 +9091,11 @@ void Unit::UpdateSpeed(UnitMoveType mtype)
                 main_speed_mod  = GetMaxPositiveAuraModifier(SPELL_AURA_MOD_INCREASE_SPEED);
                 stack_bonus     = GetTotalAuraMultiplier(SPELL_AURA_MOD_SPEED_ALWAYS);
                 non_stack_bonus += GetMaxPositiveAuraModifier(SPELL_AURA_MOD_SPEED_NOT_STACK) / 100.0f;
+
+                // Classic 1.60 Legacy perk The Quick and the Dead 1225500: movement speed while dead (ghost)
+                if (Player const* player = ToPlayer(); player && HasAuraType(SPELL_AURA_GHOST))
+                    if (int32 ghostSpeed = player->GetClassicLegacyPerkAmount(1225500, EFFECT_0))
+                        stack_bonus *= 1.0f + ghostSpeed / 100.0f;
             }
             break;
         }
@@ -9614,8 +9649,8 @@ DiminishingLevels Unit::GetDiminishing(DiminishingGroup group) const
     if (!diminish.hitCount)
         return DIMINISHING_LEVEL_1;
 
-    // If last spell was cast more than 18 seconds ago - reset level.
-    if (!diminish.stack && GetMSTimeDiffToNow(diminish.hitTime) > 18 * IN_MILLISECONDS)
+    // If last spell was cast more than 15 seconds ago - reset level (Classic 1.60, vanilla / VMaNGOS: 15, retail 18)
+    if (!diminish.stack && GetMSTimeDiffToNow(diminish.hitTime) > 15 * IN_MILLISECONDS)
         return DIMINISHING_LEVEL_1;
 
     return DiminishingLevels(diminish.hitCount);
@@ -10388,6 +10423,11 @@ void Unit::SetPower(Powers power, int32 val, bool withPowerUpdate /*= true*/)
 
     int32 oldPower = m_unitData->Power[powerIndex];
     SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::Power, powerIndex), val);
+
+    // Classic 1.60: also send combo point changes as a power update (the official rogue sniff 70338 has type 4 power updates);
+    // energize changes the power without one. The client shows them only on UnitData ClassicComboTarget (Spell::EffectEnergize)
+    if (power == POWER_COMBO_POINTS && IsPlayer() && oldPower != val)
+        withPowerUpdate = true;
 
     // no points left, no combo target (finishers, resets and logout all end up here)
     if (power == POWER_COMBO_POINTS && val == 0)
@@ -11735,7 +11775,49 @@ void Unit::SetMeleeAnimKitId(uint16 animKitId)
             if (InstanceScript const* instance = creature->GetInstanceScript())
                 dungeonEncounter = instance->GetBossDungeonEncounter(creature);
 
-            if (creature->GetMap()->IsDungeon())
+            // Classic: a boss drops its whole table on one corpse (group loot rules), as in vanilla. The retail
+            // personal encounter loot hands each table roll to one random player, so a party of 5 saw one epic.
+            bool const sharedEncounterLoot = dungeonEncounter && !tappers.empty()
+                && sConfigMgr->GetBoolDefault("Classic.SharedEncounterLoot", true);
+
+            if (sharedEncounterLoot)
+            {
+                Group* group = nullptr;
+                for (Player* tapper : tappers)
+                    if (Group* tapperGroup = tapper->GetGroup())
+                    {
+                        group = tapperGroup;
+                        break;
+                    }
+
+                Player* looter = tappers[0];
+                if (group)
+                    if (Player* groupLooter = ObjectAccessor::GetPlayer(*creature, group->GetLooterGuid()))
+                        looter = groupLooter;
+
+                Loot* loot = new Loot(creature->GetMap(), creature->GetGUID(), LOOT_CORPSE, group);
+                creature->m_loot.reset(loot);
+                loot->SetDungeonEncounterId(dungeonEncounter->ID);
+
+                if (uint32 lootid = creature->GetLootId())
+                    loot->FillLoot(lootid, LootTemplates_Creature, looter, !group, false, creature->GetLootMode(), ItemBonusMgr::GetContextForPlayer(creature->GetMap()->GetMapDifficulty(), looter));
+
+                if (creature->GetLootMode() > 0)
+                    loot->generateMoneyLoot(creature->GetCreatureDifficulty()->GoldMin, creature->GetCreatureDifficulty()->GoldMax);
+
+                if (group)
+                    loot->NotifyLootList(creature->GetMap());
+
+                uint32 epics = 0;
+                for (LootItem const& lootItem : loot->items)
+                    if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(lootItem.itemid))
+                        if (proto->GetQuality() >= ITEM_QUALITY_EPIC)
+                            ++epics;
+
+                TC_LOG_INFO("playerbot.v2", "[boss_loot] {} ({}) shared corpse: {} items ({} epic), group {}, loot method {}, tappers {}",
+                    creature->GetName(), creature->GetEntry(), loot->items.size(), epics, group ? "yes" : "no", uint32(loot->GetLootMethod()), tappers.size());
+            }
+            else if (creature->GetMap()->IsDungeon())
             {
                 if (dungeonEncounter)
                 {
@@ -12920,7 +13002,8 @@ float Unit::MeleeSpellMissChance(Unit const* victim, WeaponAttackType attType, S
     else
         missChance -= victim->GetTotalAuraModifier(SPELL_AURA_MOD_ATTACKER_MELEE_HIT_CHANCE);
 
-    return std::max(missChance, 0.f);
+    // Classic 1.60 (vanilla, VMaNGOS): the miss chance is limited to 0..60%
+    return std::clamp(missChance, 0.f, 60.f);
 }
 
 void Unit::OnPhaseChange()

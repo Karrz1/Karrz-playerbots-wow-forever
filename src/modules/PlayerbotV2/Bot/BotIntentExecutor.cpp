@@ -17,6 +17,7 @@
 #include "../Diagnostics/PerfCounters.h"
 #include "BotTextMgr.h"
 #include "RezClaims.h"
+#include "../Combat/Apl/HealClaimStore.h"
 #include "CombatManager.h"
 #include "TemporarySummon.h"
 #include "PlayerbotAPI.h"
@@ -48,7 +49,9 @@ namespace {
 // zone changes move the bot between channels like any player.
 Result SayInZoneChannel(Player* bot, uint8 channel_id, std::string const& text)
 {
-    if (!bot || text.empty())
+    // A bot that is leaving the world (its social list is dropped first) must not speak: the channel code reads the speaker's
+    // and every listener's social list (deadmines_full end, 2026-10-11: 0xc0000005 in PlayerSocial::_HasContact).
+    if (!bot || text.empty() || !bot->IsInWorld() || !bot->GetSocial())
         return Result::Other;
     auto find = [bot](uint32 id) -> Channel*
     {
@@ -123,6 +126,9 @@ struct IntentVisitor
         if (Combat::ClassicHeal::IsRezSpell(i.spell_id))
             Combat::ClassicHeal::LogRezEffectsOnce();
         Result const r = api.cast_spell(i.spell_id, i.target, i.exact_rank);
+        if (api.last_cast_fail() != 0)
+            if (Player const* bp = api.player())
+                Combat::ClassicHeal::ReleaseHealClaim(bp->GetGUID().GetCounter(), i.target, GameTime::GetGameTimeMS());
         if (r == Result::Ok && bot_ai)
             bot_ai->set_last_cast_spell_id(i.spell_id);
         // [cast_fail] per-reason tally, logged every 10 s per bot with failures.
@@ -289,7 +295,7 @@ struct IntentVisitor
     Result operator()(SetRaidTargetIconIntent const& i){ return api.set_raid_target_icon(i.symbol, i.target); }
     Result operator()(ActivateSpecIntent const& i)     { return api.activate_spec(i.spec_id); }
     Result operator()(ResetCooldownsIntent const&)     { return api.reset_all_cooldowns(); }
-    Result operator()(TradeDeclineIntent const& i)     { return i.accept ? api.accept_owner_trade(i.owner) : api.decline_trade(); }
+    Result operator()(TradeDeclineIntent const& i)     { return i.accept ? api.trade_with(i.owner, i.gift) : api.decline_trade(); }
     Result operator()(UseItemByEntryIntent const& i)   { return api.use_item_by_entry(i.item_entry, i.target); }
     Result operator()(UseItemIntent const& i)          { return api.use_item_by_slot(i.bag, i.slot, i.target); }
     Result operator()(LootIntent const& i)              { return api.loot_corpse(i.corpse_or_object); }
@@ -381,6 +387,7 @@ struct IntentVisitor
             if      constexpr (std::is_same_v<T, VendorBuyIntent>)            return api.vendor_buy_by_slot(op.npc, op.vendor_slot, op.count);
             else if constexpr (std::is_same_v<T, VendorSellIntent>)           return api.sell_item_by_slot(op.npc, op.bag, op.slot, op.count);
             else if constexpr (std::is_same_v<T, VendorSellTrashIntent>)      return api.sell_trash(op.npc);
+            else if constexpr (std::is_same_v<T, MakeBagRoomIntent>)          return api.make_room(op.min_free);
             else if constexpr (std::is_same_v<T, RepairAllIntent>)            return api.repair_all(op.npc, op.from_guild_bank);
             else if constexpr (std::is_same_v<T, VendorBuyByCategoryIntent>)  return api.vendor_buy_by_category(op.npc, op.item_class, op.item_subclass, op.total_count);
             else if constexpr (std::is_same_v<T, VendorBuyByEntryIntent>)     return api.vendor_buy_by_entry(op.npc, op.item_entry, op.count);

@@ -49,6 +49,7 @@ public:
 
     // Raid brain (Bot/Raid): read once per config load, not per tick.
     bool   raid_enabled() const { return raid_enabled_; }
+    bool   boss_warnings_enabled() const { return boss_warnings_enabled_; }
     bool   raid_auto_accept_rez() const { return raid_auto_accept_rez_; }
 
     // Housing
@@ -287,7 +288,7 @@ public:
     //   (PlayerbotV2.Combat.SkipUnfightable)
     bool combat_skip_unfightable() const { return combat_skip_unfightable_; }
 
-    // Group threat discipline (port of Karrz's wow-1.12 GroupPveRestraint /
+    // Group threat discipline (port of Karrz's ike3-based bots GroupPveRestraint /
     // MCRaidHoldDamage). Non-tank bots in a group with a tank hold damage
     // until the tank has an opening threat lead and stay under max_ratio of
     // the tank's threat. Leads are level-60 values, scaled by bot level.
@@ -434,6 +435,7 @@ private:
     char        command_prefix_ = '!';
 
     bool   raid_enabled_     = true;
+    bool   boss_warnings_enabled_ = true;
     bool   raid_auto_accept_rez_ = true;
 
     bool   housing_enabled_  = true;

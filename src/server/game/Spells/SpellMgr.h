@@ -21,6 +21,8 @@
 // For static or at-server-startup loaded spell data
 
 #include "ClassicSpellValue.h"
+#include "DB2Structure.h"
+#include <deque>
 #include "Define.h"
 #include "DBCEnums.h"
 #include "Duration.h"
@@ -711,6 +713,7 @@ class TC_GAME_API SpellMgr
 
         // Classic 1.60: vanilla damage / heal / absorb value of an effect of a legacy spell (ClassicSpellValue.h)
         ClassicSpellValue::Value const* GetClassicSpellValue(uint32 spellId, uint32 effectIndex) const;
+        ClassicSpellValue::Cost const* GetClassicSpellCost(uint32 spellId) const;
 
         SkillLineAbilityMapBounds GetSkillLineAbilityMapBounds(uint32 spell_id) const;
 
@@ -779,7 +782,9 @@ class TC_GAME_API SpellMgr
         void LoadSpellInfoServerside();
         void LoadSpellInfoCustomAttributes();
         void LoadSpellInfoCorrections();
+        void LoadClassicSpellInfo();                        // must be after LoadSpellInfoCorrections (table classic_spell_info: cast time, cooldowns, duration, range)
         void LoadClassicSpellValues();                      // must be after LoadSpellInfoStore
+        void LoadClassicSpellCosts();                       // must be after LoadSpellInfoStore
         void LoadSpellInfoSpellSpecificAndAuraState();
         void LoadSpellInfoDiminishing();
         void LoadSpellInfoImmunities();
@@ -812,7 +817,12 @@ class TC_GAME_API SpellMgr
         PetLevelupSpellMap         mPetLevelupSpellMap;
         PetDefaultSpellsMap        mPetDefaultSpellsMap;           // only spells not listed in related mPetLevelupSpellMap entry
         SpellTotemModelMap         mSpellTotemModel;
+        // the cast time / duration / range rows the classic_spell_info overrides point to (a SpellInfo holds a pointer to its DB2 row; these outlive it)
+        std::deque<SpellCastTimesEntry> mClassicCastTimes;
+        std::deque<SpellDurationEntry> mClassicDurations;
+        std::deque<SpellRangeEntry> mClassicRanges;
         std::unordered_map<uint64, ClassicSpellValue::Value> mClassicSpellValues;   // (spellId << 8 | effectIndex)
+        std::unordered_map<uint32, ClassicSpellValue::Cost> mClassicSpellCosts;
 };
 
 #define sSpellMgr SpellMgr::instance()
