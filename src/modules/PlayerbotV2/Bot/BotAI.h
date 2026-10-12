@@ -2114,6 +2114,11 @@ public:
     uint32 last_quest_diag_ms() const { return last_quest_diag_ms_; }
     void   set_last_quest_diag_ms(uint32 ms) { last_quest_diag_ms_ = ms; }
 
+    // Throttle stamp for the `[quest_accept_stall]` diagnostic in QuestRules: an offer in sight that idle:quest_accept
+    // did not act on. One line per bot per 30s.
+    uint32 last_accept_stall_diag_ms() const { return last_accept_stall_diag_ms_; }
+    void   set_last_accept_stall_diag_ms(uint32 ms) { last_accept_stall_diag_ms_ = ms; }
+
     // Throttle stamp for the `[wander_reason]` diagnostic in
     // State_Idle. One log line per bot per 60s — wander fires 1000+/min
     // fleet-wide so anything tighter would drown the log.
@@ -3982,6 +3987,7 @@ private:
     // BotSnapshotBuilder. Single uint32 since the diagnostic logs once
     // per bot per 5s regardless of quest_id.
     uint32 last_quest_diag_ms_ = 0;
+    uint32 last_accept_stall_diag_ms_ = 0;
     uint32 last_moving_ms_     = 0;     // for idle:ambient_sit sustained-idle gate
     // Throttle for the `[wander_reason]` diagnostic — 1 line per bot
     // per 60s. Wander fires ~1000+/min fleet-wide.

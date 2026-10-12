@@ -26,6 +26,7 @@
 #include <vector>
 #include <string>
 
+#include "StrandedWatch.h"
 #include "WorldLoadFacts.h"
 #include "WorldFactionMix.h"
 #include "PoolBalance.h"
@@ -129,6 +130,8 @@ private:
     void DriveGlobalSpawn(uint32 now_ms, std::vector<Anchor> const& anchors);
     // Classic 1.60: a Skyborne bot that reached level 10 on Zephras Isle is carried once to a leveling town (the isle has no exit).
     void DriveGraduation(uint32 now_ms);
+    // Residents standing in lava or on ground with no way out are placed again (Fleet/StrandedWatch.h).
+    void DriveStranded(uint32 now_ms, std::vector<Anchor> const& anchors);
     // Level range of the bots around this anchor: its zone's, lifted to MinLevel, except on Zephras Isle (Fleet/SkyborneIsle.h).
     void WindowFor(Anchor const& a, uint8& lo, uint8& hi) const;
     bool PlaceNear(Player* bot, Player* anchor);
@@ -177,6 +180,9 @@ private:
     struct Seeding { uint32 started_ms = 0; uint32 setup_done_ms = 0; };
     std::unordered_map<uint64, Seeding> seeding_;
     uint32 last_grad_ms_ = 0;
+    uint32 last_stranded_ms_ = 0;
+    uint64 n_stranded_moved_ = 0;      // residents found in lava or with no way out and placed again
+    std::unordered_map<uint64, StrandedState> stranded_;
     uint64 n_graduated_ = 0;           // Skyborne bots moved off Zephras Isle at level 10
     uint64 n_seeded_ = 0;              // residents created by the seeding pass and put to sleep
     uint64 n_woken_ = 0;               // sleeping residents logged in at their saved position

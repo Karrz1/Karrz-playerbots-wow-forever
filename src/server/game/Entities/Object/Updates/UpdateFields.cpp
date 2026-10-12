@@ -1151,8 +1151,8 @@ void UnitData::WriteCreate(EnumFlag<UpdateFieldFlag> fieldVisibilityFlags, ByteB
     data << float(ModTimeRate);
     data << int32(CreatedBySpell);
     data << int32(EmoteState);
-    data << int16(0);                           // Classic 1.60.1.70009: two unknown int16 (client UnitData +0x1E0, +0x1E2)
-    data << int16(0);
+    data << int16(ClassicTrainingPointsUsed);   // Classic 1.60: hunter pet training points used / total (client UnitData +0x1E0, +0x1E2)
+    data << int16(ClassicTrainingPointsTotal);
     if (fieldVisibilityFlags.HasFlag(UpdateFieldFlag::Owner))
     {
         for (uint32 i = 0; i < 5; ++i)
@@ -1294,14 +1294,15 @@ void UnitData::AppendAllowedFieldsMaskForFlag(Mask& allowedMaskForTarget, EnumFl
 
 void UnitData::FilterDisallowedFieldsMaskForFlag(Mask& changesMask, EnumFlag<UpdateFieldFlag> fieldVisibilityFlags)
 {
-    Mask allowedMaskForTarget({ 0xFFFEFFFFu, 0x7FDFFFFFu, 0x07BFBFF1u, 0xFFFFC001u, 0xFFFFFFFFu, 0x07F00000u, 0x00000000u, 0x00000000u });
+    // Classic: bits 231/232 (pet training points) are seen by everyone (official 70291 creates of other hunters' pets carry them)
+    Mask allowedMaskForTarget({ 0xFFFEFFFFu, 0x7FDFFFFFu, 0x07BFBFF1u, 0xFFFFC001u, 0xFFFFFFFFu, 0x07F00000u, 0x00000000u, 0x00000180u });
     UnitDataAppendAllowedFieldsMaskForFlag(allowedMaskForTarget, fieldVisibilityFlags);
     changesMask &= allowedMaskForTarget;
 }
 
 void UnitData::WriteUpdate(EnumFlag<UpdateFieldFlag> fieldVisibilityFlags, ByteBuffer& data, Player const* receiver, Unit const* owner) const
 {
-    Mask allowedMaskForTarget({ 0xFFFEFFFFu, 0x7FDFFFFFu, 0x07BFBFF1u, 0xFFFFC001u, 0xFFFFFFFFu, 0x07F00000u, 0x00000000u, 0x00000000u });
+    Mask allowedMaskForTarget({ 0xFFFEFFFFu, 0x7FDFFFFFu, 0x07BFBFF1u, 0xFFFFC001u, 0xFFFFFFFFu, 0x07F00000u, 0x00000000u, 0x00000180u });
     UnitDataAppendAllowedFieldsMaskForFlag(allowedMaskForTarget, fieldVisibilityFlags);
     WriteUpdate(_changesMask & allowedMaskForTarget, data, receiver, owner, false);
 }
@@ -1313,6 +1314,8 @@ void UnitData::WriteUpdate(EnumFlag<UpdateFieldFlag> fieldVisibilityFlags, ByteB
 static uint32 ClassicUnitDataBit70009(uint32 bit)
 {
     if (bit == 230) return 141;             // ClassicComboTarget, the guid after CurrentAreaID
+    if (bit == 231) return 86;              // ClassicTrainingPointsUsed, first int16 after EmoteState
+    if (bit == 232) return 87;              // ClassicTrainingPointsTotal
     if (bit == 70) return 71;               // VisFlags: after AnimTier in the Classic client
     if (bit == 71) return 70;               // AnimTier
     if (bit <= 71) return bit;
@@ -1784,6 +1787,14 @@ void UnitData::WriteUpdate(Mask const& changesMask, ByteBuffer& data, Player con
         {
             data << int32(EmoteState);
         }
+        if (changesMask[231])
+        {
+            data << int16(ClassicTrainingPointsUsed);
+        }
+        if (changesMask[232])
+        {
+            data << int16(ClassicTrainingPointsTotal);
+        }
         if (changesMask[85])
         {
             data << int32(BaseMana);
@@ -2232,6 +2243,8 @@ void UnitData::ClearChangesMask()
     Base::ClearChangesMask(AutoAttackRangeMod);
     Base::ClearChangesMask(NameplateAttachToGUID);
     Base::ClearChangesMask(ClassicComboTarget);
+    Base::ClearChangesMask(ClassicTrainingPointsUsed);
+    Base::ClearChangesMask(ClassicTrainingPointsTotal);
     Base::ClearChangesMask(AssistActionData);
     Base::ClearChangesMask(Power);
     Base::ClearChangesMask(MaxPower);

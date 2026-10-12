@@ -3,6 +3,8 @@
 #include "Fleet/WorldLeash.h"
 #include "WorldBotSpawner.h"
 #include "WakeSelect.h"
+#include "StrandedWatch.h"
+#include "TownGatherSource.h"
 #include "WorldFactionMix.h"
 #include "SkyborneIsle.h"
 #include "BotPopulationManager.h"
@@ -27,6 +29,7 @@
 #include "GameObject.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
+#include "PathGenerator.h"
 #include "PlayerbotMovement.h"
 #include "Random.h"
 #include "StringFormat.h"
@@ -309,6 +312,27 @@ uint32 WorldBotSpawner::CountAmbientNear(Anchor const& a) const
     return n;
 }
 
+// Lava or slime under (x, y, z): ground a resident must never stand on, whatever the navmesh says about the surface below it.
+static bool InMagma(Map* map, PhaseShift const& phase, float x, float y, float z)
+{
+    LiquidData ld;
+    ZLiquidStatus const st = map->GetLiquidStatus(phase, x, y, z, {}, &ld);
+    if (!(st & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER | LIQUID_MAP_WATER_WALK)))
+        return false;
+    return ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) || ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Slime);
+}
+
+// A complete navmesh path from `from` (standing where it is) to (x, y, z). A map without a mesh gives no verdict: reachable.
+static bool CompletePathTo(Player* from, float x, float y, float z)
+{
+    PathGenerator pg(from);
+    ::Playerbot::BotMovement::SehSafeCalculatePath(pg, x, y, z);
+    PathType const t = pg.GetPathType();
+    if (t & (PATHFIND_NOT_USING_PATH | PATHFIND_SHORTCUT))
+        return true;
+    return (t & PATHFIND_NORMAL) && !(t & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE | PATHFIND_FARFROMPOLY));
+}
+
 // A sleeper saved in a crowd (the roster was once placed on one flight master point per town) must not wake into it. It wakes at a
 // quest hub of the same zone that suits its level, chosen anew each time, or failing that a few yards off the spot, on the
 // ground. A bot with nobody around it stays exactly where it slept.
@@ -324,6 +348,27 @@ void WorldBotSpawner::StepOffStack(Player* bot)
         {
             Playerbot::BotMovement::SafeNearTeleport(bot, bot->GetPositionX(), bot->GetPositionY(), gz + 0.3f, bot->GetOrientation());
             TC_LOG_INFO("playerbot.v2", "[world] {} woke {:.1f} y under the ground, lifted onto it", bot->GetName(), gz - bot->GetPositionZ());
+        }
+    }
+    // A sleeper saved off the navmesh (over a lava pit, inside a wall, on a roof: a spot an older build placed it on) cannot path
+    // anywhere and stands there for good. Move it to the nearest walkable ground, if there is any close by.
+    if (bot->GetMap() && !bot->IsInCombat() && bot->IsAlive())
+    {
+        Position onmesh;
+        float const px = bot->GetPositionX(), py = bot->GetPositionY(), pz = bot->GetPositionZ();
+        if (!::Playerbot::BotMovement::NearestNavPoint(bot, px, py, pz, 3.0f, 4.0f, onmesh))
+        {
+            Position wide;
+            if (::Playerbot::BotMovement::NearestNavPoint(bot, px, py, pz, 40.0f, 12.0f, wide))
+            {
+                Playerbot::BotMovement::SafeNearTeleport(bot, wide.GetPositionX(), wide.GetPositionY(), wide.GetPositionZ() + 0.3f,
+                                                         bot->GetOrientation(), /*navmesh_point*/ true);
+                TC_LOG_INFO("playerbot.v2", "[world] {} woke off the navmesh at ({:.0f},{:.0f},{:.0f}), moved {:.0f} y onto walkable ground",
+                            bot->GetName(), px, py, pz, std::hypot(wide.GetPositionX() - px, wide.GetPositionY() - py));
+            }
+            else
+                TC_LOG_INFO("playerbot.v2", "[world] {} woke off the navmesh at ({:.0f},{:.0f},{:.0f}), no walkable ground within 40 y",
+                            bot->GetName(), px, py, pz);
         }
     }
     constexpr float kCrowdYards = 8.0f;
@@ -371,7 +416,7 @@ bool WorldBotSpawner::PlaceNear(Player* bot, Player* anchor)
     // Spawn spots: quest hubs (and, in a capital, the hubs of the town) around the anchor, so the crowd stands where
     // bots actually live and then goes about its own business there. A ring spot around the player is only the
     // fallback; a crowd that is always rebuilt on a ring reads as bots following the player.
-    struct Spot { float x, y, z, r, d; };
+    struct Spot { float x, y, z, r, d; float w = 1.0f; };
     Anchor self;   // the anchor as a plain record, to count the bots already around him
     self.guid = anchor->GetGUID(); self.map = anchor->GetMapId(); self.x = anchor->GetPositionX(); self.y = anchor->GetPositionY();
     self.zone = anchor->GetZoneId();
@@ -380,6 +425,19 @@ bool WorldBotSpawner::PlaceNear(Player* bot, Player* anchor)
     {
         float const ax = anchor->GetPositionX(), ay = anchor->GetPositionY();
         float const min_d = in_town ? 35.0f : 60.0f;
+        // A capital: where people gather (bank, auction house, inn, flight master, battlemaster), not the quest-giver hubs, which in
+        // Ironforge are the ward entrance rooms.
+        if (in_town)
+            for (::Playerbot::V2::Fleet::GatherSpot const& g : ::Playerbot::V2::Fleet::TownGatherSpots(
+                     anchor->GetMapId(), ax, ay, std::min(cfg_.activity_radius * 0.9f, 150.0f), anchor->GetTeam() == ALLIANCE))
+            {
+                float const d = Dist2D(g.x, g.y, ax, ay);
+                if (d < min_d * 0.5f) continue;
+                Spot const sp{ g.x, g.y, g.z, ::Playerbot::V2::Fleet::kGatherRadius, d, g.weight };
+                hubs.push_back(sp);
+                if (d <= 150.0f) near_hubs.push_back(sp);
+            }
+        if (!(in_town && !hubs.empty()))
         Services::Hubs().ForEach([&](::Playerbot::V2::Travel::QuestHub const& h)
         {
             if (h.mapId != anchor->GetMapId()) return;
@@ -393,6 +451,25 @@ bool WorldBotSpawner::PlaceNear(Player* bot, Player* anchor)
             }
         });
     }
+
+    // Where the residents of this map already stand, so a hub pick can prefer the less crowded of a few: a town's hubs near the
+    // player are few, and "the closest ones first" put the whole crowd in one doorway.
+    std::vector<std::pair<float, float>> crowd;
+    if (in_town)
+        Services::Registry().for_each([&](BotId id, BotRegistryEntry const&)
+        {
+            Player* o = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
+            if (o && o->IsInWorld() && o->GetMapId() == anchor->GetMapId() && o->GetZoneId() == anchor->GetZoneId() && owner_.IsAmbientBot(id, o))
+                crowd.emplace_back(o->GetPositionX(), o->GetPositionY());
+        });
+    auto crowd_at = [&](Spot const& h)
+    {
+        uint32 n = 0;
+        float const r = h.r + 15.0f;
+        for (auto const& c : crowd)
+            if (Dist2D(c.first, c.second, h.x, h.y) <= r) ++n;
+        return n;
+    };
 
     float bx = 0, by = 0, bz = 0;
     bool have = false, hidden = false;
@@ -409,12 +486,34 @@ bool WorldBotSpawner::PlaceNear(Player* bot, Player* anchor)
             // Arrival: while fewer than 20 bots stand around the player, the first ones go to the hubs closest to him, so
             // the nearest ones appear first; the rest spread as usual.
             std::vector<Spot> pool = base;
-            if (arriving && pool.size() > 4)
+            if (arriving && pool.size() > 8)
             {
-                std::partial_sort(pool.begin(), pool.begin() + 4, pool.end(), [](Spot const& l, Spot const& r) { return l.d < r.d; });
-                pool.resize(4);
+                std::partial_sort(pool.begin(), pool.begin() + 8, pool.end(), [](Spot const& l, Spot const& r) { return l.d < r.d; });
+                pool.resize(8);
             }
-            Spot const& h = pool[urand(0u, uint32(pool.size() - 1))];
+            // In a town: of three hubs drawn at random, the one with the fewest residents already around it.
+            // Weighted by what gathers there (bank and auction house over a lone vendor), then the least crowded for its weight.
+            auto draw = [&]() -> Spot const*
+            {
+                float total = 0.0f;
+                for (Spot const& sp : pool) total += sp.w;
+                float t = frand(0.0f, total);
+                for (Spot const& sp : pool)
+                {
+                    t -= sp.w;
+                    if (t < 0.0f) return &sp;
+                }
+                return &pool.back();
+            };
+            Spot const* pick = draw();
+            if (in_town)
+                for (int k = 0; k < 2; ++k)
+                {
+                    Spot const* alt = draw();
+                    if (float(crowd_at(*alt)) / alt->w < float(crowd_at(*pick)) / pick->w)
+                        pick = alt;
+                }
+            Spot const& h = *pick;
             float const a = frand(0.0f, 2.0f * float(M_PI));
             float const rr = frand(0.0f, h.r);
             x = h.x + std::cos(a) * rr;
@@ -434,11 +533,22 @@ bool WorldBotSpawner::PlaceNear(Player* bot, Player* anchor)
         // The ground height of a canal or pond is its floor: never put a bot on a spot that has water over it (even ankle-deep: the check is at the floor, not at head height).
         if (map->GetLiquidStatus(anchor->GetPhaseShift(), x, y, z + 0.05f, {}) & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER))
             continue;
-        bx = x; by = y; bz = z;
+        // The height probe finds ANY surface within 60 y below the player: the floor of a lava pit (Ironforge's Great Forge), a roof,
+        // a lower level. Stand only where a walkable navmesh polygon is, so the bot can path from its spot to anywhere.
+        Position nav;
+        if (!::Playerbot::BotMovement::NearestNavPoint(anchor, x, y, z, 4.0f, 5.0f, nav))
+            continue;
+        // Walkable is not yet "a place to live": never lava or slime, and in a town a spot the player can walk to. The Great Forge's
+        // pit floor is ground to the probe and to the mesh but joins nothing; a bot put there stands in it for good.
+        if (InMagma(map, anchor->GetPhaseShift(), nav.GetPositionX(), nav.GetPositionY(), nav.GetPositionZ() + 0.05f))
+            continue;
+        if (in_town && !CompletePathTo(anchor, nav.GetPositionX(), nav.GetPositionY(), nav.GetPositionZ()))
+            continue;
+        bx = nav.GetPositionX(); by = nav.GetPositionY(); bz = nav.GetPositionZ();
         last_place_dist_ = dist;
         have = true;
         // Prefer a spot the anchor cannot see, so bots do not pop into view; keep the last candidate otherwise.
-        hidden = !anchor->IsWithinLOS(x, y, z + 1.5f);
+        hidden = !anchor->IsWithinLOS(bx, by, bz + 1.5f);
     }
     if (!have)
         return false;
@@ -698,7 +808,7 @@ void WorldBotSpawner::DriveSpawn(uint32 now_ms, std::vector<Anchor> const& ancho
         std::vector<uint8> slot_levels;
         for (uint32 i = 0; i < want; ++i)
         {
-            slots.push_back(BotIsAlliance(a.alliance, urand(0, 99), FriendlyPctFor(cfg_.mix, a.zone)));
+            slots.push_back(BotIsAllianceInZone(a.zone, a.alliance, urand(0, 99), FriendlyPctFor(cfg_.mix, a.zone)));
             slot_levels.push_back(uint8(urand(lo, hi)));
         }
 
@@ -719,6 +829,78 @@ void WorldBotSpawner::DriveSpawn(uint32 now_ms, std::vector<Anchor> const& ancho
     }
 
     DriveGlobalSpawn(now_ms, anchors);
+}
+
+// Residents that stand where they cannot live: in lava (at once), or in a town on ground with no way out of it
+// (no complete path to the nearest player three checks running). They are placed again the way a new resident is, next to the nearest player, which now refuses such
+// spots. This clears what older builds left in the Great Forge pit (and what sleeps there and wakes); the placement checks stop
+// new ones. A few bots per pass, each bot looked at every kStrandedCheckMs.
+void WorldBotSpawner::DriveStranded(uint32 now_ms, std::vector<Anchor> const& anchors)
+{
+    constexpr uint32 kPassMs = 2000u;
+    constexpr uint32 kProbesPerPass = 3u;      // path probes (the costly ones) per pass; lava checks are cheap
+    constexpr float  kTownPathRange = 200.0f;  // a town's player this close gives the reference for "a way out"
+    if (last_stranded_ms_ && getMSTimeDiff(last_stranded_ms_, now_ms) < kPassMs)
+        return;
+    last_stranded_ms_ = now_ms;
+    if (anchors.empty())
+        return;
+
+    uint32 probes = 0;
+    std::vector<uint64> seen;
+    Services::Registry().for_each([&](BotId id, BotRegistryEntry const&)
+    {
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
+        if (!p || !p->IsInWorld() || !p->IsAlive() || !p->GetMap() || p->IsBeingTeleported() || p->IsInFlight() || p->GetTransport())
+            return;
+        if (!owner_.IsAmbientBot(id, p) || p->GetGroup() || p->IsInCombat() || p->InBattleground() || p->InBattlegroundQueue()
+            || p->GetMap()->IsDungeon() || p->GetMap()->IsBattlegroundOrArena())
+            return;
+        if (!owner_.SetupDone(uint64(id)) || pending_.contains(uint64(id)) || seeding_.contains(uint64(id)))
+            return;
+        StrandedState& st = stranded_[uint64(id)];
+        if (!StrandedDue(st, now_ms))
+            return;
+
+        // The nearest player on the bot's map: the reference for a way out, and where a stranded bot is put again.
+        Anchor const* near_a = nullptr;
+        float near_d = 1e9f;
+        for (Anchor const& a : anchors)
+        {
+            if (a.map != p->GetMapId()) continue;
+            float const d = Dist2D(p->GetPositionX(), p->GetPositionY(), a.x, a.y);
+            if (d < near_d) { near_d = d; near_a = &a; }
+        }
+        if (!near_a)
+            return;   // nobody on this map: the despawn pass logs it out
+
+        float const px = p->GetPositionX(), py = p->GetPositionY(), pz = p->GetPositionZ();
+        bool const magma = InMagma(p->GetMap(), p->GetPhaseShift(), px, py, pz + 0.05f);
+        bool path_out = true;
+        uint8 tlo = 0, thi = 0;
+        bool const in_town = !::Playerbot::V2::World::VanillaZoneLevelRange(p->GetZoneId(), tlo, thi);
+        if (!magma && in_town && near_a->zone == p->GetZoneId() && near_d <= kTownPathRange)
+        {
+            if (probes >= kProbesPerPass)
+                return;   // next pass: st stays due
+            ++probes;
+            path_out = CompletePathTo(p, near_a->x, near_a->y, near_a->z);
+        }
+        if (!StrandedUpdate(st, magma, path_out, px, py, pz, now_ms))
+            return;
+
+        Player* ap = ObjectAccessor::FindConnectedPlayer(near_a->guid);
+        if (!ap || !ap->IsInWorld() || !PlaceNear(p, ap))
+            return;
+        placed_[uint64(id)] = Placed{ now_ms };
+        ++n_stranded_moved_;
+        TC_LOG_INFO("playerbot.v2", "[world] {} ({}) was {} at ({:.0f},{:.0f},{:.0f}) in zone {}, placed again next to {}",
+                    p->GetName(), uint64(id), magma ? "standing in lava" : "on ground with no way out", px, py, pz, p->GetZoneId(), ap->GetName());
+    });
+    // Forget bots that are gone.
+    if (stranded_.size() > 2048u)
+        for (auto it = stranded_.begin(); it != stranded_.end();)
+            it = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(it->first)) ? std::next(it) : stranded_.erase(it);
 }
 
 void WorldBotSpawner::DriveGraduation(uint32 now_ms)
@@ -862,7 +1044,7 @@ void WorldBotSpawner::DriveWake(uint32 now_ms, Anchor const& a, uint32 want)
                 if (Player* ap = ObjectAccessor::FindConnectedPlayer(a.guid); ap && ap->GetMap())
                     c.wet = (ap->GetMap()->GetLiquidStatus(ap->GetPhaseShift(), f[4].GetFloat(), f[5].GetFloat(), f[7].GetFloat() + 0.05f, {})
                              & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER)) != 0;
-                c.faction_ok = IsAllianceRace(f[2].GetUInt8()) == BotIsAlliance(a.alliance, urand(0, 99), FriendlyPctFor(cfg_.mix, a.zone));
+                c.faction_ok = IsAllianceRace(f[2].GetUInt8()) == BotIsAllianceInZone(a.zone, a.alliance, urand(0, 99), FriendlyPctFor(cfg_.mix, a.zone));
                 cands.push_back(c);
             } while (res->NextRow());
             // Never more than the target still lacks, and never past the global cap.
@@ -1157,6 +1339,7 @@ void WorldBotSpawner::OnWorldTick(uint32 now_ms)
     DriveSpawn(now_ms, anchors);
     DriveSeed(now_ms);
     DriveGraduation(now_ms);
+    DriveStranded(now_ms, anchors);
 
     last_tick_cost_ms_ = getMSTimeDiff(t0, getMSTime());
     max_tick_cost_ms_ = std::max(max_tick_cost_ms_, last_tick_cost_ms_);

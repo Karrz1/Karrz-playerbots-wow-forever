@@ -250,6 +250,9 @@ public:
     // Thread-safe (shared lock).
     GraphNode const* FindNearestNodeOnMap(uint32 map_id, float x, float y,
                                           float max_range = 400.f) const;
+    // Same, measured in 3D (a floor above or below counts, see NearestNode3D.h) and skipping the nodes `skip` rejects.
+    GraphNode const* FindNearestNodeOnMap3D(uint32 map_id, float x, float y, float z, float max_range,
+                                            std::function<bool(GraphNode const&)> const& skip) const;
 
     // Vanilla realm (IsVanillaRealm): true when a flight master creature is
     // spawned at this TaxiNodes entry in the world DB, i.e. a bot that walks

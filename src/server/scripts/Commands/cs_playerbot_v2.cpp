@@ -1107,6 +1107,26 @@ public:
         bool const with_me = ToLowerAscii(who) == "all";
         std::string names;
         uint32 saved = 0;
+        // Save group REPLACES the saved roster (Karrz, 2026-10-11: after a second save the call said 78 saved where the first said 39: the
+        // bots of the earlier save stayed saved next to the new ones). A companion saved earlier that is not in the group now is unsaved.
+        if (with_me)
+        {
+            Group const* grp = me->GetGroup();
+            uint32 dropped = 0, with_group = 0;
+            for (Playerbot::BotId id : CompanionsMatching(sess, "all"))
+                if (grp && grp->IsMember(ObjectGuid::Create<HighGuid::Player>(id)) && ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id)))
+                    ++with_group;
+            // A group with none of the owner's bots in it saves nothing and must not wipe the roster.
+            for (Playerbot::BotId id : CompanionsMatching(sess, "all"))
+                if (with_group && Playerbot::Services::Owners().GetOwner(id).saved && !(grp && grp->IsMember(ObjectGuid::Create<HighGuid::Player>(id))))
+                {
+                    Playerbot::Services::Owners().SetSaved(id, false);
+                    TC_LOG_INFO("playerbot.v2", "[roster_save] {} was saved earlier and is not in the group: unsaved", CompanionName(id));
+                    ++dropped;
+                }
+            if (dropped)
+                TC_LOG_INFO("playerbot.v2", "[roster_save] Save group replaced the roster: {} earlier bot(s) unsaved", dropped);
+        }
         for (Playerbot::BotId id : CompanionsMatching(sess, who))
         {
             if (with_me)
@@ -1129,6 +1149,14 @@ public:
             {
                 uint8 const sub = grp->GetMemberGroup(ObjectGuid::Create<HighGuid::Player>(id));
                 Playerbot::Services::Owners().SetStoredSubgroup(id, sub);
+                uint16 pos = 0;
+                for (Group::MemberSlot const& slot : grp->GetMemberSlots())
+                {
+                    if (slot.guid.GetCounter() == id)
+                        break;
+                    ++pos;
+                }
+                Playerbot::Services::Owners().SetStoredOrder(id, pos);
                 TC_LOG_INFO("playerbot.v2", "[roster_save] {} saved in raid group {}", CompanionName(id), uint32(sub) + 1u);
             }
             else

@@ -634,6 +634,59 @@ struct PlayerLevelInfo
 
 typedef std::vector<uint32> PlayerCreateInfoSpells;
 
+// Classic 1.60 in-game Store (world tables shop_group / shop_product / shop_product_item)
+struct ShopGroup
+{
+    uint32 ID = 0;
+    std::string Name;
+    int32 IconFileDataID = 0;
+    int32 Ordering = 0;
+};
+
+enum class ShopAction : uint8
+{
+    Item        = 1,    // Param1 item, Param2 count (mailed)
+    Gold        = 2,    // Param1 copper
+    Spell       = 3,    // Param1 spell
+    Service     = 4,    // Param1 ShopService
+    Profession  = 5,    // Param1 skill line, Param2 skill value (0 = 300)
+    Level       = 6,    // Param1 level
+    Title       = 7,    // Param1 CharTitles id
+    Reputation  = 8,    // Param1 faction, Param2 standing
+    RealmTransfer = 9,  // character transfer to another realm (work in progress): the product is sent as a character service, so the
+                        // Store opens its character / realm window
+    BoostToken  = 10,   // Param1 boost type (6 = level 60): a character boost button on the character screen (auth.account_boost_token)
+};
+
+enum class ShopService : int32
+{
+    Rename          = 1,
+    Customize       = 2,
+    RaceChange      = 3,
+    FactionChange   = 4,
+};
+
+struct ShopProductAction
+{
+    ShopAction Action = ShopAction::Item;
+    int32 Param1 = 0;
+    int32 Param2 = 0;
+};
+
+struct ShopProduct
+{
+    uint32 ID = 0;
+    uint32 GroupID = 0;
+    std::string Name;
+    std::string Description;
+    int32 IconFileDataID = 0;
+    uint32 Price = 0;           // shop points
+    uint32 NormalPrice = 0;     // crossed-out price, 0 = no sale
+    int32 Ordering = 0;
+    std::vector<ShopProductAction> Actions;
+    bool InGameOnly = false;    // has actions that need the character in game (anything but items)
+};
+
 struct PlayerCreateInfoAction
 {
     PlayerCreateInfoAction(uint8 _button, uint32 _action, uint8 _type) : button(_button), type(_type), action(_action) { }
@@ -1048,6 +1101,10 @@ class TC_GAME_API ObjectMgr
         ClassicCreatureClassLevelStats const* GetCreatureClassicClassLevelStats(uint8 level, uint8 unitClass) const;
         void LoadItemClassicBlock();
         uint32 GetItemClassicBlock(uint32 entry) const;
+        void LoadShop();
+        std::map<uint32, ShopGroup> const& GetShopGroups() const { return _shopGroupStore; }
+        std::map<uint32, ShopProduct> const& GetShopProducts() const { return _shopProductStore; }
+        ShopProduct const* GetShopProduct(uint32 id) const;
         static CreatureModel const* ChooseDisplayId(CreatureTemplate const* cinfo, CreatureData const* data = nullptr);
         static void ChooseCreatureFlags(CreatureTemplate const* cInfo, uint64* npcFlags, uint32* unitFlags, uint32* unitFlags2, uint32* unitFlags3, CreatureStaticFlagsHolder const& staticFlags, CreatureData const* data = nullptr);
         EquipmentInfo const* GetEquipmentInfo(uint32 entry, int8& id) const;
@@ -1841,6 +1898,8 @@ class TC_GAME_API ObjectMgr
         std::unordered_map<uint16, ClassicCreatureClassLevelStats> _creatureClassicClassLevelStatsStore;
         std::unordered_map<uint32, CreatureClassicMelee> _creatureClassicMeleeStore;
         std::unordered_map<uint32, uint32> _itemClassicBlockStore;
+        std::map<uint32, ShopGroup> _shopGroupStore;
+        std::map<uint32, ShopProduct> _shopProductStore;
         CreatureModelContainer _creatureModelStore;
         std::unordered_map<uint32, CreatureSummonedData> _creatureSummonedDataStore;
         CreatureAddonContainer _creatureAddonStore;

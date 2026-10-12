@@ -84,3 +84,27 @@ TEST_CASE("WorldFactionMix: the share is relative to the player's own faction, A
     }
     CHECK(pct <= 100);
 }
+
+TEST_CASE("WorldFactionMix: a capital holds only its own faction, whoever the player is", "[worldfactionmix]")
+{
+    for (uint32_t roll = 0; roll < 100; ++roll)
+    {
+        // Ironforge, Stormwind, Darnassus: Alliance bots for an Alliance and for a Horde visitor
+        for (uint32_t zone : { 1537u, 1519u, 1657u })
+        {
+            CHECK(BotIsAllianceInZone(zone, true, roll, 90));
+            CHECK(BotIsAllianceInZone(zone, false, roll, 90));
+        }
+        // Orgrimmar, Undercity, Thunder Bluff: Horde bots for both
+        for (uint32_t zone : { 1637u, 1497u, 1638u })
+        {
+            CHECK_FALSE(BotIsAllianceInZone(zone, true, roll, 90));
+            CHECK_FALSE(BotIsAllianceInZone(zone, false, roll, 90));
+        }
+    }
+    // outside a capital the share is still relative to the player
+    uint32_t own = 0;
+    for (uint32_t roll = 0; roll < 100; ++roll)
+        own += BotIsAllianceInZone(33, false, roll, 70) == false;
+    CHECK(own == 70);
+}

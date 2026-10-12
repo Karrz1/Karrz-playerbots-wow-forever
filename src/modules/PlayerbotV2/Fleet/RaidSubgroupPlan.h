@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -89,6 +91,44 @@ inline std::vector<SubgroupMove> PlanSubgroupMoves(std::vector<SubgroupMember> m
         if (!changed)
             break;
     }
+    return out;
+}
+
+struct OrderMember
+{
+    std::uint64_t guid = 0;
+    bool          movable = false;        // an owned companion
+    std::uint16_t order = 0xFFFF;         // stored list index; 0xFFFF = none
+};
+
+// The member list the group should have: the places held by owned members that have a stored order are handed out again, in stored
+// order, to those members. Humans and members without a stored order keep their place. Returns the guids in list order; empty when
+// the list is already as wanted.
+inline std::vector<std::uint64_t> PlanMemberOrder(std::vector<OrderMember> const& members)
+{
+    std::vector<std::size_t> slots;      // list indices held by orderable members
+    std::vector<std::size_t> by_order;   // the same members, sorted by stored order
+    for (std::size_t i = 0; i < members.size(); ++i)
+        if (members[i].movable && members[i].order != 0xFFFF)
+        {
+            slots.push_back(i);
+            by_order.push_back(i);
+        }
+    std::stable_sort(by_order.begin(), by_order.end(),
+        [&](std::size_t a, std::size_t b) { return members[a].order < members[b].order; });
+    std::vector<std::uint64_t> out;
+    out.reserve(members.size());
+    for (OrderMember const& m : members)
+        out.push_back(m.guid);
+    bool changed = false;
+    for (std::size_t k = 0; k < slots.size(); ++k)
+    {
+        if (out[slots[k]] != members[by_order[k]].guid)
+            changed = true;
+        out[slots[k]] = members[by_order[k]].guid;
+    }
+    if (!changed)
+        out.clear();
     return out;
 }
 

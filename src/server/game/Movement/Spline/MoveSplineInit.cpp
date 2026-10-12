@@ -18,6 +18,7 @@
 #include "MoveSplineInit.h"
 #include "Log.h"
 #include "Creature.h"
+#include "Map.h"
 #include "MoveSpline.h"
 #include "MovementPackets.h"
 #include "PathGenerator.h"
@@ -38,6 +39,36 @@ namespace Movement
         bool PlayerSideUnit(Unit const* unit)
         {
             return unit->IsPlayer() || unit->GetCharmerOrOwnerGUID().IsPlayer();
+        }
+
+        // A steep path segment is a walkable slope, not a cliff or a jump between two levels, when the ground under it follows the line
+        // from one end to the other: the terrain at every sample point lies within a step's height of the straight line. Stairs and
+        // ramps (Zephras Isle, Thendal: dz 3.2 over 3 yards of ground, a bot froze at the foot of each) pass; a drop where the line
+        // runs through air above the lower level does not.
+        bool SegmentFollowsGround(Unit const* unit, Vector3 const& from, Vector3 const& to)
+        {
+            Map* map = unit->GetMap();
+            if (!map)
+                return false;
+
+            constexpr float kSampleSpacing = 1.0f;
+            constexpr int kMinSamples = 3;
+            constexpr int kMaxSamples = 16;
+            constexpr float kGroundTolerance = 1.25f;
+
+            float const flat = std::sqrt((to.x - from.x) * (to.x - from.x) + (to.y - from.y) * (to.y - from.y));
+            int const samples = std::clamp(int(flat / kSampleSpacing), kMinSamples, kMaxSamples);
+            for (int s = 1; s <= samples; ++s)
+            {
+                float const t = float(s) / float(samples + 1);
+                float const x = from.x + (to.x - from.x) * t;
+                float const y = from.y + (to.y - from.y) * t;
+                float const z = from.z + (to.z - from.z) * t;
+                float const ground = map->GetHeight(unit->GetPhaseShift(), x, y, z + 2.0f, true, 6.0f);
+                if (ground <= INVALID_HEIGHT || std::fabs(ground - z) > kGroundTolerance)
+                    return false;
+            }
+            return true;
         }
     }
 
@@ -224,7 +255,8 @@ namespace Movement
                 {
                     Vector3 const d = args.path[i] - args.path[i - 1];
                     float const flat = std::sqrt(d.x * d.x + d.y * d.y);
-                    if (std::fabs(d.z) > 3.0f && flat < 1.5f * std::fabs(d.z))
+                    if (std::fabs(d.z) > 3.0f && flat < 1.5f * std::fabs(d.z) &&
+                        !SegmentFollowsGround(unit, args.path[i - 1], args.path[i]))
                     {
                         TC_LOG_INFO("playerbot.v2", "[spline_cut] unit={} segment {}/{} dz={:.1f} flat={:.1f} at ({:.1f},{:.1f},{:.1f})",
                                     unit->GetGUID().GetCounter(), i, args.path.size(), d.z, flat,

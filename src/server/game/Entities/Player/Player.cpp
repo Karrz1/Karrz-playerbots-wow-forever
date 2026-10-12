@@ -30814,11 +30814,40 @@ void Player::AddPetToUpdateFields(PetStable::PetInfo const& pet, PetSaveMode slo
     ufPet.ModifyValue(&UF::StablePetInfo::DisplayID).SetValue(pet.DisplayId);
     ufPet.ModifyValue(&UF::StablePetInfo::ExperienceLevel).SetValue(pet.Level);
     ufPet.ModifyValue(&UF::StablePetInfo::PetFlags).SetValue(ClassicStablePetFlags(slot));
-    ufPet.ModifyValue(&UF::StablePetInfo::LoyaltyLevel).SetValue(1);     // no pet loyalty on this server yet
+    ufPet.ModifyValue(&UF::StablePetInfo::LoyaltyLevel).SetValue(pet.LoyaltyLevel);
+    ufPet.ModifyValue(&UF::StablePetInfo::LoyaltyPoints).SetValue(uint32(std::max(pet.LoyaltyPoints, 0)));  // official meaning unverified
     ufPet.ModifyValue(&UF::StablePetInfo::Happiness).SetValue(pet.Mana); // hunter pets keep their happiness in the mana column
     ufPet.ModifyValue(&UF::StablePetInfo::Experience).SetValue(pet.Experience);
     ufPet.ModifyValue(&UF::StablePetInfo::NextLevelExperience).SetValue(Pet::GetHunterPetNextLevelExperience(pet.Level));
     ufPet.ModifyValue(&UF::StablePetInfo::Name).SetValue(pet.Name);
+}
+
+void Player::UpdateStablePetLoyalty(uint32 petNumber, uint8 loyaltyLevel, int32 loyaltyPoints)
+{
+    if (m_petStable)
+    {
+        if (PetStable::PetInfo* currentPet = m_petStable->GetCurrentPet())
+        {
+            if (currentPet->PetNumber == petNumber)
+            {
+                currentPet->LoyaltyLevel = loyaltyLevel;
+                currentPet->LoyaltyPoints = loyaltyPoints;
+            }
+        }
+    }
+
+    if (!m_activePlayerData->PetStable.has_value())
+        return;
+
+    int32 ufIndex = m_activePlayerData->PetStable->Pets.FindIndexIf([petNumber](UF::StablePetInfo const& p) { return p.PetNumber == petNumber; });
+    if (ufIndex < 0)
+        return;
+
+    auto petSetter = m_values.ModifyValue(&Player::m_activePlayerData)
+        .ModifyValue(&UF::ActivePlayerData::PetStable, 0)
+        .ModifyValue(&UF::StableInfo::Pets, ufIndex);
+    SetUpdateFieldValue(petSetter.ModifyValue(&UF::StablePetInfo::LoyaltyLevel), loyaltyLevel);
+    SetUpdateFieldValue(petSetter.ModifyValue(&UF::StablePetInfo::LoyaltyPoints), uint32(std::max(loyaltyPoints, 0)));
 }
 
 void Player::SetNumStableSlots(uint8 slots)
@@ -30997,6 +31026,7 @@ void Player::SetPetSlot(uint32 petNumber, PetSaveMode dstPetSlot)
                     {
                         SetUpdateFieldValue(petSetter.ModifyValue(&UF::StablePetInfo::ExperienceLevel), uint32(info->Level));
                         SetUpdateFieldValue(petSetter.ModifyValue(&UF::StablePetInfo::Happiness), info->Mana);
+                        SetUpdateFieldValue(petSetter.ModifyValue(&UF::StablePetInfo::LoyaltyLevel), info->LoyaltyLevel);
                         SetUpdateFieldValue(petSetter.ModifyValue(&UF::StablePetInfo::Experience), info->Experience);
                         SetUpdateFieldValue(petSetter.ModifyValue(&UF::StablePetInfo::NextLevelExperience), Pet::GetHunterPetNextLevelExperience(info->Level));
                     }
@@ -31232,6 +31262,18 @@ void Player::_LoadPetStable(uint32 summonedPetNumber, PreparedQueryResult result
 
     m_petStable = std::make_unique<PetStable>();
 
+    // Classic 1.60: hunter pet loyalty (character_pet_loyalty; pets saved before it existed have no row and count as Best Friend)
+    std::unordered_map<uint32, std::pair<uint8, int32>> petLoyalty;
+    if (QueryResult loyaltyResult = CharacterDatabase.PQuery("SELECT l.id, l.loyalty, l.loyalty_points FROM character_pet_loyalty l "
+        "JOIN character_pet p ON p.id = l.id WHERE p.owner = {}", GetGUID().GetCounter()))
+    {
+        do
+        {
+            Field* fields = loyaltyResult->Fetch();
+            petLoyalty[fields[0].GetUInt32()] = { fields[1].GetUInt8(), fields[2].GetInt32() };
+        } while (loyaltyResult->NextRow());
+    }
+
     //         0      1        2      3    4           5     6     7        8          9       10      11        12              13       14              15
     // SELECT id, entry, modelid, level, exp, Reactstate, slot, name, renamed, curhealth, curmana, abdata, savetime, CreatedBySpell, PetType, specialization FROM character_pet WHERE owner = ?
     if (result)
@@ -31257,6 +31299,11 @@ void Player::_LoadPetStable(uint32 summonedPetNumber, PreparedQueryResult result
             petInfo.CreatedBySpellId = fields[13].GetUInt32();
             petInfo.Type = PetType(fields[14].GetUInt8());
             petInfo.SpecializationId = fields[15].GetUInt16();
+            if (auto loyalty = petLoyalty.find(petInfo.PetNumber); loyalty != petLoyalty.end())
+            {
+                petInfo.LoyaltyLevel = loyalty->second.first;
+                petInfo.LoyaltyPoints = loyalty->second.second;
+            }
             if (slot >= PET_SAVE_FIRST_ACTIVE_SLOT && slot < PET_SAVE_LAST_ACTIVE_SLOT)
             {
                 m_petStable->ActivePets[slot] = std::move(petInfo);

@@ -250,7 +250,13 @@ WorldPacket const* FeatureSystemStatusGlueScreen::Write()
     // WoW Classic 1.60.1.70009 layout, from the client's reader (0x7F9E70): 6 bytes of flags (their order differs from retail and is not
     // mapped yet, so all flags are sent as off), no KioskSessionDurationMinutes, array elements directly after the counts.
     // Retail flags misread by the Classic client enabled the Timerunning (Remix) UI and disabled character creation.
-    for (int32 i = 0; i < 6; ++i)
+    // Bit 0 (MSB of the first byte) is BpayStoreAvailable like retail: the glue handler (70058 0x23e2be0) copies it to the
+    // byte C_StoreSecure.IsAvailable() returns, so without it the Store says "unavailable" at character select.
+    // Not set: in the 70058 decoder bit 41 (byte 5, 0x40; message +0x169) is C_RealmList.ShouldShowRealmsAsCheatButton() (the nav
+    // bar's Realms button that CharacterSelectNavBar.lua:391 expects during a character service flow), but on 70338 0x40 showed no
+    // button and crashed the client at the next realm login: ASSERTSAFE(isRuleActive) in PremadeGroupFinderStyleUtils.cpp:23.
+    _worldPacket << uint8(BpayStoreAvailable ? 0x80 : 0x00);
+    for (int32 i = 1; i < 6; ++i)
         _worldPacket << uint8(0);
 
     _worldPacket << uint32(CommercePricePollTimeSeconds);

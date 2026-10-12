@@ -37,6 +37,8 @@ namespace {
 constexpr float kLootRange = 11.0f;
 // A human leads an instance group: bots walk only to corpses this close to him (the rest wait in the queue).
 constexpr float kHumanLootLeashYd = 20.0f;
+// A bot tank leads: bots walk only to corpses this close to the anchor tank (rejoin_tank pulls a follower back at 40 y).
+constexpr float kTankLootLeashYd = 28.0f;
 constexpr uint16 SKILL_SKINNING_LOCAL = 393;
 
 // PROF-P2b: resolve the rank-appropriate skinning cast spell from the bot's
@@ -367,6 +369,26 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
                                         return;
                                     break;
                                 }
+                    // A bot-led dungeon group: a corpse further from the anchor tank than kTankLootLeashYd waits (the queue rotates to
+                    // the next corpse). ingroup:dungeon_rejoin_tank walks a follower back once it is 40 y from the tank, so a loot
+                    // walk to a corpse near that line ping-ponged with it and the follower stood still for 45 s (deadmines_full
+                    // c82a7e21: Scnpriest alternated idle:move_to_corpse / ingroup:dungeon_rejoin_tank from t=947 s to t=1020 s).
+                    if (s.is_in_instance() && g.leader_is_bot())
+                        if (GroupMemberSummary const* tk = States::GroupAnchorTank(s, ai, g);
+                            tk && tk->online && tk->is_alive && tk->guid != s.guid() && tk->map_id == s.map_id())
+                        {
+                            const float tx = c->GetPositionX() - tk->x, ty = c->GetPositionY() - tk->y;
+                            if (tx * tx + ty * ty > kTankLootLeashYd * kTankLootLeashYd)
+                            {
+                                if (rotate_sentinel == c->GetGUID())
+                                    return;             // came full circle this tick: every queued corpse is too far
+                                if (rotate_sentinel.IsEmpty())
+                                    rotate_sentinel = c->GetGUID();
+                                q.push_back(q.front());
+                                q.pop_front();
+                                continue;
+                            }
+                        }
                     emit.move_to(c->GetPositionX(), c->GetPositionY(),
                                  c->GetPositionZ(), /*run*/ true);
                     // Lease a few seconds of follow-recall slack so a grouped

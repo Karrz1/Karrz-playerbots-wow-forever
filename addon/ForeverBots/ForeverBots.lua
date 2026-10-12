@@ -878,12 +878,28 @@ end
 
 -- The player's own invite: the call typed /invite makes (the client's portrait "Invite" sends nothing for a bot on 70338).
 local function InviteByName(name)
+    -- Always says what it did, so a click that sends nothing is visible in the chat frame (portrait Invite, 2026-10-12: no
+    -- packet reached the server and nothing was shown).
+    local can
+    if C_PartyInfo and C_PartyInfo.CanInvite then
+        local okC, res = pcall(C_PartyInfo.CanInvite)
+        if okC then can = res end
+    end
+    if can == false then Print("cannot invite " .. name .. " (the game says you may not invite right now)") end
+    local sent, how = false, nil
     if C_PartyInfo and C_PartyInfo.InviteUnit then
         local ok, err = pcall(C_PartyInfo.InviteUnit, name)
-        if ok then return end
-        Debug("invite: C_PartyInfo.InviteUnit failed: " .. tostring(err))
+        if ok then sent, how = true, "C_PartyInfo.InviteUnit" else Debug("invite: C_PartyInfo.InviteUnit failed: " .. tostring(err)) end
     end
-    if SlashCmdList and SlashCmdList.INVITE then SlashCmdList.INVITE(name) else Print("type /invite " .. name) end
+    if not sent and InviteUnit then
+        local ok, err = pcall(InviteUnit, name)
+        if ok then sent, how = true, "InviteUnit" else Debug("invite: InviteUnit failed: " .. tostring(err)) end
+    end
+    if not sent and SlashCmdList and SlashCmdList.INVITE then
+        local ok, err = pcall(SlashCmdList.INVITE, name)
+        if ok then sent, how = true, "/invite" else Debug("invite: /invite failed: " .. tostring(err)) end
+    end
+    if sent then Print("invite sent to " .. name .. " (" .. how .. ")") else Print("could not send the invite; type /invite " .. name) end
 end
 
 local function BotWhisper(text)
