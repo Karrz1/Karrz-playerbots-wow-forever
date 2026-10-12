@@ -9,11 +9,13 @@ WoW Forever (Classic 1.60 beta) TrinityCore server by advocaite.
 
 The ready-made package is on the Releases page: **https://github.com/Karrz1/Karrz-playerbots-wow-forever/releases/latest**
 
-1. Download **one file**: `WoW-Forever-Bots-<version>.zip`. Unzip it into a folder **without spaces** in its path, for example `C:\WoWForever`.
-2. Double-click **Install.cmd**. Windows asks once for permission. A window asks you to pick your WoW Forever game folder (build 70338, the folder that contains `.build.info`); then it sets up the database, extracts the maps from your own client (the slow part: 30 minutes to a few hours), installs the add-on and a local certificate, creates the shortcuts, starts the server and offers to create your account (name, password, optionally GM).
-3. From then on use the **WoW Forever Bots** menu (Start Menu or Desktop, or `WoW-Forever-Bots.cmd`): **1** Start server, **2** Shut down server, **3** Auto-restart (restarts it if it crashes), **4** Update (installs the newest release, keeps your characters), **5** Create account, **6** Join our Discord. Start the game from advocaite's ForeverLauncher, log in with your account, realm Trinity.
+*A one-click installer (one zip, run `Install.cmd`) is coming soon. Until then:*
 
-The package contains no Blizzard files; the maps are made from your own client. `SHA256SUMS.txt` on the release page lets you check the download. Full text: `README.md` inside the zip.
+1. Download the **core** zip and the **db** zip (and `SHA256SUMS.txt` to check them) and unzip both into one folder with no spaces, for example `C:\WoWForever`.
+2. Run `repack\first-run.ps1`. It sets up the local database and the settings, and adds the Start Menu folder "WoW Forever Bots" (Start server, Stop server, Update server, Join our Discord).
+3. Extract the maps from **your own** WoW Forever client (build 70338): `repack\extract-data.ps1 -Client "<your client folder>"`. It is slow (up to a few hours). Then start the server from the Start Menu.
+
+Later updates: click **Update server** in the Start Menu; it installs the newest release and keeps your characters. Full steps: `README.md` inside the core zip.
 
 ## Players: get the add-on
 
