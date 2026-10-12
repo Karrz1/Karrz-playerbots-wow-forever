@@ -5,6 +5,16 @@
 **WoW Forever Bots by Karrz**: bot companions, raid and battleground bots, world bots and an auction house bot for the
 WoW Forever (Classic 1.60 beta) TrinityCore server by advocaite.
 
+## Download the repack (Windows)
+
+The ready-made package is on the Releases page: **https://github.com/Karrz1/Karrz-playerbots-wow-forever/releases/latest**
+
+1. Download the **core** zip and the **db** zip (and `SHA256SUMS.txt` to check them) and unzip both into one folder with no spaces, for example `C:\WoWForever`.
+2. Run `repack\first-run.ps1`. It sets up the local database and the settings, and adds the Start Menu folder "WoW Forever Bots" (Start server, Stop server, Update server, Join our Discord).
+3. Extract the maps from **your own** WoW Forever client (build 70338): `repack\extract-data.ps1 -Client "<your client folder>"`. It is slow (up to a few hours). Then start the server from the Start Menu.
+
+Later updates: click **Update server** in the Start Menu; it installs the newest release and keeps your characters. Full steps: `README.md` inside the core zip.
+
 ## Players: get the add-on
 
 The add-on adds a window with one button per class and role, so you can add a bot to your group, give orders and pull.
