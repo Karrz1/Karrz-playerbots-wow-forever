@@ -1,5 +1,7 @@
 # WoW Forever Bots
 
+**Join our Discord:** https://discord.gg/Jk596N3xun (help, news, bug reports)
+
 **WoW Forever Bots by Karrz**: bot companions, raid and battleground bots, world bots and an auction house bot for the
 WoW Forever (Classic 1.60 beta) TrinityCore server by advocaite.
 
