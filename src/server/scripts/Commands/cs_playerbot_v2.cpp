@@ -4,6 +4,7 @@
  */
 
 #include "ScriptMgr.h"
+#include <set>
 
 #if TRINITY_PLAYERBOT_V2
 
@@ -23,7 +24,9 @@
 #include "ObjectMgr.h"            // .playerbot graveyardscan: world_safe_locs
 #include "PhasingHandler.h"
 #include "TerrainMgr.h"
+#include "ClassicSpellValue.h"
 #include "Log.h"
+#include <fstream>
 #include "Player.h"
 #include "WorldSession.h"
 #include "TypeContainerVisitor.h"
@@ -37,6 +40,8 @@
 #include "LFGMgr.h"
 #include "Diagnostics/BotInspector.h"
 #include "Diagnostics/BotSmokeTest.h"
+#include "Diagnostics/CreatureStats.h"
+#include "Diagnostics/SpellAuditFormat.h"
 #include "Diagnostics/ScenarioRunner.h"
 #include "Fleet/BotAccountMgr.h"
 #include "Fleet/BotCharacterFactory.h"
@@ -581,6 +586,8 @@ public:
             { "reseed",        HandleReseed,        rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "smoketest",     HandleSmoketest,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "scenario",      HandleScenario,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "creaturestats", HandleCreatureStats, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "spellaudit",    HandleSpellAudit,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "graveyardscan", HandleGraveyardScan, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "wipefleet",     HandleWipeFleet,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "roadstats",     HandleRoadStats,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -614,6 +621,7 @@ public:
             { "list",          HandleBotList,       rbac::RBAC_PERM_COMMAND_GM, Console::No  },
             { "world",         HandleBotWorld,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "bgstress",      HandleBotBgStress,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "bgsoak",        HandleBotBgSoak,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
         };
         static ChatCommandTable root =
         {
@@ -699,7 +707,7 @@ public:
     // .bot about: the name of the bots, so it shows in the command list and `.bot` help
     static bool HandleBotAbout(ChatHandler* handler)
     {
-        handler->SendSysMessage("Karrz's Player Bots by Karrz, based on agatho's PlayerbotV2 (GPL-2.0). .bot add <class> [tank|healer|dps], .bot call, .bot dismiss; all orders: BOT_COMMANDS.md");
+        handler->SendSysMessage("WoW Forever Bots by Karrz, based on agatho's PlayerbotV2 (GPL-2.0). .bot add <class> [tank|healer|dps], .bot call, .bot dismiss; all orders: BOT_COMMANDS.md");
         return true;
     }
 
@@ -732,7 +740,7 @@ public:
         uint8 const cls = ParseClass(class_arg);
         if (!cls || !sChrClassesStore.LookupEntry(cls))
         {
-            handler->SendSysMessage("Karrz's Player Bots. Usage: .bot add <class> [tank|healer|dps] [race] [male|female]  e.g. .bot add priest healer");
+            handler->SendSysMessage("WoW Forever Bots. Usage: .bot add <class> [tank|healer|dps] [race] [male|female]  e.g. .bot add priest healer");
             return Refuse(handler);
         }
 
@@ -856,6 +864,35 @@ public:
         }
         else
             ids = roster ? SavedCompanions(sess) : CompanionsMatching(sess, who);
+        // `.bot call all` / `.summon saved` with a saved roster brings exactly that roster. A companion that is only in the group (a crafting
+        // bot invited earlier) is taken out of it: it held a place and the last saved bot was refused at 40 (2026-10-11).
+        if (roster && !groupOnly)
+        {
+            std::vector<Playerbot::BotId> savedOnly;
+            for (Playerbot::BotId id : CompanionsMatching(sess, "all"))
+                if (Playerbot::Services::Owners().GetOwner(id).saved)
+                    savedOnly.push_back(id);
+            if (!savedOnly.empty())
+            {
+                Group* grp = me->GetGroup();
+                uint32 removed = 0;
+                for (Playerbot::BotId id : ids)
+                    if (!Playerbot::Services::Owners().GetOwner(id).saved)
+                    {
+                        ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(id);
+                        if (grp && grp->IsMember(guid))
+                        {
+                            grp->RemoveMember(guid);
+                            Playerbot::Services::SessionMgr().LogoutBot(guid);
+                            TC_LOG_INFO("playerbot.v2", "[roster_call] {} is not on the saved roster: taken out of the group", CompanionName(id));
+                            ++removed;
+                        }
+                    }
+                TC_LOG_INFO("playerbot.v2", "[roster_call] {} calls the saved roster: {} saved, {} unsaved taken out, group now {}", me->GetName(),
+                            uint32(savedOnly.size()), removed, me->GetGroup() ? me->GetGroup()->GetMembersCount() : 1u);
+                ids = std::move(savedOnly);
+            }
+        }
         if (ids.empty() && roster)
         { handler->SendSysMessage("No saved or grouped companions. `.bot save all` saves the ones with you, `.bot call <name>` calls one."); return Refuse(handler); }
         if (ids.empty())
@@ -1080,6 +1117,22 @@ public:
                     continue;
             }
             Playerbot::Services::Owners().SetSaved(id, true);
+            // Its role is stored with it (a bot nobody ever gave a role would be re-read from its talents at the next call).
+            if (Player* online = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id)))
+            {
+                Playerbot::Role const r = Playerbot::V2::Fleet::BotPopulationManager::StoreCurrentRole(online);
+                TC_LOG_INFO("playerbot.v2", "[roster_save] {} role {}", CompanionName(id),
+                            r == Playerbot::Role::Tank ? "tank" : r == Playerbot::Role::Healer ? "healer" : "dps");
+            }
+            // The raid sub-group it stands in is stored with it: `.bot call all` and a relog put it back there.
+            if (Group const* grp = me->GetGroup(); grp && grp->isRaidGroup() && grp->IsMember(ObjectGuid::Create<HighGuid::Player>(id)))
+            {
+                uint8 const sub = grp->GetMemberGroup(ObjectGuid::Create<HighGuid::Player>(id));
+                Playerbot::Services::Owners().SetStoredSubgroup(id, sub);
+                TC_LOG_INFO("playerbot.v2", "[roster_save] {} saved in raid group {}", CompanionName(id), uint32(sub) + 1u);
+            }
+            else
+                TC_LOG_INFO("playerbot.v2", "[roster_save] {} saved (not in a raid, no group stored)", CompanionName(id));
             names += (names.empty() ? "" : ", ") + CompanionName(id);
             ++saved;
         }
@@ -1156,6 +1209,17 @@ public:
         if (!bgType)
         { handler->SendSysMessage(Playerbot::Services::Population().BgStressReport().c_str()); return true; }
         handler->SendSysMessage(Playerbot::Services::Population().StartBgStress(*bgType, cycles.value_or(3), holdSec.value_or(60)).c_str());
+        return true;
+    }
+
+    // `.bot bgsoak <bg_type> [max_minutes]`: one bot-only battleground played to its end (see BotPopulationManager::StartBgSoak).
+    static bool HandleBotBgSoak(ChatHandler* handler, Optional<uint16> bgType, Optional<uint32> maxMinutes)
+    {
+        if (!Playerbot::Services::Initialized())
+        { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
+        if (!bgType)
+        { handler->SendSysMessage(Playerbot::Services::Population().BgSoakReport().c_str()); return true; }
+        handler->SendSysMessage(Playerbot::Services::Population().StartBgSoak(*bgType, maxMinutes.value_or(30)).c_str());
         return true;
     }
 
@@ -3586,7 +3650,147 @@ public:
         return true;
     }
 
-    // .playerbot scenario list | run <name> | runall [name part] | summary | status | result | abort
+    // .playerbot spellaudit
+    // Read-only: writes SpellAudit.tsv to the logs folder, one line per legacy spell (id < 1,000,000) with the numbers this server holds for it:
+    // cast time, cooldowns, duration, range, proc chance and charges, stack, levels, and per effect the type, aura, base points, the vanilla
+    // classic_spell_value mean when one applies, per level points, misc value, tick period, trigger spell, chain targets and radius.
+    // tools/classic_spell_values/compare_spells.py compares the file with the VMaNGOS spell_template and writes the coverage report.
+    static bool HandleSpellAudit(ChatHandler* handler)
+    {
+        namespace Sa = Playerbot::Diagnostics::SpellAudit;
+        std::string const path = sLog->GetLogsDir() + "SpellAudit.tsv";
+        std::ofstream out(path, std::ios::trunc);
+        if (!out)
+        { handler->PSendSysMessage("spellaudit: cannot write %s", path.c_str()); return false; }
+        out << Sa::Header() << '\n';
+        LocaleConstant const locale = sWorld->GetDefaultDbcLocale();
+        uint32 written = 0;
+        for (uint32 id = 1; id < 1000000; ++id)
+        {
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE);
+            if (!info)
+                continue;
+            Sa::Row r;
+            r.id = id;
+            r.name = info->SpellName ? std::string((*info->SpellName)[locale]) : std::string();
+            r.school_mask = info->SchoolMask;
+            r.cast_ms = info->CastTimeEntry ? info->CastTimeEntry->Base : 0;
+            r.recovery_ms = info->RecoveryTime;
+            r.category_recovery_ms = info->CategoryRecoveryTime;
+            r.duration_ms = info->GetDuration();
+            r.range_max = info->GetMaxRange(false);
+            r.proc_chance = info->ProcChance;
+            r.proc_charges = info->ProcCharges;
+            r.stack = info->StackAmount;
+            r.max_targets = info->MaxAffectedTargets;
+            r.base_level = info->BaseLevel;
+            r.max_level = info->MaxLevel;
+            r.spell_level = info->SpellLevel;
+            for (SpellPowerEntry const* power : info->PowerCosts)
+                if (power && power->PowerType == POWER_MANA)
+                {
+                    r.mana_cost = power->ManaCost;
+                    r.mana_cost_pct = power->PowerCostPct;
+                    r.power_row_id = power->ID;
+                    break;
+                }
+            r.family_name = info->SpellFamilyName;
+            for (uint32 part = 0; part < 4; ++part)
+                r.family_flags[part] = info->SpellFamilyFlags[part];
+            std::vector<SpellEffectInfo> const& effects = info->GetEffects();
+            for (size_t i = 0; i < effects.size() && i < r.effects.size(); ++i)
+            {
+                SpellEffectInfo const& e = effects[i];
+                Sa::EffectRow& row = r.effects[i];
+                row.effect = uint32(e.Effect);
+                row.aura = uint32(e.ApplyAuraName);
+                row.base_points = e.BasePoints;
+                row.points_per_level = e.RealPointsPerLevel;
+                row.misc = e.MiscValue;
+                row.amplitude_ms = e.ApplyAuraPeriod;
+                row.trigger_spell = e.TriggerSpell;
+                row.chain_targets = e.ChainTargets;
+                row.radius_max = e.TargetARadiusEntry ? e.TargetARadiusEntry->RadiusMax : 0.0f;
+                row.radius_b_max = e.TargetBRadiusEntry ? e.TargetBRadiusEntry->RadiusMax : 0.0f;
+                if (ClassicSpellValue::Value const* v = sSpellMgr->GetClassicSpellValue(id, uint32(i)))
+                {
+                    row.classic_value = true;
+                    row.classic_mean = ClassicSpellValue::Mean(*v);
+                }
+            }
+            out << Sa::FormatLine(r) << '\n';
+            ++written;
+        }
+        handler->PSendSysMessage("spellaudit: %u spells written to %s", written, path.c_str());
+        return true;
+    }
+
+    // .playerbot creaturestats [@Player] <entry> [<entry>...]
+    // Read-only audit of the final health, mana, armor, damage, swing time and resistances creatures get (client ExpectedStat tables x the stored
+    // modifiers). Each entry is summoned next to the GM, read, logged as one [creature_stats] line and despawned; no stat is changed.
+    static bool HandleCreatureStats(ChatHandler* handler, Tail entries)
+    {
+        namespace Cs = Playerbot::Diagnostics::CreatureStats;
+        // From a GM in game the creatures are summoned next to that GM. From the console or SOAP there is no session, so they are summoned
+        // next to the player named by an "@Name" token, or else the first player in the world.
+        Player* gm = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        std::vector<uint32> list;
+        // "map <id>[,<id>...]" reads every creature entry spawned on those maps instead; "instances" is every vanilla dungeon and raid map
+        std::set<uint32> maps;
+        bool mapMode = false;
+        for (std::string_view token : Trinity::Tokenize(std::string_view(entries), ' ', false))
+        {
+            if (!token.empty() && token[0] == '@')
+            {
+                gm = ObjectAccessor::FindPlayerByName(token.substr(1));
+                continue;
+            }
+            if (token == "map")
+            {
+                mapMode = true;
+                continue;
+            }
+            if (token == "instances")
+            {
+                for (uint32 mapId : { 33, 34, 36, 43, 47, 48, 70, 90, 109, 129, 189, 209, 229, 230, 249, 289, 329, 349, 389, 409, 429, 469, 509, 531, 533 })
+                    maps.insert(mapId);
+                continue;
+            }
+            for (std::string_view part : Trinity::Tokenize(token, ',', false))
+                if (Optional<uint32> id = Trinity::StringTo<uint32>(part))
+                {
+                    if (mapMode)
+                        maps.insert(*id);
+                    else
+                        list.push_back(*id);
+                }
+        }
+        if (!maps.empty())
+        {
+            std::set<uint32> distinct(list.begin(), list.end());
+            for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+                if (maps.count(data.mapId))
+                    distinct.insert(data.id);
+            list.assign(distinct.begin(), distinct.end());
+            handler->PSendSysMessage("creaturestats: %u distinct creature entries on %u map(s).", uint32(list.size()), uint32(maps.size()));
+        }
+        if (!gm)
+            for (auto const& [id, session] : sWorld->GetAllSessions())
+                if (Player* cand = session ? session->GetPlayer() : nullptr; cand && cand->IsInWorld())
+                { gm = cand; break; }
+        if (!gm || !gm->IsInWorld())
+        { handler->SendSysMessage("creaturestats needs an in-world player to summon next to (name one with @Name)."); return false; }
+        if (list.empty())
+        { handler->SendSysMessage("Usage: .playerbot creaturestats [@Player] <entry> [<entry>...] | map <mapId>[,<mapId>...] | instances"); return false; }
+        std::vector<std::string> report;
+        uint32 const logged = Cs::Run(gm, list, report);
+        for (std::string const& line : report)
+            handler->SendSysMessage(line);
+        handler->PSendSysMessage("creaturestats: %u of %u entries logged as [creature_stats] in Playerbot.log.", logged, uint32(list.size()));
+        return logged > 0;
+    }
+
+    // .playerbot scenario list | run <name>[@checkpoint] | runall [name part] | runbatch [name part] | summary | status | result | abort
     // Bot-only scenario tests (Diagnostics/ScenarioRunner.h): a squad is made, staged, grouped and sent into content with no client
     // logged in, watched by the invariant checks, and judged. Works from the console, so a script can start it and scrape
     // "[scenario] result=" from Playerbot.log.
@@ -3613,6 +3817,14 @@ public:
             handler->SendSysMessage("runall started. `.playerbot scenario summary` lists the finished ones, one line each.");
             return true;
         }
+        if (v == "runbatch")
+        {
+            std::string error;
+            if (!Scn::StartBatch(name ? *name : std::string(), 5, error))
+            { handler->PSendSysMessage("scenario: %s.", error.c_str()); return false; }
+            handler->SendSysMessage("runbatch started: five dungeons at a time, the next five when all have passed. `.playerbot scenario summary` lists the finished ones.");
+            return true;
+        }
         if (v == "abort")
         {
             handler->SendSysMessage(Scn::Abort() ? "Scenario aborted." : "No scenario is running.");
@@ -3628,7 +3840,7 @@ public:
             handler->PSendSysMessage("Scenario '%s' started. `.playerbot scenario status` shows progress; the verdict is logged as [scenario] result=.", name->c_str());
             return true;
         }
-        handler->SendSysMessage("Usage: .playerbot scenario list | run <name> | runall [name part] | summary | status | result | abort");
+        handler->SendSysMessage("Usage: .playerbot scenario list | run <name>[@checkpoint] | runall [name part] | runbatch [name part] | summary | status | result | abort");
         return false;
     }
 
@@ -4776,6 +4988,9 @@ void AddSC_playerbot_v2_commandscript()
 }
 
 #else
+
+#include "Chat.h"
+#include "WorldSession.h"
 
 bool PlayerbotV2TrySummon(ChatHandler* handler, char const*)
 {

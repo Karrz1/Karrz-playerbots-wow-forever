@@ -17,6 +17,7 @@
 #include "LFG.h"
 #include "Log.h"
 #include <mutex>
+#include <unordered_set>
 #include <shared_mutex>
 #include <span>
 #include <string_view>
@@ -176,7 +177,28 @@ void CopyMemberAuras(Unit const* u,
             // long-duration raid buffs the State_Idle group-buff
             // maintainer needs to avoid double-casting.
             uint32 const tracked_id = TrackedRaidBuffId(si->Id);
-            if (!tracked_id) continue;
+            if (!tracked_id)
+            {
+                // MC Magmadar 2026-10-10: the targets of every blessing showed no tracked buff and the paladins recast them all fight.
+                // Once per spell id, name any long positive aura that looks like a raid buff and is not tracked, so the next log shows
+                // which id the cast actually applies.
+                if (base->GetMaxDuration() >= 120000)
+                {
+                    static std::mutex untracked_mu;
+                    static std::unordered_set<uint32> untracked_seen;
+                    bool first;
+                    {
+                        std::lock_guard<std::mutex> lk(untracked_mu);
+                        first = untracked_seen.insert(si->Id).second;
+                    }
+                    if (first)
+                    {
+                        char const* n = si->SpellName ? (*si->SpellName)[sWorld->GetDefaultDbcLocale()] : nullptr;
+                        TC_LOG_INFO("playerbot.v2", "[buff_track] untracked positive aura {} \"{}\" lasts {} s", si->Id, n ? n : "", base->GetMaxDuration() / 1000);
+                    }
+                }
+                continue;
+            }
             AuraEntry e{};
             e.spell_id    = tracked_id;
             e.stacks      = base->GetStackAmount();

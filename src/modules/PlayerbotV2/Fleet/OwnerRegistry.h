@@ -83,10 +83,27 @@ public:
     Role DeclaredRole(BotId bot) const;
     void SetDeclaredRole(BotId bot, Role role);
 
+    // The raid sub-group (0-based) the owner had the companion in, kept across relog and restart so `.bot call all` and a relog put it
+    // back (RaidSubgroupPlan.h). 0xFF = none stored. Writes immediately. Migration 0026.
+    uint8 StoredSubgroup(BotId bot) const;
+    void  SetStoredSubgroup(BotId bot, uint8 subgroup);
+
+    // The Classic spec id the owner had the companion in when it was saved (`.bot save`), 0 = none stored. Pinned again when the bot is
+    // set up on a call or login (BotPopulationManager::ApplyCompanionRole) if it still fits the stored role. Writes immediately.
+    // Migration 0027.
+    uint32 StoredSpec(BotId bot) const;
+    void   SetStoredSpec(BotId bot, uint32 spec);
+
     // The gear mode an owner account chose for its companions (Gear::Owned::GearMode value; 0 = match when never set). Writes
     // immediately. Migration 0025.
     uint8 OwnerGearMode(uint32 account_id) const;
     void  SetOwnerGearMode(uint32 account_id, uint8 mode);
+
+    // The owner's crowd-control switch (the ForeverBots panel's CC icon, group order "crowdcontrol on|off"): whether the bots of the
+    // groups this account leads mark and hold crowd-control targets (Playerbot.Behavior.MarkCc must be on as well). On when never
+    // set; memory only, so a restart is back to on. Returns true when the value changed.
+    bool CcEnabled(uint32 account_id) const;
+    bool SetCcEnabled(uint32 account_id, bool enabled);
 
     // Returns the bot ids currently owned by `account_id`. Empty if none.
     // O(N) in the registry; only used by GM diagnostic commands and the
@@ -185,7 +202,10 @@ private:
     std::unordered_set<BotId>                starter_pet_granted_;
     std::unordered_set<BotId>                gear_varied_;
     std::unordered_map<BotId, Role>          declared_role_;
+    std::unordered_map<BotId, uint32>        spec_;
+    std::unordered_map<BotId, uint8>         subgroup_;   // 0-based raid sub-group
     std::unordered_map<uint32, uint8>        owner_gear_mode_;
+    std::unordered_set<uint32>               cc_disabled_;
 };
 
 } // namespace Playerbot

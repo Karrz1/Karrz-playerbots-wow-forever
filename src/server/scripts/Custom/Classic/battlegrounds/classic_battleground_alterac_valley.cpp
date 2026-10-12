@@ -61,7 +61,7 @@ namespace ClassicAlteracValley
     static constexpr uint32 MineTickTime = 45 * IN_MILLISECONDS;
     static constexpr uint32 MineReclaimTime = 20 * MINUTE * IN_MILLISECONDS;
     static constexpr uint32 SnivvleYellTime = 70 * IN_MILLISECONDS;
-    // ZoneScript::DoAction id the banners send; unique, see classic_battleground_warsong_gulch.cpp.
+    // ZoneScript::DoAction id the banners send; unique, see ClassicWarsongGulch::Actions in battleground_warsong_gulch.cpp.
     static constexpr uint32 ActionUseBanner = 0x41560001;
     // The retail quest scripts (Battlegrounds/AlteracValley/alterac_valley.h ACTION_TURN_IN_SCRAPS) report armor scrap
     // turn-ins to the zone script with this id.

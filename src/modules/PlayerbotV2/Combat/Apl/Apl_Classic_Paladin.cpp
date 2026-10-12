@@ -5,7 +5,7 @@
 // 70 and 0 = Retribution melee DPS. Spell ids are vanilla rank 1 and resolve
 // to the highest known rank in the snapshot view and API::cast_spell.
 //
-// Priorities follow Karrz's ike3 vanilla strategies (Karrz's earlier VMaNGOS bot tree (wow-1.12)
+// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
 // raid10-revamp, playerbot/strategy/paladin/*Strategy.cpp, MANGOSBOT_ZERO).
 // Blessings follow the group assignment in Bot/ClassicUpkeep.cpp (each
 // paladin covers one blessing per class, Greater Blessings with Symbol of

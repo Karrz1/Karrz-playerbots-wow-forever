@@ -98,6 +98,14 @@ char const* RaidRoleName(RaidRole role);
 // item spells' auras (+healing, +damage, +attack power, hit, crit, mp5...) that are not item stats.
 int32 ScoreItemRaid(ItemTemplate const* tpl, uint8 cls, uint16 spec, uint8 level, uint8 slot);
 
+// True when the (class, spec) fights with weapons in both hands or a two-hander, so a shield or a held-in-off-hand caster item
+// (Royal Scepter of Vek'lor) in the off hand is dead weight: rogues, warriors that are not protection, hunters and enhancement
+// shamans. Its off hand is a weapon or empty (behind a two-hander).
+inline bool OffhandMustBeWeapon(uint8 cls, uint16 spec)
+{
+    return cls == CLASS_ROGUE || cls == CLASS_HUNTER || (cls == CLASS_WARRIOR && spec != 73) || (cls == CLASS_SHAMAN && spec == 263);
+}
+
 // True for items that must never reach a bot as PvE gear: honor-rank rewards, PvP-power / resilience stats,
 // battleground reputation rewards (Stormpike, Frostwolf, Arathi, Warsong, Silverwing), tournament gear.
 bool IsPvpItem(ItemTemplate const* tpl);

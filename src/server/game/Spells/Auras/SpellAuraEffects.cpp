@@ -627,7 +627,7 @@ NonDefaultConstructible<pAuraEffectHandler> AuraEffectHandler[TOTAL_AURAS]=
     &AuraEffect::HandleNULL,                                      //554
     &AuraEffect::HandleNULL,                                      //555
     &AuraEffect::HandleNULL,                                      //556
-    &AuraEffect::HandleNULL,                                      //557
+    &AuraEffect::HandleAuraModRangedHaste,                        //557 Classic 1.60: ranged ammo haste (quivers and ammo pouches 14824 / 29418, VMaNGOS HandleRangedAmmoHaste)
     &AuraEffect::HandleNULL,                                      //558
     &AuraEffect::HandleNULL,                                      //559
     &AuraEffect::HandleNULL,                                      //560

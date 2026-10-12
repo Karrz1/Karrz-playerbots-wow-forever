@@ -249,7 +249,9 @@ public:
     { return emit(SetRaidTargetIconIntent{symbol, target}); }
     bool activate_spec(uint32 spec_id) { return emit(ActivateSpecIntent{spec_id}); }
     bool trade_decline()  { return emit(TradeDeclineIntent{}); }
-    bool trade_accept_owner(ObjectGuid owner) { return emit(TradeDeclineIntent{ true, owner }); }
+    bool trade_accept_owner(ObjectGuid owner) { return emit(TradeDeclineIntent{ true, owner, true }); }
+    // Trade with a stranger at the fair price: no gifts taken.
+    bool trade_bargain(ObjectGuid partner) { return emit(TradeDeclineIntent{ true, partner, false }); }
 
     // NPC / world-interaction shorthands. The corresponding API methods all
     // expect the bot to be in interact range with the target — caller is
@@ -423,6 +425,8 @@ public:
     { return emit(VendorIntent{VendorSellIntent{vendor, bag, slot, count}}); }
     bool vendor_sell_trash(ObjectGuid vendor)
     { return emit(VendorIntent{VendorSellTrashIntent{vendor}}); }
+    bool make_bag_room(uint8 min_free = 4)
+    { return emit(VendorIntent{MakeBagRoomIntent{min_free}}); }
     bool repair_all(ObjectGuid vendor, bool from_guild_bank = false)
     { return emit(VendorIntent{RepairAllIntent{vendor, from_guild_bank}}); }
     bool vendor_buy_category(ObjectGuid vendor, uint8 item_class, uint8 item_subclass, uint8 total_count)

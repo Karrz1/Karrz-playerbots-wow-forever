@@ -8,6 +8,7 @@
 #include "Util/SlowCall.h"
 #include "PlayerbotV2.h"
 #include "Services.h"
+#include "Fleet/RaidSubgroupPlan.h"
 #include "Bot/BotRegistry.h"
 #include "Bot/BotSnapshot.h"
 #include "Bot/World/LearnFlightpaths.h"
@@ -24,11 +25,13 @@
 #include "Fleet/BotGuildMgr.h"
 #include "Fleet/BotCoordinationBus.h"
 #include "Fleet/CraftOrderBoard.h"
+#include "Fleet/PlayerCraftOrders.h"
 #include "Fleet/BotQueueFiller.h"
 #include "Fleet/JunkQuestResolver.h"
 #include "Bot/ClassTables.h"   // MaxPlayerLevel()
 #include "Bot/Battleground/BgTeamCoordinator.h"
 #include "Bot/Dungeon/PveGroupCoordinator.h"
+#include "Bot/Raid/BossWarnings.h"
 #include "Bot/Raid/RaidBrain.h"
 #include "DB2Stores.h"
 #include "World.h"
@@ -44,6 +47,7 @@
 #include "Bot/BotRng.h"
 #include "Bot/BotCommandParser.h"
 #include "Bot/BotChatReactor.h"
+#include "Bot/GroupOrderText.h"
 #include "Bot/BotTextMgr.h"
 #include "Chat.h"
 #include "Bot/BotIntent.h"
@@ -82,6 +86,7 @@
 #include "Fleet/BotComposition.h"
 #include "Combat/ApRegistry.h"
 #include "Player.h"
+#include "Spell.h"
 #include "Map.h"
 #include "ObjectAccessor.h"
 #include "Log.h"
@@ -109,6 +114,7 @@
 #include <array>
 #include <cctype>
 #include <string_view>
+#include "Bot/DeathCause.h"
 
 #if !TRINITY_PLAYERBOT_V2
 #error "PlayerbotV2 module compiled without TRINITY_PLAYERBOT_V2 defined; CMake misconfiguration"
@@ -685,7 +691,7 @@ void UpdateTankThreatMultiplier(BotId id, Player* p, BotAI const* ai,
     if (api.threat_multiplier() == want)
         return;
     api.set_threat_multiplier(want);
-    TC_LOG_INFO("playerbot.v2", "[tank_threat] {} threat x{:.2f} (duty {})",
+    TC_LOG_DEBUG("playerbot.v2", "[tank_threat] {} threat x{:.2f} (duty {})",
                 p->GetName(), want, duty);
 }
 
@@ -706,7 +712,7 @@ void UpdateCastSpeed(Player* p, BotSnapshot const& snap, ConfigReader::CastPacin
     if (api.cast_speed_multiplier() == want)
         return;
     api.set_cast_speed_multiplier(want);
-    TC_LOG_INFO("playerbot.v2", "[cast_speed] {} context={} cast/gcd x{:.2f} (skill {:+d}%)",
+    TC_LOG_DEBUG("playerbot.v2", "[cast_speed] {} context={} cast/gcd x{:.2f} (skill {:+d}%)",
                 p->GetName(), CastContextName(ctx), want,
                 cfg.enabled ? CastSkillOffsetPct(snap.guid, cfg.variance_pct) : 0);
 }
@@ -746,7 +752,7 @@ void Module::Init()
     if (initialized_)
         return;
 
-    TC_LOG_INFO("server.loading", "Karrz's Player Bots {} by Karrz, based on agatho's PlayerbotV2 (built {}).",
+    TC_LOG_INFO("server.loading", "WoW Forever Bots {} by Karrz, based on agatho's PlayerbotV2 (built {}).",
                 "0.1", __DATE__);
     TC_LOG_INFO("server.loading", "[PlayerbotV2] Initializing module.");
 
@@ -1006,6 +1012,13 @@ void Module::Shutdown()
         snapshot_build_pool_.reset();
     }
 
+    // Log every headless bot out while ALL services are still alive: ~WorldSession runs LogoutPlayer, whose
+    // hooks (OnPlayerLogout, group/guild) reach Population/Guilds/Perf, which Services::Shutdown destroys
+    // before the session manager. Update() performs the logout for each kicked session and reaps it.
+    Services::SessionMgr().LogoutAll();
+    for (int pass = 0; pass < 10 && Services::SessionMgr().active_count() > 0; ++pass)
+        Services::SessionMgr().Update(0);
+
     // Stop threads first; then tear down state.
     Services::Shutdown();
 
@@ -1031,6 +1044,49 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
     static TickId      next_tick    = 1;
     total += diff;
     ::Playerbot::Diagnostics::Scenario::Tick(std::uint32_t(diff.count()));   // bot scenario tests (.playerbot scenario)
+
+    // [cast_state] (Karrz, WSG start room 2026-10-11: a healer stood with the casting animation on while casting nothing). Twice a
+    // second, every bot in a battleground: a line when the spell it is casting changes (spell id, generic or channel, 0 = none), and a
+    // [cast_stale] line when the server holds no cast at all but the unit data still names a channel spell: what a client draws as a
+    // cast that never ends. The log answers which of the two it was; nothing is cleared here.
+    {
+        static std::chrono::milliseconds last_cast_check{0};
+        static std::unordered_map<BotId, uint32> cast_seen;
+        static std::unordered_map<BotId, uint32> stale_logged_ms;
+        static uint32 cast_lines = 0;
+        if (total - last_cast_check >= std::chrono::milliseconds(500))
+        {
+            last_cast_check = total;
+            uint32 const now_ms = GameTime::GetGameTimeMS();
+            Services::Registry().for_each([&](BotId id, BotRegistryEntry const& e)
+            {
+                if (!e.ai) return;
+                Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
+                if (!p || !p->IsInWorld() || !p->GetMap() || !p->GetMap()->IsBattleground()) { cast_seen.erase(id); return; }
+                Spell const* gen = p->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+                Spell const* chan = p->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+                uint32 const now_spell = chan ? chan->GetSpellInfo()->Id : gen ? gen->GetSpellInfo()->Id : 0u;
+                uint32& seen = cast_seen[id];
+                if (seen != now_spell && cast_lines < 1500)
+                {
+                    ++cast_lines;
+                    TC_LOG_INFO("playerbot.v2", "[cast_state] {} spell {} -> {} ({}) casting_state={} mounted={}", p->GetName(), seen, now_spell,
+                                chan ? "channel" : gen ? "generic" : "none", p->HasUnitState(UNIT_STATE_CASTING), p->IsMounted());
+                    seen = now_spell;
+                }
+                if (!gen && !chan && !p->HasUnitState(UNIT_STATE_CASTING) && p->GetChannelSpellId() != 0)
+                {
+                    uint32& last = stale_logged_ms[id];
+                    if (!last || now_ms - last >= 5000u)
+                    {
+                        last = now_ms ? now_ms : 1u;
+                        TC_LOG_INFO("playerbot.v2", "[cast_stale] {} no server cast but channel spell {} still in unit data (visual {})", p->GetName(),
+                                    p->GetChannelSpellId(), p->GetChannelSpellXSpellVisualId());
+                    }
+                }
+            });
+        }
+    }
 
     // Bots hovering over the floor in a battleground: the start points (AB Trollbane Hall z=-9.0 over a courtyard at -15) sit a few
     // yards above the ground. A player falls client-side; a bot never does, so it stood in the air until it walked. Once a second,
@@ -1365,6 +1421,7 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
         Services::BgCoordinator().Update(coord_t0);
         Services::PveCoordinator().Update(coord_t0);
         Raid::GetBrain().Update(coord_t0);   // after the PvE plan: reads its main tank
+        Raid::UpdateBossWarnings(coord_t0);
         t_snap_setup_ms += getMSTimeDiff(coord_t0, getMSTime());
     }
 
@@ -1873,6 +1930,15 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
         last_craft_board_at_ = craft_board_total_;
         if (Services::Initialized())
             Services::CraftOrders().Tick(GameTime::GetGameTimeMS());
+    }
+
+    // Owner craft orders ("craft <item> x5" whispered to a bot): one pass a second.
+    player_craft_total_ += diff;
+    if (player_craft_total_ - last_player_craft_at_ >= std::chrono::milliseconds(1000))
+    {
+        last_player_craft_at_ = player_craft_total_;
+        if (Services::Initialized())
+            ::Playerbot::V2::PlayerCraftOrders::Tick(GameTime::GetGameTimeMS());
     }
 
     // 3. Schedule tick for due bots.
@@ -2470,6 +2536,11 @@ void Module::OnPlayerLogin(Player* p)
     // for sessionless bots.)
     p->SetPlayerLocalFlag(PLAYER_LOCAL_FLAG_OVERRIDE_TRANSPORT_SERVER_TIME);
 
+    // Defense and the weapon skills at the level's maximum on every login: a bot created or levelled before the skills were
+    // raised with the level (companions of an older build, world bots) otherwise keeps the skill-ups it happened to earn (a
+    // warrior at Defense 181, a paladin at 52) and takes crushing blows on most swings from a boss.
+    ::Playerbot::API(p).learn_weapon_skills_free();
+
     // Take off anything the client cannot draw BEFORE other players get a
     // chance to inspect this bot. Without it a bot that logs in wearing such an
     // item stays a client-crash hazard until the next 5-min gear-backfill pass.
@@ -2667,6 +2738,7 @@ namespace {
 // digest reads (scripts/bot-log-digest.ps1). World thread only; one entry per player at most, erased at the death.
 struct LethalHit { uint32 spell = 0; int32 amount = 0; int32 overkill = 0; };
 std::unordered_map<uint64, LethalHit> g_lethal_hits;
+std::mutex g_lethal_hits_mtx;   // OnDamageTaken may run on a map thread when MapUpdate.Threads > 1
 
 // Members of a group still alive on this map, `skip` (the one who just died) excluded: the wipe test of tools/Fight-Report.ps1.
 void CountGroupAlive(Group const* g, Player const* skip, uint32& alive, uint32& total)
@@ -2684,15 +2756,19 @@ void CountGroupAlive(Group const* g, Player const* skip, uint32& alive, uint32& 
 
 void LogPlayerDeath(Player* vp, Unit* killer, BotAI const* vai)
 {
+    // Consume the stashed hit first so an early return below cannot leak the entry.
+    LethalHit hit;
+    {
+        std::lock_guard lk(g_lethal_hits_mtx);
+        if (auto it = g_lethal_hits.find(vp->GetGUID().GetCounter()); it != g_lethal_hits.end())
+        {
+            hit = it->second;
+            g_lethal_hits.erase(it);
+        }
+    }
     Map* map = vp->GetMap();
     if (!vai && !(map && (map->IsDungeon() || map->IsBattlegroundOrArena())))
         return;   // humans only where it matters: raids, dungeons, battlegrounds
-    LethalHit hit;
-    if (auto it = g_lethal_hits.find(vp->GetGUID().GetCounter()); it != g_lethal_hits.end())
-    {
-        hit = it->second;
-        g_lethal_hits.erase(it);
-    }
     std::string killer_txt = "-";
     if (killer)
     {
@@ -2731,6 +2807,7 @@ void LogPlayerDeath(Player* vp, Unit* killer, BotAI const* vai)
                 }
     uint32 grp_alive = 0, grp_total = 0;
     CountGroupAlive(vp->GetGroup(), vp, grp_alive, grp_total);
+    Playerbot::V2::DeathCause::Note(vp->GetGUID().GetCounter(), fmt::format("{} by {} ({} dmg)", spell_txt, killer_txt, hit.amount));
     TC_LOG_INFO("playerbot.v2",
         "[bot_death] ts={} {} ({}) map={} pos={:.1f},{:.1f},{:.1f} killer={} spell={} dmg={} overkill={} rule={} killer_at={} spell_data={} class={} grp_alive={}/{}",
         uint64(GameTime::GetGameTime()), vp->GetName(), vai ? "bot" : "player", vp->GetMapId(),
@@ -2856,8 +2933,11 @@ void Module::OnDamageTaken(Unit* attacker, Unit* victim, int32 amount, uint32 sp
     Diagnostics::Parity::NoteDamage(attacker, victim, amount, spell_id);   // the damage_parity tally; one atomic load when none runs
     // Killing blow on a player: remember the spell for the [bot_death] line (one compare per hit otherwise).
     if (victim && amount > 0 && victim->IsPlayer() && uint64(amount) >= victim->GetHealth())
+    {
+        std::lock_guard lk(g_lethal_hits_mtx);
         g_lethal_hits[victim->GetGUID().GetCounter()] =
             LethalHit{ spell_id, amount, int32(uint64(amount) - victim->GetHealth()) };
+    }
     // Intentionally a no-op. The BotEventInbox was retired 2026-05-21
     // after audit found zero consumers + the snapshot's in_combat /
     // hp / attackers vector already covers every actual rule need.
@@ -2977,6 +3057,19 @@ void Module::OnItemLooted(Player* p, uint32 item_id)
     BotChatter::OnItemLooted(p, item_id);
 }
 
+void Module::OnRaidSubgroupChanged(Group* group, ObjectGuid member, uint8 subgroup)
+{
+    // The leader moved a raid member (or a restore did, which is not recorded). An owned companion's new sub-group is stored so a
+    // relog or `.bot call all` puts it back. Battleground groups have sub-groups of their own and are not the roster.
+    if (!initialized_ || !group || group->isBGGroup() || group->isBFGroup() || Fleet::g_subgroup_restoring)
+        return;
+    BotId const id = member.GetCounter();
+    if (!member.IsPlayer() || Services::Owners().GetOwner(id).account_id == 0)
+        return;
+    Services::Owners().SetStoredSubgroup(id, subgroup);
+    TC_LOG_INFO("playerbot.v2", "[roster_save] {} moved to raid group {}{}", member.ToString(), uint32(subgroup) + 1u, Services::Owners().GetOwner(id).saved ? " (saved)" : "");
+}
+
 void Module::OnSpiritReleased(Player* p)
 {
     // The owner pressed Release Spirit (ike3 / Karrz: companions release with
@@ -3018,6 +3111,144 @@ void Module::OnGuildMemberAdded(uint64 guild_id, ObjectGuid joiner_guid, std::st
     BotChatReactor::ReactGuildJoin(guild_id, joiner_guid, joiner_name);
 }
 
+// Runs a recognized bare group order (ClassifyGroupOrder already normalized it) for the sender's bots in the group.
+// Shared by party/raid chat and by the addon-message transport.
+void Module::RouteGroupOrder(Player* sender, Group* group, std::string order)
+{
+    uint32 const account = sender->GetSession() ? sender->GetSession()->GetAccountId() : 0;
+    if (account == 0)
+        return;
+    if (order.rfind("crowdcontrol ", 0) == 0 || order.rfind("crowd control ", 0) == 0 || order == "cc on" || order == "cc off")
+    {
+        // A switch of the owner's, not an order to each bot: set once, answer once.
+        std::string const word = order.substr(order.find_last_of(' ') + 1);
+        if (word != "on" && word != "off")
+            return;
+        bool const on = word == "on";
+        bool const changed = Services::Owners().SetCcEnabled(account, on);
+        TC_LOG_INFO("playerbot.v2", "[cc_switch] {} turns crowd control {} ({})", sender->GetName(), word, changed ? "changed" : "already");
+        ChatHandler(sender->GetSession()).PSendSysMessage("Crowd control for your bots: %s.", on ? "on" : "off");
+        return;
+    }
+    uint32 tanks = 0;
+    // Raid pull: the main tank (raid-frame flag) pulls alone; with none set, every tank as before.
+    ObjectGuid pull_main_tank;
+    char const* pull_why = "every tank (no main tank set)";
+    if ((order == "pull" || order == "pull back") && group->isRaidGroup())
+        for (Group::MemberSlot const& slot : group->GetMemberSlots())
+            if (slot.flags & MEMBER_FLAG_MAINTANK) { pull_main_tank = slot.guid; pull_why = "the main tank"; break; }
+    if (order == "pull back")
+    {
+        // Exactly ONE bot pulls: the tank assigned to the selected mob's raid icon, else the main tank, else the
+        // owned tank closest to the mob. Every other bot (other tanks included) holds where it stands.
+        Unit* sel = sender->GetSelectedUnit();
+        ObjectGuid assigned;
+        if (sel)
+        {
+            auto const marks = Services::Owners().TankMarks(group->GetGUID().GetCounter());
+            for (uint8 i = 0; i < 8 && assigned.IsEmpty(); ++i)
+                if (group->GetTargetIcon(i) == sel->GetGUID())
+                    for (auto const& [tank_low, marker] : marks)
+                        if ((marker & 7) == i) { assigned = ObjectGuid::Create<HighGuid::Player>(tank_low); break; }
+        }
+        if (!assigned.IsEmpty())
+        { pull_main_tank = assigned; pull_why = "the tank assigned to that icon"; }
+        else if (pull_main_tank.IsEmpty())
+        {
+            float best = 1e9f;
+            for (GroupReference const& itr : group->GetMembers())
+            {
+                Player* m = itr.GetSource();
+                if (!m || m == sender || !m->IsAlive()) continue;
+                BotId const mid = m->GetGUID().GetCounter();
+                if (!Services::Registry().has(mid) || !Services::Owners().IsOwner(mid, account, sender->GetGUID().GetCounter()) ||
+                    BotCommandParser::BotRole(m) != Role::Tank)
+                    continue;
+                float const d = sel ? m->GetDistance(sel) : m->GetDistance(sender);
+                if (d < best) { best = d; pull_main_tank = m->GetGUID(); }
+            }
+            pull_why = "the tank closest to the mob";
+        }
+        TC_LOG_INFO("playerbot.v2", "[pull_back] {} pulls: {} chosen as {}; every other bot holds",
+            sender->GetName(), pull_main_tank.IsEmpty() ? std::string("nobody") : pull_main_tank.ToString(), pull_why);
+    }
+    for (GroupReference const& itr : group->GetMembers())
+    {
+        Player* member = itr.GetSource();
+        if (!member || member == sender) continue;
+        BotId const mid = member->GetGUID().GetCounter();
+        // Quest words also reach an unowned bot in the group (a world bot the player invited): it shares and accepts
+        // quests like a companion; every other order stays with the bots the sender owns.
+        bool const quest_word = order == "share" || order == "accept" || order == "accept all" || order == "quests" ||
+                                order == "quest list";
+        if (!Services::Registry().has(mid) ||
+            !(Services::Owners().IsOwner(mid, account, sender->GetGUID().GetCounter()) ||
+              (quest_word && Services::Owners().GetOwner(mid).account_id == 0)))
+            continue;
+        if (order == "pull back")
+        {
+            // Only the tank pulls and returns (the main tank when a raid flags one); everyone else carries on.
+            if (BotCommandParser::BotRole(member) != Role::Tank ||
+                (!pull_main_tank.IsEmpty() && member->GetGUID() != pull_main_tank))
+            {
+                // The other tanks come and stand beside the owner, where the mob is brought to (Karrz 2026-10-08: "all the
+                // warriors should be standing beside me when I say pull back"); everyone else holds where they stand
+                // (like "pull"); "fall back" is the whole-raid version.
+                if (BotCommandParser::BotRole(member) == Role::Tank && member->IsAlive())
+                    BotCommandParser::DispatchSingle(sender, member, "follow", "party");
+                else
+                    BotCommandParser::ReleaseOwnerFollowOrder(sender, member, "party pull back");
+                continue;
+            }
+            BotCommandParser::DispatchSingle(sender, member, order, "party");
+            ++tanks;
+            continue;
+        }
+        if (order == "pull")
+        {
+            // A tank with an icon assignment goes too, to its own mob (MC Garr 2026-10-08: only the flagged main tank pulled).
+            bool assigned_tank = false;
+            for (auto const& [tank_low, marker] : Services::Owners().TankMarks(group->GetGUID().GetCounter()))
+                if (tank_low == mid) { assigned_tank = true; break; }
+            if (BotCommandParser::BotRole(member) != Role::Tank ||
+                (!pull_main_tank.IsEmpty() && member->GetGUID() != pull_main_tank && !assigned_tank))
+            {
+                // The rest join once it is engaged: the owner handed the fight back.
+                if (BotCommandParser::BotRole(member) == Role::Tank)
+                    TC_LOG_INFO("playerbot.v2", "[raid_pull] {} stays back: tank without an icon assignment (main tank {})",
+                                member->GetName(), pull_main_tank.IsEmpty() ? std::string("none") : pull_main_tank.ToString());
+                BotCommandParser::ReleaseOwnerFollowOrder(sender, member, "party pull");
+                continue;
+            }
+            TC_LOG_INFO("playerbot.v2", "[raid_pull] {} is sent to pull ({})", member->GetName(),
+                        assigned_tank ? "its icon assignment" : "the main tank / no main tank set");
+            BotCommandParser::DispatchSingle(sender, member, "tank", "party");
+            ++tanks;
+            continue;
+        }
+        BotCommandParser::DispatchSingle(sender, member, order, "party");
+    }
+    if ((order == "pull" || order == "pull back") && !tanks)
+        ChatHandler(sender->GetSession()).SendSysMessage("No tank among your bots to pull; use attack instead.");
+    return;
+}
+
+void Module::OnAddonOrder(Player* sender, Group* group, std::string const& prefix, std::string const& text)
+{
+    if (!initialized_ || !sender || !group) return;
+    auto const order = ClassifyAddonOrder(prefix, text, Services::Config().behavior_owner_commands());
+    if (!order) return;
+    TC_LOG_INFO("playerbot.v2", "[addon_order] {} -> '{}'", sender->GetName(), *order);
+    RouteGroupOrder(sender, group, *order);
+}
+
+void Module::OnAddonWhisper(Player* sender, Player* receiver, std::string const& prefix, std::string const& text)
+{
+    if (!initialized_ || !sender || !receiver || text.empty() || prefix != kAddonOrderPrefix) return;
+    TC_LOG_INFO("playerbot.v2", "[addon_whisper] {} -> {}", sender->GetName(), receiver->GetName());
+    OnWhisperReceived(sender, receiver, text);
+}
+
 void Module::OnPartyChat(Player* sender, Group* group, std::string const& msg)
 {
     // Squad-chat command surface. Only messages prefixed with `;` are
@@ -3038,151 +3269,9 @@ void Module::OnPartyChat(Player* sender, Group* group, std::string const& msg)
     if (msg.front() != ';')
     {
         // A bare group order ("follow", "stay", ...) in party or raid chat goes to every bot of the sender's in the
-        // group. The ForeverBots addon sends these, and it is what a player types. Other chatter stays ignored.
-        std::string order = msg;
-        std::transform(order.begin(), order.end(), order.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-        order.erase(0, order.find_first_not_of(" \t"));
-        order.erase(order.find_last_not_of(" \t") + 1);
-        // "assist" is "attack my target"; "pull" sends the tanks at it and the rest follow once it is engaged; "flee"
-        // breaks off and runs back to the sender; "release" makes every dead bot release its spirit and run back to its
-        // corpse (living ones ignore it).
-        // "fallback" (also "fall back", "back") runs every bot to the rally point and re-forms there; "rally here"
-        // sets that point (BotCommandParser OrderFallback). "pull back" (also "pullback", "pull and back") is the main
-        // tank's pull-and-return: ranged opener, run to the rally point, tank the mob there (OrderPullBack). Exact
-        // phrases only.
-        // The owner's plain-language words (Playerbot.Behavior.OwnerCommands, BotCommandParser OwnerWordOrder) are exact
-        // phrases too: summon, passive / defensive / aggressive, the questions who / help / stats / gear / inventory, the
-        // quest orders, loot / loot all, sell grey, repair. "drop quest <name>" is an argument order below.
-        static constexpr std::array<std::string_view, 18> kGroupOrders =
-            { "follow", "stay", "hold", "resume", "attack", "come", "disengage", "assist", "pull", "flee", "release",
-              "fallback", "fall back", "pull back", "pullback", "pull and back", "back", "rally here" };
-        static constexpr std::array<std::string_view, 20> kOwnerWords =
-            { "summon", "passive", "defensive", "aggressive", "who", "help", "stats", "gear", "inventory",
-              "quests", "quest list", "accept", "accept all", "turn in", "turnin", "share", "loot", "loot all",
-              "sell grey", "repair" };
-        bool const owner_word = Services::Config().behavior_owner_commands() &&
-            (std::find(kOwnerWords.begin(), kOwnerWords.end(), order) != kOwnerWords.end() || order.rfind("drop quest ", 0) == 0);
-        // Formation / spacing / main tank orders carry an argument ("formation circle", "spacing tight", "set main tank X").
-        // Gear orders: "equip <item link / name / upgrades / best>", "use your best gear" (BotCommandParser OrderEquip).
-        bool const arg_order = order.rfind("gear ", 0) == 0 || order == "equip" || order.rfind("equip ", 0) == 0 || order == "use your best gear" ||
-            order == "wear your best gear" || order.rfind("formation ", 0) == 0 || order.rfind("spacing ", 0) == 0 ||
-            order == "spread out" || order == "spaced out" || order == "tight" || order == "close" ||
-            order == "maintank" || order == "main tank" || order == "set main tank" ||
-            order.rfind("set main tank ", 0) == 0 || order.rfind("main tank ", 0) == 0 || order.rfind("maintank ", 0) == 0 ||
-            // The ForeverBots panel's icon assignment, follow distance and tank-marker orders (each bot stores its own part
-            // and only the lowest-guid bot answers, see BotCommandParser OrderAssign / OrderDistance / OrderTankMarker).
-            order.rfind("assign ", 0) == 0 || order.rfind("distance ", 0) == 0 || order.rfind("follow distance ", 0) == 0 ||
-            order.rfind("tank ", 0) == 0 || order == "clear tanks" || order == "clear tank" ||
-            order.rfind("rti ", 0) == 0 || order.rfind("pull rti", 0) == 0;
-        if (!arg_order && !owner_word && std::find(kGroupOrders.begin(), kGroupOrders.end(), order) == kGroupOrders.end())
-            return;
-        if (order == "assist")
-            order = "attack";
-        if (order == "pullback" || order == "pull and back")
-            order = "pull back";
-        uint32 const account = sender->GetSession() ? sender->GetSession()->GetAccountId() : 0;
-        if (account == 0)
-            return;
-        uint32 tanks = 0;
-        // Raid pull: the main tank (raid-frame flag) pulls alone; with none set, every tank as before.
-        ObjectGuid pull_main_tank;
-        char const* pull_why = "every tank (no main tank set)";
-        if ((order == "pull" || order == "pull back") && group->isRaidGroup())
-            for (Group::MemberSlot const& slot : group->GetMemberSlots())
-                if (slot.flags & MEMBER_FLAG_MAINTANK) { pull_main_tank = slot.guid; pull_why = "the main tank"; break; }
-        if (order == "pull back")
-        {
-            // Exactly ONE bot pulls: the tank assigned to the selected mob's raid icon, else the main tank, else the
-            // owned tank closest to the mob. Every other bot (other tanks included) holds where it stands.
-            Unit* sel = sender->GetSelectedUnit();
-            ObjectGuid assigned;
-            if (sel)
-            {
-                auto const marks = Services::Owners().TankMarks(group->GetGUID().GetCounter());
-                for (uint8 i = 0; i < 8 && assigned.IsEmpty(); ++i)
-                    if (group->GetTargetIcon(i) == sel->GetGUID())
-                        for (auto const& [tank_low, marker] : marks)
-                            if ((marker & 7) == i) { assigned = ObjectGuid::Create<HighGuid::Player>(tank_low); break; }
-            }
-            if (!assigned.IsEmpty())
-            { pull_main_tank = assigned; pull_why = "the tank assigned to that icon"; }
-            else if (pull_main_tank.IsEmpty())
-            {
-                float best = 1e9f;
-                for (GroupReference const& itr : group->GetMembers())
-                {
-                    Player* m = itr.GetSource();
-                    if (!m || m == sender || !m->IsAlive()) continue;
-                    BotId const mid = m->GetGUID().GetCounter();
-                    if (!Services::Registry().has(mid) || !Services::Owners().IsOwner(mid, account, sender->GetGUID().GetCounter()) ||
-                        BotCommandParser::BotRole(m) != Role::Tank)
-                        continue;
-                    float const d = sel ? m->GetDistance(sel) : m->GetDistance(sender);
-                    if (d < best) { best = d; pull_main_tank = m->GetGUID(); }
-                }
-                pull_why = "the tank closest to the mob";
-            }
-            TC_LOG_INFO("playerbot.v2", "[pull_back] {} pulls: {} chosen as {}; every other bot holds",
-                sender->GetName(), pull_main_tank.IsEmpty() ? std::string("nobody") : pull_main_tank.ToString(), pull_why);
-        }
-        for (GroupReference const& itr : group->GetMembers())
-        {
-            Player* member = itr.GetSource();
-            if (!member || member == sender) continue;
-            BotId const mid = member->GetGUID().GetCounter();
-            // Quest words also reach an unowned bot in the group (a world bot the player invited): it shares and accepts
-            // quests like a companion; every other order stays with the bots the sender owns.
-            bool const quest_word = order == "share" || order == "accept" || order == "accept all" || order == "quests" ||
-                                    order == "quest list";
-            if (!Services::Registry().has(mid) ||
-                !(Services::Owners().IsOwner(mid, account, sender->GetGUID().GetCounter()) ||
-                  (quest_word && Services::Owners().GetOwner(mid).account_id == 0)))
-                continue;
-            if (order == "pull back")
-            {
-                // Only the tank pulls and returns (the main tank when a raid flags one); everyone else carries on.
-                if (BotCommandParser::BotRole(member) != Role::Tank ||
-                    (!pull_main_tank.IsEmpty() && member->GetGUID() != pull_main_tank))
-                {
-                    // The other tanks come and stand beside the owner, where the mob is brought to (Karrz 2026-10-08: "all the
-                    // warriors should be standing beside me when I say pull back"); everyone else holds where they stand
-                    // (like "pull"); "fall back" is the whole-raid version.
-                    if (BotCommandParser::BotRole(member) == Role::Tank && member->IsAlive())
-                        BotCommandParser::DispatchSingle(sender, member, "follow", "party");
-                    else
-                        BotCommandParser::ReleaseOwnerFollowOrder(sender, member, "party pull back");
-                    continue;
-                }
-                BotCommandParser::DispatchSingle(sender, member, order, "party");
-                ++tanks;
-                continue;
-            }
-            if (order == "pull")
-            {
-                // A tank with an icon assignment goes too, to its own mob (MC Garr 2026-10-08: only the flagged main tank pulled).
-                bool assigned_tank = false;
-                for (auto const& [tank_low, marker] : Services::Owners().TankMarks(group->GetGUID().GetCounter()))
-                    if (tank_low == mid) { assigned_tank = true; break; }
-                if (BotCommandParser::BotRole(member) != Role::Tank ||
-                    (!pull_main_tank.IsEmpty() && member->GetGUID() != pull_main_tank && !assigned_tank))
-                {
-                    // The rest join once it is engaged: the owner handed the fight back.
-                    if (BotCommandParser::BotRole(member) == Role::Tank)
-                        TC_LOG_INFO("playerbot.v2", "[raid_pull] {} stays back: tank without an icon assignment (main tank {})",
-                                    member->GetName(), pull_main_tank.IsEmpty() ? std::string("none") : pull_main_tank.ToString());
-                    BotCommandParser::ReleaseOwnerFollowOrder(sender, member, "party pull");
-                    continue;
-                }
-                TC_LOG_INFO("playerbot.v2", "[raid_pull] {} is sent to pull ({})", member->GetName(),
-                            assigned_tank ? "its icon assignment" : "the main tank / no main tank set");
-                BotCommandParser::DispatchSingle(sender, member, "tank", "party");
-                ++tanks;
-                continue;
-            }
-            BotCommandParser::DispatchSingle(sender, member, order, "party");
-        }
-        if ((order == "pull" || order == "pull back") && !tanks)
-            ChatHandler(sender->GetSession()).SendSysMessage("No tank among your bots to pull; use attack instead.");
+        // group. Other chatter stays ignored.
+        if (auto const order = ClassifyGroupOrder(msg, Services::Config().behavior_owner_commands()))
+            RouteGroupOrder(sender, group, *order);
         return;
     }
     const std::string body = msg.substr(1);

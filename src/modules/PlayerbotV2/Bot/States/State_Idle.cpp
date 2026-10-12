@@ -18,12 +18,15 @@
 #include "Bot/PositioningGates.h"
 #include "Bot/Dungeon/Tactics/DungeonTactics.h"   // IsKnownBossUnit: the tactics table's boss flag
 #include "Bot/MarkGate.h"              // Playerbot.Behavior.MarksNeedOrder
+#include "Bot/ConjureGate.h"
+#include "Bot/RaidFight.h"             // CastsInsteadOfSlotWalk: a ranged DPS in reach of its target casts, it does not walk to its slot
 #include "Bot/CcPick.h"                // PickCcTarget - idle:dungeon_auto_cc_script
 #include "Bot/CasterStepOut.h"         // StepOutFromMob - the dungeon use of ranged spacing (5b)
 #include "Bot/Battleground/BattlegroundScript.h"
 #include "Bot/Battleground/BgWaypointRoutes.h"
 #include "Bot/Battleground/BgAvPlan.h"
 #include "Bot/Battleground/BgTargetPick.h"
+#include "Bot/Battleground/BgTactics.h"
 #include "Group/GroupSnapshot.h"
 #include "../Services.h"
 #include "Util/ConfigReader.h"  // full type for Services::Config() (detour pull-gate knobs)
@@ -438,7 +441,7 @@ bool MaintainGroupUtility(BotSnapshotView const& s, GroupSnapshotView const& g,
 //   - Warlock Create Healthstone (best known rank) → any healthstone
 //   - Mage Conjure Mana Cake / Refreshment (190336) → mana food
 // Skipped if the bot already has the item in its bag. Returns true on emit.
-bool MaintainConjuredItem(BotSnapshotView const& s, BotIntentEmitter& emit)
+bool MaintainConjuredItem(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit, uint32 now_ms)
 {
     // Conjure spells are hard-cast — server rejects them with
     // SPELL_FAILED_MOVING (75) while the bot is in motion. Without this
@@ -459,9 +462,12 @@ bool MaintainConjuredItem(BotSnapshotView const& s, BotIntentEmitter& emit)
         // rank. In dungeons / raids the dungeon hold swallows this rule;
         // idle:classic_healthstone (ClassicUpkeepRules) covers them.
         uint32 const create = Classic::CreateHealthstoneSpell(s);
-        if (create && !Classic::HasHealthstone(s) && s.is_ready(create))
+        if (create && !Classic::HasHealthstone(s) && s.is_ready(create)
+            && V2::MayConjure(s.in_combat(), s.recently_in_combat(5000), s.power(POWER_MANA), s.mana_cost(create))
+            && !ai.action_recently_tried(BotAI::ActionKind::ClassUpkeep, create, now_ms))
         {
             emit.cast(create);
+            ai.note_action_retry(BotAI::ActionKind::ClassUpkeep, create, now_ms);
             return true;
         }
     }
@@ -1073,6 +1079,7 @@ bool MaintainOocRez(BotSnapshotView const& s, GroupSnapshotView const& g,
     // starting the same 10 s cast (Combat::ClassicHeal::RezTarget).
     // (Mass Resurrection above is self-cast AoE - left ungated.)
     constexpr float kRezCastRange = 28.0f;
+    if (Combat::ClassicHeal::RaidFightLive(g, s.map_id())) return false;   // only a druid raises in a live fight
     const ObjectGuid target = Combat::ClassicHeal::RezTarget(s, g, kRezCastRange,
         [](GroupMemberSummary const& m) { return ClassOocRez(m.cls) != 0 && m.level >= 10; });
     if (target.IsEmpty()) return false;
@@ -1116,9 +1123,7 @@ bool RaidOocRez(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g,
     // spent the fight on raid:ooc_rez and were refused each time), so the test is the core's own: any combat, stalker-only included. And a
     // rez waits for the fight to end while a tank of the group is still in it: the healers heal first (Karrz: rez after the encounter).
     if (s.in_combat()) return skip("in combat");
-    for (auto const& m : *g.members())
-        if (m.online && m.is_alive && m.in_combat && m.role == Role::Tank && m.map_id == s.map_id())
-            return skip("the fight is still on (a tank is in combat)");
+    if (Combat::ClassicHeal::RaidFightLive(g, s.map_id())) return skip("the fight is still on");
     if (!rez || s.cls() == CLASS_DRUID) return false;
     if (!s.knows_spell(rez))  return skip("spell not known");
     if (!g.dead_member(s.map_id())) return false;
@@ -1136,11 +1141,15 @@ bool RaidOocRez(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g,
             ai.set_last_rule_fired("raid:ooc_rez_stop");
             return true;
         }
-        return skip("spell not ready (cooldown, GCD, moving or no mana)");
+        // No corpse in cast range: a moving raid bot is "not ready" only because it moves, so it must not stop here. MC 2026-10-10: the owner
+        // lay 43-57 y from every rezzer, each logged "spell not ready" and kept to formation until one walked in by chance. Fall through to
+        // the walk below; only a bot with a corpse in range and a real cooldown/GCD waits.
+        if (!Combat::ClassicHeal::OocRezTarget(s, g).IsEmpty())
+            return skip("spell not ready (cooldown, GCD or no mana)");
     }
 
     // In cast range: the shared pick (owner first, spread over the rezzers, a corpse already being raised skipped).
-    if (ObjectGuid const t = Combat::ClassicHeal::OocRezTarget(s, g); !t.IsEmpty())
+    if (ObjectGuid const t = Combat::ClassicHeal::OocRezTarget(s, g); !t.IsEmpty() && s.is_ready(rez))
     {
         emit.cast(rez, t);
         ai.set_last_rule_fired("raid:ooc_rez");
@@ -2890,6 +2899,21 @@ bool RaidFormationHold(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView co
                 emit.stop_movement();   // the walk in flight would refuse the heal (is_ready: no hard cast while moving)
             return s.is_moving();
         }
+    // A ranged DPS with its target in spell reach and in sight casts instead of walking to its slot (live MC 2026-10-11: about 15 casters
+    // and hunters at full mana, [dps_idle] "raid:move / moving" with the target 5-16 y away and LoS ok): a cast is refused while the bot
+    // moves, so the slot walk kept them from ever fighting. The slot is for keeping shape while the raid waits, not a duty that outranks
+    // the fight; out of reach or out of sight the walk, and the range / LoS rules, go on as before.
+    if (ai.effective_role(s) == Role::Dps)
+        if (NearbyUnit const* vu = s.victim_info(); vu && vu->hp > 0)
+        {
+            float bx, by, bz; s.position(bx, by, bz);
+            if (Playerbot::V2::CastsInsteadOfSlotWalk(true, true, vu->in_los, std::hypot(vu->x - bx, vu->y - by), vu->combat_reach))
+            {
+                if (s.is_moving())
+                    emit.stop_movement();   // the walk in flight would refuse the cast
+                return s.is_moving();
+            }
+        }
     // A slot walk that does not arrive is given up for a while (MC Garr 2026-10-10: casters 20-24 y from the boss re-issued the same
     // walk for minutes, z wobbling on the spot, and never faced or cast): the bot is standing in range of its fight, which beats the
     // slot. No-progress: moving, yet under kFormationProgress y from where the walk began after kFormationStuckMs.
@@ -2914,8 +2938,17 @@ bool RaidFormationHold(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView co
             w.giveup_until_ms = now_ms + kFormationBackoffMs;
             w.since_ms = 0;
             emit.stop_movement(/*clear_generators=*/ true);
-            TC_LOG_INFO("playerbot.v2", "[formation_stuck] {} moved {:.1f}y in {} ms on its slot walk: slot given up for {} ms",
-                        s.name(), std::hypot(bx - w.x, by - w.y), kFormationStuckMs, kFormationBackoffMs);
+            // What the walk was aimed at and who held the spline, so a repeat says why it did not arrive (the move in flight is the
+            // slot walk's own commit unless a rule with another target took the window).
+            float cx = 0.f, cy = 0.f, cz = 0.f;
+            ai.move_commit_target(cx, cy, cz);
+            TC_LOG_INFO("playerbot.v2", "[formation_stuck] {} moved {:.1f}y in {} ms on its slot walk: slot given up for {} ms "
+                        "(at {:.1f},{:.1f},{:.1f}, {:.0f}y from tank {}, in-flight move to {:.1f},{:.1f},{:.1f} age {}ms progress age {}ms, "
+                        "last rule {}, rooted {})",
+                        s.name(), std::hypot(bx - w.x, by - w.y), kFormationStuckMs, kFormationBackoffMs, bx, by, bz,
+                        std::hypot(bx - tk->x, by - tk->y), tk->name, cx, cy, cz, ai.move_commit_age_ms(now_ms),
+                        ai.move_commit_prog_age_ms(now_ms), ai.last_rule_fired(), s.is_rooted());
+            Classic::NoteRaidSupport(Classic::RaidSupportKind::FormationGiveUp, s.map_id());
             return false;
         }
     }
@@ -6172,15 +6205,24 @@ bool BgTryUseObjectiveGo(BotSnapshotView const& s, BotAI& ai,
         // Match the GO to a node by position (3y tolerance). If matched +
         // own-team + not contested → skip (don't re-cap a held node).
         bool skip_held = false;
-        for (auto const& n : s.bg_node_states())
+        int32_t matched_node = -1;
         {
-            float ndx = n.x - go->x;
-            float ndy = n.y - go->y;
-            if (ndx * ndx + ndy * ndy < 9.0f)
+            int32_t idx = 0;
+            for (auto const& n : s.bg_node_states())
             {
-                if (n.owner_team == my_team_id && !n.is_contested)
-                    skip_held = true;
-                break;
+                float ndx = n.x - go->x;
+                float ndy = n.y - go->y;
+                if (ndx * ndx + ndy * ndy < 9.0f)
+                {
+                    // owner_team is the holder, or the assaulting team while the node is contested: a node our team holds or is already
+                    // assaulting has nothing to click (the AB script ignores the owner clicking its own contested banner, so the bot
+                    // stood at the pole retrying every 15 s).
+                    if (n.owner_team == my_team_id)
+                        skip_held = true;
+                    matched_node = idx;
+                    break;
+                }
+                ++idx;
             }
         }
         if (skip_held) continue;
@@ -6233,7 +6275,10 @@ bool BgTryUseObjectiveGo(BotSnapshotView const& s, BotAI& ai,
         // legit failure (carrier dropped flag, re-pickup) but not every
         // snapshot tick. The 5-min default lockout would be too long.
         const uint32 bg_now_ms = GameTime::GetGameTimeMS();
-        const uint64 go_low = go->guid.GetCounter();
+        // A classic AB node can carry two clickable banners at once (the contested faction banner and the neutral banner that stays
+        // as its aura). The cooldown is per NODE for those: per banner, the bot alternated between the two every 3 s and each switch
+        // restarted its 5 s capture, so ~25 bots started 36 captures each and 9 finished (AB 2026-10-11).
+        const uint64 go_low = matched_node >= 0 ? (0x4E4F4445ull << 32) | uint64(matched_node) : go->guid.GetCounter();
         if (ai.action_recently_tried(BotAI::ActionKind::BgUseGo,
                                      go_low, bg_now_ms))
             continue;
@@ -6273,7 +6318,10 @@ bool BgPushThroughNodes(BotSnapshotView const& s, BotAI& ai,
     // in the signature for future per-map routing hints.
     (void)bg_advice;
 
-    emit.move_to(tx, ty, tz, /*run=*/true);
+    // Long haul by the recorded routes (AV 2026-10-11: two PushEndgame bots stood 2307 y from the captain for the whole match; a single
+    // move_to over that distance never advances). BgRouteMove steps from waypoint to waypoint of the ike3-recorded graph and falls back to
+    // a plain move_to only where no route covers the bot or the goal.
+    BgRouteMove(s, ai, emit, tx, ty, tz, /*run=*/true);
     ai.set_last_rule_fired("idle:bg_push_endgame");
     return true;
 }
@@ -9210,8 +9258,42 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                         // progression after it lapses. STRICT no-op where the earliest
                         // boss is seen every tick (RFC/Deadmines): found_idx == done,
                         // the stamp refreshes, the suppression branch never runs.
-                        const int done_idx =
-                            static_cast<int>(s.raw().dungeon_exec.bosses_done_count);
+                        // Owed-boss waiver: the boss we owe may be gone for good (killed in a dungeon whose instance script keeps no
+                        // per-boss state, so bosses_done_count never moves; or evaded). A later boss in the scan then stands in
+                        // for it and the tank sits on the owed waypoint, with no LOS to the stand-in, forever (Deadmines
+                        // 2026-10-10: ~30 [boss_nav] lines at dist 0.0). Once the tank has stood within kOwedArriveR of the owed
+                        // waypoint for kOwedWaiveMs with the owed boss still unsighted, the owed boss is waived.
+                        const uint32 raw_done = s.raw().dungeon_exec.bosses_done_count;
+                        const uint32 owed_map = self_be->GetMapId();
+                        int done_idx = static_cast<int>(raw_done);
+                        if (found_idx >= 0)
+                        {
+                            const int floor_idx = static_cast<int>(ai.dungeon_owed_floor(owed_map, raw_done));
+                            if (found_idx < floor_idx)
+                                ai.set_dungeon_owed_floor(owed_map, raw_done, 0u);   // a waived boss is back in scan: it is real
+                            else
+                                done_idx = std::max(done_idx, floor_idx);
+                        }
+                        if (found_idx > done_idx && done_idx < static_cast<int>(advice.progression_waypoints.size()))
+                        {
+                            constexpr float    kOwedArriveR = 8.0f;
+                            constexpr uint32_t kOwedWaiveMs = 8000u;
+                            auto const& owp = advice.progression_waypoints[done_idx];
+                            const float odx = owp.x - bx_adv;
+                            const float ody = owp.y - by_adv;
+                            if (odx * odx + ody * ody > kOwedArriveR * kOwedArriveR)
+                                ai.set_dungeon_owed_reach_ms(0u);
+                            else if (ai.dungeon_owed_reach_ms() == 0u)
+                                ai.set_dungeon_owed_reach_ms(now_ms);
+                            else if (now_ms - ai.dungeon_owed_reach_ms() >= kOwedWaiveMs)
+                            {
+                                TC_LOG_INFO("playerbot.v2",
+                                    "[boss_nav] {} owed boss idx={} (entry {}) not sighted after {}s at its waypoint: waived, next owed idx={}",
+                                    s.name(), done_idx, advice.bosses[done_idx], kOwedWaiveMs / 1000u, done_idx + 1);
+                                ai.set_dungeon_owed_floor(owed_map, raw_done, static_cast<uint32>(done_idx + 1));
+                                done_idx += 1;
+                            }
+                        }
                         if (found_idx == done_idx)
                             ai.set_dungeon_earliest_boss_seen(now_ms);
                         else if (found_idx > done_idx && boss_target &&
@@ -9240,7 +9322,7 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                             float btx = boss_target->GetPositionX();
                             float bty = boss_target->GetPositionY();
                             float btz = boss_target->GetPositionZ();
-                            if (found_idx != done_idx && done_idx >= 0 && done_idx <
+                            if (found_idx > done_idx && done_idx >= 0 && done_idx <
                                 static_cast<int>(advice.progression_waypoints.size()))
                             {
                                 auto const& wp = advice.progression_waypoints[done_idx];
@@ -10389,8 +10471,9 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                         // earliest reachable live boss is naturally the right one.
                         G3D::Vector3 boss_step;
                         int next_boss_idx = -1;
-                        const int done_idx =
-                            static_cast<int>(s.raw().dungeon_exec.bosses_done_count);
+                        const int done_idx = std::max(
+                            static_cast<int>(s.raw().dungeon_exec.bosses_done_count),
+                            static_cast<int>(ai.dungeon_owed_floor(self->GetMapId(), s.raw().dungeon_exec.bosses_done_count)));
                         for (int bi = 0; bi < static_cast<int>(advice.bosses.size()); ++bi)
                         {
                             for (Creature* c : creatures)
@@ -12287,7 +12370,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                 }
                 // Mage table food / healthstones only during prep — mid-
                 // match the cast time isn't worth it.
-                if (s.bg_in_prep() && MaintainConjuredItem(s, emit))
+                if (s.bg_in_prep() && MaintainConjuredItem(s, ai, emit, now_ms))
                 {
                     ai.set_last_rule_fired("idle:bg_conjured_item");
                     return true;
@@ -12617,7 +12700,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                 my_role = BgRole::Attacker;       // every roamer pushes
         }
 
-        // Arathi Basin: how many bots defend follows the node count, not the role table (ike3 bots, Karrz's earlier VMaNGOS bot tree (wow-1.12) raid10-revamp
+        // Arathi Basin: how many bots defend follows the node count, not the role table (ike3 bots, the ike3-based playerbot code raid10-revamp
         // bcc8b9f, BattleGroundTactics.cpp, BATTLEGROUND_AB): the further behind on held bases, the more everybody attacks. Of every
         // ten bots (team rank mod 10) 1 defend when losing, 2 when level or ahead, 3 when two or more bases ahead; the rest attack.
         // Roamers and healers keep their jobs. A held base counts only when it is not being contested.
@@ -12726,6 +12809,60 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                 if (e.hp <= 0 || e.untargetable || e.is_pacified || e.is_cc_locked) continue;
                 float const edx = e.x - sx, edy = e.y - sy;
                 if (edx * edx + edy * edy <= BgTargetPick::kBgEngageRange * BgTargetPick::kBgEngageRange) { enemy_near_for_mount = true; break; }
+            }
+        }
+        // Capture abort (ported from mod-playerbots BattleGroundTactics: AB bots stop capturing when an enemy player is within 11 yd
+        // of the banner and fight instead). The bot stands within ~5 y of the banner it is channeling, so its own distance stands in
+        // for the banner's. Cancelling frees the next tick for the fight rules; the 3 s per-node retry lets it click again after.
+        // Arathi Basin only: AV bots keep channeling the banner with enemies near (mod-playerbots skips the check in AV and WSG too).
+        if (s.raw().bg.current_type_id == 3 && near_objective_go && s.is_casting() && s.is_alive() && s.bg_friendly_flag_carrier() != s.guid())
+        {
+            float sx = 0.f, sy = 0.f, sz = 0.f;
+            s.position(sx, sy, sz);
+            float nearest = 1e9f;
+            bool have_enemy = false;
+            for (auto const& e : s.nearby_enemies())
+            {
+                if (!e.is_player || e.hp <= 0) continue;
+                float const edx = e.x - sx, edy = e.y - sy;
+                float const d = std::sqrt(edx * edx + edy * edy);
+                if (d < nearest) { nearest = d; have_enemy = true; }
+            }
+            if (BgTactics::ShouldAbortCapture(true, have_enemy, nearest) == BgTactics::CaptureAbort::EnemyNear &&
+                emit.cancel_cast())
+            {
+                TC_LOG_INFO("playerbot.v2", "[bg_capture] abort bot={} enemy_at={:.1f}", s.bot_id(), nearest);
+                ai.set_last_rule_fired("idle:bg_capture_abort");
+                return true;
+            }
+        }
+        // Stand-still watchdog (mod-playerbots re-rolls every bot's objective every 60 s in WSG/AV): a live-match bot that has not
+        // moved 3 yd in a minute, with an order it is far from and nothing to fight or cast, is pushed toward the order and the
+        // stall is logged ([bg_stall]) so the cause can be found in the soak logs.
+        {
+            float sx = 0.f, sy = 0.f, sz = 0.f;
+            s.position(sx, sy, sz);
+            auto const& ord = s.raw().bg.order;
+            bool const live = s.raw().bg.status == 3;
+            bool const busy = !s.is_alive() || s.in_combat() || s.is_casting() || !live || near_objective_go;
+            if (ai.bg_stall().Update(s.published_at_ms(), sx, sy, busy) && ord.kind != BgState::BgOrder::None)
+            {
+                float const odx = ord.x - sx, ody = ord.y - sy;
+                if (odx * odx + ody * ody > 12.0f * 12.0f)
+                {
+                    TC_LOG_INFO("playerbot.v2", "[bg_stall] bot={} order={} dist={:.0f} last_rule={} at=({:.0f},{:.0f},{:.0f}) goal=({:.0f},{:.0f}) type={}",
+                                s.bot_id(), uint32(ord.kind), std::sqrt(odx * odx + ody * ody), ai.last_rule_fired() ? ai.last_rule_fired() : "",
+                                sx, sy, sz, ord.x, ord.y, uint32(s.raw().bg.current_type_id));
+                    BgRouteMove(s, ai, emit, ord.x, ord.y, ord.z, /*run=*/true);
+                    ai.set_last_rule_fired("idle:bg_stall_nudge");
+                    return true;
+                }
+                // Standing AT the ordered post for a minute with nothing to fight: the plan keeps a bot where there is nothing left to do
+                // (AV 2026-10-11, Karrz: a pile of bots idle at Stonehearth). Log the order and the rule so the soak shows which orders
+                // park bots; no movement here, the planner owns where a bot goes next.
+                TC_LOG_INFO("playerbot.v2", "[bg_stall] at_post bot={} order={} squad={} entry={} last_rule={} type={}", s.bot_id(),
+                            uint32(ord.kind), uint32(ord.squad), ord.target_entry,
+                            ai.last_rule_fired() ? ai.last_rule_fired() : "", uint32(s.raw().bg.current_type_id));
             }
         }
         if (near_objective_go && s.is_casting() && s.is_alive() && !s.in_combat())
@@ -13070,6 +13207,11 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
             }
         }
 
+        // Flag callouts (FC up/down, EFC, carrying) belong to flag maps only. Karrz, AB 2026-10-11: a bot called "FC down" in Arathi
+        // Basin, which has no flags. A flag map is one whose script names a flag spot; node maps (AB, AV) never do.
+        const bool ctf_map = bg_advice.enemy_flag_x != 0.f || bg_advice.enemy_flag_y != 0.f ||
+                             bg_advice.own_flag_x != 0.f || bg_advice.own_flag_y != 0.f;
+
         // BG callout: "FC down" / "FC up". Edge-trigger on friendly
         // carrier transitions. Real players say "FC down" then "FC up
         // at X" — we drop the HP suffix since the snapshot drops the
@@ -13077,7 +13219,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
         {
             const bool fc_now = !s.bg_friendly_flag_carrier().IsEmpty();
             const bool fc_prev = ai.prev_friendly_fc_set();
-            if (fc_prev != fc_now)
+            if (ctf_map && fc_prev != fc_now)
             {
                 const uint32 fc_now_ms = GameTime::GetGameTimeMS();
                 // Distinct keys for up/down so the 20s lockout per
@@ -13117,7 +13259,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
         // Without this, real players outside FC range never learn where
         // the FC is despite the bot's omniscient snapshot. 30s lockout
         // per (node_entry) so the same camp doesn't spam chat.
-        if (!s.bg_enemy_flag_carrier().IsEmpty() &&
+        if (ctf_map && !s.bg_enemy_flag_carrier().IsEmpty() &&
             (s.raw().bg.enemy_carrier_x != 0.f ||
              s.raw().bg.enemy_carrier_y != 0.f))
         {
@@ -13165,7 +13307,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
         // BG callout: "carrying, low" — when bot IS the friendly FC
         // and HP drops below 50%, broadcast a status. Real flag
         // carriers ping their healers explicitly when in trouble.
-        if (s.is_alive() && s.bg_friendly_flag_carrier() == s.guid() &&
+        if (ctf_map && s.is_alive() && s.bg_friendly_flag_carrier() == s.guid() &&
             s.hp_pct() < 50)
         {
             const uint32 fcs_now = GameTime::GetGameTimeMS();
@@ -13317,6 +13459,29 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                     ai.note_action_retry(BotAI::ActionKind::BgCallout,
                                          callout_key, c_now_ms);
                     ai.set_last_rule_fired("idle:bg_callout_inc");
+                    return true;
+                }
+            }
+        }
+
+        // BG callout: "<node> assaulted" (node maps: AB, AV). A node whose capture the ENEMY is flipping (owner_team names the team doing
+        // the flip while is_contested, see BgTeamCoordinator) is being assaulted right now; one bot per node says it, 20 s apart.
+        if (!ctf_map)
+        {
+            uint8 const my_team_id = s.team();
+            for (auto const& n : s.bg_node_states())
+            {
+                if (n.is_destroyed || !n.is_contested || n.owner_team == 0 || n.owner_team == my_team_id) continue;
+                const uint64 as_key = (uint64(13) << 32) | uint64(n.entry);
+                const uint32 as_now = GameTime::GetGameTimeMS();
+                if (ai.action_recently_tried(BotAI::ActionKind::BgCallout, as_key, as_now)) continue;
+                if (!BgCalloutCoordinator::TryClaim(/*kind=*/13, uint64(n.entry), as_now, /*lockout=*/20u * 1000u)) continue;
+                std::string node_name = n.name.empty() ? std::to_string(n.entry) : n.name;
+                std::string msg = node_name + " assaulted";
+                if (emit.raid_chat(msg))
+                {
+                    ai.note_action_retry(BotAI::ActionKind::BgCallout, as_key, as_now);
+                    ai.set_last_rule_fired("idle:bg_callout_assaulted");
                     return true;
                 }
             }
@@ -14016,6 +14181,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
             // pick up a flag stays at 12 y (one runner stays focused, the escorts and everyone else peel off).
             float const eng_range =
                 (eng_has_order && s.raw().bg.order.kind == BgState::BgOrder::PickupFlag) ? 24.0f
+                : (s.raw().bg.current_type_id == 1 && s.raw().bg.status == 3) ? BgAvPlan::AggroRange(s.raw().bg.in_progress_ms)   // ike3 AV aggro 40 -> 10 yd
                 : (my_role == BgRole::Healer ? 36.0f : BgTargetPick::kBgEngageRange);   // Karrz 2026-10-09: bigger radius. The snapshot scans this far in a BG; healers close a bit less
             float self_x = 0.f, self_y = 0.f, self_z = 0.f;
             s.position(self_x, self_y, self_z);

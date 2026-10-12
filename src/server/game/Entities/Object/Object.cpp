@@ -19,6 +19,7 @@
 #include "BattlefieldMgr.h"
 #include "CellImpl.h"
 #include "CinematicMgr.h"
+#include "ClassicSpellHit.h"
 #include "CombatLogPackets.h"
 #include "Corpse.h"
 #include "CreatureGroups.h"
@@ -1786,6 +1787,36 @@ int32 WorldObject::ModSpellDuration(SpellInfo const* spellInfo, WorldObject cons
                     duration *= 2;
             }
         }
+
+        // Classic 1.60 Legacy perks
+        if (Player const* targetPlayer = unitTarget->ToPlayer())
+        {
+            // Gourmand 1225499: beneficial effects from eating food last longer (Well Fed buffs: food icon 136000, Well Fed XP Boost)
+            if (spellInfo->IconFileDataId == 136000 || spellInfo->Id == 1243969)
+                if (int32 pct = targetPlayer->GetClassicLegacyPerkAmount(1225499, EFFECT_0))
+                    AddPct(duration, pct);
+
+            // Permanence 1225502 EFFECT_1: the benefits gained from resting at a camp last longer
+            static constexpr uint32 CampBenefitSpells[] = { 1229451, 1229513, 1229519, 1229718, 1229741, 1230098, 1230124, 1230164, 1230172,
+                1230552, 1230587, 1283701, 1294877 };
+            if (std::ranges::find(CampBenefitSpells, spellInfo->Id) != std::end(CampBenefitSpells))
+                if (int32 pct = targetPlayer->GetClassicLegacyPerkAmount(1225502, EFFECT_1))
+                    AddPct(duration, pct);
+        }
+
+        // Permanence 1225502 EFFECT_0: class abilities granting long-duration stat or attribute benefits to party / raid members
+        if (Player const* casterPlayer = ToPlayer(); casterPlayer && spellInfo->SpellFamilyName != SPELLFAMILY_GENERIC
+            && duration >= int32(10 * MINUTE * IN_MILLISECONDS))
+        {
+            bool grantsAttributes = std::ranges::any_of(spellInfo->GetEffects(), [](SpellEffectInfo const& effect)
+            {
+                return effect.IsAura(SPELL_AURA_MOD_STAT) || effect.IsAura(SPELL_AURA_MOD_TOTAL_STAT_PERCENTAGE) || effect.IsAura(SPELL_AURA_MOD_RESISTANCE)
+                    || effect.IsAura(SPELL_AURA_MOD_ATTACK_POWER) || effect.IsAura(SPELL_AURA_MOD_DAMAGE_DONE) || effect.IsAura(SPELL_AURA_MOD_HEALING_DONE);
+            });
+            if (grantsAttributes)
+                if (int32 pct = casterPlayer->GetClassicLegacyPerkAmount(1225502, EFFECT_0))
+                    AddPct(duration, pct);
+        }
     }
 
     return std::max(duration, 0);
@@ -1878,34 +1909,26 @@ SpellMissInfo WorldObject::MagicSpellHitResult(Unit* victim, SpellInfo const* sp
         if (spellInfo->HasAttribute(SPELL_ATTR7_NO_ATTACK_MISS))
             return 0.0f;
 
+        // vanilla: SPELL_ATTR_EX3_ALWAYS_HIT spells never miss (they are not subject to the 1% minimum miss below)
+        if (spellInfo->HasAttribute(SPELL_ATTR3_ALWAYS_HIT))
+            return 0.0f;
+
         SpellSchoolMask schoolMask = spellInfo->GetSchoolMask();
-        // PvP - PvE spell misschances per leveldif > 2
-        int32 lchance = victim->GetTypeId() == TYPEID_PLAYER ? 7 : 11;
         int32 thisLevel = GetLevelForTarget(victim);
         if (GetTypeId() == TYPEID_UNIT && ToCreature()->IsTrigger())
             thisLevel = std::max<int32>(thisLevel, spellInfo->SpellLevel);
         int32 leveldif = int32(victim->GetLevelForTarget(this)) - thisLevel;
-        int32 levelBasedHitDiff = leveldif;
 
-        // Base hit chance from attacker and victim levels
-        float modHitChance = 100;
-        if (levelBasedHitDiff >= 0)
-        {
-            if (victim->GetTypeId() != TYPEID_PLAYER)
-            {
-                modHitChance = 94 - 3 * std::min(levelBasedHitDiff, 3);
-                levelBasedHitDiff -= 3;
-            }
-            else
-            {
-                modHitChance = 96 - std::min(levelBasedHitDiff, 2);
-                levelBasedHitDiff -= 2;
-            }
-            if (levelBasedHitDiff > 0)
-                modHitChance -= lchance * std::min(levelBasedHitDiff, 7);
-        }
+        // Classic 1.60 (vanilla, VMaNGOS SpellCaster::MagicSpellHitChance): 96% against the same level, -1% per level up to +2,
+        // then -11% per level against creatures (-7% against players): 96 / 95 / 94 / 83 / 72; never below 22%
+        int32 lchance = victim->GetTypeId() == TYPEID_PLAYER ? 7 : 11;
+        float modHitChance;
+        if (leveldif < 3)
+            modHitChance = float(96 - leveldif);
         else
-            modHitChance = 97 - levelBasedHitDiff;
+            modHitChance = float(94 - (leveldif - 2) * lchance);
+        if (modHitChance < 22.0f)
+            modHitChance = 22.0f;
 
         // Spellmod from SpellModOp::HitChance
         if (Player* modOwner = GetSpellModOwner())
@@ -1923,7 +1946,14 @@ SpellMissInfo WorldObject::MagicSpellHitResult(Unit* victim, SpellInfo const* sp
         if (Unit const* unit = ToUnit())
             HitChance += unit->m_modSpellHitChance;
 
-        RoundToInterval(HitChance, 0.0f, 100.0f);
+        // Classic 1.60 (vanilla, VMaNGOS MagicSpellHitChance): binary spells are fully resisted with the target's average resist
+        // chance for their school (no partial resists for them, Unit::CalcSpellResistedDamage)
+        if (spellInfo->HasAttribute(SPELL_ATTR0_CU_BINARY_SPELL) && (schoolMask & SPELL_SCHOOL_MASK_MAGIC)
+            && !((schoolMask & SPELL_SCHOOL_MASK_HOLY) && victim->GetTypeId() != TYPEID_UNIT))
+            HitChance *= 1.0f - Unit::CalculateAverageResistReduction(this, schoolMask, victim, spellInfo);
+
+        // vanilla: always at least 1% hit and at least 1% miss
+        RoundToInterval(HitChance, 1.0f, 99.0f);
 
         return 100.0f - HitChance;
     }();

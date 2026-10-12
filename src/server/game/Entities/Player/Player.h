@@ -1679,6 +1679,9 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         Player* GetTrader() const;
         TradeData* GetTradeData() const { return m_trade; }
         void TradeCancel(bool sendback, TradeStatus status = TRADE_STATUS_CANCELLED);
+        // Closes a trade that can no longer finish: the partner is gone, left the map or walked out of range, or the two sides
+        // disagree about being in it. Called every Update, free when no trade is open.
+        void UpdateTradeState();
         void InitiateTrade(Player* trader); // PlayerBot integration: minimal core hook
 
         CinematicMgr* GetCinematicMgr() const { return _cinematicMgr.get(); }
@@ -2245,7 +2248,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         uint32 GetPowerIndex(Powers power) const override;
 
         // Vanilla combo points: they belong to one unit, which the Classic client reads as the owner-only ComboTarget
-        ObjectGuid GetComboTarget() const { return *m_unitData->ComboTarget; }
+        ObjectGuid GetComboTarget() const { return *m_unitData->ClassicComboTarget; }
         void SetComboTarget(ObjectGuid const& guid);
         void GainComboPointsOn(Unit const* victim);
         void UpdateComboTarget();
@@ -2457,6 +2460,11 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         void UpdateClassicLegacyUnlock();
         void UpdateClassicProfessionTitles();
         static bool IsClassicCertificationSkill(uint32 skillId);
+        // Classic 1.60 Legacy perks (Legacy trait trees 1187 Professions, 1188 Adventure, 1189 Progression)
+        int32 GetClassicLegacyPerkAmount(uint32 spellId, SpellEffIndex effIndex) const;
+        uint64 ApplyClassicLegacyPriceMod(uint64 price, int32 priceType) const;
+        void SetClassicFreeHelpfulSpellsUntil(TimePoint until) { _classicFreeHelpfulSpellsUntil = until; }
+        bool HasClassicFreeHelpfulSpells() const;
         void GrantClassicFreeBankTab();
         bool HasSkill(uint32 skill) const;
         void LearnSkillRewardedSpells(uint32 skillId, uint32 skillValue, Races race);
@@ -3158,6 +3166,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         // Gamemaster whisper whitelist
         GuidList WhisperList;
         TimePoint m_regenInterruptTimestamp;
+        TimePoint m_manaSpentTimestamp;                     // Classic 1.60: the five second rule starts when mana is paid, nothing else
         uint32 m_regenTimerCount;
         float m_healthFraction;
         std::array<float, MAX_POWERS_PER_CLASS> m_powerFraction;
@@ -3347,6 +3356,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         int32 m_spellPenetrationItemMod;
         std::array<int32, 140 - 83> m_classicItemMods = { };   // ItemModType 83 .. 139 (ITEM_MOD_CLASSIC_*), from equipped items
         int32 m_classicBlockValueBonus = 0;                    // ITEM_MOD_BLOCK_VALUE of equipped items
+        mutable TimePoint _classicFreeHelpfulSpellsUntil;            // Legacy perk The Quick and the Dead: free helpful spells after resurrection
 
         SpellModContainer m_spellMods;
 

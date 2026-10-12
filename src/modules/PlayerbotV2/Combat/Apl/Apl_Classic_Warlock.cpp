@@ -11,7 +11,7 @@
 // else Imp; dungeon / raid group: Felhunter for the designated Spell Lock
 // warlocks, Imp for the rest) and points it at the victim in combat.
 //
-// Priorities follow Karrz's ike3 vanilla strategies (Karrz's earlier VMaNGOS bot tree (wow-1.12)
+// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
 // raid10-revamp, playerbot/strategy/warlock/*Strategy.cpp, MANGOSBOT_ZERO):
 // armor + pet upkeep, emergency Death Coil / Howl of Terror / Drain Life,
 // Life Tap at low mana, dots (Corruption, Curse of Agony, Immolate, Siphon

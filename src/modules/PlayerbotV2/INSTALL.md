@@ -1,4 +1,4 @@
-# PlayerbotV2 — installation
+# WoW Forever Bots — installation
 
 Setting up a server with bots, from a clean machine. Steps 1–5 are required;
 step 6 is for an existing server whose world database has drifted and is **not**

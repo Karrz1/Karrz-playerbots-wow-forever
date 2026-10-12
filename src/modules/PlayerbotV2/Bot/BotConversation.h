@@ -40,6 +40,7 @@ enum class ConvIntent : uint8_t
     Insult,
     Compliment,
     Goodbye,
+    Greeting,        // only answered here for someone the bot knows (see ConversationContext::knows_sender)
 };
 
 struct ConversationContext
@@ -54,6 +55,7 @@ struct ConversationContext
     std::vector<std::string> professions;  // "mining", "tailoring"
     uint32_t level = 1;
     bool in_group = false;
+    bool knows_sender = false;             // the sender is in the bot's group (its owner / party): greet them as a known person
     uint32_t bot_seed = 0;                 // stable per bot: drives its writing style
     ConvTone tone = ConvTone::Neutral;
     ConvLength length = ConvLength::Normal;

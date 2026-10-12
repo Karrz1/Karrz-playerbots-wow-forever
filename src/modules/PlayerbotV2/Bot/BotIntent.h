@@ -131,6 +131,8 @@ struct AcceptRezIntent       {};
 struct VendorBuyIntent       { ObjectGuid npc; uint8 vendor_slot; uint8 count; };
 struct VendorSellIntent      { ObjectGuid npc; uint8 bag, slot; uint8 count; };
 struct VendorSellTrashIntent { ObjectGuid npc; };
+// Clear bag rot until min_free slots are free, no vendor needed (API::make_room).
+struct MakeBagRoomIntent     { uint8 min_free = 4; };
 struct RepairAllIntent       { ObjectGuid npc; bool from_guild_bank; };
 // Buy first vendor item matching item_class/item_subclass that the bot meets
 // the level requirement for. Used by auto-restock rules where the AI doesn't
@@ -348,7 +350,8 @@ struct ResetCooldownsIntent {};
 // don't accept arbitrary trades (item-theft vector).
 // accept = the owner's gift trade (Playerbot.Behavior.AcceptOwnerTrade): API::accept_owner_trade instead of the decline.
 // A flag on this intent rather than a new IntentBody alternative (the variant is at its size limit).
-struct TradeDeclineIntent    { bool accept = false; ObjectGuid owner; };
+// gift = the partner may hand over gifts (owner / group mate); false = fair-price buying and selling only (BotTrade.h).
+struct TradeDeclineIntent    { bool accept = false; ObjectGuid owner; bool gift = true; };
 // Send a group invite to the named player. Mirrors HandlePartyInviteOpcode
 // — same gating around faction/instance/level/social ignore. Used by the
 // idle:invite_to_group rule so solo bots gather pickup parties at dungeon
@@ -584,7 +587,7 @@ struct VendorIntent
 {
     std::variant<
         VendorBuyIntent, VendorSellIntent, VendorSellTrashIntent,
-        RepairAllIntent, VendorBuyByCategoryIntent, VendorBuyByEntryIntent
+        RepairAllIntent, VendorBuyByCategoryIntent, VendorBuyByEntryIntent, MakeBagRoomIntent
     > op;
 };
 // Hunter pet stable management — keeps `PetAttackIntent` / `PetCastSpellIntent`
@@ -790,7 +793,8 @@ auto WrapForIntentBody(T&& body)
                        std::is_same_v<U, VendorSellTrashIntent>      ||
                        std::is_same_v<U, RepairAllIntent>            ||
                        std::is_same_v<U, VendorBuyByCategoryIntent>  ||
-                       std::is_same_v<U, VendorBuyByEntryIntent>)
+                       std::is_same_v<U, VendorBuyByEntryIntent>     ||
+                       std::is_same_v<U, MakeBagRoomIntent>)
         return VendorIntent{std::forward<T>(body)};
     else if constexpr (std::is_same_v<U, SwapPetToSlotIntent>      ||
                        std::is_same_v<U, DeleteStabledPetIntent>   ||

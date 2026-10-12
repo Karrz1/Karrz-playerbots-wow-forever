@@ -17,7 +17,8 @@
 #include "ClassicSpec.h"                         // Classic::IsSingleSpecClass — combat:pve_heal_focus
 #include "Bot/Dungeon/MarkCc.h"               // MarkCc::TryCast - combat:marked_cc
 #include "Bot/Dungeon/DungeonScript.h"          // DungeonAdvice — DungeonCombatPositioning (BUG G-P0a)
-#include "Bot/Battleground/BgTargetPick.h"       // BgTargetPick::Pick — combat:bg_victim_invalid
+#include "Bot/Battleground/BgTargetPick.h"
+#include "Bot/Battleground/BgTactics.h"       // BgTargetPick::Pick — combat:bg_victim_invalid
 #include "Bot/Battleground/BattlegroundScript.h" // BattlegroundAdvice — BgCarrierHomeward (BUG BG-P0a)
 #include "Bot/States/MaintainHelpers.h"          // DungeonCombatPositioning / BgCarrierHomeward
 #include "Group/GroupSnapshot.h"
@@ -95,7 +96,8 @@ bool IsMeleeSpec(uint8 cls, uint32 spec)
 // pull-gate / disengage machinery, not here.
 bool IsAttackerFightable(NearbyUnit const& u)
 {
-    return !u.untargetable && !u.is_pacified && u.hp > 0 && !u.cannot_reach;
+    // A boss pacified by its own spell (Geddon's Inferno) is the fight, not a prop; the builder's tally agrees.
+    return !u.untargetable && (!u.is_pacified || u.is_dungeon_boss || u.is_boss_rank) && u.hp > 0 && !u.cannot_reach;
 }
 
 // Names which fightable ingredient failed, for the [skip_unfightable] diag:
@@ -505,7 +507,7 @@ bool MaybeUseManaPotion(BotSnapshotView const& s, GroupSnapshotView const& g, Bo
 } // anonymous
 
 // ---- Group threat discipline ----
-// Port of Karrz's wow-1.12 group threat rules (MoltenCoreDungeonActions.cpp
+// Port of Karrz's ike3-based bots group threat rules (MoltenCoreDungeonActions.cpp
 // MCRaidHoldDamage / MCRaidWaitForTank, MoltenCoreDungeonStrategies.cpp
 // GroupPveRestraint), generalised from Molten Core to any group with a tank.
 // The pure verdict lives in BotSnapshotView::threat_hold(); this layer adds
@@ -640,10 +642,13 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
     // threat per second less a tenth (MC Garr 2026-10-10: about 70 damage per second per DPS bot, mages held at 93 %).
     constexpr float kRaidThreatMaxRatio = 1.0f;
     ThreatHold h = s.threat_hold(target, lead, s.is_in_raid() ? std::max(cfg.threat_max_ratio(), kRaidThreatMaxRatio) : cfg.threat_max_ratio());
-    // The release is bounded: a mob switches to a non-tank at 110% of the tank's threat in melee reach, 130% at range. Past 105% (melee)
-    // / 120% (caster) the hold stays however long it has lasted - after the 3 s release a caster kept nuking over the tank for the
+    // The release is bounded: a mob switches to a non-tank at 110% of the tank's threat in melee reach, 130% at range. Past 100% (melee)
+    // / 110% (caster) the hold stays however long it has lasted - after the 3 s release a caster kept nuking over the tank for the
     // whole fight and pulled the Defias Miner that killed the mage (deadmines_full run 9). Below those the release stands.
-    const float hard_ratio = IsMeleeSpec(s.cls(), s.spec()) ? 1.05f : 1.20f;
+    // Deadmines 2026-10-10: with the tank stunned (its threat standing still) the 3 s release let the rogue climb to 1725 against
+    // the tank's 1663, past the tank with no hold left; a melee DPS therefore never releases above the tank's own threat, a caster
+    // keeps a tenth of margin under the 130 % a ranged attacker needs to take the mob.
+    const float hard_ratio = IsMeleeSpec(s.cls(), s.spec()) ? 1.0f : 1.10f;
     const bool past_hard_limit = u->tank_threat > 0.0f && u->my_threat >= u->tank_threat * hard_ratio;
     if (h == ThreatHold::OverThreat && !past_hard_limit && PartyOverThreatExpired(s, target))
     {
@@ -1142,7 +1147,7 @@ bool ThreatHoldWait(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& emit,
 }
 
 
-// [dps_idle] probe (live MC 2026-10-06: "only about half the casters do
+// [dps_idle_reason] probe (live MC 2026-10-06: "only about half the casters do
 // anything"). Runs when DispatchInCombat returns, whichever path it took: a
 // ranged DPS bot that neither pushed a cast / attack / item use this tick nor
 // is casting, channelling, wanding / auto-shooting or on the GCD is idle.
@@ -1162,9 +1167,19 @@ struct CombatIdleProbe
     {
         BotAI::CombatIdleState& st = ai.combat_idle();
         uint32 const now = s.published_at_ms();
-        bool const ranged_dps = s.is_alive() && ai.effective_role(s) == Role::Dps && !IsMeleeSpec(s.cls(), s.spec());
-        bool const acting = !ranged_dps || emit.combat_action_count() != actions_before || s.is_casting() ||
-                            s.raw().cast.is_autorepeat || s.gcd_active();
+        bool const dps = s.is_alive() && ai.effective_role(s) == Role::Dps;
+        bool const melee = IsMeleeSpec(s.cls(), s.spec());
+        // A melee bot swings without any emitted action: it is busy while its victim is in reach.
+        bool swinging = false;
+        if (melee)
+            if (NearbyUnit const* vi = s.victim_info(); vi && vi->hp > 0)
+            {
+                float bx, by, bz; s.position(bx, by, bz);
+                float const dx = vi->x - bx, dy = vi->y - by;
+                swinging = std::sqrt(dx * dx + dy * dy) <= 5.0f + vi->combat_reach;
+            }
+        bool const acting = !dps || emit.combat_action_count() != actions_before || s.is_casting() ||
+                            s.raw().cast.is_autorepeat || s.gcd_active() || swinging;
         if (acting)
         {
             st.idle_since_ms = 0;
@@ -1194,13 +1209,14 @@ struct CombatIdleProbe
             v.IsEmpty()                     ? "no target" :
             !u                              ? "target not in snapshot" :
             !u->in_los                      ? "out of LoS" :
+            melee && dist > 5.f + u->combat_reach ? "not in melee range" :
             dist > 32.f                     ? "target out of range" :
             s.is_moving()                   ? "moving" :
             has_mana && s.power_pct(0) < 10 ? "OOM" :
                                               "no rule acted";
         char const* rule = ai.rule_fire_seq() != rules_before ? ai.last_rule_fired() : nullptr;
-        TC_LOG_INFO("playerbot.v2", "[dps_idle] {} {:.1f}s idle: {}{}{} target={} dist={:.1f} los={} moving={} mana={}",
-            s.name(), idle_ms / 1000.f, rule ? rule : derived, rule ? " / " : "", rule ? derived : "",
+        TC_LOG_INFO("playerbot.v2", "[dps_idle_reason] {} not attacking because {}{}{} ({:.1f}s) target={} dist={:.1f} los={} moving={} mana={}",
+            s.name(), rule ? rule : derived, rule ? " / " : "", rule ? derived : "", idle_ms / 1000.f,
             v.IsEmpty() ? std::string("none") : (u ? std::to_string(u->entry) + "/" : std::string()) + std::to_string(v.GetCounter()),
             dist, u ? int(u->in_los) : 0, int(s.is_moving()), has_mana ? s.power_pct(0) : -1);
     }
@@ -1558,7 +1574,7 @@ void DispatchInCombat(BotAI& ai,
                       GroupSnapshotView group,
                       BotIntentEmitter& emit)
 {
-    // Reports a ranged DPS bot that ends this tick with nothing to do ([dps_idle]).
+    // Reports a damage bot that ends this tick with nothing to do ([dps_idle_reason]).
     CombatIdleProbe const idle_probe{ ai, snapshot, emit, emit.combat_action_count(), ai.rule_fire_seq() };
     ReFaceVictim(snapshot, emit);
     ApPredicateContext ctx{ snapshot, group, ai.aoe_preference(), {} };
@@ -1893,8 +1909,14 @@ void DispatchInCombat(BotAI& ai,
                 }
                 // In an instance a no-XP creature that is fighting someone (a victim, not pacified) is a real enemy that merely gives
                 // no experience: abandoning it leaves the bot idle under its blows. Only props and dummies are dropped.
-                const bool fighting_us = snapshot.is_in_instance() && !vu->is_pacified && !vu->victim.IsEmpty();
-                if ((vu->no_xp_kill || vu->is_pacified) && !quest_target && !fighting_us)
+                // A boss reads pacified while one of its own spells holds it (Baron Geddon's Inferno roots and pacifies him for the
+                // channel): that is a pause in the fight, not a prop (MC Geddon 2026-10-11: 632 drops, the raid stood off him).
+                const bool fighting_us = snapshot.is_in_instance() &&
+                    ((!vu->is_pacified && !vu->victim.IsEmpty()) || vu->is_dungeon_boss || vu->is_boss_rank);
+                // A target the owner ordered us onto (Attack / Engage) is never dropped for giving no XP: the order is the reason, and
+                // dropping it every tick restarted the rotation (damage_parity 2026-10-11: ~590 drops a leg, white swings and Overpower only).
+                const bool ordered = ai.is_manual_mode(now_ms) && ai.owner_command() == BotAI::OwnerCommand::Engage && ai.owner_target() == vg;
+                if ((vu->no_xp_kill || vu->is_pacified) && !quest_target && !fighting_us && !ordered)
                 {
                     emit.stop_attack();
                     ai.note_engage(vg, now_ms);   // 8s re-engage shield
@@ -2623,6 +2645,35 @@ void DispatchInCombat(BotAI& ai,
                 ? snapshot.raw().bg.bg_role == uint8(BgRole::FCEscort)
                 : ord.kind == BgState::BgOrder::EscortFC;
         }
+        // Before the pickup there is no carrier: the escorts of the pickup runner (order focus = the runner) keep to it the same way
+        // (BgTactics::EscortMustReturn), so the runner does not reach the defended flag room alone.
+        if (!i_am_carrier && escort_duty && snapshot.bg_friendly_flag_carrier().IsEmpty() &&
+            snapshot.raw().bg.order.kind == BgState::BgOrder::EscortFC && !snapshot.raw().bg.order.focus.IsEmpty() &&
+            snapshot.raw().bg.order.focus != snapshot.raw().guid)
+        {
+            ObjectGuid const rf = snapshot.raw().bg.order.focus;
+            float rdist = -1.f;
+            for (auto const& f : snapshot.raw().combat.nearby_friends)
+                if (f.guid == rf)
+                {
+                    const float rdx = f.x - bx, rdy = f.y - by;
+                    rdist = std::sqrt(rdx * rdx + rdy * rdy);
+                    break;
+                }
+            bool runner_enemy_close = false;
+            for (auto const& e : snapshot.nearby_enemies())
+            {
+                if (e.hp <= 0 || e.untargetable || e.is_pacified || e.is_cc_locked) continue;
+                const float edx = e.x - bx, edy = e.y - by;
+                if (edx * edx + edy * edy <= 30.0f * 30.0f) { runner_enemy_close = true; break; }
+            }
+            if (BgTactics::EscortMustReturn(rdist, runner_enemy_close))
+            {
+                emit.follow(rf, 8.0f);
+                ai.set_last_rule_fired("combat:bg_escort_follow_runner");
+                return;
+            }
+        }
         if (!i_am_carrier && escort_duty &&
             !snapshot.bg_friendly_flag_carrier().IsEmpty() &&
             snapshot.bg_friendly_flag_carrier() != snapshot.raw().guid)
@@ -2731,14 +2782,31 @@ void DispatchInCombat(BotAI& ai,
                 // Roamer / carrier-seeker ran through the enemy team without casting or swinging. An enemy within 22 y now wins:
                 // the bot fights it (the rotation below closes and chases), and runs for the flag only when nothing hostile is
                 // close, or when it holds the PickupFlag order (the one runner stays on the flag).
+                // The one runner holding the PickupFlag order rushes past enemies only with company (BgTactics::RunnerMayRush): alone it
+                // fights what is near, the escorts catch up. WSG soak 2026-10-11: the same runner lifted the flag and died with it four
+                // times running because it went into the defended room by itself.
                 bool adv_enemy_close = false;
-                if (snapshot.raw().bg.order.kind != BgState::BgOrder::PickupFlag)
+                {
+                    int enemies_near = 0, friends_near = 0;
                     for (auto const& e : snapshot.nearby_enemies())
                     {
                         if (e.hp <= 0) continue;
                         const float edx = e.x - bx, edy = e.y - by;
-                        if (edx * edx + edy * edy <= 30.0f * 30.0f) { adv_enemy_close = true; break; }
+                        if (edx * edx + edy * edy <= BgTactics::kRunnerEnemyRange * BgTactics::kRunnerEnemyRange) ++enemies_near;
                     }
+                    if (snapshot.raw().bg.order.kind != BgState::BgOrder::PickupFlag)
+                        adv_enemy_close = enemies_near > 0;
+                    else
+                    {
+                        for (auto const& f : snapshot.raw().combat.nearby_friends)
+                        {
+                            if (f.hp <= 0) continue;
+                            const float fdx2 = f.x - bx, fdy2 = f.y - by;
+                            if (fdx2 * fdx2 + fdy2 * fdy2 <= BgTactics::kRunnerCompanyRange * BgTactics::kRunnerCompanyRange) ++friends_near;
+                        }
+                        adv_enemy_close = !BgTactics::RunnerMayRush(friends_near, enemies_near);
+                    }
+                }
                 if (fd2 > 144.0f && !adv_enemy_close)
                 {
                     emit.move_to(adv.enemy_flag_x, adv.enemy_flag_y,
@@ -3501,7 +3569,7 @@ void DispatchInCombat(BotAI& ai,
             // used to race to the first corpse and burn their cast / cooldown.
             const uint8 brez_cls = snapshot.cls();
             const ObjectGuid dead = Combat::ClassicHeal::RezTarget(snapshot, group, 28.0f,
-                [brez_cls](GroupMemberSummary const& m) { return m.cls == brez_cls && m.role != Role::Tank; });
+                [brez_cls](GroupMemberSummary const& m) { return m.cls == brez_cls && m.role != Role::Tank; }, /*in_combat_ok*/ true);   // a combat rez: the rezzers are in the fight
             if (!dead.IsEmpty())
             {
                 if (!ai.brez_acked() || ai.brez_target() != dead)

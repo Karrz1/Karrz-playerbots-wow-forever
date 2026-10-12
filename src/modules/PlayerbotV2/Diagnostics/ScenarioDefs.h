@@ -190,14 +190,17 @@ struct RaidBossRow
     char const* boss_name;
     std::uint32_t timeout_min;
     std::uint32_t keep_entry = 0;        // the boss's own adds (staging leaves them alive); 0 = none
+    std::uint32_t min_tranq_shots = 0;   // a kill must have seen at least this many Tranquilizing Shots (Magmadar's Frenzy); 0 = not checked
+    std::uint32_t min_decurses = 0;      // ... and this many curses removed (Lucifron's, Gehennas'); 0 = not checked
 };
 
 // In the order of the raid. Each starts at the boss's room with the encounter pre-spawned (the earlier bosses alive too).
 inline constexpr RaidBossRow kMcBosses[] = {
     { "mc_garr",      "Molten Core: 40 level 60 raiders to Garr",      12057, "Garr",      15, 12099 },   // 12099 Firesworn
-    { "mc_lucifron",  "Molten Core: 40 level 60 raiders to Lucifron",  12118, "Lucifron",  15, 12119 },   // Flamewaker Protector
-    { "mc_magmadar",  "Molten Core: 40 level 60 raiders to Magmadar",  11982, "Magmadar",  15 },
-    { "mc_gehennas",  "Molten Core: 40 level 60 raiders to Gehennas",  12259, "Gehennas",  15, 11661 },   // Flamewaker
+    { "mc_lucifron",  "Molten Core: 40 level 60 raiders to Lucifron",  12118, "Lucifron",  15, 12119, 0, 1 },   // Flamewaker Protector; Lucifron's Curse must be removed
+    { "mc_magmadar",  "Molten Core: 40 level 60 raiders to Magmadar",  11982, "Magmadar",  15, 0, 1 },          // Frenzy must be tranquilized
+    { "mc_gehennas",  "Molten Core: 40 level 60 raiders to Gehennas",  12259, "Gehennas",  15, 11661, 0, 1 },   // Flamewaker; Gehennas' Curse must be removed
+    { "mc_geddon",    "Molten Core: 40 level 60 raiders to Baron Geddon", 12056, "Baron Geddon", 15 },   // Inferno (19698, 20 y): the raid must leave his range; more than 6 deaths fails it
 };
 
 inline ScenarioDef MakeMcScenario(RaidBossRow const& r)
@@ -221,6 +224,8 @@ inline ScenarioDef MakeMcScenario(RaidBossRow const& r)
     d.limits.max_deaths = 6;
     d.limits.dps_hold_ms = 20000;
     d.limits.tanks_dead_is_wipe = true;
+    d.limits.min_tranq_shots = r.min_tranq_shots;
+    d.limits.min_decurses = r.min_decurses;
     d.limits.stray_yards = 120.f;                                    // a raid spreads over a room
     d.arrive_near_entry = r.boss_entry;
     d.keep_entry = r.keep_entry;
@@ -339,6 +344,12 @@ inline std::vector<ScenarioDef> const& ScenarioCatalogue()
                 s_parity_names.push_back(std::string("incoming_damage_") + r.cls_name);
                 s_parity_names.push_back("Incoming damage, " + std::string(r.cls_name) + " tank: a level 63 dummy at bare / T1 / T3 armor, then Firesworn, Magmadar and a Deadmines mob");
                 v.push_back(MakeParityScenario(r, s_parity_names[s_parity_names.size() - 2].c_str(), s_parity_names.back().c_str(), 5, 15));
+            }
+            if (r.cls == ScnClass::Hunter)
+            {
+                s_parity_names.push_back("trap_audit_hunter");
+                s_parity_names.push_back("Trap audit, hunter: Explosive, Immolation, Frost and Freezing Trap out of combat, a dummy walked onto each, the trap must fire and do its effect");
+                v.push_back(MakeParityScenario(r, s_parity_names[s_parity_names.size() - 2].c_str(), s_parity_names.back().c_str(), 6, 8));
             }
             s_parity_names.push_back(std::string("talent_audit_") + r.cls_name);
             s_parity_names.push_back("Talent audit, " + std::string(r.cls_name) + ": key talents in the spellbook with their effects" +

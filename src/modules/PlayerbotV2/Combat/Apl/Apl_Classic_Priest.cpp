@@ -6,7 +6,7 @@
 // DPS list. Spell ids are vanilla rank 1 and resolve to the highest known
 // rank in the snapshot view and API::cast_spell.
 //
-// Priorities follow Karrz's ike3 vanilla strategies (Karrz's earlier VMaNGOS bot tree (wow-1.12)
+// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
 // raid10-revamp, playerbot/strategy/priest/*Strategy.cpp, MANGOSBOT_ZERO):
 // shield + Flash Heal on critical, Greater Heal on low, Renew on topping,
 // Prayer of Healing on group damage, dispels (the raid dispel plan), Power
@@ -212,21 +212,31 @@ bool ShouldShieldCritical(ApPredicateContext const& ctx)
     // Weakened Soul from any priest's shield blocks it (member debuff list).
     return t.hp_pct <= 35
         && !TargetHasMyAura(ctx, POWER_WORD_SHIELD, t.guid) && !TargetHasMyAura(ctx, WEAKENED_SOUL, t.guid)
-        && !ClassicHeal::MemberHasDebuff(ctx.group, t.guid, WEAKENED_SOUL);
+        && !ClassicHeal::MemberHasDebuff(ctx.group, t.guid, WEAKENED_SOUL)
+        && !ClassicHeal::ShieldClaimedByOther(ctx.bot, t.guid);
 }
 void DoShieldCritical(ApPredicateContext const& ctx, BotIntentEmitter& e)
 {
-    e.cast(POWER_WORD_SHIELD, LowestFriendOrSelf(ctx).guid);
+    ObjectGuid const t = LowestFriendOrSelf(ctx).guid;
+    if (e.cast(POWER_WORD_SHIELD, t))
+        ClassicHeal::NoteShieldCast(ctx.bot, t);
 }
 
 // Power Word: Shield on the tank as the pull lands: inside an instance map, the first swings on the group's tank (a Deadmines
 // pack of eight miners took 60% of the warrior's health in the first seconds, before the first heal landed). Not on a tank
 // already shielded or Weakened Soul'd, not below 35% mana (the shield then waits for the emergency rule), and not while
 // someone is in the emergency band, which belongs to the heals.
+// A shield is the worst heal per mana (449 mana for about 900 absorbed, against Greater Heal's 556 for about 1950: MC Garr 2026-10-11,
+// 33 shields cost the healers 14.8k mana, about 15 % of all they spent), so it goes on a tank only when the swings on it are worth the
+// absorb and the tank is not already full: the swings on it add up to at least kShieldMinIncoming, its projected health is at or under
+// kShieldMaxTankHpPct, and the healer has kShieldMinManaPct mana. The emergency rule (ShouldShieldCritical) is not gated by these.
+constexpr int64 kShieldMinIncoming  = 450;
+constexpr int32 kShieldMaxTankHpPct = 85;
+constexpr int32 kShieldMinManaPct   = 50;
 ObjectGuid TankToShield(ApPredicateContext const& ctx)
 {
     auto const* members = ctx.group.members();
-    if (!members || !ClassicHeal::RaidHealing(ctx.bot) || !ctx.bot.in_combat() || ClassicHeal::ManaPct(ctx.bot) < 35)
+    if (!members || !ClassicHeal::RaidHealing(ctx.bot) || !ctx.bot.in_combat() || ClassicHeal::ManaPct(ctx.bot) < kShieldMinManaPct)
         return ObjectGuid::Empty;
     float bx, by, bz; ctx.bot.position(bx, by, bz);
     for (GroupMemberSummary const& m : *members)
@@ -236,10 +246,10 @@ ObjectGuid TankToShield(ApPredicateContext const& ctx)
         if (ClassicHeal::Dist2(m.x, m.y, m.z, bx, by, bz) > 30.0f * 30.0f)
             continue;
         ClassicHeal::Patient const p = ClassicHeal::PatientFor(ctx.bot, ctx.group, m.guid);
-        if (!p.valid || p.incoming <= 0)
-            continue;       // nobody is hitting it yet
+        if (!p.valid || p.incoming < kShieldMinIncoming || p.hp_pct > kShieldMaxTankHpPct)
+            continue;       // nobody is hitting it hard enough yet, or it is still full
         if (TargetHasMyAura(ctx, POWER_WORD_SHIELD, m.guid) || TargetHasMyAura(ctx, WEAKENED_SOUL, m.guid)
-            || ClassicHeal::MemberHasDebuff(ctx.group, m.guid, WEAKENED_SOUL))
+            || ClassicHeal::MemberHasDebuff(ctx.group, m.guid, WEAKENED_SOUL) || ClassicHeal::ShieldClaimedByOther(ctx.bot, m.guid))
             continue;
         return m.guid;
     }
@@ -251,7 +261,9 @@ bool ShouldShieldTank(ApPredicateContext const& ctx)
 }
 void DoShieldTank(ApPredicateContext const& ctx, BotIntentEmitter& e)
 {
-    e.cast(POWER_WORD_SHIELD, TankToShield(ctx));
+    ObjectGuid const t = TankToShield(ctx);
+    if (!t.IsEmpty() && e.cast(POWER_WORD_SHIELD, t))
+        ClassicHeal::NoteShieldCast(ctx.bot, t);
 }
 
 // Renew on the tank early in a pull: instant, 15 s, and the cheapest healing a levelling priest has. The rotation's own Renew sits
@@ -351,6 +363,7 @@ bool ShouldRenew(ApPredicateContext const& ctx)
     if (!Ready(ctx, RENEW)) return false;
     HealTarget const t = LowestFriendOrSelf(ctx);
     return t.hp_pct <= 85 && !TargetHasMyAura(ctx, RENEW, t.guid) && ClassicHeal::HotAllowed(ctx.bot, ctx.group, t.guid)
+        && ClassicHeal::HotWorthIt(ctx.bot, ctx.group, t.guid)
         && !ClassicHeal::HotClaimedByOther(ctx.bot, ctx.group, t.guid, RENEW);
 }
 void DoRenew(ApPredicateContext const& ctx, BotIntentEmitter& e)

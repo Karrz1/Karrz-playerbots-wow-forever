@@ -1,4 +1,5 @@
 #include "BotQueueFiller.h"
+#include <set>
 #include "ClassicSpec.h"
 #include "BotAccountMgr.h"          // altbot (non-pool account) draft exemption
 #include "BotPool.h"
@@ -133,6 +134,17 @@ RoleNeeds NeedsFor(BotQueueFiller::QueueKind kind)
 // only. (Originally inlined here; deduped 2026-05-10 when the idle rule
 // landed.)
 
+// A bot already confined to a fill (jit purpose) may be reassigned to another queue, but only while it is still in the open
+// world: one that is inside the match it was made for sits in the battleground group on the battleground map, and queueing it
+// again is rejected (grouped_not_leader / in_bg). AV 2026-10-11: 67 such bots were picked as "queued" every cycle, the ask for
+// the last Horde slot counted as met, and the reuse/create fallback never ran for 7 minutes.
+bool CommittedBotReusable(Player const* bot)
+{
+    if (bot->InBattleground() || bot->GetGroup() || bot->IsBeingTeleported() || !bot->IsAlive()) return false;
+    Map const* map = bot->GetMap();
+    return !(map && (map->IsDungeon() || map->IsBattlegroundOrArena()));
+}
+
 // Bracket -> level midpoint
 uint8 BracketMidpoint(uint8 bracket)
 {
@@ -227,7 +239,11 @@ void BotQueueFiller::Fill(FillRequest const& req)
   // Run the fill flow once per faction we need to populate.
   // For BG: 2 passes (player faction + enemy faction).
   // For LFG: 1 pass (player faction only).
-  for (int faction_pass = 0; faction_pass < (is_bg ? 2 : 1); ++faction_pass)
+  // A running-match top-up is the deficit of ONE side (req.faction). Running the second pass with that same count asked the
+  // other side for the wrong number: AV 18 v 23 asked Alliance for 17 (gate: 0 free) from the Horde call and Horde for
+  // 17 from the Alliance call, so the leading side's queue kept filling while the lagging side got a mixed-up wave.
+  int const faction_passes = (is_bg && !req.single_faction) ? 2 : 1;
+  for (int faction_pass = 0; faction_pass < faction_passes; ++faction_pass)
   {
     bool const want_alliance = (faction_pass == 0) ? player_is_alliance : !player_is_alliance;
 
@@ -287,8 +303,10 @@ void BotQueueFiller::Fill(FillRequest const& req)
         // (jit purpose) may be reassigned here, so Committed passes.
         switch (::Playerbot::Pool::CheckFreeBot(bot, id))
         {
-            case ::Playerbot::Pool::Verdict::Free:
-            case ::Playerbot::Pool::Verdict::Committed: break;
+            case ::Playerbot::Pool::Verdict::Free:      break;
+            case ::Playerbot::Pool::Verdict::Committed:
+                if (!CommittedBotReusable(bot))         { ++rej_grouped; continue; }
+                break;
             case ::Playerbot::Pool::Verdict::Combat:    ++rej_combat; continue;
             case ::Playerbot::Pool::Verdict::Instanced:
             case ::Playerbot::Pool::Verdict::Dead:      ++rej_dungeon; continue;
@@ -508,6 +526,8 @@ void BotQueueFiller::Fill(FillRequest const& req)
             {
                 auto const v = ::Playerbot::Pool::CheckFreeBot(bot, id);
                 if (v != ::Playerbot::Pool::Verdict::Free && v != ::Playerbot::Pool::Verdict::Committed)
+                                                          { ++p2_filtered_out; continue; }
+                if (v == ::Playerbot::Pool::Verdict::Committed && !CommittedBotReusable(bot))
                                                           { ++p2_filtered_out; continue; }
             }
             if (is_bg && bot->IsDeserter())               { ++p2_filtered_out; continue; }
@@ -823,6 +843,9 @@ void BotQueueFiller::Fill(FillRequest const& req)
             // Tag format: "<KIND>:<INSTANCE_ID>:<ROLE>" e.g. "BG:128:DPS",
             // "LFG:271:HEAL". Parsed in the population manager.
             uint64 guid_low = created.guid.GetCounter();
+            // A BG bot is created inside the bracket that asked for it, spread over the bracket's levels (twinks as well as 60s).
+            uint8 const bot_level = is_bg ? uint8(Battleground::BracketLevelFor(req.bracket_min_level, req.bracket_max_level, MaxPlayerLevel(),
+                                                                                    target_level, urand(0, 1000))) : target_level;
             char const* kind_str = (req.kind == QueueKind::Bg) ? "BG" : "LFG";
             char tag_buf[48];
             std::snprintf(tag_buf, sizeof(tag_buf), "%s:%u:%s",
@@ -830,7 +853,7 @@ void BotQueueFiller::Fill(FillRequest const& req)
             CharacterDatabase.PExecute(
                 "UPDATE playerbot_v2_character SET distribution_level={}, jit_for_queue='{}', "
                 "last_seen_at=NOW() WHERE character_guid_low={}",
-                uint32(target_level), tag_buf, guid_low);
+                uint32(bot_level), tag_buf, guid_low);
             // DEFERRED login (BG audit follow-up): Create's SaveToDB is
             // async -- a same-tick LoginBot loses the race and the session
             // is kicked with "Player::LoadFromDB failed" (observed: 542
@@ -918,6 +941,7 @@ struct HumanBgWait { ObjectGuid guid; uint16 bg_type; uint32 since_ms; uint32 la
 std::vector<HumanBgWait> g_human_waits;                // world thread only (hook + tick)
 uint32 g_last_room_pass_ms = 0;
 std::unordered_map<uint64, uint32> g_room_victims;     // bot -> leave requested at
+std::unordered_map<uint32, uint32> g_room_made_ms;     // bg type -> last time a bot was asked to leave for a human
 
 bool IsPoolBot(Player const* bot, BotId id)
 {
@@ -1125,6 +1149,85 @@ std::vector<std::pair<std::pair<int32, int32>, Player*>> EvictableBots(Battlegro
     return out;
 }
 
+
+struct Placement
+{
+    Battleground* bg = nullptr;
+    uint32 missing = 0;                                     // places the human's party still needs after the free ones
+    std::vector<std::pair<std::pair<int32, int32>, Player*>> victims;
+    bool any_room = false;                                  // some instance has the places already: TC's queue invites the player there
+    std::string why;                                        // per-instance verdicts, for the "no running instance" log
+};
+
+uint32 HumansIn(Battleground const* bg)
+{
+    uint32 n = 0;
+    for (auto const& slot : bg->GetPlayers())
+    {
+        Player const* p = ObjectAccessor::FindConnectedPlayer(slot.first);
+        if (p && p->GetSession() && !p->GetSession()->IsBot()) ++n;
+    }
+    return n;
+}
+
+uint32 BotsOnTeam(Battleground const* bg, Team team)
+{
+    uint32 n = 0;
+    for (auto const& slot : bg->GetPlayers())
+    {
+        Player const* p = ObjectAccessor::FindConnectedPlayer(slot.first);
+        if (p && p->GetSession() && p->GetSession()->IsBot() && bg->GetPlayerTeam(slot.first) == team) ++n;
+    }
+    return n;
+}
+
+// The running (or preparing) instance of this type and bracket a real player is put into, mixed or bot-only: the one with the most
+// real players, then the one with the most bots on the player's team. A full team makes room by evicting bots (EvictableBots: never a
+// human, an owner's companion, a flag carrier or a bot in combat). A new instance is only opened when none can take the player.
+Placement ChoosePlacement(Team team, uint32 need, uint32 bg_type_id, uint8 bracket)
+{
+    Placement best;
+    uint32 best_humans = 0, best_bots = 0;
+    std::set<uint32> seen;
+    auto consider = [&](Battleground* bg)
+    {
+        if (!bg || !seen.insert(bg->GetInstanceID()).second) return;
+        if (bg->isRated() || uint8(bg->GetBracketId()) != bracket)
+        { best.why += Trinity::StringFormat(" [inst {} wrong bracket {} / rated]", bg->GetInstanceID(), uint32(bg->GetBracketId())); return; }
+        if (bg->GetStatus() != STATUS_IN_PROGRESS && bg->GetStatus() != STATUS_WAIT_JOIN)
+        { best.why += Trinity::StringFormat(" [inst {} status {}]", bg->GetInstanceID(), uint32(bg->GetStatus())); return; }
+        // a waiting real player is invited into any physically free place (BattlegroundQueue::FillPlayersToBG), balance gate aside, so the
+        // places that must be made are counted from the team size: a team already over the cap (12 in a 10-a-side match) loses enough
+        // bots to leave room for the player, not just one
+        uint32 const taken = std::max(bg->GetPlayersCountByTeam(team), bg->GetInvitedCount(team));
+        uint32 const free_slots = Battleground::PhysicalRoom(taken, bg->GetMaxPlayersPerTeam());
+        uint32 const missing = Battleground::PlacesToMake(taken, bg->GetMaxPlayersPerTeam(), need);
+        auto victims = missing ? EvictableBots(bg, team) : decltype(best.victims){};
+        if (missing && victims.size() < missing)             // only real players on that side to swap: not a candidate
+        { best.why += Trinity::StringFormat(" [inst {} free {} need {} evictable {}]", bg->GetInstanceID(), free_slots, need, victims.size()); return; }
+        if (!missing) best.any_room = true;
+        uint32 const humans = HumansIn(bg), bots = BotsOnTeam(bg, team);
+        if (!best.bg || Battleground::PlacementBetter(humans, bots, best_humans, best_bots))
+        {
+            best.bg = bg; best.missing = missing; best.victims = std::move(victims);
+            best_humans = humans; best_bots = bots;
+        }
+    };
+    BattlegroundTemplate const* tmpl = sBattlegroundMgr->GetBattlegroundTemplateByTypeId(BattlegroundTypeId(bg_type_id));
+    if (!tmpl) return best;
+    for (int32 map_id : tmpl->MapIDs)
+        for (Battleground* bg : sBattlegroundMgr->GetBGFreeSlotQueueStore(map_id))
+            if (bg && uint32(bg->GetTypeID()) == bg_type_id) consider(bg);
+    // full instances leave the free-slot store: reach them through the bots inside
+    for (BotId id : Services::Lifecycle().snapshot_ids())
+    {
+        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
+        Battleground* bg = bot ? bot->GetBattleground() : nullptr;
+        if (bg && uint32(bg->GetTypeID()) == bg_type_id) consider(bg);
+    }
+    return best;
+}
+
 } // namespace
 
 bool BotQueueFiller::ClaimRunningBgForHuman(Player* human, uint32 bg_type_id, uint8 bracket, uint32* open_slots)
@@ -1136,35 +1239,10 @@ bool BotQueueFiller::ClaimRunningBgForHuman(Player* human, uint32 bg_type_id, ui
     Team const team = human->GetTeam();
     uint32 const need = human->GetGroup() ? human->GetGroup()->GetMembersCount() : 1u;
 
-    // A running BG of this type and bracket with a place already (TC's own free-slot queue invites the human).
-    Battleground* best = nullptr;
-    uint32 best_missing = std::numeric_limits<uint32>::max();
-    std::vector<std::pair<std::pair<int32, int32>, Player*>> best_victims;
-    std::string why;                                           // per-instance verdicts for the "no running instance" log
-    auto consider = [&](Battleground* bg)
-    {
-        if (!bg) return;
-        if (bg->isRated() || uint8(bg->GetBracketId()) != bracket)
-        { why += Trinity::StringFormat(" [inst {} wrong bracket {} / rated]", bg->GetInstanceID(), uint32(bg->GetBracketId())); return; }
-        if (bg->GetStatus() != STATUS_IN_PROGRESS && bg->GetStatus() != STATUS_WAIT_JOIN)
-        { why += Trinity::StringFormat(" [inst {} status {}]", bg->GetInstanceID(), uint32(bg->GetStatus())); return; }
-        uint32 const free_slots = bg->GetFreeSlotsForTeam(team);
-        uint32 const missing = free_slots >= need ? 0u : need - free_slots;
-        auto victims = missing ? EvictableBots(bg, team) : decltype(best_victims){};
-        if (missing && victims.size() < missing)                  // cannot make the room: not a candidate
-        { why += Trinity::StringFormat(" [inst {} free {} need {} evictable {}]", bg->GetInstanceID(), free_slots, need, victims.size()); return; }
-        if (missing < best_missing) { best = bg; best_missing = missing; best_victims = std::move(victims); }
-    };
-    for (int32 map_id : tmpl->MapIDs)
-        for (Battleground* bg : sBattlegroundMgr->GetBGFreeSlotQueueStore(map_id))
-            if (uint32(bg->GetTypeID()) == bg_type_id) consider(bg);
-    if (!best || best_missing)
-        for (BotId id : Services::Lifecycle().snapshot_ids())
-        {
-            Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
-            Battleground* bg = bot ? bot->GetBattleground() : nullptr;
-            if (bg && uint32(bg->GetTypeID()) == bg_type_id && bg != best) consider(bg);
-        }
+    Placement placed = ChoosePlacement(team, need, bg_type_id, bracket);
+    Battleground* best = placed.bg;
+    uint32 const best_missing = placed.missing;
+    std::string const& why = placed.why;
     if (!best)
     {
         TC_LOG_INFO("playerbot.v2", "[bg_queue] HumanPriority: {} queued bg_type={} bracket={}: no running instance can take {} slot(s), a normal fill follows;{}",
@@ -1221,17 +1299,6 @@ void BotQueueFiller::MakeRoomForRealPlayers(uint32 now_ms)
 
     std::erase_if(g_room_victims, [&](auto const& kv) { return (now_ms - kv.second) > 30u * 1000u; });
 
-    // Index running BGs through the bots inside them (the manager's BG store is private; a BG
-    // with no bot in it has no bot to remove anyway).
-    std::unordered_map<uint64, Battleground*> bgs;           // (type, instance) -> bg
-    for (BotId id : Services::Lifecycle().snapshot_ids())
-    {
-        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
-        if (!bot) continue;
-        if (Battleground* bg = bot->GetBattleground())
-            bgs.emplace((uint64(bg->GetTypeID()) << 32) | bg->GetInstanceID(), bg);
-    }
-
     for (auto it = g_human_waits.begin(); it != g_human_waits.end();)
     {
         Player* human = ObjectAccessor::FindConnectedPlayer(it->guid);
@@ -1245,6 +1312,8 @@ void BotQueueFiller::MakeRoomForRealPlayers(uint32 now_ms)
         }
         HumanBgWait& w = *it++;
         if (w.last_try_ms && now_ms - w.last_try_ms < 10u * 1000u) continue;
+        // one bot has left for this type a moment ago: its place is the player's, wait for the invitation before asking another
+        if (RoomRecentlyMade(w.bg_type, now_ms)) continue;
 
         Team const team = human->GetTeam();
         uint32 const need = human->GetGroup() ? human->GetGroup()->GetMembersCount() : 1u;
@@ -1253,22 +1322,13 @@ void BotQueueFiller::MakeRoomForRealPlayers(uint32 now_ms)
         PVPDifficultyEntry const* diff = DB2Manager::GetBattlegroundBracketByLevel(tmpl->MapIDs.front(), human->GetLevel());
         if (!diff) continue;
 
-        Battleground* target = nullptr;
-        bool has_room = false;
-        for (auto const& [key, bg] : bgs)
-        {
-            if (uint32(bg->GetTypeID()) != w.bg_type || bg->GetBracketId() != diff->GetBracketId()) continue;
-            if (bg->GetStatus() != STATUS_IN_PROGRESS && bg->GetStatus() != STATUS_WAIT_JOIN) continue;
-            if (bg->GetFreeSlotsForTeam(team) >= need) { has_room = true; break; }   // normal queue handles it
-            target = bg;
-        }
-        if (has_room || !target) continue;
-
-        // Enough bots leave for the whole party: the human's group needs `need` places, `free_now` are open already.
-        uint32 const free_now = target->GetFreeSlotsForTeam(team);
-        uint32 const missing = need > free_now ? need - free_now : 1u;
-        auto victims = EvictableBots(target, team);
-        if (victims.empty()) continue;
+        // Same choice as ClaimRunningBgForHuman: the instance with the most real players, then the most bots on the player's team.
+        Placement placed = ChoosePlacement(team, need, w.bg_type, uint8(diff->GetBracketId()));
+        Battleground* target = placed.bg;
+        // no instance, or one has the places already (TC's queue invites the player there at once, an eviction elsewhere would be wasted)
+        if (!target || placed.missing == 0 || placed.any_room) continue;
+        uint32 const missing = placed.missing;
+        auto victims = std::move(placed.victims);
         uint32 asked = 0;
         for (auto const& [key, victim] : victims)
         {
@@ -1285,8 +1345,15 @@ void BotQueueFiller::MakeRoomForRealPlayers(uint32 now_ms)
                 victim->GetName(), key.first, key.second, target->GetInstanceID(), w.bg_type, human->GetName(),
                 team == ALLIANCE ? "ALLIANCE" : "HORDE", need);
         }
+        if (asked) g_room_made_ms[w.bg_type] = now_ms ? now_ms : 1u;
         w.last_try_ms = now_ms;
     }
+}
+
+bool BotQueueFiller::RoomRecentlyMade(uint32 bg_type_id, uint32 now_ms)
+{
+    auto const it = g_room_made_ms.find(bg_type_id);
+    return it != g_room_made_ms.end() && (now_ms - it->second) < 20u * 1000u;
 }
 
 } // namespace Playerbot::V2::Fleet

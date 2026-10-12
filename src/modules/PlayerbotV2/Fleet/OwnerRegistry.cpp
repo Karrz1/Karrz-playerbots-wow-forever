@@ -14,7 +14,7 @@ auto& Db() { return CharacterDatabase; }
 size_t OwnerRegistry::LoadFromDb()
 {
     auto result = Db().Query(
-        "SELECT character_guid_low, owner_account_id, owner_player_guid, companion_saved, starter_pet_granted, gear_varied, companion_role "
+        "SELECT character_guid_low, owner_account_id, owner_player_guid, companion_saved, starter_pet_granted, gear_varied, companion_role, companion_subgroup, companion_spec "
         "FROM playerbot_v2_character "
         "WHERE owner_account_id != 0 OR companion_role != 0");
     auto gear_modes = Db().Query("SELECT owner_account_id, gear_mode FROM playerbot_v2_owner_gear");
@@ -26,6 +26,8 @@ size_t OwnerRegistry::LoadFromDb()
     starter_pet_granted_.clear();
     gear_varied_.clear();
     declared_role_.clear();
+    subgroup_.clear();
+    spec_.clear();
     if (!result)
     {
         TC_LOG_INFO("playerbot.v2", "[PlayerbotV2 Owners] No owner bindings yet.");
@@ -46,6 +48,10 @@ size_t OwnerRegistry::LoadFromDb()
             gear_varied_.insert(bot);
         if (uint8 const r = f[6].GetUInt8(); r >= 1 && r <= 3)
             declared_role_[bot] = Role(r - 1);
+        if (uint8 const sg = f[7].GetUInt8(); sg >= 1 && sg <= 8)
+            subgroup_[bot] = uint8(sg - 1);
+        if (uint32 const sp = f[8].GetUInt16(); sp != 0)
+            spec_[bot] = sp;
     } while (result->NextRow());
     uint32 tanks = 0, healers = 0, dps = 0;
     for (auto const& [bot, role] : declared_role_)
@@ -239,6 +245,18 @@ void OwnerRegistry::SetOwnerGearMode(uint32 account_id, uint8 mode)
     Db().DirectPExecute("REPLACE INTO playerbot_v2_owner_gear (owner_account_id, gear_mode) VALUES ({}, {})", account_id, uint32(mode));
 }
 
+bool OwnerRegistry::CcEnabled(uint32 account_id) const
+{
+    std::shared_lock lk(mtx_);
+    return !cc_disabled_.contains(account_id);
+}
+
+bool OwnerRegistry::SetCcEnabled(uint32 account_id, bool enabled)
+{
+    std::unique_lock lk(mtx_);
+    return enabled ? cc_disabled_.erase(account_id) > 0 : cc_disabled_.insert(account_id).second;
+}
+
 Role OwnerRegistry::DeclaredRole(BotId bot) const
 {
     std::shared_lock lk(mtx_);
@@ -266,6 +284,63 @@ void OwnerRegistry::SetDeclaredRole(BotId bot, Role role)
     }
     Db().DirectPExecute("UPDATE playerbot_v2_character SET companion_role = {} WHERE character_guid_low = {}",
         role == Role::Unknown ? 0u : uint32(role) + 1u, bot);
+}
+
+uint8 OwnerRegistry::StoredSubgroup(BotId bot) const
+{
+    std::shared_lock lk(mtx_);
+    auto const it = subgroup_.find(bot);
+    return it == subgroup_.end() ? uint8(0xFF) : it->second;
+}
+
+void OwnerRegistry::SetStoredSubgroup(BotId bot, uint8 subgroup)
+{
+    {
+        std::unique_lock lk(mtx_);
+        auto const it = subgroup_.find(bot);
+        if (subgroup > 7)
+        {
+            if (it == subgroup_.end())
+                return;
+            subgroup_.erase(it);
+        }
+        else
+        {
+            if (it != subgroup_.end() && it->second == subgroup)
+                return;
+            subgroup_[bot] = subgroup;
+        }
+    }
+    Db().DirectPExecute("UPDATE playerbot_v2_character SET companion_subgroup = {} WHERE character_guid_low = {}",
+        subgroup > 7 ? 0u : uint32(subgroup) + 1u, bot);
+}
+
+uint32 OwnerRegistry::StoredSpec(BotId bot) const
+{
+    std::shared_lock lk(mtx_);
+    auto const it = spec_.find(bot);
+    return it == spec_.end() ? 0u : it->second;
+}
+
+void OwnerRegistry::SetStoredSpec(BotId bot, uint32 spec)
+{
+    {
+        std::unique_lock lk(mtx_);
+        auto const it = spec_.find(bot);
+        if (spec == 0)
+        {
+            if (it == spec_.end())
+                return;
+            spec_.erase(it);
+        }
+        else
+        {
+            if (it != spec_.end() && it->second == spec)
+                return;
+            spec_[bot] = spec;
+        }
+    }
+    Db().DirectPExecute("UPDATE playerbot_v2_character SET companion_spec = {} WHERE character_guid_low = {}", spec, bot);
 }
 
 bool OwnerRegistry::IsOwner(BotId bot, uint32 sender_account, uint64 sender_guid) const

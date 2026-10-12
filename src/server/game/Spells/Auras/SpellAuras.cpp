@@ -17,6 +17,7 @@
 
 #include "SpellAuras.h"
 #include "CellImpl.h"
+#include "ClassicSpellValue.h"
 #include "Common.h"
 #include "Containers.h"
 #include "CreatureAI.h"
@@ -534,6 +535,10 @@ void Aura::_InitEffects(uint32 effMask, Unit* caster, SpellEffectValue const* ba
 bool Aura::CanPeriodicTickCrit() const
 {
     if (GetSpellInfo()->HasAttribute(SPELL_ATTR2_CANT_CRIT))
+        return false;
+
+    // Classic 1.60 (vanilla): damage and healing over time never critically strike (Renew, Rejuvenation, Corruption, Immolate...)
+    if (ClassicSpellValue::AppliesToSpell(GetId()))
         return false;
 
     if (GetSpellInfo()->HasAttribute(SPELL_ATTR8_PERIODIC_CAN_CRIT))

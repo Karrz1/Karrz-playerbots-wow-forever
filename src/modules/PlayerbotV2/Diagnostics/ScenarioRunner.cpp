@@ -4,6 +4,7 @@
 #include "ScenarioDefs.h"
 #include "../Bot/BotAI.h"
 #include "../Bot/BotRegistry.h"
+#include "../Bot/ClassicUpkeep.h"
 #include "../Fleet/BotCharacterFactory.h"
 #include "../Fleet/BotIdentityRegistry.h"
 #include "../Fleet/BotPool.h"
@@ -124,6 +125,9 @@ struct Run
     bool group_logged = false;
     std::string arrive_blocker;          // why no landing spot was found (the hostile that blocked the nearest candidate)
     std::uint32_t stage_timeout_ms = kStageTimeoutMs;
+    // Classic::RaidSupportTotal readings (tranq shots, curses removed, formation slot give-ups) when the run began.
+    std::uint32_t base_tranq = 0, base_decurse = 0, base_giveup = 0;
+    bool support_based = false;
     // Playerbot.log's size once a second of the run (run_ms, bytes), the last kReportWindowMs of it: where the failure report
     // starts reading the log.
     std::deque<std::pair<std::uint32_t, std::uintmax_t>> log_marks;
@@ -134,15 +138,24 @@ struct Run
     bool has_stage = false;            // a checkpoint with a listed staging spot (ScenarioCheckpoint::stage_*)
     float stage_x = 0.f, stage_y = 0.f, stage_z = 0.f;
     std::string from_key;
+    // Which of the squads running side by side this is (0 = the first): a squad beyond the first is made of characters of its own,
+    // with the slot's letter in their names (SquadName).
+    int slot = 0;
 };
 
-Run g_run;
+// The scenarios running now: one, or up to g_parallel (`runbatch`) with a squad and an instance each.
+std::vector<std::unique_ptr<Run>> g_runs;
+std::size_t g_parallel = 1;        // runs started together by one wave of runall (1) / runbatch (5)
+bool g_halt_on_fail = false;       // runbatch: a wave with a FAIL stops the batch (the next wave waits for the fix)
+bool g_wave_failed = false;
 
-// A fresh run. Run holds atomics, so it is rebuilt in place instead of assigned.
-void ResetRun()
+// The name of a squad member in a slot: slot 0 keeps the catalogue's name (the characters that already exist), the others carry the
+// slot's letter after the first two letters ("Scnwarrior" -> "Scbnwarrior"), so no name is a substring of another slot's.
+std::string SquadName(std::string const& name, int slot)
 {
-    g_run.~Run();
-    new (&g_run) Run();
+    if (slot <= 0 || name.size() < 3)
+        return name;
+    return name.substr(0, 2) + char('a' + slot) + name.substr(2);
 }
 
 // `scenario runall`: the names still to run, and one line per finished scenario.
@@ -673,7 +686,7 @@ Player* StandIn(Run& run)
     if (!run.def->stand_in)
         return nullptr;
     for (Member const& m : run.members)
-        if (m.def.name == run.def->stand_in)
+        if (m.def.name == SquadName(run.def->stand_in, run.slot))
             return Find(m.id);
     return nullptr;
 }
@@ -944,6 +957,15 @@ std::vector<std::string> LogLinesSince(Run const& run, std::uint32_t from_ms)
             if (line.find(tag) != std::string::npos) { keep = true; break; }
         if (!keep)
             continue;
+        // Squads running side by side share the log: keep the lines that name one of this squad's characters.
+        if (g_parallel > 1)
+        {
+            bool mine = false;
+            for (Member const& m : run.members)
+                if (line.find(m.def.name) != std::string::npos) { mine = true; break; }
+            if (!mine)
+                continue;
+        }
         if (line.size() > 400)
             line.resize(400);
         out.push_back(line);
@@ -1029,13 +1051,21 @@ void WriteResult(std::string const& text)
         out << text << '\n';
 }
 
-bool BeginScenario(std::string const& name, std::string& error);
+// The support tallies a run is judged against start at its first second: earlier runs on the same map left theirs behind.
+void BaseSupport(Run& run)
+{
+    run.base_tranq = Classic::RaidSupportTotal(Classic::RaidSupportKind::Tranq, run.def->map);
+    run.base_decurse = Classic::RaidSupportTotal(Classic::RaidSupportKind::Decurse, run.def->map);
+    run.base_giveup = Classic::RaidSupportTotal(Classic::RaidSupportKind::FormationGiveUp, run.def->map);
+    run.support_based = true;
+}
+
+bool BeginScenario(std::string const& name, int slot, std::string& error);
 void StartNext();
 
 // Takes the squad out of the content and ends the run.
-void Finish(bool timed_out, std::string const& note = {})
+void Finish(Run& run, bool timed_out, std::string const& note = {})
 {
-    Run& run = g_run;
     ScenarioDef const& def = *run.def;
     ReportPull(run, "final");
     if (def.parity)
@@ -1048,6 +1078,25 @@ void Finish(bool timed_out, std::string const& note = {})
     }
     if (timed_out)
         run.monitor->NoteTimeout(run.run_ms, note.empty() ? fmt::format("goal not met in {} s", def.timeout_ms / 1000u) : note);
+
+    if (run.support_based)
+    {
+        std::uint32_t const tranq = Classic::RaidSupportTotal(Classic::RaidSupportKind::Tranq, def.map) - run.base_tranq;
+        std::uint32_t const decurse = Classic::RaidSupportTotal(Classic::RaidSupportKind::Decurse, def.map) - run.base_decurse;
+        std::uint32_t const giveups = Classic::RaidSupportTotal(Classic::RaidSupportKind::FormationGiveUp, def.map) - run.base_giveup;
+        if (def.limits.min_tranq_shots || def.limits.min_decurses || tranq || decurse || giveups)
+            run.monitor->NoteInfo(fmt::format("support: tranquilizing shots {}, curses removed {}, formation slot give-ups {}", tranq, decurse, giveups));
+        // Judged once the boss is dead: a run that ended on another failure has not had its chance to show the support.
+        if (run.goal_reached)
+        {
+            if (def.limits.min_tranq_shots && tranq < def.limits.min_tranq_shots)
+                run.monitor->NoteSupportMissing(run.run_ms, fmt::format("{} Tranquilizing Shot(s) cast, at least {} expected: the hunters never tranquilized the Frenzy ([raid_tranq])",
+                                                                       tranq, def.limits.min_tranq_shots));
+            if (def.limits.min_decurses && decurse < def.limits.min_decurses)
+                run.monitor->NoteSupportMissing(run.run_ms, fmt::format("{} curse(s) removed, at least {} expected: the boss's curse was never cleansed ([raid_dispel])",
+                                                                       decurse, def.limits.min_decurses));
+        }
+    }
 
     bool const pass = run.monitor->passed(run.goal_reached);
     std::string text = fmt::format("[scenario] result={} name={} level={} squad={} run_s={} goal={} failures={}",
@@ -1095,6 +1144,8 @@ void Finish(bool timed_out, std::string const& note = {})
             line += " goal not reached";
         g_summary.push_back(line);
         TC_LOG_INFO("playerbot.v2", "[scenario_all] {}", line);
+        if (!pass)
+            g_wave_failed = true;
     }
 
     // A detached stand-in has no AI to come back: it is logged out, and the next staging logs it in with a fresh one.
@@ -1113,7 +1164,15 @@ void Finish(bool timed_out, std::string const& note = {})
             }
             ::Playerbot::BotMovement::SafeTeleport(p, kStageMap, kStageX, kStageY, kStageZ, 0.f, 0);
         }
-    ResetRun();
+    // Take the run out of the list but keep it alive to the end of this function: `run` is a reference into it.
+    std::unique_ptr<Run> owned;
+    for (auto it = g_runs.begin(); it != g_runs.end(); ++it)
+        if (it->get() == &run)
+        {
+            owned = std::move(*it);
+            g_runs.erase(it);
+            break;
+        }
     StartNext();
 }
 
@@ -1150,7 +1209,7 @@ void Sample(Run& run, std::vector<ScenarioSample>& out)
 }
 
 // Starts the named scenario: the catalogue entry, a goal creature this world's DB knows, a fresh run in the Stage phase.
-bool BeginScenario(std::string const& full_name, std::string& error)
+bool BeginScenario(std::string const& full_name, int slot, std::string& error)
 {
     // `name@key`: a checkpoint start inside a dungeon scenario.
     std::string name = full_name, from_key;
@@ -1195,53 +1254,68 @@ bool BeginScenario(std::string const& full_name, std::string& error)
         if (ct->Name != def->goal_name)
             TC_LOG_WARN("playerbot.v2", "[scenario] {} goal creature {} is '{}' in the DB, the scenario says '{}'", def->name, def->goal_entry, ct->Name, def->goal_name);
     }
-    ResetRun();
-    g_run.def = def;
-    g_run.phase = Phase::Stage;
+    auto owned = std::make_unique<Run>();
+    Run& run = *owned;
+    run.def = def;
+    run.slot = slot;
+    run.phase = Phase::Stage;
     ScenarioLimits limits = def->limits;
     limits.expected_group = std::uint32_t(def->squad.size());
-    g_run.monitor = std::make_unique<ScenarioMonitor>(limits);
-    g_run.stage_timeout_ms = kStageTimeoutMs + std::uint32_t(def->squad.size()) * kStageTimeoutPerBotMs;
-    g_run.arrive_entry = cp ? cp->creature_entry : def->arrive_near_entry;
-    g_run.checkpoint = cp != nullptr;
+    run.monitor = std::make_unique<ScenarioMonitor>(limits);
+    run.stage_timeout_ms = kStageTimeoutMs + std::uint32_t(def->squad.size()) * kStageTimeoutPerBotMs;
+    run.arrive_entry = cp ? cp->creature_entry : def->arrive_near_entry;
+    run.checkpoint = cp != nullptr;
     if (cp && cp->stage_z != 0.f)
     {
-        g_run.has_stage = true;
-        g_run.stage_x = cp->stage_x; g_run.stage_y = cp->stage_y; g_run.stage_z = cp->stage_z;
+        run.has_stage = true;
+        run.stage_x = cp->stage_x; run.stage_y = cp->stage_y; run.stage_z = cp->stage_z;
     }
-    g_run.from_key = from_key;
-    if (g_run.arrive_entry && !FindBossSpawn(g_run))
+    run.from_key = from_key;
+    if (run.arrive_entry && !FindBossSpawn(run))
     {
-        error = fmt::format("no spawn of creature {} on map {} in this world's creature table: the scenario's data is wrong", g_run.arrive_entry, def->map);
-        ResetRun();
+        error = fmt::format("no spawn of creature {} on map {} in this world's creature table: the scenario's data is wrong", run.arrive_entry, def->map);
         return false;
     }
     for (ScenarioMember const& sm : def->squad)
     {
         Member m;
         m.def = sm;
-        g_run.members.push_back(m);
+        m.def.name = SquadName(sm.name, slot);
+        run.members.push_back(m);
     }
-    TC_LOG_INFO("playerbot.v2", "[scenario] start name={} level={} squad={}{}", def->name, uint32(def->level), def->squad.size(),
-                from_key.empty() ? std::string() : " from=" + from_key);
+    TC_LOG_INFO("playerbot.v2", "[scenario] start name={} level={} squad={}{}{}", def->name, uint32(def->level), def->squad.size(),
+                from_key.empty() ? std::string() : " from=" + from_key, slot ? fmt::format(" slot={}", slot) : std::string());
+    g_runs.push_back(std::move(owned));
     return true;
 }
 
 // runall: the next queued scenario, or the totals when the queue is empty. A scenario that cannot even start is a FAIL line, not the end.
 void StartNext()
 {
-    while (g_all && !g_queue.empty())
+    // A wave (one scenario for runall, g_parallel side by side for runbatch) starts only when the previous one has ended.
+    if (g_all && g_runs.empty() && g_halt_on_fail && g_wave_failed && !g_queue.empty())
     {
-        std::string const name = g_queue.front();
-        g_queue.pop_front();
-        std::string error;
-        if (BeginScenario(name, error))
-            return;
-        std::string const line = fmt::format("{} FAIL cannot start: {}", name, error);
-        g_summary.push_back(line);
-        TC_LOG_INFO("playerbot.v2", "[scenario_all] {}", line);
+        TC_LOG_INFO("playerbot.v2", "[scenario_all] the last wave had a FAIL: the batch stops here with {} scenario(s) not started; fix, then `runbatch` again", g_queue.size());
+        g_queue.clear();
     }
-    if (g_all)
+    if (g_all && g_runs.empty())
+    {
+        g_wave_failed = false;
+        while (!g_queue.empty() && g_runs.size() < g_parallel)
+        {
+            std::string const name = g_queue.front();
+            g_queue.pop_front();
+            std::string error;
+            // Slots are taken in order and a wave starts from none: the next free slot is the number running.
+            if (BeginScenario(name, int(g_runs.size()), error))
+                continue;
+            std::string const line = fmt::format("{} FAIL cannot start: {}", name, error);
+            g_summary.push_back(line);
+            g_wave_failed = true;
+            TC_LOG_INFO("playerbot.v2", "[scenario_all] {}", line);
+        }
+    }
+    if (g_all && g_runs.empty() && g_queue.empty())
     {
         g_all = false;
         std::size_t pass = 0;
@@ -1256,21 +1330,34 @@ void StartNext()
 
 bool Start(std::string const& name, std::string& error)
 {
-    if (g_run.phase != Phase::Idle)
+    if (!g_runs.empty())
     {
-        error = fmt::format("scenario '{}' is already running", g_run.def->name);
+        error = fmt::format("scenario '{}' is already running", g_runs.front()->def->name);
         return false;
     }
     g_all = false;
     g_queue.clear();
-    return BeginScenario(name, error);
+    g_parallel = 1;
+    return BeginScenario(name, 0, error);
 }
+
+static bool StartWaves(std::string const& filter, std::size_t parallel, bool halt_on_fail, std::string& error);
 
 bool StartAll(std::string const& filter, std::string& error)
 {
-    if (g_run.phase != Phase::Idle)
+    return StartWaves(filter, 1, false, error);
+}
+
+bool StartBatch(std::string const& filter, std::size_t size, std::string& error)
+{
+    return StartWaves(filter, std::clamp<std::size_t>(size ? size : 5, 1, 8), true, error);
+}
+
+static bool StartWaves(std::string const& filter, std::size_t parallel, bool halt_on_fail, std::string& error)
+{
+    if (!g_runs.empty())
     {
-        error = fmt::format("scenario '{}' is already running", g_run.def->name);
+        error = fmt::format("scenario '{}' is already running", g_runs.front()->def->name);
         return false;
     }
     g_queue.clear();
@@ -1284,6 +1371,13 @@ bool StartAll(std::string const& filter, std::string& error)
         error = "no scenario matches '" + filter + "'";
         return false;
     }
+    // A raid (forty bots) or a whole-dungeon clear is never run beside other squads.
+    for (std::string const& n : g_queue)
+        if (ScenarioDef const* d = FindScenario(n); d && (d->arrive_near_entry || d->full_clear))
+            parallel = 1;
+    g_parallel = parallel;
+    g_halt_on_fail = halt_on_fail && parallel > 1;
+    g_wave_failed = false;
     g_all = true;
     StartNext();
     return true;
@@ -1291,24 +1385,47 @@ bool StartAll(std::string const& filter, std::string& error)
 
 bool Abort()
 {
-    if (g_run.phase == Phase::Idle)
+    if (g_runs.empty())
         return false;
-    g_queue.clear();    // an aborted runall stops after this one
-    Finish(true, "aborted by the operator");
+    g_queue.clear();    // an aborted runall stops after the running ones
+    std::vector<Run*> running;
+    for (auto const& r : g_runs)
+        running.push_back(r.get());
+    for (Run* r : running)
+        Finish(*r, true, "aborted by the operator");
     return true;
 }
 
-bool Running() { return g_run.phase != Phase::Idle; }
+bool Running() { return !g_runs.empty(); }
+
+static void TickRun(Run& run, std::uint32_t diff_ms);
 
 void Tick(std::uint32_t diff_ms)
 {
-    Run& run = g_run;
+    if (g_runs.empty())
+        return;
+    // Finish() removes the run and may start the next wave: tick a copy of the list, and only runs that are still there.
+    std::vector<Run*> running;
+    for (auto const& r : g_runs)
+        running.push_back(r.get());
+    for (Run* r : running)
+    {
+        bool alive = false;
+        for (auto const& q : g_runs)
+            if (q.get() == r) { alive = true; break; }
+        if (alive)
+            TickRun(*r, diff_ms);
+    }
+}
+
+static void TickRun(Run& run, std::uint32_t diff_ms)
+{
     if (run.phase == Phase::Idle)
         return;
     // A death ends the run at once, before the dead bot can release and turn one failure into a cascade of wrong_map ones.
     if (run.phase == Phase::Run && run.monitor->terminal())
     {
-        Finish(false);
+        Finish(run, false);
         return;
     }
     run.step_acc_ms += diff_ms;
@@ -1341,7 +1458,7 @@ void Tick(std::uint32_t diff_ms)
             }
             if (!run.monitor->failures().empty())
             {
-                Finish(false);   // a character that cannot be made: the run cannot start
+                Finish(run, false);   // a character that cannot be made: the run cannot start
                 return;
             }
             if (all && run.def->parity)
@@ -1360,7 +1477,7 @@ void Tick(std::uint32_t diff_ms)
                 if (!subject || !Parity::Begin(subject, Parity::Kind(run.def->parity), run.def->parity_leg_s, error))
                 {
                     run.monitor->NoteSetupFailure(run.run_ms, run.members.front().def.name, error.empty() ? "the bot is gone" : error);
-                    Finish(false);
+                    Finish(run, false);
                     return;
                 }
                 TC_LOG_INFO("playerbot.v2", "[scenario] {} {} staged, the measurement begins", run.def->name, subject->GetName());
@@ -1382,7 +1499,7 @@ void Tick(std::uint32_t diff_ms)
             else if (run.phase_ms >= run.stage_timeout_ms)
             {
                 run.monitor->NoteSetupFailure(run.run_ms, "", "squad not ready after " + std::to_string(run.stage_timeout_ms / 1000u) + " s: " + run.stage_status);
-                Finish(false);
+                Finish(run, false);
             }
             return;
         }
@@ -1432,6 +1549,7 @@ void Tick(std::uint32_t diff_ms)
                 run.phase = Phase::Run;
                 run.phase_ms = 0;
                 run.run_ms = 0;
+                BaseSupport(run);
                 DetachStandIn(run);
                 LogGear(run);
                 TC_LOG_INFO("playerbot.v2", "[scenario] {} squad is inside map {}, run begins", run.def->name, run.def->map);
@@ -1439,7 +1557,7 @@ void Tick(std::uint32_t diff_ms)
             else if (run.phase_ms >= kEnterTimeoutMs)
             {
                 run.monitor->NoteSetupFailure(run.run_ms, "", "squad did not arrive on map " + std::to_string(run.def->map) + ": " + run.stage_status);
-                Finish(false);
+                Finish(run, false);
             }
             return;
         }
@@ -1459,7 +1577,7 @@ void Tick(std::uint32_t diff_ms)
                 {
                     run.monitor->NoteSetupFailure(run.run_ms, "", fmt::format("no floor in sight of creature {} within 32-64 y of its spawn at {:.1f},{:.1f},{:.1f} and clear of hostiles: cannot place the raid{}",
                                                   run.arrive_entry, run.boss_x, run.boss_y, run.boss_z, run.arrive_blocker));
-                    Finish(false);
+                    Finish(run, false);
                     return;
                 }
                 for (Member const& m : run.members)
@@ -1511,6 +1629,7 @@ void Tick(std::uint32_t diff_ms)
                 run.phase = Phase::Run;
                 run.phase_ms = 0;
                 run.run_ms = 0;
+                BaseSupport(run);
                 if (run.checkpoint)
                     DetachStandIn(run);
                 LogGear(run);
@@ -1522,7 +1641,7 @@ void Tick(std::uint32_t diff_ms)
             else if (run.phase_ms >= kArriveTimeoutMs)
             {
                 run.monitor->NoteSetupFailure(run.run_ms, "", fmt::format("only {} of {} raiders arrived at the boss room", arrived, run.members.size()));
-                Finish(false);
+                Finish(run, false);
             }
             return;
         }
@@ -1563,7 +1682,7 @@ void Tick(std::uint32_t diff_ms)
             }
             if (attack_due && !IssueAttack(run))
             {
-                Finish(false);
+                Finish(run, false);
                 return;
             }
             PlayStandIn(run);
@@ -1591,18 +1710,18 @@ void Tick(std::uint32_t diff_ms)
                     terminal = true;
             }
             if (run.goal_reached)
-                Finish(false);
+                Finish(run, false);
             else if (terminal)
-                Finish(false);
+                Finish(run, false);
             else if (run.run_ms >= run.def->timeout_ms)
-                Finish(true);
+                Finish(run, true);
             return;
         }
         case Phase::Parity:
         {
             if (run.phase_ms >= run.def->timeout_ms)
             {
-                Finish(true, fmt::format("{} did not finish in {} s", run.def->name, run.def->timeout_ms / 1000u));
+                Finish(run, true, fmt::format("{} did not finish in {} s", run.def->name, run.def->timeout_ms / 1000u));
                 return;
             }
             std::string failure;
@@ -1612,7 +1731,7 @@ void Tick(std::uint32_t diff_ms)
                     run.goal_reached = true;
                 else
                     run.monitor->NoteSetupFailure(run.phase_ms, run.members.front().def.name, failure);
-                Finish(false);
+                Finish(run, false);
             }
             return;
         }
@@ -1623,54 +1742,72 @@ void Tick(std::uint32_t diff_ms)
 
 void NoteBotDeath(std::uint64_t guid_low, ScenarioDeath death)
 {
-    if (g_run.phase != Phase::Run)
-        return;
-    for (Member const& m : g_run.members)
-        if (m.id == guid_low)
-        {
-            death.id = guid_low;
-            g_run.monitor->NoteDeath(g_run.run_ms, death);
-            return;
-        }
+    for (auto const& r : g_runs)
+    {
+        if (r->phase != Phase::Run)
+            continue;
+        for (Member const& m : r->members)
+            if (m.id == guid_low)
+            {
+                death.id = guid_low;
+                r->monitor->NoteDeath(r->run_ms, death);
+                return;
+            }
+    }
 }
 
 void NoteDamage(Unit* attacker, Unit* victim, std::int32_t amount)
 {
-    if (!g_run.pull_started.load() || amount <= 0 || !attacker)
+    if (g_runs.empty() || amount <= 0 || !attacker)
         return;
     Unit* const owner = attacker->GetCharmerOrOwnerOrSelf();
     if (!owner || !owner->IsPlayer())
         return;
-    auto const it = g_run.pull.find(owner->GetGUID().GetCounter());
-    if (it == g_run.pull.end())
+    std::uint64_t const id = owner->GetGUID().GetCounter();
+    for (auto const& r : g_runs)
+    {
+        if (!r->pull_started.load())
+            continue;
+        auto const it = r->pull.find(id);
+        if (it == r->pull.end())
+            continue;
+        it->second.damage.fetch_add(std::uint64_t(amount), std::memory_order_relaxed);
+        it->second.hits.fetch_add(1u, std::memory_order_relaxed);
+        if (victim && r->def && victim->GetEntry() == r->def->goal_entry)
+            it->second.boss_damage.fetch_add(std::uint64_t(amount), std::memory_order_relaxed);
         return;
-    it->second.damage.fetch_add(std::uint64_t(amount), std::memory_order_relaxed);
-    it->second.hits.fetch_add(1u, std::memory_order_relaxed);
-    if (victim && g_run.def && victim->GetEntry() == g_run.def->goal_entry)
-        it->second.boss_damage.fetch_add(std::uint64_t(amount), std::memory_order_relaxed);
+    }
 }
 
 void NoteCreatureKilled(std::uint32_t map, std::uint32_t entry)
 {
-    if (g_run.phase != Phase::Run || !g_run.def)
-        return;
-    if (g_run.def->goal == ScenarioGoalKind::KillCreature && map == g_run.def->map && entry == g_run.def->goal_entry)
-        g_run.goal_reached = true;
+    // Squads on the same map do not exist side by side (a wave holds distinct dungeons), so the map and the entry name the run.
+    for (auto const& r : g_runs)
+        if (r->phase == Phase::Run && r->def && r->def->goal == ScenarioGoalKind::KillCreature && map == r->def->map && entry == r->def->goal_entry)
+            r->goal_reached = true;
 }
 
 std::string Status()
 {
-    if (g_run.phase == Phase::Idle)
+    if (g_runs.empty())
         return "No scenario is running.";
-    if (g_run.phase == Phase::Parity)
-        return fmt::format("Scenario {}: {}", g_run.def->name, Parity::Status());
-    char const* phase = g_run.phase == Phase::Stage ? "staging" : g_run.phase == Phase::Enter ? "entering" : g_run.phase == Phase::Arrive ? "moving to the boss room" : "running";
-    std::string text = fmt::format("Scenario {}: {} for {} s, {} failure(s) so far.", g_run.def->name, phase,
-                                   (g_run.phase == Phase::Run ? g_run.run_ms : g_run.phase_ms) / 1000u, g_run.monitor->failures().size());
-    if (g_run.phase == Phase::Stage && !g_run.stage_status.empty())
-        text += " [" + g_run.stage_status + "]";
-    for (ScenarioFailure const& f : g_run.monitor->failures())
-        text += fmt::format("\n  {} {} at {} s: {}", ToString(f.kind), f.bot.empty() ? "-" : f.bot, f.at_ms / 1000u, f.detail);
+    std::string text;
+    for (auto const& rp : g_runs)
+    {
+        Run const& r = *rp;
+        if (r.phase == Phase::Parity)
+        {
+            text += std::string(text.empty() ? "" : "\n") + fmt::format("Scenario {}: {}", r.def->name, Parity::Status());
+            continue;
+        }
+        char const* phase = r.phase == Phase::Stage ? "staging" : r.phase == Phase::Enter ? "entering" : r.phase == Phase::Arrive ? "moving to the boss room" : "running";
+        text += std::string(text.empty() ? "" : "\n") + fmt::format("Scenario {}: {} for {} s, {} failure(s) so far.", r.def->name, phase,
+                                       (r.phase == Phase::Run ? r.run_ms : r.phase_ms) / 1000u, r.monitor->failures().size());
+        if (r.phase == Phase::Stage && !r.stage_status.empty())
+            text += " [" + r.stage_status + "]";
+        for (ScenarioFailure const& f : r.monitor->failures())
+            text += fmt::format("\n  {} {} at {} s: {}", ToString(f.kind), f.bot.empty() ? "-" : f.bot, f.at_ms / 1000u, f.detail);
+    }
     return text;
 }
 

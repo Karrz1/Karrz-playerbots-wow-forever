@@ -15,7 +15,7 @@
 // of combat by idle:classic_weapon (Bot/ClassicUpkeep.cpp).
 // Skipped: Kidney Shot, Vanish, Gouge. Feint: threat dump at 60% of the tank's threat (idea from Karrz's VMaNGOS bots).
 //
-// Priorities follow Karrz's ike3 vanilla strategies (Karrz's earlier VMaNGOS bot tree (wow-1.12)
+// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
 // raid10-revamp, playerbot/strategy/rogue/*Strategy.cpp, MANGOSBOT_ZERO).
 
 #include "../ApRegistry.h"

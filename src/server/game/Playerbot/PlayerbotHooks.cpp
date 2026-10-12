@@ -57,6 +57,16 @@ void OnPartyChat(Player* sender, Group* group, std::string const& msg)
     V2::Module::instance().OnPartyChat(sender, group, msg);
 }
 
+void OnAddonMessage(Player* sender, Group* group, std::string const& prefix, std::string const& text)
+{
+    V2::Module::instance().OnAddonOrder(sender, group, prefix, text);
+}
+
+void OnAddonWhisper(Player* sender, Player* receiver, std::string const& prefix, std::string const& text)
+{
+    V2::Module::instance().OnAddonWhisper(sender, receiver, prefix, text);
+}
+
 void OnGuildChat(Player* sender, uint64 guild_id, std::string const& msg)
 {
     V2::Module::instance().OnGuildChat(sender, guild_id, msg);
@@ -85,6 +95,11 @@ void OnItemLooted(Player* p, uint32 item_id)
 void OnSpiritReleased(Player* p)
 {
     V2::Module::instance().OnSpiritReleased(p);
+}
+
+void OnRaidSubgroupChanged(Group* group, ObjectGuid member, uint8 subgroup)
+{
+    V2::Module::instance().OnRaidSubgroupChanged(group, member, subgroup);
 }
 
 void OnGuildMemberAdded(uint64 guild_id, ObjectGuid joiner_guid, std::string const& joiner_name)

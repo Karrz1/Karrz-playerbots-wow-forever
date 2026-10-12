@@ -382,6 +382,9 @@ public:
     // in (items or money), and the bot's own side is empty (a bot never gives anything away). Locked = not yet (the
     // window stays open), ServerRefused = the trade was not an acceptable gift and is cancelled.
     Result accept_owner_trade(ObjectGuid owner);
+    // One step of a trade window with `partner`: gifts for the owner / group mates (`gift_ok`), otherwise buying and selling at the
+    // fair price (BotTrade.h). Called every tick while the window is open.
+    Result trade_with(ObjectGuid partner, bool gift_ok);
 
     // Accept (or decline) a pending battleground invite popup. Mirrors
     // HandleBattleFieldPortOpcode's accept-invite branch end-to-end:
@@ -672,6 +675,8 @@ public:
     // Sell every grey-quality (Poor) item in bags to the named vendor. Used
     // by the "sell" whisper command and by the inventory-pressure rule.
     Result sell_trash(ObjectGuid npc);
+    // Clears bag rot until `min_free` bag slots are free, with no vendor needed (see BotTrade::kKeepFreeSlots).
+    Result make_room(uint32 min_free);
     // Buy `count` of the item at vendor slot `vendor_slot` from `npc`. The
     // item id is read from the vendor's slot list (no client-side hint
     // needed). Auto-stores into the first available bag slot. Returns

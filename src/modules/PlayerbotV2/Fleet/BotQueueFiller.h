@@ -54,6 +54,9 @@ public:
         // per side every cycle and the team count overshot max_per_team
         // (observed: WSG with 13 alliance vs 7 horde in a 10v10).
         uint8     max_total_bots = 0;
+        // BG only: fill req.faction alone. A top-up asks each side for its own deficit; the default (both sides, same count)
+        // is for a player's queue, where both sides need the same roster.
+        bool      single_faction = false;
         // BG-specific: the PVPDifficulty bracket's actual MIN/MAX levels
         // (from DB2). Bots outside this range fail BG queue with
         // `no_bracket` (PVPDifficultyEntry lookup returns null). Without
@@ -118,6 +121,10 @@ public:
     // team (kills*3 + HKs - deaths; never a flag carrier, never in combat) gets a BgLeaveIntent.
     // TC's own queue update (scheduled by the leave) then invites the human.
     static void MakeRoomForRealPlayers(uint32 now_ms);
+
+    // True for 20 s after MakeRoomForRealPlayers asked a bot of this battleground type to leave. BgTopUp skips the type meanwhile, so it
+    // does not queue a bot into the place that was freed for the waiting human.
+    static bool RoomRecentlyMade(uint32 bg_type_id, uint32 now_ms);
 };
 
 } // namespace Playerbot::V2::Fleet

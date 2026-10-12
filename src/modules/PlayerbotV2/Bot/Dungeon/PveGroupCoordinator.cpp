@@ -2,10 +2,12 @@
 
 #include "PveGroupCoordinator.h"
 #include "Bot/SpellFamily.h"
+#include "Bot/DeathCause.h"
 #include "DungeonScript.h"
 #include "../BotRegistry.h"
 #include "../BotCommandParser.h"
 #include "../BotSnapshotView.h"
+#include "../RaidFight.h"
 #include "../ClassTables.h"
 #include "../Raid/RaidBrain.h"
 #include "../Raid/RaidEncounters.h"
@@ -35,6 +37,7 @@
 #include "SpellAuras.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "WorldSession.h"
 
 #include <mutex>
 #include <algorithm>
@@ -50,6 +53,11 @@ namespace {
 // synchronized kill target, and a 500ms refresh after an add dies is well
 // inside human reaction time.
 constexpr uint32 kPlanIntervalMs = 500;
+
+// How long a spoken Attack counts as "just given" for the group's release (the release then stands for the fight, see the latch below).
+constexpr uint32 kOwnerAttackWindowMs = 10000;
+
+using V2::OwnerAttackRecent;
 
 } // namespace
 
@@ -113,6 +121,9 @@ void PveGroupCoordinator::Update(uint32 now_ms)
                  // A Pull is the tanks' own engage: it must not release the rest of the raid (Karrz, MC Gehennas
                  // 2026-10-08: "pull, then I say attack"). Only a non-tank bot carrying the order is the owner's Attack.
                  (!m->IsRaid() || BotCommandParser::BotRole(p) != Role::Tank))
+            b.owner_order = true;
+        // The spoken Attack, however the pull gate treated this bot (only the main tank carries Engage while the mob is idle).
+        if (OwnerAttackRecent(now_ms, e.ai->owner_attack_ms(), kOwnerAttackWindowMs))
             b.owner_order = true;
     });
 
@@ -1145,13 +1156,29 @@ void PveGroupCoordinator::ReassignTankTarget(uint64 group_low, uint32 map_id, ui
         o->second.tank_target = mob;
 }
 
+// The CC switch of the human who runs the group (OwnerRegistry::CcEnabled, group order "crowdcontrol on|off"): the leader when it is a
+// player, else the first player in the group. A group without a player has no switch and keeps crowd control on.
+static bool GroupCcSwitchOn(Group const* grp)
+{
+    if (!grp)
+        return true;
+    Player const* human = ObjectAccessor::FindConnectedPlayer(grp->GetLeaderGUID());
+    if (!human || !human->GetSession() || human->GetSession()->IsBot())
+    {
+        human = nullptr;
+        for (GroupReference const& r : grp->GetMembers())
+            if (Player const* m = r.GetSource(); m && m->GetSession() && !m->GetSession()->IsBot()) { human = m; break; }
+    }
+    return !human || !human->GetSession() || Services::Owners().CcEnabled(human->GetSession()->GetAccountId());
+}
+
 void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool is_raid,
                                           std::vector<Member> const& mem,
                                           std::vector<std::shared_ptr<BotSnapshot const>> const& snaps,
                                           std::unordered_map<uint64, PveOrder>& plan)
 {
     const bool tank_dps_on = Services::Config().behavior_tank_markers();
-    const bool cc_on = Services::Config().behavior_mark_cc();
+    bool cc_on = Services::Config().behavior_mark_cc();
     if (!tank_dps_on && !cc_on)
         return;
     Group* grp = nullptr;
@@ -1160,6 +1187,8 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
             if ((grp = gp->GetGroup())) break;
     if (!grp)
         return;
+    // The owner's CC switch off: no crowd-control marks or holds for this group (the kill-order marks go on).
+    cc_on = cc_on && GroupCcSwitchOn(grp);
 
     std::unordered_map<uint64, Member const*> by_low;
     for (auto const& e : mem)
@@ -1851,6 +1880,25 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                 it->second.claimed_by_other_tanks[n++] = g;
             }
         }
+        // Who holds which mob, logged when it changes: the evidence for a tank contest on a loose mob.
+        {
+            static std::unordered_map<uint64, std::string> s_last_assign;
+            std::string line;
+            for (Member const* t : tanks)
+            {
+                auto it = plan.find(t->guid_low);
+                if (it == plan.end()) continue;
+                line += t->src->name + (t->guid_low == main_tank ? "(MT)" : "") + "=" + std::to_string(it->second.tank_target.GetCounter()) +
+                        "/claims" + std::to_string([&] { size_t c = 0; for (ObjectGuid const& g : it->second.claimed_by_other_tanks) c += !g.IsEmpty(); return c; }()) +
+                        (it->second.tank_hold ? "/hold" : "") + " ";
+            }
+            std::string& last = s_last_assign[bkey];
+            if (line != last)
+            {
+                last = line;
+                TC_LOG_INFO("playerbot.v2", "[raid_tank] group={} map={} assignment: {}", group_low, map_id, line.empty() ? std::string("no tanks") : line);
+            }
+        }
 
         // -- Automatic raid markers (Playerbot.Behavior.TankMarkers) -----------
         // Every duty tank's mob (engaged, or the pack mob reserved for it) gets the next marker in star, circle, diamond,
@@ -1988,7 +2036,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             // call: its mob is controlled until the owner turns it skull.
             auto cc_symbol = [&](uint8 m) -> bool
             {
-                if (m == 7 || !Services::Config().behavior_mark_cc()) return false;
+                if (m == 7 || !Services::Config().behavior_mark_cc() || !GroupCcSwitchOn(mk_grp)) return false;
                 if (held_by[m])
                     if (auto h = by_low.find(held_by[m]); h != by_low.end() && h->second->is_bot && !h->second->tank &&
                         MarkCc::IsMarkCcClass(h->second->cls))
@@ -2233,12 +2281,17 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
         if (fl.in_fight) ++fl.deaths;
         auto hb = fl.hit_by.find(e.guid_low);
         auto hp = fl.hp_pct.find(e.guid_low);
+        // An area spell has no victim on the mob: the death hook's killing blow says what it was.
+        std::string const killing_blow = V2::DeathCause::Take(e.guid_low);
+        std::string hit_by = hb != fl.hit_by.end() ? hb->second : std::string();
+        if (!killing_blow.empty())
+            hit_by += (hit_by.empty() ? "" : "; ") + std::string("killing blow ") + killing_blow;
         TC_LOG_INFO("playerbot.v2",
             "[raid_death] group={} map={} t={}s {} ({} {}) died; last seen {}% hp, hit by: {}",
             group_low, map_id, fl.in_fight ? (now_ms - fl.started_ms) / 1000 : 0,
             e.src->name, role_tag(e), e.is_bot ? "bot" : "player",
             hp != fl.hp_pct.end() ? hp->second : -1,
-            hb != fl.hit_by.end() && !hb->second.empty() ? hb->second : std::string("nothing seen"));
+            hit_by.empty() ? std::string("nothing seen") : hit_by);
     }
     for (auto const& e : mem)
     {

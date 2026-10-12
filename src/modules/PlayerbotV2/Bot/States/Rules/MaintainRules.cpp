@@ -341,9 +341,9 @@ bool GroupUtilityFire(BotSnapshotView const& s, BotAI& ai,
 // ---------- idle:conjured_item ----------
 bool ConjuredItemFire(BotSnapshotView const& s, BotAI& ai,
                       GroupSnapshotView const&,
-                      BotIntentEmitter& emit, uint32)
+                      BotIntentEmitter& emit, uint32 now_ms)
 {
-    if (!MaintainConjuredItem(s, emit)) return false;
+    if (!MaintainConjuredItem(s, ai, emit, now_ms)) return false;
     ai.set_last_rule_fired("idle:conjured_item");
     return true;
 }

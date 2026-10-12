@@ -243,7 +243,7 @@ bool MaintainPet(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit,
                  GroupSnapshotView const* g = nullptr);
 bool MaintainGroupUtility(BotSnapshotView const& s, GroupSnapshotView const& g,
                           BotIntentEmitter& emit);
-bool MaintainConjuredItem(BotSnapshotView const& s, BotIntentEmitter& emit);
+bool MaintainConjuredItem(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit, uint32 now_ms);
 bool MaintainOocFood(BotSnapshotView const& s, BotAI const& ai, BotIntentEmitter& emit);
 bool MaintainOocDispel(BotSnapshotView const& s, GroupSnapshotView const& g,
                        BotIntentEmitter& emit);

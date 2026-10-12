@@ -18,6 +18,24 @@ enum class Step : unsigned char
 
 constexpr std::uint32_t kTradeIdleMs = 90000u;   // a window the other side leaves open this long is closed
 
+// What a bot remembers about the window it is answering. Keyed by the window's own serial (TradeData::GetSerial), never by a
+// time gap: a proposal that follows a finished or cancelled trade at once (a player retrying) is a new window that must be begun
+// again, and a gap rule carried the old "already begun" over so the proposer's window never opened.
+struct Seen
+{
+    std::uint64_t serial = 0;
+    std::uint32_t first_ms = 0;
+    bool begun = false;
+};
+
+inline void Adopt(Seen& seen, std::uint64_t serial, std::uint32_t now_ms)
+{
+    if (seen.serial == serial) return;
+    seen = Seen{};
+    seen.serial = serial;
+    seen.first_ms = now_ms ? now_ms : 1u;
+}
+
 constexpr Step NextStep(bool begun, std::uint32_t ms_since_proposal)
 {
     if (ms_since_proposal >= kTradeIdleMs) return Step::Cancel;

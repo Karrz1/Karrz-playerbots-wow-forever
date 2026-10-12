@@ -58,6 +58,10 @@ public:
     void OnGroupMemberLeft(Group* g, Player* p);
     void OnWhisperReceived(Player* sender, Player* receiver, std::string const& msg);
     void OnPartyChat(Player* sender, Group* group, std::string const& msg);
+    // A bot order sent by the ForeverBots panel as an addon message (fixed prefix, party/raid): same parser as party chat.
+    void OnAddonOrder(Player* sender, Group* group, std::string const& prefix, std::string const& text);
+    void OnAddonWhisper(Player* sender, Player* receiver, std::string const& prefix, std::string const& text);
+    void RouteGroupOrder(Player* sender, Group* group, std::string order);
     // Phase C.3: route guild chat messages to BotChatReactor::ReactGuild.
     void OnGuildChat(Player* sender, uint64 guild_id, std::string const& msg);
 
@@ -73,6 +77,8 @@ public:
     // with them (BotCommandParser::OrderRelease): inside a dungeon or raid the owner revives at the
     // graveyard and never becomes a ghost, so State_Dead's owner-is-a-ghost check cannot see it there.
     void OnSpiritReleased(Player* p);
+    // A raid member's sub-group changed: an owned companion's is stored (OwnerRegistry::SetSubgroup).
+    void OnRaidSubgroupChanged(Group* group, ObjectGuid member, uint8 subgroup);
     // SC-P2b: a new guild member joined — one online bot guildmate welcomes.
     void OnGuildMemberAdded(uint64 guild_id, ObjectGuid joiner_guid, std::string const& joiner_name);
 
@@ -327,6 +333,8 @@ private:
     // escrow for a meaningful window.
     std::chrono::milliseconds  craft_board_total_{0};
     std::chrono::milliseconds  last_craft_board_at_{0};
+    std::chrono::milliseconds  player_craft_total_{0};      // owner craft orders (Fleet/PlayerCraftOrders), ticked once a second
+    std::chrono::milliseconds  last_player_craft_at_{0};
     static constexpr std::chrono::milliseconds kCraftBoardIntervalMs{60000};
 
     // Per-phase tick-cost EMA, surfaced in the FleetStatus log so the

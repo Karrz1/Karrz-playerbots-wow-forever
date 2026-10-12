@@ -15,8 +15,8 @@ constexpr float kPi = 3.14159265358979f;
 
 inline float NormalizeAngle(float a)
 {
-    while (a > kPi) a -= 2.0f * kPi;
-    while (a < -kPi) a += 2.0f * kPi;
+    if (!std::isfinite(a)) return 0.0f;   // a bare while-loop never ends on inf
+    a = std::remainder(a, 2.0f * kPi);
     return a;
 }
 
@@ -51,11 +51,31 @@ inline void RearSpot(float bossX, float bossY, float bossFacing, float px, float
 }
 
 // The tank's spot: <reach> yards from the boss on the line from the raid's centre through the boss, so the boss stands between.
-inline void FaceAwaySpot(float bossX, float bossY, float raidX, float raidY, float reach, float& outX, float& outY)
+// turn: radians off that line (a spot with no floor on the line may have one a little to the side).
+inline void FaceAwaySpot(float bossX, float bossY, float raidX, float raidY, float reach, float turn, float& outX, float& outY)
 {
-    float const away = Bearing(raidX, raidY, bossX, bossY);
+    float const away = Bearing(raidX, raidY, bossX, bossY) + turn;
     outX = bossX + reach * std::cos(away);
     outY = bossY + reach * std::sin(away);
+}
+
+// The tank's spot on a locked axis (the bearing from the boss toward the tank's side), <turn> radians off it.
+inline void AxisSpot(float bossX, float bossY, float axis, float reach, float turn, float& outX, float& outY)
+{
+    outX = bossX + reach * std::cos(axis + turn);
+    outY = bossY + reach * std::sin(axis + turn);
+}
+
+// The tank is on the axis: its bearing from the boss within <tolerance> radians of it.
+inline bool TankOnAxis(float bossX, float bossY, float tankX, float tankY, float axis, float tolerance)
+{
+    return std::fabs(NormalizeAngle(Bearing(bossX, bossY, tankX, tankY) - axis)) <= tolerance;
+}
+
+// A locked axis stays valid while the boss has not moved further than <maxDrift> from where it was locked.
+inline bool AxisHolds(float lockX, float lockY, float bossX, float bossY, float maxDrift)
+{
+    return std::hypot(bossX - lockX, bossY - lockY) <= maxDrift;
 }
 
 // True when the boss is already turned away: the tank (the boss's victim) is on the opposite side of it from the raid's centre,

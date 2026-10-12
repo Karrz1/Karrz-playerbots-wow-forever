@@ -10,7 +10,7 @@
 // (Overpower, Revenge, Execute) are gated by the snapshot's aura-state
 // check, so their predicates only test rage and stance.
 //
-// Priorities follow Karrz's ike3 vanilla strategies (Karrz's earlier VMaNGOS bot tree (wow-1.12)
+// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
 // raid10-revamp, playerbot/strategy/warrior/*Strategy.cpp, MANGOSBOT_ZERO).
 
 #include "../ApRegistry.h"

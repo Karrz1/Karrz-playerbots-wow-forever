@@ -1,6 +1,6 @@
 #include "RaidEncounters.h"
 
-// Ported from Karrz's raid10-revamp ike3 bots (Karrz's earlier VMaNGOS bot tree (wow-1.12)). Script references (mc/..., bwl/..., ony/...) point at the
+// Ported from Karrz's raid10-revamp ike3 bots (the ike3-based playerbot code). Script references (mc/..., bwl/..., ony/...) point at the
 // VMaNGOS scripts that Forever's scripts/Custom/Classic instances were ported from; the ids are the same.
 
 namespace Playerbot::Raid {
@@ -11,8 +11,10 @@ namespace Playerbot::Raid {
         // Living Bomb (Baron Geddon): the carrier runs from the group, everybody else keeps clear of the carrier.
         r.carrierRun.push_back({ 20475, 16.0f, Who::Anyone });
         r.avoidCarrier.push_back({ 20475, 14.0f, Who::Anyone });
-        // Inferno (Baron Geddon, rooted for 8 seconds): everybody leaves his range until the aura ends.
-        r.avoidEnemyAura.push_back({ 12056, 19695, 22.0f, Who::Anyone });
+        // Inferno (Baron Geddon, rooted for 8 seconds): everybody leaves his range from the cast start until the aura ends.
+        // The damage spell 19698 reaches 20 yards (spell data); 26 gives a bot a still-moving margin, since the first ticks are
+        // light (500) and the last (5000) kill (MC Geddon 2026-10-11: the 22 y circle left bots at 16-21 y to the end).
+        r.avoidEnemyAura.push_back({ 12056, 19695, 26.0f, Who::Anyone });
         // Gehennas: Rain of Fire ground effects.
         r.avoidGroundEffect.push_back({ 12259, 19717, 3.0f, Who::Anyone });
         // Magmadar: Lava Bomb 19411 / 20474 makes the target summon a fire patch (Summon Lava Bomb 20494 / 20495, 30 / 60 s).

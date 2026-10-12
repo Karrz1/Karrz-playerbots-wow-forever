@@ -557,7 +557,8 @@ namespace
 
 void DeathRecap::LoadConfig()
 {
-    Cfg.Enabled = sConfigMgr->GetBoolDefault("Recap.Enable", true);
+    // a Hardcore realm feature: other realms neither record, announce nor play recaps
+    Cfg.Enabled = sConfigMgr->GetBoolDefault("Recap.Enable", true) && sConfigMgr->GetBoolDefault("Classic.Hardcore", false);
     Cfg.MinLevel = sConfigMgr->GetIntDefault("Recap.MinLevel", 10);
     Cfg.Seconds = std::clamp<uint32>(sConfigMgr->GetIntDefault("Recap.Seconds", 20), 5, 60);
     Cfg.Interval = std::clamp<uint32>(sConfigMgr->GetIntDefault("Recap.Interval", 200), 100, 1000);

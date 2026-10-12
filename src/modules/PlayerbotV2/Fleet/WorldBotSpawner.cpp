@@ -3,6 +3,7 @@
 #include "Fleet/WorldLeash.h"
 #include "WorldBotSpawner.h"
 #include "WakeSelect.h"
+#include "WorldFactionMix.h"
 #include "SkyborneIsle.h"
 #include "BotPopulationManager.h"
 #include "BotIdentityRegistry.h"
@@ -11,6 +12,7 @@
 #include "../Threading/TickScheduler.h"
 #include "../Services.h"
 #include "../Session/BotSessionMgr.h"
+#include "../Threading/SnapshotPublisher.h"
 #include "../Bot/BotRegistry.h"
 #include "../Bot/World/ZonePicker.h"
 #include "../Bot/World/SpreadSpot.h"
@@ -48,7 +50,7 @@ namespace {
 
 constexpr uint32 kConfigReloadMs   = 15000u;
 constexpr uint32 kReportMs         = 60000u;
-constexpr uint32 kMemReportMs      = 300000u;   // [mem] line
+constexpr uint32 kMemReportMs      = 60000u;    // [mem] line
 constexpr uint32 kPendingTimeoutMs = 120000u;   // login + setup pipeline + placement
 constexpr uint32 kQueryTimeoutMs   = 20000u;
 
@@ -151,8 +153,9 @@ static std::string MemReport(uint32 bots_online)
     for (size_t i = 0; i < rows.size() && i < 8; ++i)
         top += Trinity::StringFormat("{}{}:{}g/{}c/{}o/{}p", i ? " " : "", rows[i].id, rows[i].grids, rows[i].creatures, rows[i].gos, rows[i].players);
     return Trinity::StringFormat(
-        "[mem] rss_mb={} private_mb={} | maps={} grids={} creatures={} gameobjects={} players_on_maps={} sessions={} bots_online={} | top maps (id:grids/creatures/gobjs/players) {}",
-        ProcessRssKb() / 1024, ProcessPrivateKb() / 1024, maps, grids, creatures, gos, players, ::World::instance()->GetActiveSessionCount(), bots_online, top);
+        "[mem] rss_mb={} private_mb={} | maps={} grids={} creatures={} gameobjects={} players_on_maps={} sessions={} bots_online={} bot_sessions={} registry={} snapshots={} | top maps (id:grids/creatures/gobjs/players) {}",
+        ProcessRssKb() / 1024, ProcessPrivateKb() / 1024, maps, grids, creatures, gos, players, ::World::instance()->GetActiveSessionCount(), bots_online,
+        Services::SessionMgr().active_count(), Services::Registry().size(), Services::Snapshots().bot_count(), top);
 }
 
 WorldBotSpawner::WorldBotSpawner(BotPopulationManager& owner) : owner_(owner) {}
@@ -189,7 +192,14 @@ void WorldBotSpawner::LoadConfig()
     c.min_level        = std::clamp<uint32>(uint32(sConfigMgr->GetIntDefault("Playerbot.World.MinLevel", 10)), 1, 60);
     c.max_level        = std::clamp<uint32>(uint32(sConfigMgr->GetIntDefault("Playerbot.World.MaxLevel", 60)), c.min_level, 60);
     c.friendly_pct     = std::min<uint32>(100, uint32(sConfigMgr->GetIntDefault("Playerbot.World.FriendlyPct", 80)));
+    c.mix.default_pct   = c.friendly_pct;
+    c.mix.by_zone       = sConfigMgr->GetBoolDefault("Playerbot.World.ZoneMix", true);
+    c.mix.capital_pct   = std::min<uint32>(100, uint32(sConfigMgr->GetIntDefault("Playerbot.World.CapitalFriendlyPct", 90)));
+    c.mix.home_pct      = std::min<uint32>(100, uint32(sConfigMgr->GetIntDefault("Playerbot.World.HomeFriendlyPct", 90)));
+    c.mix.border_pct    = std::min<uint32>(100, uint32(sConfigMgr->GetIntDefault("Playerbot.World.BorderFriendlyPct", 75)));
+    c.mix.contested_pct = std::min<uint32>(100, uint32(sConfigMgr->GetIntDefault("Playerbot.World.ContestedFriendlyPct", 60)));
     c.pool_max         = uint32(sConfigMgr->GetIntDefault("Playerbot.World.PoolMax", std::max<uint32>(c.max_bots * 4, 200)));
+    c.pool_horde_pct   = std::clamp<uint32>(uint32(sConfigMgr->GetIntDefault("Playerbot.World.PoolHordePct", 50)), 5, 95);
     c.skyborne_seed_pct = std::min<uint32>(100, uint32(sConfigMgr->GetIntDefault("Playerbot.World.SkyborneSeedPct", 5)));
     cfg_ = c;
 }
@@ -688,8 +698,7 @@ void WorldBotSpawner::DriveSpawn(uint32 now_ms, std::vector<Anchor> const& ancho
         std::vector<uint8> slot_levels;
         for (uint32 i = 0; i < want; ++i)
         {
-            bool const friendly = urand(0, 99) < cfg_.friendly_pct;
-            slots.push_back(friendly ? a.alliance : !a.alliance);
+            slots.push_back(BotIsAlliance(a.alliance, urand(0, 99), FriendlyPctFor(cfg_.mix, a.zone)));
             slot_levels.push_back(uint8(urand(lo, hi)));
         }
 
@@ -780,16 +789,27 @@ void WorldBotSpawner::DriveSeed(uint32 now_ms)
     if (seeding_.size() >= cfg_.seed_in_flight || ambient_online_ + pending_.size() + seeding_.size() >= cfg_.max_bots)
         return;
     // One new resident per tick: the setup pipeline (gear, talents, spells, teleport) is the cost, not the creation.
-    bool const alliance = urand(0, 99) < 50;
+    // The census decides which faction and level bracket the roster lacks most; until it is read the seeder waits.
+    if (!pool_counts_ms_)
+        return;
+    SeedChoice const want = PickSeed(pool_counts_, cfg_.pool_horde_pct, double(urand(0, 999999)) / 1000000.0);
+    bool const alliance = want.deficit > 0 ? want.alliance : urand(0, 99) >= cfg_.pool_horde_pct;
     // A small share of the seeds are Skyborne residents of Zephras Isle: level 1-9, asleep on the island (their pipeline leaves
     // them at the start), so a player who arrives there finds the island lived in. The rest are the usual leveling-town bots.
     bool const isle = urand(0, 99) < cfg_.skyborne_seed_pct;
-    uint8 const level = isle ? uint8(urand(Skyborne::kIsleLevelLo, Skyborne::kIsleLevelHi))
-                             : uint8(urand(cfg_.min_level, cfg_.max_level));
+    uint8 level;
+    if (isle)
+        level = uint8(urand(Skyborne::kIsleLevelLo, Skyborne::kIsleLevelHi));
+    else if (want.deficit > 0)
+        level = uint8(urand(std::max(cfg_.min_level, PoolBracketLo(want.bracket)), std::max(cfg_.min_level, std::min(cfg_.max_level, PoolBracketHi(want.bracket)))));
+    else
+        level = uint8(urand(cfg_.min_level, cfg_.max_level));
     if (uint64 const guid = owner_.SpawnAmbientBot(level, alliance, isle ? Skyborne::RaceForTeam(alliance) : uint8(0)))
     {
         seeding_[guid] = Seeding{ now_ms ? now_ms : 1u, 0 };
         ++pool_count_;
+        if (!isle)
+            PoolAdd(pool_counts_, alliance, level);
     }
     else
         ++n_spawn_failed_;
@@ -842,7 +862,7 @@ void WorldBotSpawner::DriveWake(uint32 now_ms, Anchor const& a, uint32 want)
                 if (Player* ap = ObjectAccessor::FindConnectedPlayer(a.guid); ap && ap->GetMap())
                     c.wet = (ap->GetMap()->GetLiquidStatus(ap->GetPhaseShift(), f[4].GetFloat(), f[5].GetFloat(), f[7].GetFloat() + 0.05f, {})
                              & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER)) != 0;
-                c.faction_ok = (IsAllianceRace(f[2].GetUInt8()) == a.alliance) == (urand(0, 99) < cfg_.friendly_pct);
+                c.faction_ok = IsAllianceRace(f[2].GetUInt8()) == BotIsAlliance(a.alliance, urand(0, 99), FriendlyPctFor(cfg_.mix, a.zone));
                 cands.push_back(c);
             } while (res->NextRow());
             // Never more than the target still lacks, and never past the global cap.
@@ -972,6 +992,7 @@ void WorldBotSpawner::FinishSpawn(Anchor const& a, std::vector<bool> const& slot
             pending_[guid] = Pending{ a.guid, now, global };
             ++pool_count_;
             ++n_created_;
+            PoolAdd(pool_counts_, alliance, slot_levels[i]);
         }
         else
             ++n_spawn_failed_;
@@ -996,6 +1017,12 @@ void WorldBotSpawner::OnWorldTick(uint32 now_ms)
     {
         last_cfg_ms_ = now_ms;
         LoadConfig();
+    }
+    // The [mem] line runs whatever the population mode: the 2026-10-11 leak hunt had World bots off and saw nothing.
+    if (!last_mem_ms_ || getMSTimeDiff(last_mem_ms_, now_ms) >= kMemReportMs)
+    {
+        last_mem_ms_ = now_ms;
+        TC_LOG_INFO("playerbot.v2", "{}", MemReport(all_online_));
     }
     if (!cfg_.enable)
     {
@@ -1050,6 +1077,35 @@ void WorldBotSpawner::OnWorldTick(uint32 now_ms)
         {
             pool_count_ = res ? int64((*res)[0].GetUInt64()) : 0;
             pool_count_inflight_ = false;
+        }));
+    }
+
+    // The roster by faction and level bracket, read every two minutes (creations in between are added as they happen): the seeder
+    // creates whatever is furthest below the target ratio (PoolBalance.h).
+    if (cfg_.seed_roster && !pool_counts_inflight_ && (!pool_counts_ms_ || getMSTimeDiff(pool_counts_ms_, now_ms) >= 120000u))
+    {
+        pool_counts_inflight_ = true;
+        queries_.AddCallback(CharacterDatabase.AsyncQuery(
+            "SELECT c.race, c.level, COUNT(*) FROM playerbot_v2_character pv JOIN characters c ON c.guid = pv.character_guid_low "
+            "WHERE pv.distribution_level > 0 AND (pv.jit_for_queue IS NULL OR pv.jit_for_queue = '') AND c.level >= 10 "
+            "GROUP BY c.race, c.level")
+            .WithCallback([this, now_ms](QueryResult res)
+        {
+            PoolCounts counts;
+            if (res)
+                do
+                {
+                    Field* f = res->Fetch();
+                    ((IsAllianceRace(f[0].GetUInt8()) ? counts.alliance : counts.horde))[PoolBracketOf(f[1].GetUInt8())] += uint32(f[2].GetUInt64());
+                } while (res->NextRow());
+            pool_counts_ = counts;
+            pool_counts_ms_ = now_ms ? now_ms : 1u;
+            pool_counts_inflight_ = false;
+            uint32 a = 0, h = 0;
+            for (std::size_t b = 0; b < kPoolBrackets; ++b) { a += counts.alliance[b]; h += counts.horde[b]; }
+            TC_LOG_INFO("playerbot.v2", "[world] roster census: Alliance {} Horde {} (target Horde {}%); per bracket A/H: {}/{} {}/{} {}/{} {}/{} {}/{}",
+                a, h, cfg_.pool_horde_pct, counts.alliance[0], counts.horde[0], counts.alliance[1], counts.horde[1], counts.alliance[2],
+                counts.horde[2], counts.alliance[3], counts.horde[3], counts.alliance[4], counts.horde[4]);
         }));
     }
 
@@ -1114,11 +1170,6 @@ void WorldBotSpawner::OnWorldTick(uint32 now_ms)
     {
         last_report_ms_ = now_ms;
         TC_LOG_INFO("playerbot.v2", "{}", Report());
-    }
-    if (!last_mem_ms_ || getMSTimeDiff(last_mem_ms_, now_ms) >= kMemReportMs)
-    {
-        last_mem_ms_ = now_ms;
-        TC_LOG_INFO("playerbot.v2", "{}", MemReport(all_online_));
     }
 }
 

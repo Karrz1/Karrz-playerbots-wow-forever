@@ -457,6 +457,22 @@ void FillOwnedCurrenciesMap(WorldPackets::Traits::TraitConfig const& traitConfig
 
                             currencies[currencySource->TraitCurrencyID] += currencySource->Amount;
                         }
+
+                        // Classic 1.60 Legacy perk Talented: talent points every level from its start level instead of from level 10
+                        // (class talent currency 3820: one point per level 10-60, SourcedMax 51 stays the limit)
+                        static constexpr int32 ClassicTalentCurrencyID = 3820;
+                        static constexpr int32 ClassicFirstTalentLevel = 10;
+                        if (currency->ID == ClassicTalentCurrencyID)
+                        {
+                            if (int32 startLevel = player.GetClassicTalentedStartLevel(); startLevel > 0 && startLevel < ClassicFirstTalentLevel)
+                            {
+                                int32 extra = std::max(0, std::min(player.GetLevel(), ClassicFirstTalentLevel - 1) - startLevel + 1);
+                                int32& amount = currencies[currency->ID];
+                                amount += extra;
+                                if (currency->SourcedMax > 0)
+                                    amount = std::min(amount, currency->SourcedMax);
+                            }
+                        }
                     }
                     break;
                 case TraitCurrencyType::TraitSourcedPlayerDataElement:
@@ -1012,6 +1028,20 @@ LearnResult ValidateConfig(WorldPackets::Traits::TraitConfig& traitConfig, Playe
     }
 
     return LearnResult::Ok;
+}
+
+LearnResult ValidateConfigForCommit(WorldPackets::Traits::TraitConfig& traitConfig, PlayerDataAccessor player)
+{
+    // Classic has one specialization containing all talent trees. Purchases
+    // are incremental; the earned-currency and entry checks still apply.
+    ChrSpecializationEntry const* specialization = sChrSpecializationStore.LookupEntry(traitConfig.ChrSpecializationID);
+    bool classicTalents = traitConfig.Type == TraitConfigType::Combat && specialization
+        && !specialization->IsPetSpecialization() && specialization->OrderIndex == 0
+        && std::ranges::none_of(sChrSpecializationStore, [specialization](ChrSpecializationEntry const* other)
+        {
+            return other->ClassID == specialization->ClassID && other->ID != specialization->ID;
+        });
+    return ValidateConfig(traitConfig, player, !classicTalents);
 }
 
 bool CanApplyTraitNode(UF::TraitConfig const& traitConfig, UF::TraitEntry const& traitEntry)

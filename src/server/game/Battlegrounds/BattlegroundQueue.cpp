@@ -532,6 +532,33 @@ void BattlegroundQueue::FillPlayersToBG(Battleground* bg, BattlegroundBracketId 
     uint32 aliCount   = m_QueuedGroups[bracket_id][BG_QUEUE_NORMAL_ALLIANCE].size();
     uint32 hordeCount = m_QueuedGroups[bracket_id][BG_QUEUE_NORMAL_HORDE].size();
 
+    // PlayerbotV2: a real player waiting at the head of a team's queue takes any place that is physically free, balance gate or not.
+    // AB 2026-10-11: a bot left the Alliance side for Karrz, but the gate (Alliance ahead of Horde) gave Alliance 0 free places, so
+    // nobody was invited into the place and the next bot was asked to leave, nine times over.
+    {
+        bool humanInvited = false;
+        for (uint32 t = 0; t < PVP_TEAMS_COUNT; ++t)
+        {
+            GroupsQueueType const& groups = m_QueuedGroups[bracket_id][t == TEAM_ALLIANCE ? BG_QUEUE_NORMAL_ALLIANCE : BG_QUEUE_NORMAL_HORDE];
+            if (groups.empty()) continue;
+            GroupQueueInfo* head = groups.front();
+            bool human = false;
+            for (auto const& [guid, info] : head->Players)
+            {
+                Player const* pl = ObjectAccessor::FindConnectedPlayer(guid);
+                if (pl && pl->GetSession() && !pl->GetSession()->IsBot()) { human = true; break; }
+            }
+            if (!human || head->IsInvitedToBGInstanceGUID) continue;
+            Team const team = t == TEAM_ALLIANCE ? ALLIANCE : HORDE;
+            uint32 const taken = std::max(bg->GetPlayersCountByTeam(team), bg->GetInvitedCount(team));
+            uint32 const room = Battleground::PhysicalRoom(taken, bg->GetMaxPlayersPerTeam());
+            if (m_SelectionPools[t].AddGroup(head, room) && !m_SelectionPools[t].SelectedGroups.empty())
+                humanInvited = true;
+        }
+        if (humanInvited)
+            return;   // the bots follow on the next update
+    }
+
     // try to get even teams
     if (sWorld->getIntConfig(CONFIG_BATTLEGROUND_INVITATION_TYPE) == BG_QUEUE_INVITATION_TYPE_EVEN)
     {
@@ -856,19 +883,23 @@ void BattlegroundQueue::BattlegroundQueueUpdate(uint32 /*diff*/, BattlegroundBra
     {
         BGFreeSlotQueueContainer& bgQueues = sBattlegroundMgr->GetBGFreeSlotQueueStore(mapId);
         // std::list::sort is stable; the key is "has no human", so false (a human present) sorts first.
-        auto has_human = [&](Battleground const* bg)
+        // real players in the instance (inside, or invited to it)
+        auto human_count = [&](Battleground const* bg)
         {
-            if (std::ranges::find(human_instances, bg->GetInstanceID()) != human_instances.end())
-                return true;
+            uint32 n = uint32(std::ranges::count(human_instances, bg->GetInstanceID()));
             for (auto const& [guid, _] : bg->GetPlayers())
             {
                 Player const* pl = ObjectAccessor::FindConnectedPlayer(guid);
                 if (pl && pl->GetSession() && !pl->GetSession()->IsBot())
-                    return true;
+                    ++n;
             }
-            return false;
+            return n;
         };
-        bgQueues.sort([&](Battleground const* a, Battleground const* b) { return has_human(a) && !has_human(b); });
+        bgQueues.sort([&](Battleground const* a, Battleground const* b)
+        {
+            return Battleground::FillsBefore(human_count(a), a->GetPlayersCountByTeam(ALLIANCE) + a->GetPlayersCountByTeam(HORDE),
+                                             human_count(b), b->GetPlayersCountByTeam(ALLIANCE) + b->GetPlayersCountByTeam(HORDE));
+        });
         for (BGFreeSlotQueueContainer::iterator itr = bgQueues.begin(); itr != bgQueues.end();)
         {
             Battleground* bg = *itr; ++itr;

@@ -28,6 +28,7 @@
 // nothing attacking the bot or the party, no target picked.
 
 #include "Log.h"
+#include "Bot/ConjureGate.h"
 #include <unordered_map>
 #include <mutex>
 #include "Bot/IdleRule.h"
@@ -134,7 +135,7 @@ struct SkipCtx
 bool SkipRecent(void const* ctx, uint64 key)
 {
     SkipCtx const& c = *static_cast<SkipCtx const*>(ctx);
-    return c.ai->action_recently_tried(BotAI::ActionKind::ClassUpkeep, key, c.now_ms);
+    return c.ai->action_recently_tried(BotAI::ActionKind::ClassUpkeep, key, c.now_ms) || c.ai->buff_cast_trusted(key, c.now_ms);
 }
 
 // Blessings and class buffs run at 992, above idle:ooc_eat_food (875): after
@@ -166,7 +167,10 @@ bool BlessingsFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     if (!b.spell || !emit.cast(b.spell, b.target))
         return false;
     if (b.key)
+    {
         ai.note_action_retry(BotAI::ActionKind::ClassUpkeep, b.key, now_ms);
+        ai.note_buff_cast(b.key, now_ms);
+    }
     // [raid_support] why this blessing goes out (MC 2026-10-08: 45-105 blessings a minute): the target's tracked buffs as the
     // group snapshot sees them, once per paladin and key per minute.
     {
@@ -211,7 +215,10 @@ bool RaidBuffsFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     if (!b.spell || !(b.exact_rank ? emit.cast_rank(b.spell, b.target) : emit.cast(b.spell, b.target)))
         return false;
     if (b.key)
+    {
         ai.note_action_retry(BotAI::ActionKind::ClassUpkeep, b.key, now_ms);
+        ai.note_buff_cast(b.key, now_ms);
+    }
     // [raid_support] why this class buff goes out (MC Garr 2026-10-10: the druids cast Mark of the Wild over and over): the target's
     // tracked buffs as the group snapshot sees them, once per caster and key per minute.
     {
@@ -358,7 +365,8 @@ bool SoulstoneGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
         return false;
     Classic::SoulstonePick const p = Classic::PickSoulstone(s, g);
     if (p.create_spell)
-        return !s.is_moving() && !ai.action_recently_tried(BotAI::ActionKind::ClassUpkeep, p.create_spell, now_ms);
+        return !s.is_moving() && V2::MayConjure(s.in_combat(), s.recently_in_combat(5000), s.power(POWER_MANA), s.mana_cost(p.create_spell))
+            && !ai.action_recently_tried(BotAI::ActionKind::ClassUpkeep, p.create_spell, now_ms);
     return p.item && !ai.action_recently_tried(BotAI::ActionKind::ClassUpkeep, p.item, now_ms);
 }
 bool SoulstoneFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit, uint32 now_ms)
@@ -391,6 +399,7 @@ bool HealthstoneGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
         return false;
     uint32 const create = Classic::CreateHealthstoneSpell(s);
     return create && s.is_ready(create) && !Classic::HasHealthstone(s)
+        && V2::MayConjure(s.in_combat(), s.recently_in_combat(5000), s.power(POWER_MANA), s.mana_cost(create))
         && !ai.action_recently_tried(BotAI::ActionKind::ClassUpkeep, create, now_ms);
 }
 bool HealthstoneFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32 now_ms)

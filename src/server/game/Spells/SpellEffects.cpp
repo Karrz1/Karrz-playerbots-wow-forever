@@ -1409,6 +1409,15 @@ void Spell::DoCreateItem(uint32 itemId, ItemContext context /*= ItemContext::NON
 
     uint32 num_to_add = std::clamp<int32>(GetEffectValueAsInt(), 1, pProto->GetMaxStackSize());
 
+    // Classic 1.60 Legacy perk Master Chef 1225457: cooking recipes have a chance to create an extra result
+    if (int32 extraChance = player->GetClassicLegacyPerkAmount(1225457, EFFECT_0))
+    {
+        SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(m_spellInfo->Id);
+        bool cooking = std::any_of(bounds.first, bounds.second, [](auto const& pair) { return pair.second->SkillLine == SKILL_COOKING; });
+        if (cooking && roll_chance(extraChance))
+            num_to_add = std::min<uint32>(num_to_add * 2, pProto->GetMaxStackSize());
+    }
+
     /* == gem perfection handling == */
     // this is bad, should be done using spell_loot_template (and conditions)
 

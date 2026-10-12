@@ -26,7 +26,12 @@ bool Start(std::string const& name, std::string& error);
 // per scenario goes to the summary (`Summary()`, "[scenario_all]" in Playerbot.log). False when none matches or a run is going.
 bool StartAll(std::string const& filter, std::string& error);
 
-// Ends the running scenario as failed ("aborted"); a runall stops after it.
+// Like StartAll, but `size` (default 5) dungeons at once: each with a squad of its own (characters named with the slot's letter after the
+// first two, "Scbnwarrior") and its own instance. When the whole wave has ended and nothing failed, the next `size` start; a wave with a
+// FAIL stops the batch (fix, then `runbatch` again). Raids and whole-dungeon clears in the filter run one at a time.
+bool StartBatch(std::string const& filter, std::size_t size, std::string& error);
+
+// Ends the running scenario(s) as failed ("aborted"); a runall stops after it.
 bool Abort();
 
 bool Running();

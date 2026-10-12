@@ -194,7 +194,7 @@ WorldSession::WorldSession(uint32 id, std::string&& name, uint32 battlenetAccoun
         m_Address = "bot";
     }
 
-    if (!is_bot && sConfigMgr->GetBoolDefault("Playerbot.NetStat.Enable", true))
+    if (!is_bot && sConfigMgr->GetBoolDefault("Playerbot.NetStat.Enable", false))
         _netStat = std::make_unique<NetStatCounters>();
 #endif
 
@@ -920,6 +920,11 @@ void WorldSession::LogoutPlayer(bool save)
 void WorldSession::KickPlayer(std::string_view reason)
 {
     TC_LOG_INFO("network.kick", "{} kicked with reason: {}", GetPlayerInfo(), reason);
+
+    // A headless bot session has no socket to close; flag the exit directly so BotSession::Update
+    // logs the bot out and the session manager reaps it (failed logins, GM kick/ban).
+    if (IsBot())
+        forceExit = true;
 
     for (std::shared_ptr<WorldSocket> const& socket : m_Socket)
     {

@@ -606,6 +606,9 @@ void WorldSession::HandleChatAddonMessage(ChatMsg type, std::string prefix, std:
                 break;
 
             sender->WhisperAddon(text, prefix, isLogged, receiver);
+            // Playerbot V2: the ForeverBots addon whispers a bot this way in battlegrounds, where the client's own /whisper does
+            // nothing; the hook ignores every other prefix.
+            Playerbot::Hooks::OnAddonWhisper(sender, receiver, prefix, text);
             break;
         }
         // Messages sent to "RAID" while in a party will get delivered to "PARTY"
@@ -631,6 +634,9 @@ void WorldSession::HandleChatAddonMessage(ChatMsg type, std::string prefix, std:
             WorldPackets::Chat::Chat packet;
             packet.Initialize(type, isLogged ? LANG_ADDON_LOGGED : LANG_ADDON, sender, nullptr, text, 0, "", DEFAULT_LOCALE, prefix);
             group->BroadcastAddonMessagePacket(packet.Write(), prefix, true, subGroup, sender->GetGUID());
+            // Playerbot V2: the ForeverBots panel sends its bot orders as addon messages (SendChatMessage from addon code
+            // is blocked by the client in combat and in battlegrounds); the hook ignores every other prefix.
+            Playerbot::Hooks::OnAddonMessage(sender, group, prefix, text);
             break;
         }
         case CHAT_MSG_CHANNEL:

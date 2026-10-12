@@ -1388,7 +1388,10 @@ bool OnAddonWhisper(Player* sender, Player* /*receiver*/,
         return true;
     }
 
-    // Multi-chunk reassembly.
+    // Multi-chunk reassembly. 'tot' is client-controlled: bound it before the
+    // allocation below (a huge value would throw bad_alloc on the world thread).
+    if (tot > kMaxReassemblyChunks)
+        return false;
     std::lock_guard lk(g_rx_mtx);
     ReapStaleReassemblies_locked();
     ReassemblyKey key{ sess->GetAccountId(), seq };
