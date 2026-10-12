@@ -94,6 +94,11 @@ public:
     uint32 StoredSpec(BotId bot) const;
     void   SetStoredSpec(BotId bot, uint32 spec);
 
+    // The companion's index in the owner's group member list when it was saved (`.bot save`), 0xFFFF = none. The raid frame lists a
+    // sub-group in member-list order; RestoreRaidSubgroups puts the owned members back in this order. Migration 0028.
+    uint16 StoredOrder(BotId bot) const;
+    void   SetStoredOrder(BotId bot, uint16 order);
+
     // The gear mode an owner account chose for its companions (Gear::Owned::GearMode value; 0 = match when never set). Writes
     // immediately. Migration 0025.
     uint8 OwnerGearMode(uint32 account_id) const;
@@ -203,6 +208,7 @@ private:
     std::unordered_set<BotId>                gear_varied_;
     std::unordered_map<BotId, Role>          declared_role_;
     std::unordered_map<BotId, uint32>        spec_;
+    std::unordered_map<BotId, uint16>        order_;
     std::unordered_map<BotId, uint8>         subgroup_;   // 0-based raid sub-group
     std::unordered_map<uint32, uint8>        owner_gear_mode_;
     std::unordered_set<uint32>               cc_disabled_;

@@ -118,3 +118,36 @@ TEST_CASE("RaidSubgroupPlan: a full 40-man layout comes back from any join order
     for (std::uint64_t i = 1; i < 40; ++i)
         CHECK(g.at(i) == i / 5);
 }
+
+TEST_CASE("The member list is put back in the saved order", "[raidsubgroup]")
+{
+    using Playerbot::V2::Fleet::OrderMember;
+    using Playerbot::V2::Fleet::PlanMemberOrder;
+    // Human 1 first, then bots that logged in in the wrong order: saved 3, 1, 2 (list indices).
+    std::vector<OrderMember> m = {
+        { 1, false, 0xFFFF },   // the owner
+        { 10, true, 3 },
+        { 11, true, 1 },
+        { 12, true, 2 },
+    };
+    std::vector<std::uint64_t> const want = PlanMemberOrder(m);
+    REQUIRE(want.size() == 4);
+    CHECK(want[0] == 1);     // the human keeps its place
+    CHECK(want[1] == 11);
+    CHECK(want[2] == 12);
+    CHECK(want[3] == 10);
+}
+
+TEST_CASE("A list already in the saved order, or with no stored order, is left alone", "[raidsubgroup]")
+{
+    using Playerbot::V2::Fleet::OrderMember;
+    using Playerbot::V2::Fleet::PlanMemberOrder;
+    CHECK(PlanMemberOrder({ { 1, false, 0xFFFF }, { 10, true, 1 }, { 11, true, 2 } }).empty());
+    CHECK(PlanMemberOrder({ { 10, true, 0xFFFF }, { 11, true, 0xFFFF } }).empty());
+    // A bot without a stored order stays where it is while the others trade places around it.
+    auto const w = PlanMemberOrder({ { 10, true, 5 }, { 11, true, 0xFFFF }, { 12, true, 2 } });
+    REQUIRE(w.size() == 3);
+    CHECK(w[0] == 12);
+    CHECK(w[1] == 11);
+    CHECK(w[2] == 10);
+}

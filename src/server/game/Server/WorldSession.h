@@ -804,6 +804,19 @@ namespace WorldPackets
         class CommerceTokenGetMarketPrice;
     }
 
+    namespace BattlePay
+    {
+        class StartPurchase;
+        class ConfirmPurchaseResponse;
+        class GetVasAccountCharacterList;
+        class GetVasTransferTargetRealmList;
+        class DistributionAssignVas;
+        class RequestCharacterGuildFollowInfo;
+        class StartVasPurchase;
+        class DistributionAssignToTarget;
+        struct DistributionObject;
+    }
+
     namespace Totem
     {
         class TotemDestroyed;
@@ -1280,6 +1293,21 @@ class TC_GAME_API WorldSession
         void HandleLfgListProbe(WorldPackets::Null& packet);    // Classic 1.60 Group Finder: layouts still being worked out
         void HandleRecentAllyProbe(WorldPackets::Null& packet); // Classic 1.60 Social window: Recent Allies tab (RecentAllies.cpp)
         void HandleGetLastCatalogFetch(WorldPackets::Null& null);   // Classic 1.60 catalog shop
+        void HandleBattlePayGetProductList(WorldPackets::Null& null);   // Classic 1.60 in-game Store
+        void HandleBattlePayGetPurchaseList(WorldPackets::Null& null);
+        void SendShopProductList();
+        void SendShopDistributionList();
+        static constexpr uint64 BoostDistributionIdBase = UI64LIT(0x100000000);    // boost token distribution id = base + auth.account_boost_token.ID
+        static WorldPackets::BattlePay::DistributionObject MakeBoostDistribution(uint32 tokenId, uint32 boostType, int32 status);
+        void HandleBattlePayDistributionAssignToTarget(WorldPackets::BattlePay::DistributionAssignToTarget& assign);
+        static void ProcessIncomingCharacterTransfers();    // realm transfers to this realm (auth.character_transfer)
+        void HandleGetVasAccountCharacterList(WorldPackets::BattlePay::GetVasAccountCharacterList& request);
+        void HandleGetVasTransferTargetRealmList(WorldPackets::BattlePay::GetVasTransferTargetRealmList& request);
+        void HandleBattlePayStartVasPurchase(WorldPackets::BattlePay::StartVasPurchase& startVasPurchase);
+        void HandleRequestCharacterGuildFollowInfo(WorldPackets::BattlePay::RequestCharacterGuildFollowInfo& request);
+        void HandleBattlePayDistributionAssignVas(WorldPackets::BattlePay::DistributionAssignVas& assign);
+        void HandleBattlePayStartPurchase(WorldPackets::BattlePay::StartPurchase& startPurchase);
+        void HandleBattlePayConfirmPurchaseResponse(WorldPackets::BattlePay::ConfirmPurchaseResponse& confirmPurchaseResponse);
         void Handle_EarlyProccess(WorldPackets::Null& null); // just mark packets processed in WorldSocket::ReadDataHandler
         void LogUnprocessedTail(WorldPacket const* packet);
 
@@ -2078,6 +2106,20 @@ class TC_GAME_API WorldSession
         std::unordered_map<uint32 /*realmAddress*/, uint8> _realmCharacterCounts;
         std::unordered_map<uint32, std::function<void(MessageBuffer)>> _battlenetResponseCallbacks;
         uint32 _battlenetRequestToken;
+
+        // Classic 1.60 in-game Store: the purchase waiting for the player's confirmation
+        struct ShopPendingPurchase
+        {
+            uint64 PurchaseID = 0;
+            uint32 ProductID = 0;
+            uint32 ServerToken = 0;
+            ObjectGuid Target;
+            int64 TimeCreated = 0;
+            uint32 TransferRealmAddress = 0;    // realm transfer (character service window): destination realm
+        };
+        Optional<ShopPendingPurchase> _shopPendingPurchase;
+        Optional<std::pair<ObjectGuid, uint32>> _hardcoreTransferValidated;    // character, destination realm address of the token's check
+        void StartShopPurchase(uint32 clientToken, uint32 productId, ObjectGuid target, uint32 transferRealmAddress);
 
         time_t _logoutTime;
         bool m_inQueue;                                     // session wait in auth.queue

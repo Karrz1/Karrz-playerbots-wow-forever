@@ -651,7 +651,8 @@ namespace ClassicWarsongGulch
     {
         SPAWN_GROUP_ALLIANCE_FLAG   = 489001,
         SPAWN_GROUP_HORDE_FLAG      = 489002,
-        SPAWN_GROUP_GHOST_GATES     = 489003
+        SPAWN_GROUP_GHOST_GATES     = 489003,
+        SPAWN_GROUP_SPIRIT_GUIDES   = 489004                // VMaNGOS WS_EVENT_SPIRITGUIDES_SPAWN (world SQL 2026_10_12_40)
     };
 
     enum WorldStates : int32
@@ -770,6 +771,7 @@ struct battleground_classic_warsong_gulch : BattlegroundScript
 
         size_t const ghostGates = RemoveGroupSpawnsForMatch(battlegroundMap, SPAWN_GROUP_GHOST_GATES);
         TC_LOG_INFO("bg.battleground", "Classic WSG start: {} doors opened, {} ghost gates despawned", _doors.size(), ghostGates);
+        battlegroundMap->SpawnGroupSpawn(SPAWN_GROUP_SPIRIT_GUIDES, true);
         UpdateWorldState(WS_BATTLE_IN_PROGRESS, 1, true);
     }
 

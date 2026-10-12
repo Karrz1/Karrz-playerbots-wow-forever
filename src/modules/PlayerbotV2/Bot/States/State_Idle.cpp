@@ -31,6 +31,8 @@
 #include "../Services.h"
 #include "Util/ConfigReader.h"  // full type for Services::Config() (detour pull-gate knobs)
 #include "Travel/QuestHubDatabase.h"
+#include "Fleet/TownGatherSource.h"
+#include "Bot/World/ZonePicker.h"
 #include "MaintainHelpers.h"       // ChunkedWalkToward (idle watch)
 #include "Travel/RepairVendorIndex.h"
 #include "Travel/UnifiedTravelGraph.h"
@@ -19863,14 +19865,20 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                 // is NO known-good node within range — a genuinely isolated
                 // off-mesh bot that would otherwise saturate the path system
                 // forever.
-                auto const* node = Services::TravelGraph().FindNearestNodeOnMap(
-                    s.map_id(), s.raw().position.x, s.raw().position.y, 800.f);
+                // Nearest in 3D, and never one already tried: in a city with floors on top of each other (Ironforge) the node
+                // nearest by x/y is often on another floor, unreachable from here, and asking for it again and again kept
+                // 130 bots wedged. Each node tried is put on the bot's goal blacklist, so the next wedge picks the next one.
+                uint32 const wedge_now = s.published_at_ms();
+                auto const* node = Services::TravelGraph().FindNearestNodeOnMap3D(
+                    s.map_id(), s.raw().position.x, s.raw().position.y, s.raw().position.z, 800.f,
+                    [&](auto const& n) { return ai.goal_blacklisted(n.x, n.y, wedge_now); });
                 if (node)
                 {
                     const float ndx = node->x - s.raw().position.x;
                     const float ndy = node->y - s.raw().position.y;
                     if (ndx * ndx + ndy * ndy > 25.f)
                     {
+                        ai.blacklist_goal(node->x, node->y, wedge_now);
                         emit.move_to(node->x, node->y, node->z, /*run*/ true);
                         ai.set_last_rule_fired("idle:wander_wedge_escape");
                         return true;
@@ -20358,7 +20366,29 @@ void DispatchIdle(BotAI& ai,
                 }
                 std::sort(near.begin(), near.end(), [&](::Playerbot::V2::Travel::QuestHub const* a, ::Playerbot::V2::Travel::QuestHub const* b)
                     { return a->GetDistanceFrom(s.raw()) < b->GetDistanceFrom(s.raw()); });
-                if (!near.empty())
+                // In a capital the places to stand are the bank, the auction house, the inn (Fleet/TownGather.h); the quest hubs there are
+                // the ward entrance rooms. A different spot at each strike and for each bot, weighted by what gathers there.
+                uint8 zlo = 0, zhi = 0;
+                bool const in_capital = !::Playerbot::V2::World::VanillaZoneLevelRange(s.zone_id(), zlo, zhi);
+                std::vector<::Playerbot::V2::Fleet::GatherSpot> gather;
+                if (in_capital)
+                    gather = ::Playerbot::V2::Fleet::TownGatherSpots(s.map_id(), px, py, 150.0f, s.is_alliance());
+                std::vector<::Playerbot::V2::Fleet::GatherSpot> reach;
+                for (auto const& g : gather)
+                {
+                    float const d = std::hypot(g.x - px, g.y - py);
+                    if (d >= V2::kIdleMinHubYards && d <= V2::kIdleMaxHubYards) reach.push_back(g);
+                }
+                if (!reach.empty())
+                {
+                    uint32 const h32 = uint32(s.guid().GetCounter()) * 2654435761u + w.strikes * 40503u;
+                    int const k = ::Playerbot::V2::Fleet::PickGatherSpot(reach, float(h32 % 10000u) / 10000.0f);
+                    float const a = float(h32 % 628u) / 100.0f;
+                    float const rr = float((h32 >> 8) % 100u) / 100.0f * ::Playerbot::V2::Fleet::kGatherRadius;
+                    tx = reach[k].x + std::cos(a) * rr; ty = reach[k].y + std::sin(a) * rr; tz = reach[k].z;
+                    what = "hub";
+                }
+                else if (!near.empty())
                 {
                     ::Playerbot::V2::Travel::QuestHub const* h = near[V2::IdlePickHub(near.size(), w.strikes, s.guid().GetCounter())];
                     tx = h->location.GetPositionX(); ty = h->location.GetPositionY(); tz = h->location.GetPositionZ();

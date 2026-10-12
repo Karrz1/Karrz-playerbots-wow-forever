@@ -14,7 +14,7 @@ auto& Db() { return CharacterDatabase; }
 size_t OwnerRegistry::LoadFromDb()
 {
     auto result = Db().Query(
-        "SELECT character_guid_low, owner_account_id, owner_player_guid, companion_saved, starter_pet_granted, gear_varied, companion_role, companion_subgroup, companion_spec "
+        "SELECT character_guid_low, owner_account_id, owner_player_guid, companion_saved, starter_pet_granted, gear_varied, companion_role, companion_subgroup, companion_spec, companion_order "
         "FROM playerbot_v2_character "
         "WHERE owner_account_id != 0 OR companion_role != 0");
     auto gear_modes = Db().Query("SELECT owner_account_id, gear_mode FROM playerbot_v2_owner_gear");
@@ -28,6 +28,7 @@ size_t OwnerRegistry::LoadFromDb()
     declared_role_.clear();
     subgroup_.clear();
     spec_.clear();
+    order_.clear();
     if (!result)
     {
         TC_LOG_INFO("playerbot.v2", "[PlayerbotV2 Owners] No owner bindings yet.");
@@ -52,6 +53,8 @@ size_t OwnerRegistry::LoadFromDb()
             subgroup_[bot] = uint8(sg - 1);
         if (uint32 const sp = f[8].GetUInt16(); sp != 0)
             spec_[bot] = sp;
+        if (uint32 const ord = f[9].GetUInt8(); ord != 0)
+            order_[bot] = uint16(ord - 1);
     } while (result->NextRow());
     uint32 tanks = 0, healers = 0, dps = 0;
     for (auto const& [bot, role] : declared_role_)
@@ -313,6 +316,35 @@ void OwnerRegistry::SetStoredSubgroup(BotId bot, uint8 subgroup)
     }
     Db().DirectPExecute("UPDATE playerbot_v2_character SET companion_subgroup = {} WHERE character_guid_low = {}",
         subgroup > 7 ? 0u : uint32(subgroup) + 1u, bot);
+}
+
+uint16 OwnerRegistry::StoredOrder(BotId bot) const
+{
+    std::shared_lock lk(mtx_);
+    auto const it = order_.find(bot);
+    return it == order_.end() ? uint16(0xFFFF) : it->second;
+}
+
+void OwnerRegistry::SetStoredOrder(BotId bot, uint16 order)
+{
+    {
+        std::unique_lock lk(mtx_);
+        auto const it = order_.find(bot);
+        if (order > 254)
+        {
+            if (it == order_.end())
+                return;
+            order_.erase(it);
+        }
+        else
+        {
+            if (it != order_.end() && it->second == order)
+                return;
+            order_[bot] = order;
+        }
+    }
+    Db().DirectPExecute("UPDATE playerbot_v2_character SET companion_order = {} WHERE character_guid_low = {}",
+        order > 254 ? 0u : uint32(order) + 1u, bot);
 }
 
 uint32 OwnerRegistry::StoredSpec(BotId bot) const

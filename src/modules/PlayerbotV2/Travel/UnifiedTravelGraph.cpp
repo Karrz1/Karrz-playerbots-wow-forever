@@ -1,3 +1,4 @@
+#include "NearestNode3D.h"
 #include "UnifiedTravelGraph.h"
 
 #include "PlayerbotMovement.h"   // SehSafeCalculatePath (tile-race guard)
@@ -1051,6 +1052,23 @@ GraphNode const* UnifiedTravelGraph::FindNearestNodeOnMap(
         }
     }
     return best;
+}
+
+GraphNode const* UnifiedTravelGraph::FindNearestNodeOnMap3D(
+    uint32 map_id, float x, float y, float z, float max_range, std::function<bool(GraphNode const&)> const& skip) const
+{
+    std::shared_lock lk(_mtx);
+    auto it = _nodes_by_map.find(map_id);
+    if (it == _nodes_by_map.end()) return nullptr;
+    std::vector<NodeId> const& ids = it->second;
+    int const idx = PickNearestNode3D(ids.size(),
+        [&](std::size_t i, float& nx, float& ny, float& nz)
+        {
+            if (ids[i] >= _nodes.size()) { nx = ny = nz = 1e9f; return; }
+            nx = _nodes[ids[i]].x; ny = _nodes[ids[i]].y; nz = _nodes[ids[i]].z;
+        },
+        [&](std::size_t i) { return ids[i] < _nodes.size() && !(skip && skip(_nodes[ids[i]])); }, x, y, z, max_range);
+    return idx < 0 ? nullptr : &_nodes[ids[std::size_t(idx)]];
 }
 
 // ---------------------------------------------------------------- A* router

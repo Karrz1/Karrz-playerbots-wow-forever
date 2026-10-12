@@ -188,6 +188,23 @@ bool WqTurninFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
     return false;
 }
 
+// One line per bot per 30s when an offer is in sight and idle:quest_accept did not act on it (Zephras Isle 2026-10-12: ~90 bots
+// stood beside Allee Farheart for minutes, offers=1, not one [accept_quest] line in the whole run).
+void LogAcceptStall(BotSnapshotView const& s, BotAI& ai, char const* why, float nearest_giver_dist)
+{
+    const uint32 now_ms = s.published_at_ms();
+    const uint32 last = ai.last_accept_stall_diag_ms();
+    if (last != 0 && now_ms - last < 30000u) return;
+    ai.set_last_accept_stall_diag_ms(now_ms);
+    uint32 first_quest = 0;
+    if (!s.raw().quest_discovery.quest_offers.empty())
+        first_quest = s.raw().quest_discovery.quest_offers.front().quest_id;
+    TC_LOG_INFO("playerbot.v2",
+        "[quest_accept_stall] bot={} lvl={} why={} offers={} first_quest={} bag_free={} nearest_giver_dist={:.1f} in_combat={} moving={}",
+        s.name(), uint32(s.level()), why, uint32(s.raw().quest_discovery.quest_offers.size()), first_quest,
+        uint32(s.bag_free_slots()), nearest_giver_dist, s.in_combat() ? 1 : 0, s.is_moving() ? 1 : 0);
+}
+
 // ---------- idle:quest_accept ----------
 bool QuestAcceptGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,uint32)
 {
@@ -199,7 +216,11 @@ bool QuestAcceptGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
     // so the bot frees space the player way first; accept resumes once a slot
     // opens. bag_free_slots()==0 is the clean gate (deferring a no-item quest a
     // few ticks until space frees is harmless).
-    if (s.bag_free_slots() == 0) return false;
+    if (s.bag_free_slots() == 0)
+    {
+        if (!s.raw().quest_discovery.quest_offers.empty()) LogAcceptStall(s, ai, "bags_full", -1.f);
+        return false;
+    }
     if (s.raw().quest_discovery.quest_offers.empty())
     {
         if (ai.pending_quest_accept_at_ms() != 0) ai.set_pending_quest_accept_at_ms(0);
@@ -300,6 +321,9 @@ bool QuestAcceptFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
                                                  : "idle:quest_accept_approach");
         return true;
     }
+    LogAcceptStall(s, ai, near_dsq == std::numeric_limits<float>::max() ? "giver_not_in_scan"
+                         : s.in_combat() ? "in_combat" : "giver_too_far",
+                   near_dsq == std::numeric_limits<float>::max() ? -1.f : std::sqrt(near_dsq));
     return false;
 }
 

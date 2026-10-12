@@ -6324,6 +6324,29 @@ SpellCastResult Spell::CheckCast(bool strict, int32* param1 /*= nullptr*/, int32
                 if (m_spellInfo->SpellLevel > pet->GetLevel())
                     return SPELL_FAILED_LOWLEVEL;
 
+                // Classic 1.60: the Grimoire spells (20270...) have no level of their own any more, so check the taught rank
+                // (vanilla spellLevel of the grimoire), and only teach a demon spells of its own family skill line
+                if (learn_spellproto->SpellLevel > pet->GetLevel())
+                    return SPELL_FAILED_LOWLEVEL;
+
+                if (CreatureFamilyEntry const* family = sCreatureFamilyStore.LookupEntry(pet->GetCreatureTemplate()->family))
+                {
+                    bool familySpell = false;
+                    for (int16 skillLine : family->SkillLine)
+                    {
+                        if (!skillLine)
+                            continue;
+
+                        if (std::vector<SkillLineAbilityEntry const*> const* abilities = sDB2Manager.GetSkillLineAbilitiesBySkill(skillLine))
+                            for (SkillLineAbilityEntry const* ability : *abilities)
+                                if (ability->Spell == int32(learn_spellproto->Id))
+                                    familySpell = true;
+                    }
+
+                    if (!familySpell)
+                        return SPELL_FAILED_BAD_TARGETS;
+                }
+
                 break;
             }
             case SPELL_EFFECT_UNLOCK_GUILD_VAULT_TAB:

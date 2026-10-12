@@ -352,6 +352,9 @@ class TC_GAME_API Group
 
         void ChangeMembersGroup(ObjectGuid guid, uint8 group);
         void SwapMembersGroups(ObjectGuid firstGuid, ObjectGuid secondGuid);
+        // Puts the member list in the given order (a client lists a raid sub-group in list order). Guids not in the group are ignored;
+        // members not named keep their relative order behind the named ones. Sends the group update.
+        void ReorderMembers(std::vector<ObjectGuid> const& order);
         void SetTargetIcon(uint8 symbol, ObjectGuid target, ObjectGuid changedBy);
         ObjectGuid GetTargetIcon(uint8 symbol) const { return symbol < TARGET_ICONS_COUNT ? m_targetIcons[symbol] : ObjectGuid::Empty; }
         void SetGroupMemberFlag(ObjectGuid guid, bool apply, GroupMemberFlags flag);

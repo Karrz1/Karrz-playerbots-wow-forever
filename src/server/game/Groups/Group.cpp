@@ -1077,6 +1077,20 @@ void Group::ChangeMembersGroup(ObjectGuid guid, uint8 group)
     Playerbot::Hooks::OnRaidSubgroupChanged(this, guid, group);
 }
 
+void Group::ReorderMembers(std::vector<ObjectGuid> const& order)
+{
+    MemberSlotList sorted;
+    for (ObjectGuid const& guid : order)
+    {
+        member_witerator it = _getMemberWSlot(guid);
+        if (it != m_memberSlots.end())
+            sorted.splice(sorted.end(), m_memberSlots, it);
+    }
+    sorted.splice(sorted.end(), m_memberSlots);
+    m_memberSlots.swap(sorted);
+    SendUpdate();
+}
+
 void Group::SwapMembersGroups(ObjectGuid firstGuid, ObjectGuid secondGuid)
 {
     if (!isRaidGroup())

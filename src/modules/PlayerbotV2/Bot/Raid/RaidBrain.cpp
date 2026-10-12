@@ -271,6 +271,44 @@ void SetIdleHostiles(Plan const& plan, Player* ref)
     }
 }
 
+// Enemies already in the fight, with the reach of their melee. A ranged bot's free raid move (leave hazard, spread, stay near)
+// never ends inside it and never runs through it: leaving Garr's Massive Eruption circle sent a mage across the Firesworn pack
+// to the far side of the ring (mc_garr 2026-10-12: five casters and priests dead to Firesworn melee, last rule raid:move).
+// A mob the bot already stands inside is skipped; nothing can be done about that one from here.
+std::vector<Circle> g_engagedReach;
+constexpr float kEngagedMeleeMargin = 6.0f;   // melee range 5 + a step
+
+void SetEngagedReach(Plan const& plan)
+{
+    g_engagedReach.clear();
+    for (Unit* enemy : plan.enemies)
+        if (enemy && enemy->IsAlive() && !enemy->IsPlayer() && g_engagedReach.size() < 64)
+            g_engagedReach.push_back({ enemy->GetPositionX(), enemy->GetPositionY(), enemy->GetCombatReach() + kEngagedMeleeMargin });
+}
+
+float SegmentDist2D(float ax, float ay, float bx, float by, float px, float py)
+{
+    float const dx = bx - ax, dy = by - ay;
+    float const len2 = dx * dx + dy * dy;
+    float const t = len2 > 0.0f ? std::clamp(((px - ax) * dx + (py - ay) * dy) / len2, 0.0f, 1.0f) : 0.0f;
+    return Dist2D(px, py, ax + t * dx, ay + t * dy);
+}
+
+// True when the walk from the bot to (x, y) ends in or passes through the melee reach of an engaged enemy the bot is not
+// already inside.
+bool CrossesEngagedReach(Player* bot, float x, float y)
+{
+    float const bx = bot->GetPositionX(), by = bot->GetPositionY();
+    for (Circle const& c : g_engagedReach)
+    {
+        if (Dist2D(bx, by, c.x, c.y) < c.r)
+            continue;
+        if (SegmentDist2D(bx, by, x, y, c.x, c.y) < c.r)
+            return true;
+    }
+    return false;
+}
+
 // The fight a bot's free raid moves (leave hazard, cone, spread, stay near) must stay part of, set by DecideMove after the
 // scripted mechanics had their turn (Heigan's dance, the stomach and Gothik's sides pick their own far points). Without it a
 // bot leaving Smash or spreading took any walkable point: ledges and rocks off the side of the fight, with no sight of its
@@ -341,6 +379,8 @@ bool InFightArea(Player* bot, float x, float y, float z, bool urgent)
 bool Usable(Player* bot, float x, float y, float zHint, float& outZ, bool urgent)
 {
     if (InsideAny(g_idleHostiles, x, y, 0.0f) && !InsideAny(g_idleHostiles, bot->GetPositionX(), bot->GetPositionY(), 0.0f))
+        return false;
+    if (g_fight.active && g_fight.targetRange > 0.0f && CrossesEngagedReach(bot, x, y))   // a ranged, non-tank bot
         return false;
     if (g_pathProbes >= (urgent ? kPathProbeCap : kPathProbeRoutine))
         return false;
@@ -2519,6 +2559,7 @@ void Brain::Update(uint32_t now_ms)
         std::sort(plan.enemies.begin(), plan.enemies.end(), [](Unit* a, Unit* c) { return a->GetGUID() < c->GetGUID(); });
         TrackPull(key, b.group, plan, b.ref->GetMap(), now_ms);
         SetIdleHostiles(plan, b.ref);
+        SetEngagedReach(plan);
         AcceptBotRezOffers(b.group, b.ref->GetMap(), now_ms);
         LogReleaseState(b.group, b.ref->GetMap(), now_ms);
 

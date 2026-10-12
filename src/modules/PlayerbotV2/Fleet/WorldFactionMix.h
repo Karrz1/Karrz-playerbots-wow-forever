@@ -86,4 +86,25 @@ inline bool BotIsAlliance(bool anchor_alliance, uint32_t roll, uint32_t pct)
     return roll < pct ? anchor_alliance : !anchor_alliance;
 }
 
+// The faction a capital city belongs to (Karrz, 2026-10-12: a level 60 Horde troll walked around Ironforge among level 21s; a real
+// Horde player does not stroll through an Alliance capital). 1 = Alliance, 2 = Horde, 0 = not a capital.
+inline int CapitalFactionOfZone(uint32_t zone)
+{
+    switch (zone)
+    {
+        case 1519: case 1537: case 1657: return 1;   // Stormwind, Ironforge, Darnassus
+        case 1637: case 1497: case 1638: return 2;   // Orgrimmar, Undercity, Thunder Bluff
+        default: return 0;
+    }
+}
+
+// Faction of one bot around an anchor standing in `zone`: in a capital it is always the capital's own faction, whoever the anchor is
+// (a Horde player visiting Ironforge meets Alliance bots); elsewhere the zone share relative to the anchor.
+inline bool BotIsAllianceInZone(uint32_t zone, bool anchor_alliance, uint32_t roll, uint32_t pct)
+{
+    if (int const capital = CapitalFactionOfZone(zone))
+        return capital == 1;
+    return BotIsAlliance(anchor_alliance, roll, pct);
+}
+
 } // namespace Playerbot::V2::Fleet

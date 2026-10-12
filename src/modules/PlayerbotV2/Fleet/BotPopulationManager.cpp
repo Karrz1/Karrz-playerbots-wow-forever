@@ -1442,6 +1442,28 @@ void RestoreRaidSubgroups(Group* group, Player const* owner)
     }
     if (moves || swaps)
         TC_LOG_INFO("playerbot.v2", "[roster_restore] raid of {}: {} move(s), {} swap(s)", group->GetMembersCount(), moves, swaps);
+
+    // The order inside the sub-groups: the raid frame follows the member list, which is login order. Hand the owned members' places in
+    // the list out again in the order they were saved in.
+    std::vector<Fleet::OrderMember> order;
+    for (Group::MemberSlot const& slot : group->GetMemberSlots())
+    {
+        BotId const id = slot.guid.GetCounter();
+        Fleet::OrderMember om;
+        om.guid = id;
+        OwnerBinding const b = Services::Owners().GetOwner(id);
+        om.movable = b.account_id != 0 && b.account_id == account;
+        om.order = om.movable ? Services::Owners().StoredOrder(id) : uint16(0xFFFF);
+        order.push_back(om);
+    }
+    if (std::vector<uint64> const want = Fleet::PlanMemberOrder(order); !want.empty())
+    {
+        std::vector<ObjectGuid> guids;
+        for (uint64 low : want)
+            guids.push_back(ObjectGuid::Create<HighGuid::Player>(low));
+        group->ReorderMembers(guids);
+        TC_LOG_INFO("playerbot.v2", "[roster_restore] raid of {}: member list put back in the saved order", group->GetMembersCount());
+    }
 }
 
 // Joins the bot to the owner's group, creating it (a full party becomes a raid, whoever leads it). Empty string = joined.

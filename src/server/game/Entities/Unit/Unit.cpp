@@ -7500,14 +7500,8 @@ float Unit::SpellCritChanceTaken(Unit const* caster, Spell* spell, AuraEffect co
                         break;
                 }
 
-                // Spell crit suppression
-                if (GetTypeId() == TYPEID_UNIT)
-                {
-                    // Classic 1.60: only higher level targets lower the chance; a level 60 on a level 3 mob gained +57% crit
-                    int32 const levelDiff = static_cast<int32>(GetLevelForTarget(caster)) - caster->GetLevel();
-                    if (levelDiff > 0)
-                        crit_chance -= levelDiff * 1.0f;
-                }
+                // Classic 1.60: no spell crit suppression by target level (vanilla GetSpellCritChance has none); level only
+                // matters through the spell hit table
             }
             break;
         }
