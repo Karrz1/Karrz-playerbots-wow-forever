@@ -631,9 +631,21 @@ bool FallbackTick(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& 
     const bool healer = ai.effective_role(s) == Role::Healer;
     auto tag = [&](char const* idle_tag, char const* combat_tag)
     { ai.set_last_rule_fired(in_combat_state ? combat_tag : idle_tag); };
+    // A raid avoid circle (Baron Geddon's Inferno, a Living Bomb carrier) outranks the order's walk. The bot standing in one is left to
+    // the raid brain's step-out; a rally point or slot inside one is not walked into, the bot waits where it is (MC Geddon 2026-10-12:
+    // Fall back sent bots back to a rally point inside Inferno, 14 of the deaths read combat:fallback_hold / fallback_return).
+    PveOrder const& hazard_order = s.raw().pve_order;
+    bool const hazards = Services::Config().behavior_avoid_circles() && hazard_order.active && hazard_order.avoid_circle_count > 0;
+    if (hazards && hazard_order.in_avoid_circle(bx, by, 0.0f))
+        return false;
     // Head for (x,y,z) unless a live path already ends there (re-issuing restarts the spline).
     auto head_to = [&](float x, float y, float z, bool run)
     {
+        if (hazards && hazard_order.in_avoid_circle(x, y, 2.0f))
+        {
+            if (s.is_moving()) emit.stop_movement();
+            return false;
+        }
         if (s.is_moving() && s.has_path_destination())
         {
             float qx, qy, qz; s.path_destination(qx, qy, qz);

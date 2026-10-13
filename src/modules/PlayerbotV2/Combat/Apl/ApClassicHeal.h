@@ -2,7 +2,7 @@
 // rotations (Apl_Classic_Priest / Druid / Paladin / Shaman) and the
 // out-of-combat top-up (State_Idle MaintainOocHeal).
 //
-// Port of Karrz's ike3 vanilla healer (ike3-based bots PlayerBots):
+// Port of chris's ike3 vanilla healer (wow-1.12 PlayerBots):
 //   - PickPatient: values/PartyMemberToHeal.cpp Calculate + MCRaidPolicy
 //     HealScore. Candidates within heal range on the bot's map; members out
 //     of line of sight are skipped unless they are a tank or below 35% (the
@@ -86,7 +86,7 @@ namespace Playerbot::Combat {
 
 namespace ClassicHeal {
 
-constexpr float kHealRange      = 40.0f;   // Karrz: HealDistance 38 + slack for the snapshot cadence
+constexpr float kHealRange      = 40.0f;   // chris: HealDistance 38 + slack for the snapshot cadence
 constexpr float kDispelRange    = 30.0f;
 constexpr float kMeleeReach     = 8.0f;    // enemy-to-member distance that counts as "swinging at"
 constexpr int32 kEmergencyPct   = 35;      // HEAL_DOWNRANK_MIN_PCT / LOS exemption
@@ -163,6 +163,8 @@ struct HealTiming
     uint32     need_ms = 0;       // raid healer: last time its assignment needed healing (RaidHealerMayDamage)
     uint32     need_eval_ms = 0;  // ... and the last time that was checked
     uint32     pick_logged_ms = 0; // last NoteRaidPick line
+    uint64     dispel_key = 0;     // last assigned dispel cast (member + debuff type) ...
+    uint32     dispel_ms = 0;      // ... and when (published_at_ms clock)
 };
 
 template <typename F>
@@ -570,7 +572,7 @@ inline Patient PickPatient(BotSnapshotView const& s, GroupSnapshotView const& g,
             int32 const pct = m.hp_pct();
             if (!tank && pct >= kEmergencyPct && !InLos(s, m.guid)) continue;
             Patient const mp = MakePatient(s, m.guid, m.hp, m.max_hp, m.x, m.y, m.z, tank);
-            // A warlock's own Life Tap is intentional damage: not a reason for a heal until he is low (Karrz, live MC 2026-10-10).
+            // A warlock's own Life Tap is intentional damage: not a reason for a heal until he is low (chris, live MC 2026-10-10).
             if (raid && LifeTapSkip(m.cls == CLASS_WARLOCK, tank, mp.actual_pct, mp.incoming))
                 continue;
             consider(mp, focus == m.guid, HealGroupHas(own_groups, m.subgroup));
@@ -765,7 +767,7 @@ inline uint64 HotAnyClaimKey(ObjectGuid target)
 }
 
 // Another healer's HoT of `spell`'s chain is already on (or on its way to) `target`; for a member that is not a tank, a HoT of any
-// other kind counts too (Karrz, live MC 2026-10-10: a Life Tapping warlock carried a Renew, a Rejuvenation and a Regrowth at once,
+// other kind counts too (chris, live MC 2026-10-10: a Life Tapping warlock carried a Renew, a Rejuvenation and a Regrowth at once,
 // three healers' mana for one member). The tanks keep one HoT of each kind: their healers stack them on purpose.
 inline bool HotClaimedByOther(BotSnapshotView const& s, GroupSnapshotView const& g, ObjectGuid target, uint32 spell)
 {
@@ -1065,7 +1067,7 @@ ObjectGuid RezTarget(BotSnapshotView const& s, GroupSnapshotView const& g, float
     auto const* members = g.members();
     if (!members) return ObjectGuid::Empty;
     float bx, by, bz; s.position(bx, by, bz);
-    // The owner (a human member) is raised first (Karrz, MC Gehennas 2026-10-08: dead, nobody rezzed him), then healers, tanks, the rest.
+    // The owner (a human member) is raised first (chris, MC Gehennas 2026-10-08: dead, nobody rezzed him), then healers, tanks, the rest.
     auto band = [](GroupMemberSummary const& m) { return !m.is_bot ? -1 : m.role == Role::Healer ? 0 : m.role == Role::Tank ? 1 : 2; };
     GroupMemberSummary const* cand[40];
     int n = 0, dead = 0, far_away = 0, no_los = 0, taken_n = 0;
@@ -1099,7 +1101,7 @@ ObjectGuid RezTarget(BotSnapshotView const& s, GroupSnapshotView const& g, float
             }
         if (taken) ++taken_n; else cand[n++] = &m;
     }
-    // [raid_rez] (Karrz, MC Gehennas 2026-10-08: dead, nobody rezzed him; the log said nothing): why a dead member is, or is not,
+    // [raid_rez] (chris, MC Gehennas 2026-10-08: dead, nobody rezzed him; the log said nothing): why a dead member is, or is not,
     // picked up by this bot, at most once per 5 s per bot and only in a raid.
     if (dead > 0 && s.is_in_raid())
     {
@@ -1122,7 +1124,7 @@ ObjectGuid RezTarget(BotSnapshotView const& s, GroupSnapshotView const& g, float
         int const ba = band(*a), bb = band(*b);
         return ba != bb ? ba < bb : a->guid < b->guid;
     });
-    // One rezzer per corpse (Karrz, MC 2026-10-10: a dozen healers cast on him at once): every rezzer reads the same snapshot, so a "taken
+    // One rezzer per corpse (chris, MC 2026-10-10: a dozen healers cast on him at once): every rezzer reads the same snapshot, so a "taken
     // by whoever is already casting" check alone lets all of them start in the same tick. The rezzers within 40 yd that can cast now
     // (alive, out of combat, not already on a rez) are ranked by guid; the first n of them take the n corpses, the rest wait. The
     // ranking turns every 3 s, so a front rezzer that cannot cast (no mana, on a cooldown, held by another order) does not stall the
@@ -1178,9 +1180,16 @@ inline bool RaidFightLive(GroupSnapshotView const& g, uint32 map_id)
     return V2::RezFightLive(tanks, fighting);
 }
 
+// The fight is on while a boss encounter is in progress too: a submerged Ragnaros leaves the raid with no tank and few members in combat, and the
+// priests, paladins and shamans raised the dead in the middle of the encounter (chris, MC Rag 2026-10-12). Only a druid raises in a live fight.
+inline bool RezFightOn(BotSnapshotView const& s, GroupSnapshotView const& g)
+{
+    return s.is_encounter_in_progress() || RaidFightLive(g, s.map_id());
+}
+
 inline ObjectGuid OocRezTarget(BotSnapshotView const& s, GroupSnapshotView const& g)
 {
-    if (!RezManaOk(s) || RaidFightLive(g, s.map_id()))
+    if (!RezManaOk(s) || RezFightOn(s, g))
         return ObjectGuid::Empty;
     return RezTarget(s, g, 28.0f, [](GroupMemberSummary const& m)
     {
@@ -1259,17 +1268,30 @@ inline ObjectGuid DispelTarget(ApPredicateContext const& ctx, std::initializer_l
 // runs it; the target-picker above stays for callers outside the plan. The
 // mana floor (Classic::kDispelMinManaPct) is PickDispel's own, so the plan
 // never hands a job to a bot this gate would turn away.
+// A dispel of the same debuff type on the same member is not repeated inside this window: a cure that worked takes the debuff off
+// at once, so a second cast means it did not take (not dispellable, out of line of sight, or the debuff comes straight back).
+// deadmines_full c82a7e21: a level 21 priest cast Dispel Magic ten times on one member, 830 of its 2345 mana.
+constexpr uint32 kDispelRepeatMs = 8000;
+
+inline bool DispelRecently(void const* ctx, uint64 key)
+{
+    BotSnapshotView const& s = *static_cast<BotSnapshotView const*>(ctx);
+    uint32 const now = s.published_at_ms();
+    return WithHealTiming(s, [&](HealTiming& t) { return t.dispel_key == key && t.dispel_ms && now - t.dispel_ms < kDispelRepeatMs; });
+}
+
 inline bool ShouldAssignedDispel(ApPredicateContext const& ctx)
 {
     if (ctx.bot.is_casting())
         return false;
-    return Classic::PickDispel(ctx.bot, ctx.group).spell != 0;
+    return Classic::PickDispel(ctx.bot, ctx.group, { &DispelRecently, &ctx.bot }).spell != 0;
 }
 inline void DoAssignedDispel(ApPredicateContext const& ctx, BotIntentEmitter& e)
 {
-    Classic::CastPick const d = Classic::PickDispel(ctx.bot, ctx.group);
+    Classic::CastPick const d = Classic::PickDispel(ctx.bot, ctx.group, { &DispelRecently, &ctx.bot });
     if (d.spell && e.cast(d.spell, d.target))
     {
+        WithHealTiming(ctx.bot, [&](HealTiming& t) { t.dispel_key = d.key; t.dispel_ms = ctx.bot.published_at_ms(); return 0; });
         Classic::NoteRaidSupport(Classic::RaidSupportKind::Dispel, ctx.bot.map_id());
         if (Classic::IsCurseDispelSpell(d.spell))
             Classic::NoteRaidSupport(Classic::RaidSupportKind::Decurse, ctx.bot.map_id());

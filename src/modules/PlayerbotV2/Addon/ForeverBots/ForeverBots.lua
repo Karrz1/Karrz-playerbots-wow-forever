@@ -73,7 +73,14 @@ do
     end
 end
 
-local function GroupOrder(text)
+-- Result codes of SendAddonMessage that mean "try again in a moment" (AddonMessageThrottle 3, ChannelThrottle 8): a burst of
+-- clicks in a 40-man raid, or the other raid addons' traffic in a fight, fills the client's addon message budget, and an order
+-- lost to it is no refusal of combat. The order is retried for up to five seconds before it is given up.
+local THROTTLED = { [3] = true, [8] = true }
+local ORDER_RETRIES = 6
+
+local function GroupOrder(text, attempt)
+    attempt = attempt or 0
     local channel
     if IsInRaid and IsInRaid() then channel = "RAID"
     elseif (IsInGroup and IsInGroup()) or (GetNumPartyMembers and GetNumPartyMembers() > 0) then channel = "PARTY"
@@ -81,15 +88,29 @@ local function GroupOrder(text)
         Print("you have no group yet: add a bot first.")
         return
     end
+    local code, errText
     if prefixOk then
         local send = C_ChatInfo and C_ChatInfo.SendAddonMessage or SendAddonMessage
         local ok, res = pcall(send, ORDER_PREFIX, text, channel)
         -- Enum.SendAddonMessageResult.Success is 0; older clients return nothing, which counts as sent.
         local sent = ok and (res == nil or res == true or res == 0 or (Enum and Enum.SendAddonMessageResult and res == Enum.SendAddonMessageResult.Success))
         if sent then return end
+        if ok then code = tonumber(res) or (res == false and -1 or nil) else errText = tostring(res) end
+        if code and THROTTLED[code] and attempt < ORDER_RETRIES and C_Timer and C_Timer.After then
+            C_Timer.After(0.8, function() GroupOrder(text, attempt + 1) end)
+            return
+        end
     end
     if InCombatLockdown and InCombatLockdown() then
-        Print("the order could not be sent in combat.")
+        -- The client lets the player's own Enter send chat in combat (typing "pull back" in raid chat works while the button does
+        -- not), so the line is put in the chat box ready to send: an order is never lost.
+        local why = code and (" (addon message result " .. code .. ")") or errText and (" (" .. errText .. ")") or (prefixOk and "" or " (addon prefix not registered)")
+        if ChatFrame_OpenChat then
+            ChatFrame_OpenChat((channel == "RAID" and "/raid " or "/party ") .. text)
+            Print("the order could not be sent in combat" .. why .. ": press Enter to send it.")
+        else
+            Print("the order could not be sent in combat" .. why .. ": type it in " .. strlower(channel) .. " chat.")
+        end
         return
     end
     SendChatMessage(text, channel)
@@ -365,6 +386,48 @@ local function MakeButton(parent, text, width, onClick, height)
     return b
 end
 
+-- Fixed group orders (Follow, Pull back, Fall back, ...) are secure macro buttons that run "/raid <order>" or "/party <order>":
+-- the client keeps addon code from sending anything itself during a boss fight (SendAddonMessage is refused and the chat call
+-- raises "Interface action failed because of an AddOn", live MC Baron Geddon 2026-10-12), but a click on a secure button runs
+-- the player's own chat command, in combat too. The server reads that line like typed chat. The macro text names the channel and
+-- is set out of combat (a secure attribute cannot change in a fight): on every group change and when combat ends.
+local secureOrders = {}
+local secureDirty = false
+
+local function OrderChannelWord()
+    return (IsInRaid and IsInRaid()) and "/raid " or "/party "
+end
+
+local function RefreshOrderMacros()
+    if InCombatLockdown and InCombatLockdown() then
+        secureDirty = true
+        return
+    end
+    secureDirty = false
+    local word = OrderChannelWord()
+    for _, b in ipairs(secureOrders) do
+        b:SetAttribute("type", "macro")
+        b:SetAttribute("macrotext", word .. b.orderText)
+    end
+end
+
+local function MakeSecureOrderButton(parent, text, width, order, height)
+    local b = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate,SecureActionButtonTemplate")
+    b:SetSize(width, height or 22)
+    b:SetText(text)
+    b:RegisterForClicks("AnyUp", "AnyDown")
+    b.orderText = order
+    secureOrders[#secureOrders + 1] = b
+    RefreshOrderMacros()
+    return b
+end
+
+local orderMacroFrame = CreateFrame("Frame")
+for _, ev in ipairs({ "GROUP_ROSTER_UPDATE", "PARTY_MEMBERS_CHANGED", "RAID_ROSTER_UPDATE", "PLAYER_REGEN_ENABLED", "PLAYER_ENTERING_WORLD" }) do
+    pcall(orderMacroFrame.RegisterEvent, orderMacroFrame, ev)
+end
+orderMacroFrame:SetScript("OnEvent", function() RefreshOrderMacros() end)
+
 local function ClassColor(token)
     local c = RAID_CLASS_COLORS and RAID_CLASS_COLORS[token]
     if c then
@@ -573,7 +636,11 @@ local function BuildFrame()
         local made = {}
         for _, d in ipairs(defs) do
             local b
-            b = MakeButton(frame, d[1], d[2], function() d[5](b) end)
+            if d[6] then
+                b = MakeSecureOrderButton(frame, d[1], d[2], d[6])
+            else
+                b = MakeButton(frame, d[1], d[2], function() d[5](b) end)
+            end
             b:SetPoint("TOPLEFT", x, y)
             if d[3] then Tip(b, d[3], d[4]) end
             made[#made + 1] = b
@@ -586,22 +653,22 @@ local function BuildFrame()
     Header("Orders to the group", "Everything below goes to all your bots.")
     -- Move and fight.
     Row({
-        { "Follow", 72, "Follow", "Bots follow you and only defend. They do not advance or pull until you say Attack, Pull or Resume.", function() GroupOrder("follow") end },
-        { "Stay",   72, "Stay", "Bots hold where they stand.", function() GroupOrder("stay") end },
-        { "Attack", 72, "Attack", "Bots attack your target.", function() GroupOrder("attack") end },
-        { "Resume", 72, "Resume", "Hand the fight back: bots go on with their normal play.", function() GroupOrder("resume") end },
+        { "Follow", 72, "Follow", "Bots follow you and only defend. They do not advance or pull until you say Attack, Pull or Resume.", function() GroupOrder("follow") end, "follow" },
+        { "Stay",   72, "Stay", "Bots hold where they stand.", function() GroupOrder("stay") end, "stay" },
+        { "Attack", 72, "Attack", "Bots attack your target.", function() GroupOrder("attack") end, "attack" },
+        { "Resume", 72, "Resume", "Hand the fight back: bots go on with their normal play.", function() GroupOrder("resume") end, "resume" },
     })
     Row({
-        { "Pull",      72, "Pull", "Your tank bots open on your target; the rest join once it is engaged.", function() GroupOrder("pull") end },
-        { "Pull back", 72, "Pull back", "The main tank bot opens on your target from range, runs back to the rally point (or where it stood) and tanks it there, so nothing else aggros.", function() GroupOrder("pull back") end },
-        { "Stop",      72, "Stop", "Bots stop attacking and go back to normal.", function() GroupOrder("disengage") end },
-        { "Flee",      72, "Flee", "Bots break off and run to you.", function() GroupOrder("flee") end },
+        { "Pull",      72, "Pull", "Your tank bots open on your target; the rest join once it is engaged.", function() GroupOrder("pull") end, "pull" },
+        { "Pull back", 72, "Pull back", "The main tank bot opens on your target from range, runs back to the rally point (or where it stood) and tanks it there, so nothing else aggros.", function() GroupOrder("pull back") end, "pull back" },
+        { "Stop",      72, "Stop", "Bots stop attacking and go back to normal.", function() GroupOrder("disengage") end, "disengage" },
+        { "Flee",      72, "Flee", "Bots break off and run to you.", function() GroupOrder("flee") end, "flee" },
     })
     -- Stance toggle. Passive: the bots start nothing on their own and only defend themselves and the group until you say
     -- Attack or Pull. Aggressive: they attack anything hostile within about 10 yards of you. The button shows the stance
     -- it last sent (the bots start passive while you lead a dungeon group).
     Row({
-        { "Come", 72, "Come", "Bots teleport to you.", function() GroupOrder("come") end },
+        { "Come", 72, "Come", "Bots teleport to you.", function() GroupOrder("come") end, "come" },
         { stanceAggressive and "Aggressive" or "Passive", 98, "Stance",
           "Passive: bots start nothing and only defend. Aggressive: they attack anything hostile within about 10 yards of you. Shows what you last sent.",
           function(self)
@@ -615,26 +682,26 @@ local function BuildFrame()
     Header("After a wipe or to regroup")
     Row({
         -- Dead bots release their spirit and run back to their corpses; living ones ignore it.
-        { "Release",   96, "Release", "After a wipe: every dead bot releases, runs back to its corpse and rejoins you. Living bots ignore it.", function() GroupOrder("release") end },
+        { "Release",   96, "Release", "After a wipe: every dead bot releases, runs back to its corpse and rejoins you. Living bots ignore it.", function() GroupOrder("release") end, "release" },
         -- Fall back: every bot drops the fight, runs to the rally point (set with Set rally, else where you stand) and
         -- re-forms there; it fights only what follows until Attack, Pull or Resume.
-        { "Fall back", 96, "Fall back", "Every bot drops the fight and runs to the rally point, then re-forms there. It fights only what follows until you say Attack, Pull or Resume.", function() GroupOrder("fallback") end },
-        { "Set rally", 96, "Set rally", "Sets the rally point to where you stand (used by Fall back and Pull back).", function() GroupOrder("rally here") end },
+        { "Fall back", 96, "Fall back", "Every bot drops the fight and runs to the rally point, then re-forms there. It fights only what follows until you say Attack, Pull or Resume.", function() GroupOrder("fallback") end, "fallback" },
+        { "Set rally", 96, "Set rally", "Sets the rally point to where you stand (used by Fall back and Pull back).", function() GroupOrder("rally here") end, "rally here" },
     })
 
     y = y - 8
     Header("Formation and spacing")
     Row({
         -- Formation round you out of combat (None = the plain follow behind you) and the spacing between bots.
-        { "Circle",   72, "Circle", "Out of combat the bots stand in a ring round you.", function() GroupOrder("formation circle") end },
-        { "Arrow",    72, "Arrow", "Out of combat the bots form an arrow pointing the way you face.", function() GroupOrder("formation arrow") end },
-        { "Line",     72, "Line", "Out of combat the bots line up abreast behind you.", function() GroupOrder("formation line") end },
-        { "No form.", 72, "No formation", "The plain follow behind you.", function() GroupOrder("formation none") end },
+        { "Circle",   72, "Circle", "Out of combat the bots stand in a ring round you.", function() GroupOrder("formation circle") end, "formation circle" },
+        { "Arrow",    72, "Arrow", "Out of combat the bots form an arrow pointing the way you face.", function() GroupOrder("formation arrow") end, "formation arrow" },
+        { "Line",     72, "Line", "Out of combat the bots line up abreast behind you.", function() GroupOrder("formation line") end, "formation line" },
+        { "No form.", 72, "No formation", "The plain follow behind you.", function() GroupOrder("formation none") end, "formation none" },
     })
     Row({
-        { "Tight",  72, "Tight spacing", "About 2.5 yards between bots.", function() GroupOrder("spacing tight") end },
-        { "Close",  72, "Close spacing", "About 4 yards between bots (the default).", function() GroupOrder("spacing close") end },
-        { "Spread", 72, "Spread spacing", "About 8 yards between bots.", function() GroupOrder("spacing spread") end },
+        { "Tight",  72, "Tight spacing", "About 2.5 yards between bots.", function() GroupOrder("spacing tight") end, "spacing tight" },
+        { "Close",  72, "Close spacing", "About 4 yards between bots (the default).", function() GroupOrder("spacing close") end, "spacing close" },
+        { "Spread", 72, "Spread spacing", "About 8 yards between bots.", function() GroupOrder("spacing spread") end, "spacing spread" },
     })
     -- Distance row: how far the bots follow you (and the formation spacing), stepped 1 yard per click.
     local distLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -1092,7 +1159,7 @@ end)
 -- and the floating panel (target-driven) is the way in.
 -- Opens the client's chat box already in whisper mode for <name> (no slash text, so the client's slash parser is not involved:
 -- on client 70291 in a battleground every slash line errors inside Blizzard's HandleChatType, "table cannot be indexed with
--- secret keys", Karrz 2026-10-09). Enter then sends an ordinary whisper packet. Opened a frame later because a typed "/w" runs
+-- secret keys", chris 2026-10-09). Enter then sends an ordinary whisper packet. Opened a frame later because a typed "/w" runs
 -- from the chat box, which the client closes after the handler returns.
 function OpenWhisperBox(name, text, now)
     local function Open()
@@ -1113,11 +1180,11 @@ end
 
 -- Clicking a name in chat, a name's right-click Whisper, the friends / who / LFG lists all end in ChatFrameUtil.SendTellWithMessage,
 -- which puts "<SLASH_WHISPER1> Name " in the chat box and asks the box to parse it. On 70291 SLASH_WHISPER1 is "/cw", which the
--- client does not turn into a whisper (Karrz 2026-10-09: clicking a name shows "Say: /cw Berolt"), so the box stays in Say mode with
+-- client does not turn into a whisper (chris 2026-10-09: clicking a name shows "Say: /cw Berolt"), so the box stays in Say mode with
 -- the slash text in it. A post-hook (hooksecurefunc: the client's function is not replaced) then puts the box in whisper mode for
 -- that name and clears the slash text. It runs synchronously, inside the click that started it: an addon may only touch the chat box
 -- from a player action in a battleground (a timer callback there failed with "Interface action failed because of an AddOn" and left
--- "/cw Name" in the box, Karrz 2026-10-09). The client's own /w /whisper /t /tell are untouched.
+-- "/cw Name" in the box, chris 2026-10-09). The client's own /w /whisper /t /tell are untouched.
 local function HookSendTell()
     if not hooksecurefunc then return end
     local function ToWhisper(eb, name, text)
@@ -1152,7 +1219,7 @@ local function HookSendTell()
             if not eb then return end
             local ok, chatType = pcall(function() return eb:GetAttribute("chatType") end)
             if ok and (chatType == "WHISPER" or chatType == "BN_WHISPER") then
-                -- the client already switched to whisper mode but typed "/cw Name" into the box as well (Karrz 2026-10-11,
+                -- the client already switched to whisper mode but typed "/cw Name" into the box as well (chris 2026-10-11,
                 -- "Tell Name:" with "/cw Name" after it): keep the mode, clear that text
                 FixCwBox()
                 return
@@ -1173,7 +1240,7 @@ end
 local function AddPopupEntry()
     if not (Menu and Menu.ModifyMenu) then return end
     -- Entries through the client's supported Menu.ModifyMenu only (no UnitPopup tables, no hooks). The client's own portrait
-    -- Invite sends nothing for a bot on 70338 (Karrz 2026-10-11: no CMSG_PARTY_INVITE from the menu, typed /invite works), so
+    -- Invite sends nothing for a bot on 70338 (chris 2026-10-11: no CMSG_PARTY_INVITE from the menu, typed /invite works), so
     -- "Whisper (Forever Bots)" is added for every friendly player, "Invite (Forever Bots)" for one outside my group, and the
     -- bot-panel entry for a group member (world, party, raid and battleground menus alike).
     -- Right-clicking the target frame crashed the client once with entries of ours in MENU_UNIT_PLAYER (Menu.lua:1103,
@@ -1212,7 +1279,7 @@ end
 
 ------------------------------------------------------------------------------------------------------------- slash
 
--- Typed whispers: on this client "/w Name text" and the unit menu's "/cw Name text" do nothing (Karrz 2026-10-08: no packet
+-- Typed whispers: on this client "/w Name text" and the unit menu's "/cw Name text" do nothing (chris 2026-10-08: no packet
 -- reaches the server, no Lua error, also with every addon off), while SendChatMessage(text, "WHISPER", nil, name) works.
 -- So /w /t /tell /cw are defined here as a plain SendChatMessage whisper (the client's own /whisper and /r stay native: they work).
 -- Restored 2026-10-11: in a raid (Molten Core) typed "/w Cal hi" did nothing while "/whisper Cal hi" worked, and the box filled by
@@ -1238,7 +1305,7 @@ do
         end
         name = strtrim((strsplit("-", name)))   -- "Name-Realm" -> "Name": a single realm
         if name == "" then return end
-        -- Inside a battleground or arena the client blocks anything an addon sends itself (Karrz 2026-10-08, WSG: "Interface
+        -- Inside a battleground or arena the client blocks anything an addon sends itself (chris 2026-10-08, WSG: "Interface
         -- action failed because of an AddOn", no packet). There the whisper is put in the chat box as the server command
         -- ".w <name> <text>" and sent by the player's own Enter, which the client lets through.
         if InPvP() then
@@ -1349,6 +1416,41 @@ SlashCmdList.FOREVERBOTS = function(msg)
         show("C_ChatInfo.SendChatMessage", function() return type(C_ChatInfo and C_ChatInfo.SendChatMessage) end)
         return
     end
+    if verb == "frames" then
+        local list = ForeverBotsListIssueFrames and ForeverBotsListIssueFrames() or {}
+        Print("issue reporter frames hidden: " .. (#list > 0 and table.concat(list, ", ") or "none found"))
+        return
+    end
+    if verb == "chattest" then
+        -- Run this in a fight (type it, or bind it to a macro): says what the client does with a group order sent as an addon message
+        -- and as a plain chat line, so the order buttons can use whichever works in combat. The text "fbtest" is no bot order.
+        local channel = (IsInRaid and IsInRaid()) and "RAID" or "PARTY"
+        local function show(label, fn, ...)
+            local ok, v = pcall(fn, ...)
+            if not ok then v = "error: " .. tostring(v) elseif IsSecret(v) then v = "<secret>" end
+            Print("chattest " .. label .. " = " .. tostring(v))
+        end
+        Print("chattest: in combat " .. tostring(InCombatLockdown and InCombatLockdown()) .. ", channel " .. channel .. ", prefix registered " .. tostring(prefixOk))
+        if C_ChatInfo then
+            for _, fn in ipairs({ "InChatMessagingLockdown", "IsAddonChatRestricted" }) do
+                if C_ChatInfo[fn] then show("C_ChatInfo." .. fn, C_ChatInfo[fn]) end
+            end
+        end
+        show("SendAddonMessage result", C_ChatInfo and C_ChatInfo.SendAddonMessage or SendAddonMessage, ORDER_PREFIX, "fbtest", channel)
+        local seen = false
+        local ev = CreateFrame("Frame")
+        ev:RegisterEvent(channel == "RAID" and "CHAT_MSG_RAID" or "CHAT_MSG_PARTY")
+        ev:RegisterEvent(channel == "RAID" and "CHAT_MSG_RAID_LEADER" or "CHAT_MSG_PARTY_LEADER")
+        ev:SetScript("OnEvent", function(_, _, text) if text == "fbtest" then seen = true end end)
+        show("SendChatMessage call", SendChatMessage, "fbtest", channel)
+        if C_Timer and C_Timer.After then
+            C_Timer.After(2, function()
+                ev:UnregisterAllEvents()
+                Print("chattest: the chat line " .. (seen and "WAS" or "was NOT") .. " delivered to " .. channel .. " chat (a blocked call shows no error, only a missing line)")
+            end)
+        end
+        return
+    end
     if verb == "bgw" then
         ForeverBotsDB.bgWhisper = (class == "dot") and "dot" or "native"
         Print("battleground whisper mode: " .. ForeverBotsDB.bgWhisper .. "  (/fb bgw native|dot)")
@@ -1434,7 +1536,7 @@ loader:SetScript("OnEvent", function()
 end)
 
 -- On client 70291 a battleground leaves the chat box broken: every typed slash line (also /fb, /w) then throws
--- ChatFrameEditBox.lua:206 "table cannot be indexed with secret keys" until /reload (Karrz 2026-10-09). Say so on leaving one.
+-- ChatFrameEditBox.lua:206 "table cannot be indexed with secret keys" until /reload (chris 2026-10-09). Say so on leaving one.
 do
     local pvpWas = false
     local pvpWatch = CreateFrame("Frame")
@@ -1469,3 +1571,38 @@ do
     pcall(groupWatch.RegisterEvent, groupWatch, "GROUP_ROSTER_UPDATE")
     groupWatch:SetScript("OnEvent", function(_, ev) Report(ev == "PLAYER_ENTERING_WORLD" and "entering world" or "roster update") end)
 end
+
+------------------------------------------------------------------------------------------------------ issue reporter
+-- The beta client's "Issue Reporter" bug button (bottom right, also the "F6 to submit an issue" hint) is hidden (chris 2026-10-12).
+-- The 70338 interface source is not at hand, so the frame is found by name: any global frame whose name contains "IssueReport"
+-- or "BugReport" (and the common names tried directly). Hide() plus a Show hook that hides it again: nothing is reparented or
+-- replaced, the frame is not protected, so there is no taint and it works in combat. Re-applied on PLAYER_ENTERING_WORLD and on
+-- every ADDON_LOADED (the button may belong to a load-on-demand Blizzard addon). "/fb frames" lists what was found.
+do
+    local hooked, found = {}, {}
+    local function HideFrame(name, f)
+        if hooked[f] then return end
+        hooked[f] = true
+        found[#found + 1] = name
+        pcall(f.Hide, f)
+        pcall(hooksecurefunc, f, "Show", function(self) pcall(self.Hide, self) end)
+    end
+    local function Scan()
+        for _, name in ipairs({ "IssueReporterButton", "IssueReporterFrame", "IssueReporter", "BetaIssueReporter", "BugReportButton", "BugReportFrame" }) do
+            local f = _G[name]
+            if type(f) == "table" and f.Hide and f.GetObjectType then HideFrame(name, f) end
+        end
+        for name, f in pairs(_G) do
+            if type(name) == "string" and not hooked[f] and (name:find("IssueReport", 1, true) or name:find("BugReport", 1, true)) then
+                if type(f) == "table" and f.Hide and f.GetObjectType and f.IsProtected then HideFrame(name, f) end
+            end
+        end
+    end
+    local watch = CreateFrame("Frame")
+    watch:RegisterEvent("PLAYER_ENTERING_WORLD")
+    watch:RegisterEvent("ADDON_LOADED")
+    watch:SetScript("OnEvent", function() pcall(Scan) end)
+    pcall(Scan)
+    ForeverBotsListIssueFrames = function() pcall(Scan); return found end
+end
+

@@ -18,6 +18,7 @@
 #include "tc_catch2.h"
 
 #include "ClassicSupplies.h"
+#include <algorithm>
 #include <set>
 
 using namespace Playerbot::Classic;
@@ -79,8 +80,12 @@ TEST_CASE("the next raid consumable is the first one missing its buff that the b
     REQUIRE(next != nullptr);
     CHECK(next->item == kit[1].item);
 
-    // Only the last entry is in the bags.
-    uint32 const last = kit.back().item;
+    // Only the last entry used before the pull is in the bags (a combat potion is never used out of the fight).
+    uint32 last = 0;
+    for (RaidConsumable const& c : kit)
+        if (!c.combat)
+            last = c.item;
+    REQUIRE(last != 0);
     next = NextRaidConsumable(RaidConsumableRole::Tank, [&](uint32 i) { return i == last; }, none_buffed);
     REQUIRE(next != nullptr);
     CHECK(next->item == last);
@@ -120,4 +125,29 @@ TEST_CASE("an elixir is never used or stocked while a flask of the kit is up", "
     CHECK(kit.front().flask);
     CHECK(RaidConsumablesFor(RaidConsumableRole::Tank).front().flask);
     CHECK(RaidConsumablesFor(RaidConsumableRole::Caster).front().flask);
+}
+
+TEST_CASE("a combat potion is stocked but never used before the pull", "[classic][consumables]")
+{
+    auto const kit = RaidConsumablesFor(RaidConsumableRole::Tank);
+    auto it = std::find_if(kit.begin(), kit.end(), [](RaidConsumable const& c) { return c.item == 13457; });   // Greater Fire Protection Potion
+    REQUIRE(it != kit.end());
+    CHECK(it->combat);
+    CHECK(IsRaidConsumable(13457));
+    auto none_buffed = [](RaidConsumable const&) { return false; };
+    // Only the potion in the bags: nothing to use out of combat.
+    CHECK(NextRaidConsumable(RaidConsumableRole::Tank, [](uint32 i) { return i == 13457; }, none_buffed) == nullptr);
+    // Everything else stocked, the potion missing: it is the one to stock, flask up or not.
+    auto holds_all_but_potion = [](uint32 i) { return i == 13457 ? 0u : 99u; };
+    RaidConsumable const* stock = NextRaidConsumableToStock(RaidConsumableRole::Tank, holds_all_but_potion, none_buffed);
+    REQUIRE(stock != nullptr);
+    CHECK(stock->item == 13457);
+    auto flask_buffed = [](RaidConsumable const& c) { return c.flask; };
+    stock = NextRaidConsumableToStock(RaidConsumableRole::Tank, holds_all_but_potion, flask_buffed);
+    REQUIRE(stock != nullptr);
+    CHECK(stock->item == 13457);
+    // The other roles carry none.
+    for (RaidConsumableRole role : { RaidConsumableRole::Melee, RaidConsumableRole::Caster, RaidConsumableRole::Healer, RaidConsumableRole::Hunter })
+        for (RaidConsumable const& c : RaidConsumablesFor(role))
+            CHECK_FALSE(c.combat);
 }

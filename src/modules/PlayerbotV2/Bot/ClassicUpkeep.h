@@ -38,6 +38,8 @@ struct CastPick
     // rank 1 id cast at the highest known rank (cast): a party buff whose top
     // rank's reagent is missing but the lower rank's is in the bags.
     bool       exact_rank = false;
+    // A caster-centred buff (key kind 6): how many members it was needy of when picked, so the rule can tell a cast that reached nobody.
+    uint32     area_needy = 0;
 };
 
 // Raid support picks skip work the caller is still pacing: `skip(ctx, key)`
@@ -66,7 +68,7 @@ CastPick PickBlessing(BotSnapshotView const& s, GroupSnapshotView const& g, bool
                       PickSkip skip = {});
 
 // ======================= Raid support =======================
-// Generic group / raid support every raid needs (port of Karrz's ike3 buff,
+// Generic group / raid support every raid needs (port of chris's ike3 buff,
 // cure and resistance strategies). Assignment is computed identically by
 // every bot from the shared group snapshot, so exactly one bot takes each
 // piece of work.
@@ -111,6 +113,8 @@ CastPick PickFearWard(BotSnapshotView const& s, GroupSnapshotView const& g);
 // change the plan. Out of combat only; nothing while this bot is in a form
 // (DruidFormToLeave takes it out first).
 CastPick PickClassBuff(BotSnapshotView const& s, GroupSnapshotView const& g, PickSkip skip = {});
+// A cast PickClassBuff returned with a kind 6 key (caster-centred buff): tracks whether it reached anyone, and backs the buff off when not.
+void NoteAreaBuffCast(ObjectGuid caster, uint64 key, uint32 needy, uint32 now_ms);
 
 // Druid, out of combat: the form aura (Cat, Bear, Dire Bear, Travel, Moonkin;
 // never Aquatic) to cancel because PickClassBuff has a buff for this druid once
@@ -277,7 +281,7 @@ enum class ConsumableKind : uint8
 uint32 BestConsumable(BotSnapshotView const& s, ConsumableKind kind, bool conjured_only = false);
 
 // The bot used a combat consumable (potion, healthstone, rune, mana gem) in
-// the last `window_ms` (Karrz: at most one per 2.5 s, so a healthstone and a
+// the last `window_ms` (chris: at most one per 2.5 s, so a healthstone and a
 // potion never go in the same instant).
 bool CombatConsumableUsedRecently(BotSnapshotView const& s, uint32 window_ms = 2500);
 
@@ -288,7 +292,7 @@ bool HealIncoming(BotSnapshotView const& s, GroupSnapshotView const& g);
 bool IsEating(BotSnapshotView const& s);
 bool IsDrinking(BotSnapshotView const& s);
 
-// Karrz's SafeToRecover / UseFoodStrategy: free to sit down - nothing attacks
+// chris's SafeToRecover / UseFoodStrategy: free to sit down - nothing attacks
 // the bot and no group member fights within 45 yards and no enemy engaged with the bot or its group stands within 30 yards (Bot/RecoverRules.h).
 // Without a group view only the enemies are checked (a fight next to the bot
 // still shows as an enemy with a victim).
@@ -308,9 +312,9 @@ RecoveryPick PickRecovery(BotSnapshotView const& s, int32 start_hp, int32 start_
 // Healer mana a grouped instance tank waits for before it pulls (State_Idle
 // dungeon group-ready gate). The drink rules start a grouped healer's drink
 // below this same value, so a healer that holds the pull always drinks.
-// 85 was Karrz's ike3 "raid prepull recover" target; 75 since 2026-10-07 (Karrz: MC trash takes too long).
+// 85 was chris's ike3 "raid prepull recover" target; 75 since 2026-10-07 (chris: MC trash takes too long).
 constexpr int32 kPullReadyHealerManaPct = 75;
-// A five-man healer has no trash-pace cost to weigh (Karrz's 2026-10-07 call was about MC): a drink that starts only below 75 %
+// A five-man healer has no trash-pace cost to weigh (chris's 2026-10-07 call was about MC): a drink that starts only below 75 %
 // never starts for a priest at 75-94 %, so she pulled into every pack three-quarters full and was dry by the boss
 // (deadmines_full@sneed). Dungeon healers start the drink, and the tank's pull gate waits, below this.
 constexpr int32 kPullReadyDungeonHealerManaPct = 90;
@@ -355,7 +359,7 @@ bool IsGroupHealer(BotSnapshotView const& s, GroupSnapshotView const* g);
 int32 OocDrinkStartManaPct(BotSnapshotView const& s, GroupSnapshotView const* g,
                            int32 open_world_pct);
 
-// In-combat emergency heal item (Karrz's UsePotionsStrategy): at 30% health
+// In-combat emergency heal item (chris's UsePotionsStrategy): at 30% health
 // or below, healthstone first, then a healing potion; kept while a heal is
 // about to land unless the bot is at 20% or below. 0 = nothing to use.
 uint32 PickCombatHealthItem(BotSnapshotView const& s, GroupSnapshotView const& g);

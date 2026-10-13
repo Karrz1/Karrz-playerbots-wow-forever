@@ -112,13 +112,13 @@ void PveGroupCoordinator::Update(uint32 now_ms)
         if (p->IsAlive() && p->IsInCombat())
             b.in_combat = true;
         // The owner's go (MarksNeedOrder): an attack / engage order, a /focus pin or a pull back running on a member bot.
-        // A pull back is NOT the group's go (Karrz, MC Molten Giants 2026-10-08: four marked tanks pulled back and the whole raid
+        // A pull back is NOT the group's go (chris, MC Molten Giants 2026-10-08: four marked tanks pulled back and the whole raid
         // ran in): only the pulling tank is released; the others wait until the mob is on a tank.
         if (e.ai->pull_back_active())
             b.pullers.push_back(uint64(id));
         else if ((!e.ai->focus_target().IsEmpty() ||
                   (e.ai->is_manual_mode(now_ms) && e.ai->owner_command() == BotAI::OwnerCommand::Engage)) &&
-                 // A Pull is the tanks' own engage: it must not release the rest of the raid (Karrz, MC Gehennas
+                 // A Pull is the tanks' own engage: it must not release the rest of the raid (chris, MC Gehennas
                  // 2026-10-08: "pull, then I say attack"). Only a non-tank bot carrying the order is the owner's Attack.
                  (!m->IsRaid() || BotCommandParser::BotRole(p) != Role::Tank))
             b.owner_order = true;
@@ -212,7 +212,7 @@ void PveGroupCoordinator::Update(uint32 now_ms)
         if (b.owner_order)
             mark_release_until_[bkey] = now_ms + 10000u;
         // The Attack stands for the whole fight: while the group is in combat a live release is carried on, so it neither
-        // lapses when the owner dies or his order expires, nor re-holds the DPS mid-fight (Karrz, MC Gehennas 2026-10-08:
+        // lapses when the owner dies or his order expires, nor re-holds the DPS mid-fight (chris, MC Gehennas 2026-10-08:
         // rogues idle after the owner fell). It ends 10 s after the fight.
         else if (b.in_combat && mark_release_until_.count(bkey) && now_ms < mark_release_until_[bkey])
             mark_release_until_[bkey] = now_ms + 10000u;
@@ -615,7 +615,7 @@ void PveGroupCoordinator::Update(uint32 now_ms)
         // -- Auto skull: after the owner's Attack, the skull follows the fight --------------------------------------------
         // When the skull mob dies the skull moves to the next ENGAGED mob (kill focus first, else the most hurt), and the
         // cross to the one after if the cross is free, so the owner sees what is next and no DPS waits for a new mark
-        // (Karrz, MC Gehennas 2026-10-08). Only with a human leader, only once the owner released the marks, only on
+        // (chris, MC Gehennas 2026-10-08). Only with a human leader, only once the owner released the marks, only on
         // mobs somebody already fights; an unpulled mob is never marked. Nothing happens until the owner has put a skull.
         if (marks_released && b.in_combat && !GroupSnapshotView(*gs).leader_is_bot() && b.bots.front().second)
         if (Group* grp = b.bots.front().second->GetGroup())
@@ -637,7 +637,7 @@ void PveGroupCoordinator::Update(uint32 now_ms)
                     if (!live(mob_of(u.guid))) continue;
                     ObjectGuid const cross = grp->GetTargetIcon(kCross);
                     if (u.guid == cross) continue;
-                    // A mob carrying any other raid icon is a tank's to hold (moon, square, ... = a tank assignment, Karrz, MC Garr
+                    // A mob carrying any other raid icon is a tank's to hold (moon, square, ... = a tank assignment, chris, MC Garr
                     // 2026-10-08: the skull jumped to Garr, marked moon for his own tank, the moment the first add died): the
                     // skull never moves onto it.
                     bool tank_marked = false;
@@ -801,6 +801,8 @@ void PveGroupCoordinator::Update(uint32 now_ms)
         it = buckets.count(it->first) ? std::next(it) : fight_log_.erase(it);
     for (auto it = last_tank_target_.begin(); it != last_tank_target_.end();)
         it = buckets.count(it->first) ? std::next(it) : last_tank_target_.erase(it);
+    for (auto it = cc_held_.begin(); it != cc_held_.end();)
+        it = buckets.count(it->first) ? std::next(it) : cc_held_.erase(it);
     for (auto it = mark_release_until_.begin(); it != mark_release_until_.end();)
         it = buckets.count(it->first) ? std::next(it) : mark_release_until_.erase(it);
     for (auto it = fight_start_.begin(); it != fight_start_.end();)
@@ -1131,6 +1133,7 @@ constexpr uint32 kFightSummaryMs = 3000;
 // A spare tank never runs further than this for a mob; beyond it the mob
 // belongs to whoever is closer (or the loose-attacker pick-up).
 constexpr float kTankAssignRange = 60.0f;
+constexpr uint32 kCcHoldMs = 45000;   // how long a tank is remembered as the holder of a mob under a group member's crowd control
 // An unpulled mob this close to an engaged one belongs to the pack (the link-pull reach).
 constexpr float kPackReach = 25.0f;
 
@@ -1574,6 +1577,8 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             {
                 // [raid_tank] why a tank lost its mob (Garr 2026-10-08: one tank hopped between Firesworn ~15 times).
                 NearbyUnit const* gone = unit_any_early(it->second);
+                if (gone && gone->is_cc_locked && member_of(gone->cc_caster))
+                    cc_held_[bkey][it->second.GetCounter()] = { t->first, now_ms + kCcHoldMs };
                 TC_LOG_INFO("playerbot.v2", "[raid_tank] group={} map={} {} drops {} ({}): {}", group_low, map_id, t->second->src->name,
                             it->second.GetEntry(), it->second.GetCounter(),
                             !gone ? "out of every view or dead" : (gone->is_cc_locked ? "crowd-controlled" : (!gone->unit_in_combat ? "out of combat" : "no longer hitting the group")));
@@ -1700,6 +1705,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
         auto assign = [&](Member const* t, Mob const& m, char const* why)
         {
             sticky[t->guid_low] = m.u->guid;
+            cc_held_[bkey].erase(m.u->guid.GetCounter());
             taken.push_back(m.u->guid);
             const float dx = m.u->x - t->src->x, dy = m.u->y - t->src->y;
             Member const* v = member_of(m.u->victim);
@@ -1721,11 +1727,17 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             Mob const* held = find_mob(sit->second);
             return held && held->u->guid != m.u->guid && (held->u->is_dungeon_boss || held->u->is_boss_rank);
         };
+        // Holds of this bucket still in force: one that ran out is dropped (a CC'd mob is not in `mobs`, so only time ends it).
+        auto& cc_held = cc_held_[bkey];
+        for (auto it = cc_held.begin(); it != cc_held.end();)
+            it = now_ms >= it->second.until_ms ? cc_held.erase(it) : std::next(it);
         auto nearest_free = [&](Member const* t) -> Mob const*
         {
             auto rank = [&](Mob const& m) -> int
             {
                 if (Raid::NoTank(map_id, m.u->entry)) return 3;
+                if (auto const hold = cc_held.find(m.u->guid.GetCounter()); hold != cc_held.end() && hold->second.tank_low == t->guid_low)
+                    return -1;   // the tank that held it before the crowd control ended takes it back first
                 if (m.loose) return 0;
                 return on_boss_tank(m) ? 1 : 2;
             };
@@ -1766,6 +1778,19 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                 if (!pick) { pick = nearest_free(t); why = "nearest"; }
                 if (pick) assign(t, *pick, why);
             }
+        // A mob that has just come off a group member's crowd control goes back to the tank that held it, before any other tank
+        // is offered it as a loose mob.
+        for (Member const* t : tanks)
+        {
+            if (!t->is_bot || sticky.count(t->guid_low)) continue;
+            for (auto const& m : mobs)
+                if (auto const hold = cc_held.find(m.u->guid.GetCounter());
+                    hold != cc_held.end() && hold->second.tank_low == t->guid_low && !is_taken(m.u->guid) && !Raid::NoTank(map_id, m.u->entry))
+                {
+                    assign(t, m, "cc_released");
+                    break;
+                }
+        }
         for (Member const* t : tanks)
         {
             if (!t->is_bot || sticky.count(t->guid_low)) continue;
@@ -2002,7 +2027,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
         }
 
         // -- Generic raid kill focus ----------------------------------------
-        // Karrz's raid DPS target (DpsTargetValue McFocusTarget): every DPS
+        // chris's raid DPS target (DpsTargetValue McFocusTarget): every DPS
         // on ONE engaged, non-CC'd mob, lowest health first, instead of each
         // bot opening on whatever is nearest - 30 DPS spread over a pack
         // out-threat every tank at once. A dungeon script's priority add
@@ -2050,7 +2075,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             if (mk_grp)
                 for (uint8 m : { uint8(7), uint8(6), uint8(0), uint8(1), uint8(2), uint8(3), uint8(4), uint8(5) })
                 {
-                    // Only skull and cross are kill orders; the other icons are tank / crowd-control markers (Karrz, MC Garr
+                    // Only skull and cross are kill orders; the other icons are tank / crowd-control markers (chris, MC Garr
                     // 2026-10-08: circle marked on Garr and every DPS attacked it). An icon some bot has as its own kill symbol
                     // (assign <bot> <icon> kill) stays a kill order for the group.
                     bool kill_icon = m >= 6;
@@ -2219,6 +2244,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
     else
     {
         last_tank_target_.erase(bkey);
+        cc_held_.erase(bkey);
         last_raid_focus_.erase(bkey);
         tank_mark_auto_.erase(bkey);
         marks_set_.erase(bkey);
@@ -2717,6 +2743,21 @@ void PveGroupCoordinator::PlanFearAndResist(uint64 bkey, uint64 group_low, uint3
     if (potion)
         for (auto& [low, o] : plan)
             o.resist_potion = potion;
+    // Boss data (RaidRules::resistPotion): the potion a role drinks when this boss is engaged, whatever the global switch says. Ragnaros'
+    // Elemental Fire killed five tanks in three minutes (MC 2026-10-12). The global order, when on, wins for the bots it covers.
+    if (Raid::RaidRules const* rules = Raid::RulesForMap(map_id))
+        if (!rules->resistPotion.empty())
+            if (NearbyUnit const* eng = EngagedBoss(map_id, snaps, false))
+                for (Raid::ResistPotion const& rp : rules->resistPotion)
+                    if (rp.enemy == eng->entry)
+                        for (auto& [low, o] : plan)
+                        {
+                            auto const mit = by_low.find(low);
+                            if (o.resist_potion || mit == by_low.end())
+                                continue;
+                            if (rp.who == Raid::Who::Anyone || (rp.who == Raid::Who::Tank && mit->second->tank))
+                                o.resist_potion = rp.item;
+                        }
 }
 
 std::string PveGroupCoordinator::DebugDump() const

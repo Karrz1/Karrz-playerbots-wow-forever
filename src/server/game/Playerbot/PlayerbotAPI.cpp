@@ -544,7 +544,7 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
     uint32 const requested_id = spell_id;
     if (!exact_rank || !p_->HasSpell(spell_id))
         spell_id = HighestKnownRank(p_, spell_id);
-    // [cast_rank] (Karrz, 2026-10-08: confirm every damage spell goes out at the top known rank): per bot and requested spell, at most one
+    // [cast_rank] (chris, 2026-10-08: confirm every damage spell goes out at the top known rank): per bot and requested spell, at most one
     // line a minute, "requested -> cast".
     {
         static std::unordered_map<uint64, uint32> s_rank_log;
@@ -758,13 +758,13 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
         if (!FaceUnitForCast(p_, tu) && CastFacingEnabled())
             return last_cast_fail_ = 0, Result::Locked;
     // Spells that do not need the target in front (heals, buffs) still turn the caster to a target that is behind it when it
-    // can (Karrz, Deadmines 2026-10-10: the priest healed with her back to the target). Best effort: a caster that is moving
+    // can (chris, Deadmines 2026-10-10: the priest healed with her back to the target). Best effort: a caster that is moving
     // keeps its heading and the cast goes out anyway.
     if (tu != p_ && CastFacingEnabled() && !(info->FacingCasterFlags & SPELL_FACING_FLAG_INFRONT))
         FaceUnitForCast(p_, tu);
 
     // A bot that drank or sat and now casts stands up first, as a client does when its player casts (the drink aura ends on the
-    // cast, the sitting pose did not: Karrz saw the priest heal kneeling). Food / drink spells themselves sit the bot, so they are
+    // cast, the sitting pose did not: chris saw the priest heal kneeling). Food / drink spells themselves sit the bot, so they are
     // left alone. [stand_state] logs each change, at most one line per bot per 5 s.
     if (p_->GetStandState() == UNIT_STAND_STATE_SIT || p_->GetStandState() == UNIT_STAND_STATE_KNEEL)
         if (!info->HasAura(SPELL_AURA_MOD_POWER_REGEN) && !info->HasAura(SPELL_AURA_MOD_REGEN))
@@ -1116,7 +1116,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             return Result::Locked;
         // A free fall: the jump spline's parabola (height = g*T^2/8, MotionMaster::MoveJump) is exactly gravity over the drop
         // when T = sqrt(2*fall/g), so the leap takes that long. A fixed 8 y/s along the whole path took 3 s for a 15 y drop and
-        // looked like a slow fall (Karrz, WSG 2026-10-09). The walk off the edge is allowed 16 y/s at most.
+        // looked like a slow fall (chris, WSG 2026-10-09). The walk off the edge is allowed 16 y/s at most.
         float const dist3 = std::sqrt(dxy * dxy + fall * fall);
         float const fall_s = std::max(std::sqrt(2.0f * fall / float(Movement::gravity)), dxy / 16.0f);
         float const speed = dist3 / fall_s;
@@ -1169,7 +1169,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // Battleground start room (STATUS_WAIT_JOIN): the gates are shut and the bots only mill about their start area, so a
     // destination whose ground is far above or below the bot is off the platform (a gate-wait spot spread over the edge of
     // the plateau, a slope under a cliff). Routing there ends in a straight-line spline over empty air or in the platform
-    // step-down relocation below, which is how bots ended up hanging in the air above the AB valley (Karrz, 2026-10-08).
+    // step-down relocation below, which is how bots ended up hanging in the air above the AB valley (chris, 2026-10-08).
     // Refuse it; the idle rule picks another spot.
     if (Battleground const* prep_bg = p_->GetBattleground();
         prep_bg && prep_bg->GetStatus() == STATUS_WAIT_JOIN &&
@@ -2633,7 +2633,7 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
     }
 
     // A mounted player cannot attack (Unit::Attack returns false), so a bot riding past an enemy emitted start_attack every
-    // tick and nothing happened: bots ran past each other mounted in WSG (Karrz, 2026-10-08). Like a real player who clicks
+    // tick and nothing happened: bots ran past each other mounted in WSG (chris, 2026-10-08). Like a real player who clicks
     // an enemy, the bot gets off its mount first.
     if (p_->IsMounted() && tu->IsHostileTo(p_))
         p_->Dismount();
@@ -2993,7 +2993,7 @@ Result API::mount(uint32 mount_id)
     for (uint32 carry_aura : { 23333u, 23335u, 34976u, 121164u, 121175u, 121176u, 121177u })
         if (p_->HasAura(carry_aura)) return Result::Locked;
     // One rule for battlegrounds (Battleground::GetMountRefusal): closed start doors or an indoor area, no distance radius. Players
-    // are held to the same rule in Spell.cpp. One line per bot every 20 s says why a mount is refused (Karrz, WSG 70291).
+    // are held to the same rule in Spell.cpp. One line per bot every 20 s says why a mount is refused (chris, WSG 70291).
     if (Battleground const* bg = p_->GetBattleground())
         if (char const* why = bg->GetMountRefusal(p_))
         {
@@ -5272,7 +5272,7 @@ Result API::loot_corpse(ObjectGuid corpse)
     {
         p_->SendLoot(*loot, false);
         // SendLoot opens the loot window (LootGUID, UNIT_FLAG_LOOTING = the kneeling loot pose) and a bot has no client to close
-        // it: every bot in a group with party loot rules stayed in the loot pose through every fight and cast (Karrz, Deadmines
+        // it: every bot in a group with party loot rules stayed in the loot pose through every fight and cast (chris, Deadmines
         // 2026-10-10: "they're always looting"). Close it as a player closing the window does - the rolls the open started stay.
         if (WorldSession* sess = p_->GetSession())
             sess->DoLootRelease(loot);
@@ -5646,7 +5646,7 @@ Result API::use_game_object(ObjectGuid go_guid)
             // deck ~z9.4 over a z0 pivot). Use an operator-provided per-entry deck
             // height so the bot lands on the actual deck, not in the hull/water.
             float deckZ = 2.0f;
-            // Vanilla models whose deck is BELOW the transport pivot (Karrz's ike3
+            // Vanilla models whose deck is BELOW the transport pivot (chris's ike3
             // TravelNode.cpp generateTransportNodes exit offsets): the zeppelin
             // pivot hangs ~17y above its gondola deck (= the tower deck it docks
             // at), and the Deeprun Tram car ("Subway") pivot sits 10y above the
@@ -5710,7 +5710,7 @@ Result API::use_game_object(ObjectGuid go_guid)
     if (!obj)
     {
         // Not silent for the classic AB banners (entries 180058-180091): a bot standing at a pole that cannot click it was the
-        // "bots stand at the Stables, nothing is captured" report (Karrz, AB test 2026-10-08).
+        // "bots stand at the Stables, nothing is captured" report (chris, AB test 2026-10-08).
         if (p_->InBattleground())
             if (Map* bmap = p_->GetMap())
                 if (GameObject* raw = bmap->GetGameObject(go_guid))
@@ -5733,7 +5733,7 @@ Result API::use_game_object(ObjectGuid go_guid)
         return Result::Locked;
 
     // A battleground flag or banner is not used in a shapeshift form (a bear-form druid stood at the Lumber Mill banner doing nothing,
-    // Karrz AB 2026-10-11): leave the form first, the next click (the rule re-emits) goes through as a caster.
+    // chris AB 2026-10-11): leave the form first, the next click (the rule re-emits) goes through as a caster.
     if (p_->InBattleground() && p_->GetShapeshiftForm() != FORM_NONE &&
         (obj->GetGoType() == GAMEOBJECT_TYPE_BUTTON || obj->GetGoType() == GAMEOBJECT_TYPE_GOOBER || obj->GetGoType() == GAMEOBJECT_TYPE_FLAGSTAND ||
          obj->GetGoType() == GAMEOBJECT_TYPE_FLAGDROP || obj->GetGoType() == GAMEOBJECT_TYPE_NEW_FLAG || obj->GetGoType() == GAMEOBJECT_TYPE_NEW_FLAG_DROP ||
@@ -5746,7 +5746,7 @@ Result API::use_game_object(ObjectGuid go_guid)
 
     // Battleground node banners (AB / AV / Gilneas style BUTTON and GOOBER objects) are not instant for a player: the capture is
     // a channel of several seconds that movement or damage breaks. Calling Use() straight away let a whole squad flip the
-    // Blacksmith and Lumber Mill Alliance/Horde/Alliance/Horde every second (Karrz, AB test 2026-10-08). The bot now "channels"
+    // Blacksmith and Lumber Mill Alliance/Horde/Alliance/Horde every second (chris, AB test 2026-10-08). The bot now "channels"
     // too: the first call starts the capture, a later call (the rule re-emits every ~3 s) completes it once 5 s have passed and
     // the bot has neither moved more than 3 y nor lost health; after a completed capture it must wait 15 s before the next one.
     if (p_->InBattleground() &&
@@ -5757,7 +5757,7 @@ Result API::use_game_object(ObjectGuid go_guid)
         BannerCapture& cap = s_bannerCapture[p_->GetGUID()];
         uint32 const nowMs = GameTime::GetGameTimeMS();
         // A cast already running (the capture spell the object's Use() starts) must never be restarted by a second click: a
-        // new Use() while the bar is filling cancels it (Karrz, AB test: "she keeps casting and it stops").
+        // new Use() while the bar is filling cancels it (chris, AB test: "she keeps casting and it stops").
         if (p_->IsNonMeleeSpellCast(false))
             return Result::Locked;
         if (cap.lastDoneMs && nowMs - cap.lastDoneMs < 15000u)
@@ -7170,6 +7170,18 @@ Result API::restock_class_supplies()
     uint32 added = 0;
     bool full = false;
     uint8 const level = uint8(p_->GetLevel());
+    // The party versions of the class buffs, which no Forever trainer sells.
+    for (uint32 const spell : Classic::GroupBuffSpells(p_->GetClass()))
+    {
+        if (p_->HasSpell(spell))
+            continue;
+        if (!Classic::LearnableGroupBuff(spell, level))
+            continue;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(spell, DIFFICULTY_NONE);
+        p_->LearnSpell(spell, false);
+        ++added;
+        TC_LOG_INFO("playerbot.v2", "[supplies] {} learns {} ({})", p_->GetName(), spell, si->SpellName ? (*si->SpellName)[sWorld->GetDefaultDbcLocale()] : "");
+    }
     for (Classic::SupplyFamily const& f : Classic::GetSupplyFamilies())
     {
         if (!Classic::SupplyFamilyForClass(f, p_->GetClass())) continue;

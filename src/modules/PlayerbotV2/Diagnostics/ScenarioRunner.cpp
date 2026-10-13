@@ -78,6 +78,7 @@ struct Member
     std::uint64_t id = 0;
     bool role_pinned = false;
     bool kit_learned = false;   // the class trainer spells of the squad level are taught (LearnLevelKit)
+    bool tier_geared = false;   // the Molten Core scenarios' Tier 1 gear is on (see the staging step)
     bool ready = false;
 };
 
@@ -331,10 +332,30 @@ bool StageMember(Run& run, Member& m)
         return false;
     }
 
+    // Molten Core scenarios field the gear chris's raid wears: the Tier 1 set plus raid pieces up to that tier's item level. The setup
+    // pipeline's generated gear is a level-60 green/blue kit, so a boss fight on it runs ~4x too long (mc_garr: healers out of mana in a
+    // fight a T1 squad finishes). The mode override stays for the run (the upkeep regears with it) and is dropped in Finish.
+    if (!m.tier_geared && def.level >= 60 && std::string_view(def.name).rfind("mc_", 0) == 0)
+    {
+        ::Playerbot::V2::Fleet::BotPopulationManager::SetGearModeOverride(id, 2);   // Gear::Owned::GearMode::T1
+        bool const changed = ::Playerbot::Services::Population().RegearNow(p);
+        m.tier_geared = true;
+        TC_LOG_INFO("playerbot.v2", "[scenario] {} {} Tier 1 gear (regear changed items: {})", def.name, m.def.name, changed ? "yes" : "no");
+        run.stage_status += fmt::format("{}=t1gear ", m.def.name);
+        return false;
+    }
+
     // Food and drink in the bags, as the vendor visit of a bot that had walked here would have left them: the upkeep rules
     // eat and drink between pulls only from what they carry (Deadmines run 3: no drink line from the priest at all, while
     // the tank's healer-mana gate held the pull).
     StockRations(run, p);
+
+    // The class supplies a bot's own upkeep tops up (reagents, mana and healing potions, Demonic Runes) and the party buff spells it learns
+    // from them, so a raid squad starts as chris's bots do instead of waiting on the idle rule.
+    {
+        ::Playerbot::API api(p);
+        api.restock_class_supplies();
+    }
 
     // Full health and mana: a run starts from a rested squad, not from whatever the last one left.
     p->SetFullHealth();
@@ -505,6 +526,60 @@ std::size_t ClearRaidTrash(Run& run, Player* viewer)
     TC_LOG_INFO("playerbot.v2", "[scenario] {} cleared the trash before placing the raid: {} hostile creatures killed (boss entry {} and its formation left alone)",
                 run.def->name, doomed.size(), run.def->arrive_near_entry);
     return doomed.size();
+}
+
+// The goal boss stands alive in its room before the raid is placed. A boss that is dead or waiting out a respawn timer (a lock or a
+// persisted raid state from an earlier run, a map that outlived the lock reset) is respawned, and what was found is logged either way: a
+// boss scenario measures the fight, so a boss missing at the order is a setup fault to repair here, not a result (mc_geddon on 317cbf20
+// failed setup twice with "not alive within 400 y"). Returns whether a living boss is in the map now (a respawn from a timer happens on
+// the map's next update, so the caller re-checks at the order).
+bool EnsureBossAlive(Run& run, Player* viewer)
+{
+    Map* map = viewer->GetMap();
+    if (!map || !run.arrive_entry)
+        return false;
+    std::uint32_t objects = 0;
+    Creature* corpse = nullptr;
+    for (auto const& kv : map->GetCreatureBySpawnIdStore())
+    {
+        Creature* c = kv.second;
+        if (!c || c->GetEntry() != run.arrive_entry)
+            continue;
+        ++objects;
+        if (c->IsAlive())
+        {
+            TC_LOG_INFO("playerbot.v2", "[scenario] {} boss {} spawn {} is alive at {:.1f},{:.1f},{:.1f}", run.def->name, run.arrive_entry, kv.first,
+                        c->GetPositionX(), c->GetPositionY(), c->GetPositionZ());
+            return true;
+        }
+        corpse = c;
+    }
+    ObjectGuid::LowType spawn_id = 0;
+    for (auto const& kv : sObjectMgr->GetAllCreatureData())
+        if (kv.second.id == run.arrive_entry && kv.second.mapId == run.def->map)
+        {
+            spawn_id = kv.first;
+            break;
+        }
+    // A boss the instance script spawns itself (Ragnaros: spawn group 338, manual, spawned when Majordomo is done) has no creature in a fresh
+    // map: spawn its group, as the script would.
+    if (!objects && spawn_id)
+        if (SpawnGroupTemplateData const* group = sObjectMgr->GetSpawnGroupData(SPAWN_TYPE_CREATURE, spawn_id))
+            if (group->groupId && (group->flags & SPAWNGROUP_FLAG_MANUAL_SPAWN) && !(group->flags & SPAWNGROUP_FLAG_SYSTEM))
+            {
+                bool const spawned = map->SpawnGroupSpawn(group->groupId, /*ignoreRespawn*/ true, /*force*/ true);
+                TC_LOG_INFO("playerbot.v2", "[scenario] {} boss {} is in manual spawn group {} ({}): spawned the group: {}", run.def->name, run.arrive_entry,
+                            group->groupId, group->name, spawned);
+                return false;
+            }
+    time_t const due = spawn_id ? map->GetCreatureRespawnTime(spawn_id) : 0;
+    TC_LOG_WARN("playerbot.v2", "[scenario] {} boss {} is not alive: {} object(s) in the map, spawn row {}, respawn due in {} s; respawning it", run.def->name,
+                run.arrive_entry, objects, spawn_id ? std::to_string(spawn_id) : "none", due > GameTime::GetGameTime() ? int64(due - GameTime::GetGameTime()) : 0);
+    if (corpse)
+        corpse->Respawn(true);
+    else if (spawn_id)
+        map->Respawn(SPAWN_TYPE_CREATURE, spawn_id);
+    return false;
 }
 
 // Where the healers are in the first seconds after the landing and what each is doing (MC Garr 2026-10-10: healers 30 y out from the
@@ -1155,6 +1230,7 @@ void Finish(Run& run, bool timed_out, std::string const& note = {})
     for (Member const& m : run.members)
         if (Player* p = Find(m.id))
         {
+            ::Playerbot::V2::Fleet::BotPopulationManager::SetGearModeOverride(m.id, -1);
             LeaveGroup(p);
             p->CombatStop(true);
             if (!p->IsAlive())
@@ -1572,6 +1648,7 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
                 {
                     run.trash_cleared = true;
                     ClearRaidTrash(run, leader);
+                    EnsureBossAlive(run, leader);
                 }
                 if (!leader || !PickArrival(run, leader))
                 {

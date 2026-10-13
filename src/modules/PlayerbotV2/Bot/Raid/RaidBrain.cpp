@@ -1,7 +1,7 @@
 // RaidBrain implementation. See RaidBrain.h for the threading contract and
 // RaidEncounters.h for the rule vocabulary.
 //
-// Movement (section "Movement") is a straight port of Karrz's ike3
+// Movement (section "Movement") is a straight port of chris's ike3
 // RaidBrain::DecideMove; the elections (section "Elections") port
 // DecideRaidCast from MoltenCoreDungeonActions.cpp, minus interrupts (the
 // PvE coordinator already runs an interrupt rotation).
@@ -321,6 +321,7 @@ struct FightArea
     float targetRange = 0.0f; // ranged: stay within cast range of `target`; 0 for melee
 };
 FightArea g_fight;
+bool g_carrierRun = false;   // set while a bomb carrier's escape point is searched (RaidBrain DecideMove)
 
 constexpr float kFightRadius = 35.0f;   // from the main tank
 constexpr float kRangedReach = 30.0f;   // casting / shooting range
@@ -359,10 +360,15 @@ bool InFightArea(Player* bot, float x, float y, float z, bool urgent)
 {
     if (!g_fight.active)
         return true;
-    if (g_fight.anchor && !WithinOrCloser(bot, g_fight.anchor, x, y, kFightRadius))
+    // A carrier leaving the raid may go past the usual fight radius and out of casting range of its target: any way out comes first
+    // (Living Bomb, MC 2026-10-12: "fight area" refused 12 of the probed points; a carrier on the far end of the 50 y ranged arc was 47 y
+    // from the tank: b0a1c616, 9 more). The bomb lasts 8 s, so 70 y is within reach.
+    if (g_fight.anchor && !WithinOrCloser(bot, g_fight.anchor, x, y, g_carrierRun ? kFightRadius + 35.0f : kFightRadius))
         return false;
     Unit* target = g_fight.target;
     if (!target || target == bot)
+        return true;
+    if (g_carrierRun)
         return true;
     if (g_fight.targetRange > 0.0f && !WithinOrCloser(bot, target, x, y, g_fight.targetRange + target->GetCombatReach()))
         return false;
@@ -376,35 +382,40 @@ bool InFightArea(Player* bot, float x, float y, float z, bool urgent)
 
 // A point the bot can actually stand on and walk to, outside every idle pack's aggro reach, and (inside DecideMove) part of
 // the fight: near the main tank, in reach and sight of the bot's target, reached by a path without a detour.
+// Why the last Usable() refused a point (Clearest tallies them for its "no reachable clear spot" log).
+int g_usableWhy = 0;
+constexpr char const* kUsableWhyName[] = { "ok", "idle pack", "engaged reach", "path probe cap", "no ground", "no LoS", "fight area", "no path", "detour" };
+
 bool Usable(Player* bot, float x, float y, float zHint, float& outZ, bool urgent)
 {
+    g_usableWhy = 0;
     if (InsideAny(g_idleHostiles, x, y, 0.0f) && !InsideAny(g_idleHostiles, bot->GetPositionX(), bot->GetPositionY(), 0.0f))
-        return false;
+        return g_usableWhy = 1, false;
     if (g_fight.active && g_fight.targetRange > 0.0f && CrossesEngagedReach(bot, x, y))   // a ranged, non-tank bot
-        return false;
+        return g_usableWhy = 2, false;
     if (g_pathProbes >= (urgent ? kPathProbeCap : kPathProbeRoutine))
-        return false;
+        return g_usableWhy = 3, false;
     Map* map = bot->GetMap();
     float const height = map->GetHeight(bot->GetPhaseShift(), x, y, zHint + 2.0f, true, 12.0f);
     if (height <= INVALID_HEIGHT + 1.0f || std::fabs(height - zHint) > 12.0f)
-        return false;
+        return g_usableWhy = 4, false;
     if (!bot->IsWithinLOS(x, y, height + bot->GetCollisionHeight()))
-        return false;
+        return g_usableWhy = 5, false;
     if (!InFightArea(bot, x, y, height, urgent))
-        return false;
+        return g_usableWhy = 6, false;
     ++g_pathProbes;
     PathGenerator path(bot);
     if (!BotMovement::SehSafeCalculatePath(path, x, y, height))
-        return false;
+        return g_usableWhy = 7, false;
     if (path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE))
-        return false;
+        return g_usableWhy = 7, false;
     if (g_fight.active && path.GetPath().size() >= 2)
     {
         // A walkable point reached by climbing round a rock is up on the rock: the path must be close to the straight line.
         float const dx = x - bot->GetPositionX(), dy = y - bot->GetPositionY(), dz = height - bot->GetPositionZ();
         float const straight = std::sqrt(dx * dx + dy * dy + dz * dz);
         if (path.GetPathLength() > straight * kDetourFactor + kDetourSlack)
-            return false;
+            return g_usableWhy = 8, false;
     }
     outZ = height;
     return true;
@@ -418,7 +429,10 @@ bool SetMove(RaidOrder& out, float x, float y, float z, char const* reason)
     return true;
 }
 
-bool Escape(Player* bot, std::vector<Circle> const& circles, RaidOrder& out)
+// `tankOf` (the raid, for a tank): a tank leaving a boss's circle goes out sideways to the raid, not straight back through it. The boss
+// follows its tank when the circle ends, and the tank's way out is where the boss ends up: straight back put Geddon 19 y closer to the
+// ranged block between two Infernos (MC Geddon 2026-10-12 b0a1c616: 14 bots in range of the second one).
+bool Escape(Player* bot, std::vector<Circle> const& circles, RaidOrder& out, std::vector<Player*> const* tankOf = nullptr)
 {
     int deepest = -1;
     float depth = -1.0f;
@@ -431,7 +445,22 @@ bool Escape(Player* bot, std::vector<Circle> const& circles, RaidOrder& out)
         return false;
 
     Circle const& c = circles[deepest];
-    float const base = std::atan2(bot->GetPositionY() - c.y, bot->GetPositionX() - c.x); // straight away from the centre first
+    float base = std::atan2(bot->GetPositionY() - c.y, bot->GetPositionX() - c.x); // straight away from the centre first
+    if (tankOf && !tankOf->empty())
+    {
+        float rx = 0.0f, ry = 0.0f;
+        for (Player* p : *tankOf)
+        {
+            rx += p->GetPositionX();
+            ry += p->GetPositionY();
+        }
+        float const toRaid = std::atan2(ry / float(tankOf->size()) - c.y, rx / float(tankOf->size()) - c.x);
+        // Perpendicular to the centre-to-raid line, on the side the tank already stands on.
+        float const side = std::sin(base - toRaid) >= 0.0f ? 1.0f : -1.0f;
+        float const away = std::cos(base - toRaid);   // 1 = the tank stands between the boss and the raid
+        if (away > 0.3f)
+            base = toRaid + side * float(M_PI) * 0.5f;
+    }
     int pathChecks = 0;
     for (float extra : { 2.0f, 5.0f, 9.0f })
         for (int k = 0; k < 12; ++k)
@@ -452,38 +481,72 @@ bool Escape(Player* bot, std::vector<Circle> const& circles, RaidOrder& out)
 }
 
 // Best nearby point that increases the distance to every raid member in `others`.
+std::string g_clearestWhy;
+
 bool Clearest(Player* bot, std::vector<Player*> const& others, float wanted, RaidOrder& out, char const* reason,
               std::vector<Circle> const& avoid, bool urgent)
 {
     float nearest = 9999.0f;
     for (Player* p : others)
         nearest = std::min(nearest, Dist2D(bot->GetPositionX(), bot->GetPositionY(), p->GetPositionX(), p->GetPositionY()));
-    float bestScore = -9999.0f;
-    float bx = 0.0f, by = 0.0f, bz = 0.0f;
-    int pathChecks = 0;
-    for (float distance : { wanted, wanted * 1.4f })
-        for (int i = 0; i < 16 && pathChecks < 12; ++i)
+
+    // Candidate points on rings round the bot, scored first (cheap) and probed best first (a path query each). A carrier standing inside
+    // the raid (Living Bomb, MC 2026-10-12: nearest raider 11-14 yd, 25-30 of the ring points "not better") needs the rings that reach past
+    // the raid's edge, and probing in ring order spent the whole probe budget on the nearest, worst points.
+    struct Candidate { float x, y, score; };
+    std::vector<Candidate> candidates;
+    float const improvement = urgent ? 2.0f : 4.0f;
+    std::vector<float> rings = urgent ? std::vector<float>{ wanted * 0.7f, wanted, wanted * 1.4f, wanted * 1.9f }
+                                      : std::vector<float>{ wanted, wanted * 1.4f };
+    int const steps = urgent ? 24 : 16;
+    int skippedNear = 0, skippedAvoid = 0, why[9] = {};
+    for (float distance : rings)
+        for (int i = 0; i < steps; ++i)
         {
-            float const angle = float(i) * (2.0f * float(M_PI) / 16.0f);
+            float const angle = float(i) * (2.0f * float(M_PI) / float(steps));
             float const px = bot->GetPositionX() + distance * std::cos(angle);
             float const py = bot->GetPositionY() + distance * std::sin(angle);
             float clear = 9999.0f;
             for (Player* p : others)
                 clear = std::min(clear, Dist2D(px, py, p->GetPositionX(), p->GetPositionY()));
-            if (clear < nearest + 4.0f)
+            if (clear < nearest + improvement)
+            {
+                ++skippedNear;
                 continue; // must be a real improvement
+            }
             if (!avoid.empty() && InsideAny(avoid, px, py, 1.0f))
+            {
+                ++skippedAvoid;
                 continue;
-            ++pathChecks;
-            float pz = 0.0f;
-            if (!Usable(bot, px, py, bot->GetPositionZ(), pz, urgent))
-                continue;
-            float const score = std::min(clear, 28.0f) - 0.2f * distance;
-            if (score > bestScore) { bestScore = score; bx = px; by = py; bz = pz; }
+            }
+            candidates.push_back({ px, py, std::min(clear, wanted + 12.0f) - 0.2f * distance });
         }
-    if (bestScore <= -9999.0f)
-        return false;
-    return SetMove(out, bx, by, bz, reason);
+    std::stable_sort(candidates.begin(), candidates.end(), [](Candidate const& a, Candidate const& b) { return a.score > b.score; });
+
+    int pathChecks = 0;
+    for (Candidate const& c : candidates)
+    {
+        if (pathChecks >= (urgent ? 14 : 12))
+            break;
+        ++pathChecks;
+        float pz = 0.0f;
+        if (!Usable(bot, c.x, c.y, bot->GetPositionZ(), pz, urgent))
+        {
+            ++why[g_usableWhy];
+            continue;
+        }
+        return SetMove(out, c.x, c.y, pz, reason);
+    }
+
+    // Why nothing was found, for the carrier-run log: candidates no better than standing here, candidates inside a hazard circle, and
+    // what refused each point that was probed.
+    std::ostringstream w;
+    w << "not better " << skippedNear << ", in hazard " << skippedAvoid;
+    for (int i = 1; i < 9; ++i)
+        if (why[i])
+            w << ", " << kUsableWhyName[i] << " " << why[i];
+    g_clearestWhy = w.str();
+    return false;
 }
 
 // Keeps a decision for a couple of seconds so bots do not jitter between equally good points.
@@ -559,6 +622,10 @@ bool BreathLine(Unit* enemy, uint32_t spell, uint32_t now, float& x, float& y, f
     return true;
 }
 
+// When an AvoidEnemyAura rule's aura or cast was last seen on an enemy, by (enemy guid << 32) ^ aura. World thread only.
+std::unordered_map<uint64_t, uint32_t> g_auraCircleSeen;
+constexpr uint32_t kAuraCircleTailMs = 2500;
+
 // Every avoid-circle that applies to this member right now.
 std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t now)
 {
@@ -568,10 +635,20 @@ std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t no
     for (AvoidEnemyAura const& rule : rules.avoidEnemyAura)
         if (Matches(rule.who, self, plan.mainTank))
             for (Unit* enemy : plan.enemies)
+            {
+                if (enemy->GetEntry() != rule.enemy)
+                    continue;
                 // The aura, or the cast that applies it: the circle opens when the boss starts the spell, not a plan
                 // interval after it landed (MC Geddon 2026-10-11: 35 of 36 deaths in one Inferno, bots still inside).
-                if (enemy->GetEntry() == rule.enemy && (enemy->HasAura(rule.aura) || IsCasting(enemy, rule.aura)))
+                // It stays open kAuraCircleTailMs after both end: the last, heaviest tick of a periodic spell (Inferno: 5000) lands after the
+                // boss's aura is gone, and a bot walking back at the aura's end took it (MC Geddon 2026-10-12).
+                uint64_t const key = (enemy->GetGUID().GetCounter() << 32) ^ rule.aura;
+                if (enemy->HasAura(rule.aura) || IsCasting(enemy, rule.aura))
+                    g_auraCircleSeen[key] = now;
+                auto const seen = g_auraCircleSeen.find(key);
+                if (seen != g_auraCircleSeen.end() && now - seen->second <= kAuraCircleTailMs)
                     circles.push_back({ enemy->GetPositionX(), enemy->GetPositionY(), rule.radius });
+            }
     for (AvoidCarrier const& rule : rules.avoidCarrier)
         if (Matches(rule.who, self, plan.mainTank) && !bot->HasAura(rule.aura))
             for (Member const& m : plan.members)
@@ -767,6 +844,53 @@ bool FaceAxisFor(Plan const& plan, Unit* enemy, uint32_t now, float& axis)
     return true;
 }
 
+// A bot standing in lava or slime leaves it for the nearest dry navmesh point. The Ragnaros fight (live 2026-10-12) had bots standing in
+// the lava round the platform and not moving out; the log line says whether the core even applies the liquid to them (z against the
+// surface), the move takes them out. A point on or within a yard of the surface counts as in it (a bot falls in at once).
+std::unordered_map<uint64_t, uint32_t> g_lastLavaLog;
+
+bool InMagma(Player* bot, float& surfaceZ)
+{
+    LiquidData ld;
+    ZLiquidStatus const st = bot->GetMap()->GetLiquidStatus(bot->GetPhaseShift(), bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+        map_liquidHeaderTypeFlags::Magma | map_liquidHeaderTypeFlags::Slime, &ld);
+    if (st & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER))
+    {
+        surfaceZ = ld.level;
+        return true;
+    }
+    if ((st & (LIQUID_MAP_WATER_WALK | LIQUID_MAP_ABOVE_WATER)) && bot->GetPositionZ() - ld.level < 1.0f)
+    {
+        surfaceZ = ld.level;
+        return true;
+    }
+    return false;
+}
+
+bool LeaveMagma(Player* bot, uint32_t now, RaidOrder& out)
+{
+    float surface = 0.0f;
+    if (!InMagma(bot, surface))
+        return false;
+    uint32_t& at = g_lastLavaLog[bot->GetGUID().GetCounter()];
+    bool const log = now - at >= 5000;
+    if (log)
+        at = now;
+    Position dry;
+    if (!BotMovement::NearestNavPoint(bot, bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), 25.0f, 15.0f, dry))
+    {
+        if (log)
+            TC_LOG_INFO("playerbot.v2.raid", "[raid_lava] {} stands in magma at ({:.1f},{:.1f},{:.1f}), surface z {:.1f}, hp {}%: no navmesh point within 25 y",
+                bot->GetName(), bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), surface, uint32(bot->GetHealthPct()));
+        return false;
+    }
+    if (log)
+        TC_LOG_INFO("playerbot.v2.raid", "[raid_lava] {} stands in magma at ({:.1f},{:.1f},{:.1f}), surface z {:.1f}, hp {}%: leaves for ({:.1f},{:.1f},{:.1f})",
+            bot->GetName(), bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), surface, uint32(bot->GetHealthPct()),
+            dry.GetPositionX(), dry.GetPositionY(), dry.GetPositionZ());
+    return SetMove(out, dry.GetPositionX(), dry.GetPositionY(), dry.GetPositionZ(), "leave lava");
+}
+
 void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<Circle> const& circles, RaidOrder& out)
 {
     // 0. Scripted mechanics (Heigan's dance, Sapphiron's ice blocks) own the bot's movement while they run.
@@ -783,6 +907,10 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
     if (others.empty())
         return;
 
+    // Standing in lava or slime comes before every other move.
+    if (LeaveMagma(bot, now, out))
+        return;
+
     // 1. Carrier run (Living Bomb style): leave the group until clear of everyone.
     for (CarrierRun const& rule : rules.carrierRun)
         if (bot->HasAura(rule.aura) && Matches(rule.who, self, plan.mainTank))
@@ -792,13 +920,16 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                 nearest = std::min(nearest, Dist2D(bot->GetPositionX(), bot->GetPositionY(), p->GetPositionX(), p->GetPositionY()));
             if (nearest >= rule.clearDistance - 1.0f)
                 return; // already clear: stand still, do not run into other hazards
-            if (Clearest(bot, others, rule.clearDistance, out, "carrier run", circles, /*urgent*/ true)) { Remember(bot, out, now); return; }
+            g_carrierRun = true;
+            bool const found = Clearest(bot, others, rule.clearDistance, out, "carrier run", circles, /*urgent*/ true);
+            g_carrierRun = false;
+            if (found) { Remember(bot, out, now); return; }
             uint32_t& at = g_lastCarrierLog[bot->GetGUID().GetCounter()];
             if (now - at >= 3000)
             {
                 at = now;
-                TC_LOG_INFO("playerbot.v2.raid", "[raid] {} carries aura {} but found no reachable clear spot (nearest raider {:.0f} yd)",
-                    bot->GetName(), rule.aura, nearest);
+                TC_LOG_INFO("playerbot.v2.raid", "[raid] {} carries aura {} but found no reachable clear spot (nearest raider {:.0f} yd; {})",
+                    bot->GetName(), rule.aura, nearest, g_clearestWhy);
             }
             return;
         }
@@ -807,7 +938,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
     if (!circles.empty() && InsideAny(circles, bot->GetPositionX(), bot->GetPositionY(), 0.0f))
     {
         if (UseSticky(bot, circles, now, out)) return;
-        if (Escape(bot, circles, out)) { Remember(bot, out, now); return; }
+        if (Escape(bot, circles, out, self.tank ? &others : nullptr)) { Remember(bot, out, now); return; }
         return;
     }
     // Melee whose target stands inside a hazard for them: hold instead of chasing back in.
@@ -1253,15 +1384,14 @@ void ElectTankSwaps(Election& e)
 }
 
 // A boss that a Blink, a fear or a death left on a non-tank (Shazzrah's Gate of Shazzrah resets his threat and teleports him to a
-// random player; Magmadar's Panic scatters the tanks): a tank taunts it back at once, the main tank first, and takes the tank
-// assignment with it. Lucifron, Magmadar, Gehennas, Shazzrah. Logged as [raid_retaunt].
+// random player; Magmadar's Panic scatters the tanks; Ragnaros' Wrath resets it): a tank taunts it back at once, the main tank first, and
+// takes the tank assignment with it. The bosses are RaidRules::retaunt. Logged as [raid_retaunt].
 void ElectRetaunt(Election& e)
 {
-    static constexpr uint32_t kBosses[] = { 12118, 11982, 12259, 12264 };
     Plan& plan = e.plan;
     for (Unit* enemy : plan.enemies)
     {
-        if (std::find(std::begin(kBosses), std::end(kBosses), enemy->GetEntry()) == std::end(kBosses) || Controlled(enemy))
+        if (std::find(plan.rules->retaunt.begin(), plan.rules->retaunt.end(), enemy->GetEntry()) == plan.rules->retaunt.end() || Controlled(enemy))
             continue;
         Unit* held = enemy->GetVictim();
         Player* holder = held ? held->ToPlayer() : nullptr;
@@ -2118,7 +2248,7 @@ BossReadiness EvaluateBoss(uint32_t bossEntry, detail::Plan const& plan)
     return r;
 }
 
-// The gaps to the humans of the group (Karrz, MC Magmadar 2026-10-10: no hunter in the raid, nobody could remove Frenzy and only
+// The gaps to the humans of the group (chris, MC Magmadar 2026-10-10: no hunter in the raid, nobody could remove Frenzy and only
 // the log said so). Once per boss per minute, whether it is sent before the pull or at the engage.
 std::unordered_map<uint64_t, uint32_t> g_readyWarned;   // (group << 32 | boss entry) -> ms of the last warning
 
@@ -2152,7 +2282,7 @@ void WarnBeforePull(detail::Plan const& plan, Map* map, uint32_t now_ms)
         BossReadiness const r = EvaluateBoss(t->GetEntry(), plan);
         if (!r.any)
             continue;
-        // A human pull skips the bots' mana gate (Karrz pulled Magmadar with the healers at 58%), so the mana is checked here too.
+        // A human pull skips the bots' mana gate (chris pulled Magmadar with the healers at 58%), so the mana is checked here too.
         WarnOwners(map, plan.groupLow, t->GetEntry(), t->GetName(), r.missing, now_ms, r.healerManaPct);
         return;
     }
@@ -2288,7 +2418,7 @@ void EndQuietPulls(uint32_t now_ms)
                         ChatHandler(hp->GetSession()).SendSysMessage(fmt::format("Wipe: {} lasted {} s, {} died, first down {}.",
                             PullLabel(pl), (pl.lastSeenMs - pl.startMs) / 1000, pl.deaths,
                             pl.firstDead.empty() ? std::string("nobody seen") : pl.firstDead));
-        // [raid_wipe] encounter end (Karrz, MC Garr 2026-10-08: the whole raid dead and released, "A member of your group is in combat"
+        // [raid_wipe] encounter end (chris, MC Garr 2026-10-08: the whole raid dead and released, "A member of your group is in combat"
         // still blocked his release; the client's own encounter state stayed on). With nobody of the group alive on the map: end the
         // encounter for every group member, wherever they are (SendToPlayers reaches only the map), fail any boss still IN_PROGRESS
         // and make the mobs of the pull evade and reset.
@@ -2323,7 +2453,7 @@ void EndQuietPulls(uint32_t now_ms)
 
 } // namespace
 
-// [release] (Karrz, MC 2026-10-08: "A member of your group is in combat" blocks Release Spirit, which worked in the morning): while a human of
+// [release] (chris, MC 2026-10-08: "A member of your group is in combat" blocks Release Spirit, which worked in the morning): while a human of
 // the group is dead, every 5 s which members the client can see in combat, whether an offer is pending on him and whether the map's
 // encounter is on. The server's repop handler has no combat check; this shows what the client is reacting to.
 static void LogReleaseState(Group const* group, Map const* map, uint32_t now_ms)

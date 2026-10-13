@@ -161,6 +161,11 @@ private:
     // Per-(group, map) raid tank -> mob assignment, sticky while the mob
     // lives so tanks don't trade mobs (and threat) every plan.
     std::unordered_map<uint64, std::unordered_map<uint64, ObjectGuid>> last_tank_target_;
+    // Per-(group, map): the tank that held a mob when a group member's crowd control (Banish, Polymorph, Shackle) took it out of the
+    // assignment -> that tank, until when. When the CC ends the same tank takes the mob back first (MC Garr 2026-10-12: banished
+    // Firesworn came off and hit mages while the nearest tank was 27-57 y away).
+    struct CcHold { uint64 tank_low = 0; uint32 until_ms = 0; };
+    std::unordered_map<uint64, std::unordered_map<uint64, CcHold>> cc_held_;   // bucket -> mob guid counter -> hold
     // Per-(group, map) raid tank roster (guid lows, duty order): the tank-spec
     // members that act as tanks. Grows while the raid fights, shrinks back
     // out of combat; the other tank-spec bots play DPS (raid_dps_tank).

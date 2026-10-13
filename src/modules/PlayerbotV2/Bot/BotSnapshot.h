@@ -443,17 +443,17 @@ struct NearbyUnit
 
     // Hostile units only: average main-hand melee swing (UnitData Min/Max
     // damage, modifiers included). Classic healers sum it over the enemies
-    // meleeing a group member to estimate the next hits (Karrz's ike3
+    // meleeing a group member to estimate the next hits (chris's ike3
     // "preheal" incoming damage) for heal-target projection and rank
     // sizing (Combat/Apl/ApClassicHeal.h). 0 for friends.
     float      melee_swing = 0.f;
 
-    // ---- Threat discipline (port of Karrz's GroupPveRestraint /
-    // MCRaidHoldDamage / LooseAttackers, ike3-based bots ike3 playerbot). Read by the
+    // ---- Threat discipline (port of chris's GroupPveRestraint /
+    // MCRaidHoldDamage / LooseAttackers, wow-1.12 ike3 playerbot). Read by the
     // builder from the unit's ThreatManager on the build thread; consumed by
     // BotSnapshotView::threat_hold() and loose_attacker(). Zero / false on
     // units without a threat list (players, threatless creatures).
-    // The bot's threat on this unit: max(bot, bot's pet), as Karrz counts it.
+    // The bot's threat on this unit: max(bot, bot's pet), as chris counts it.
     float      my_threat = 0.f;
     // Highest threat any group TANK (see CombatTargetsState::group_tank)
     // within 50y of the unit holds on it. 0 when the group has no tank.
@@ -1479,7 +1479,7 @@ struct LootRollEntry
     uint8      vote_mask;
     bool       is_upgrade;
     bool       is_quest_item;
-    // Loot etiquette with a human in the group (Karrz's LootRollAction):
+    // Loot etiquette with a human in the group (chris's LootRollAction):
     // a human group member on the bot's map, and whether one of them could
     // use the item and would want it (HumanWouldWantItem).
     bool       human_in_group = false;
@@ -2655,6 +2655,9 @@ struct BotSnapshot
     // The owner is in the bot's group: the bot is a companion and does what its owner's party does, not world-bot
     // errands (questing, vendors, gathering, travel). See IdleRuleRegistry::tick.
     bool owner_in_group = false;
+    // Flat distance to the owner when it is on the bot's map, else -1. nearby_friends keeps only the 12 nearest friends, so in a raid
+    // the owner is rarely in it (companion_may_sit).
+    float owner_dist = -1.0f;
     // Owner "max dps" / "save mana" (BotAI::tactic_burn / tactic_save_mana), mirrored by the builder.
     bool tactic_burn = false;
     bool tactic_save_mana = false;
@@ -2934,6 +2937,7 @@ struct BotSnapshot
         owner_name.clear();
         owner_guid = ObjectGuid::Empty;
         owner_in_group = false;
+        owner_dist = -1.0f;
         tactic_burn = false;
         tactic_save_mana = false;
 

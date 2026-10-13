@@ -128,7 +128,7 @@ void DiagSkipUnfightable(BotSnapshotView const& s, ObjectGuid victim,
     }
 }
 
-// Emergency-survival item (Karrz's UsePotionsStrategy): at 30% health or
+// Emergency-survival item (chris's UsePotionsStrategy): at 30% health or
 // below use a healthstone, else the best healing potion in the bags for the
 // bot's level, unless a group heal is about to land (kept down to 20%). Not
 // mid-cast (a healer finishes its heal first), at most one combat consumable
@@ -490,7 +490,7 @@ bool MaybeUseOffensiveRacial(BotSnapshotView const& s, Role role, BotIntentEmitt
     return false;
 }
 
-// Mana refill (Karrz's UsePotionsStrategy): at 20% mana or below (a healer in
+// Mana refill (chris's UsePotionsStrategy): at 20% mana or below (a healer in
 // a boss fight: 35%) a conjured mana gem, then the best mana potion for the
 // level, then a Dark / Demonic Rune. Same cast / spacing / cooldown gates as
 // the healing item above.
@@ -507,7 +507,7 @@ bool MaybeUseManaPotion(BotSnapshotView const& s, GroupSnapshotView const& g, Bo
 } // anonymous
 
 // ---- Group threat discipline ----
-// Port of Karrz's ike3-based bots group threat rules (MoltenCoreDungeonActions.cpp
+// Port of chris's wow-1.12 group threat rules (MoltenCoreDungeonActions.cpp
 // MCRaidHoldDamage / MCRaidWaitForTank, MoltenCoreDungeonStrategies.cpp
 // GroupPveRestraint), generalised from Molten Core to any group with a tank.
 // The pure verdict lives in BotSnapshotView::threat_hold(); this layer adds
@@ -517,7 +517,7 @@ namespace {
 using ThreatHold = BotSnapshotView::ThreatHold;
 
 // First tick a (bot, target) pair entered the opening hold. Rules run on the
-// AI worker pool, so the map is shared and locked (Karrz's firstHeld map).
+// AI worker pool, so the map is shared and locked (chris's firstHeld map).
 std::mutex                         g_threat_hold_mu;
 std::unordered_map<uint64, uint32> g_threat_hold_since;
 struct FightWaitClock { uint32 first_ms; uint32 last_ms; };
@@ -529,7 +529,7 @@ std::unordered_map<uint64, FightWaitClock> g_threat_fight_clock;   // per bot: w
 // so its loose-attacker pick-up / taunt takes it). Non-victim DPS then hold
 // damage as if over threat until a tank has it back - every hit they land
 // now is threat the tank must out-taunt. Raids only: 5-man and non-elite
-// trash keep Karrz's "everyone fights a mob on a member" rule. The group
+// trash keep chris's "everyone fights a mob on a member" rule. The group
 // snapshot carries no cooldowns, so a tank's taunt readiness is approximated
 // by "on this mob or free".
 bool LooseRaidEliteOnMember(BotSnapshotView const& s, NearbyUnit const& u, GroupSnapshotView const* g)
@@ -664,7 +664,7 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
             "[raid_threat] {} holds damage on entry {} ({}): over threat mine={:.0f} tank={:.0f}",
             s.name(), u->entry, target.GetCounter(), u->my_threat, u->tank_threat);
     // Raid DPS wait for the owner's Attack: the tanks pull, everyone else holds until the owner presses Attack
-    // (/focus, an Engage order, or the group's mark release) - Karrz, MC Gehennas 2026-10-08. A mob that hits this
+    // (/focus, an Engage order, or the group's mark release) - chris, MC Gehennas 2026-10-08. A mob that hits this
     // bot or its pet is still answered (self-defence), and no mob held by a bot-led group is touched.
     if (h == ThreatHold::None && cfg.raid_dps_wait_attack() && s.is_in_raid() && g && !g->leader_is_bot() &&
         u->victim != s.guid() && ai.effective_role(s) != Role::Healer)
@@ -768,7 +768,7 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
 }
 
 // Over the tank's threat: shed it with the class's vanilla threat drop when
-// one is ready (Karrz's bots used the same set). Returns true on an emit.
+// one is ready (chris's bots used the same set). Returns true on an emit.
 bool TryThreatDrop(BotSnapshotView const& s, ObjectGuid target, BotIntentEmitter& emit)
 {
     struct Drop { uint8 cls; uint32 spell; uint32 needs_aura; bool on_target; };
@@ -788,7 +788,7 @@ bool TryThreatDrop(BotSnapshotView const& s, ObjectGuid target, BotIntentEmitter
 }
 
 // Loose elite / boss on this non-tank bot in a tanked dungeon or raid group
-// (Karrz's bots: the victim gets out of the way so the tank can pick the mob
+// (chris's bots: the victim gets out of the way so the tank can pick the mob
 // up). Hunter Feign Death, rogue Vanish (else Feint), priest Fade at once;
 // a mage Frost Novas a mob in melee reach first; then everyone steps toward
 // its anchor tank - a Classic healer casting its instant heals / HoTs /
@@ -955,7 +955,7 @@ bool RangedMeleedDefense(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView 
         {
             const float step = std::min(10.0f, dist - 5.0f);
             const float sx = bx + dx / dist * step, sy = by + dy / dist * step, sz = bz + dz / dist * step;
-            // Never into an idle pack's aggro reach: the run to the tank pulled the next pack (Karrz, Deadmines 2026-10-10).
+            // Never into an idle pack's aggro reach: the run to the tank pulled the next pack (chris, Deadmines 2026-10-10).
             if (!RaidStandPointBlocked(s, sx, sy, sz) && !RaidPointInUnpulledReach(s, sx, sy, sz))
             {
                 if (emit.move_to(sx, sy, sz, /*run*/ true) || s.has_path_destination())
@@ -978,7 +978,7 @@ bool RangedMeleedDefense(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView 
     return true;
 }
 
-// Raid overheal cancel - the "stopcast" technique (Karrz's ike3 healers stop a
+// Raid overheal cancel - the "stopcast" technique (chris's ike3 healers stop a
 // heal whose target got topped up meanwhile). Direct single-target heals
 // only: no channel, no Chain Heal, no party / area heal (Prayer of Healing's
 // cast target is the priest itself). Mana is spent when a cast completes, so
@@ -1118,7 +1118,7 @@ bool PreemptiveTankHeal(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView c
 }
 
 // Hold on a target the bot is NOT attacking (the re-acquire paths): a melee
-// bot still walks up to the mob - Karrz's "reach melee" was never vetoed -
+// bot still walks up to the mob - chris's "reach melee" was never vetoed -
 // so it is in place the moment the hold lifts. Returns true when it claimed
 // the tick.
 bool ThreatHoldWait(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& emit,
@@ -1555,7 +1555,12 @@ bool MeleeSpreadSpot(BotSnapshotView const& s, GroupSnapshotView const& g, Nearb
     {
         const uint32 rank = (k + i * 3) % n;   // a blocked slot tries the one three along
         float x, y;
-        MeleeArcSpot(s.guid().GetCounter(), rank, n, v.x, v.y, v.o, 1.0f, outer, x, y);
+        // Raid (chris 2026-10-12): melee stack on the boss's back, nearly on top of each other, unless a boss rule spreads them. A 70 degree
+        // arc instead of the 160 degree one of a dungeon pack.
+        if (s.is_in_raid())
+            MeleeArcSpot(s.guid().GetCounter(), rank, n, v.x, v.y, v.o, 1.0f, outer, x, y, 1.2217f);
+        else
+            MeleeArcSpot(s.guid().GetCounter(), rank, n, v.x, v.y, v.o, 1.0f, outer, x, y);
         if (RaidStandPointBlocked(s, x, y, v.z)) continue;
         ox = x; oy = y;
         static std::atomic<uint32> s_last_log{ 0 };
@@ -2200,7 +2205,7 @@ void DispatchInCombat(BotAI& ai,
     // the anchor tank or around the pillar, staying out of the melee splash
     // and ground hazards - before the healer follow / gap-close below, which
     // only react to range.
-    // Under an owner Stay / Hold the bot keeps its spot unless a mob is on it (Karrz, Deadmines 2026-10-10: Edrin and Graziella
+    // Under an owner Stay / Hold the bot keeps its spot unless a mob is on it (chris, Deadmines 2026-10-10: Edrin and Graziella
     // kept stepping 10-16 y for LoS under Stay).
     bool held_in_place = false;
     if (ai.holding_position(snapshot.published_at_ms()))
@@ -2499,7 +2504,7 @@ void DispatchInCombat(BotAI& ai,
 
     // ---- The owner's skull (else cross) is the DPS target in every group ----
     // The raid kill focus carries it in raids; 5-man and open-world groups have no coordinator focus, so a DPS bot that
-    // already fights something would stay on it (Karrz 2026-10-08: "DPS should follow the skull all the time"). Tanks hold
+    // already fights something would stay on it (chris 2026-10-08: "DPS should follow the skull all the time"). Tanks hold
     // aggro and healers heal; an idle mark still needs the owner's order (MarkGate) and the tank's opening lead (threat hold).
     if (!snapshot.in_battleground() && group.exists() && snapshot.is_alive() && !snapshot.is_casting())
     {
@@ -2683,7 +2688,7 @@ void DispatchInCombat(BotAI& ai,
             if (fcx != 0.f || fcy != 0.f)
             {
                 const float dx = fcx - bx, dy = fcy - by;
-                // An enemy within 30 y wins over the return (Karrz, WSG 2026-10-09: a druid on this rule stood in the tunnel for 40 s
+                // An enemy within 30 y wins over the return (chris, WSG 2026-10-09: a druid on this rule stood in the tunnel for 40 s
                 // with "no target" while enemy players ran past): the escort fights what is in front of it, and returns when none is close.
                 bool escort_enemy_close = false;
                 for (auto const& e : snapshot.nearby_enemies())
@@ -2777,7 +2782,7 @@ void DispatchInCombat(BotAI& ai,
                 // runner's job IS to run the flag, not trade blows mid-field;
                 // it pushes through, fighting only incidentally. Other roles
                 // (Attacker/Defender/Healer) hold the line.
-                // 2026-10-08 (WSG test, Karrz: "running past each other without fighting"; [dps_idle] "85 s idle:
+                // 2026-10-08 (WSG test, chris: "running past each other without fighting"; [dps_idle] "85 s idle:
                 // combat:bg_fc_advance_flag, enemy at 3.8 y"): this rule returned before the rotation every tick, so every
                 // Roamer / carrier-seeker ran through the enemy team without casting or swinging. An enemy within 22 y now wins:
                 // the bot fights it (the rotation below closes and chases), and runs for the flag only when nothing hostile is
@@ -2976,7 +2981,7 @@ void DispatchInCombat(BotAI& ai,
                       switch_rule = "combat:bg_focus_enemy_healer"; }
                 }
             }
-            // Victim validity (Karrz, WSG 2026-10-09: a priest stood beside him swinging at nothing): a victim that is gone, dead,
+            // Victim validity (chris, WSG 2026-10-09: a priest stood beside him swinging at nothing): a victim that is gone, dead,
             // untargetable, unreachable, or a creature that does not fight us while an enemy player is close is dropped for the
             // nearest enemy player, or released when there is none (the attacker seeding below picks the next one).
             if (switch_to.IsEmpty() && !snapshot.victim().IsEmpty())
@@ -3283,7 +3288,7 @@ void DispatchInCombat(BotAI& ai,
     // is_alive guard, not hp > 0: a released ghost main tank has hp == 1
     // and would otherwise soak front-loaded heals all corpse run.
     // Classic 1.60 healers skip this pin: their APL heal picker
-    // (Combat/Apl/ApClassicHeal.h, Karrz's HealScore) already weighs the
+    // (Combat/Apl/ApClassicHeal.h, chris's HealScore) already weighs the
     // heal_focus (+20) against emergencies elsewhere and downranks the cast,
     // and the retail ClassOocHeal ids are not the vanilla heals.
     {
@@ -3559,7 +3564,8 @@ void DispatchInCombat(BotAI& ai,
             default: break;
         }
         // A tank holds the boss and never rezzes in the fight (MC Garr 2026-10-10: the bear tank cast Rebirth mid-fight, twice refused).
-        if (brez_spell != 0 && ai.effective_role(snapshot) != Role::Tank && snapshot.knows_spell(brez_spell) && snapshot.is_ready(brez_spell))
+        if (brez_spell != 0 && ai.effective_role(snapshot) != Role::Tank && snapshot.knows_spell(brez_spell) && snapshot.is_ready(brez_spell)
+            && (snapshot.cls() != CLASS_DRUID || snapshot.power(0) >= snapshot.mana_cost(snapshot.resolve_rank(brez_spell) ? snapshot.resolve_rank(brez_spell) : brez_spell)))   // mana: the core refuses an unaffordable Rebirth NO_POWER
         {
             // Target: a corpse in range and line of sight, healers then tanks
             // first. A corpse another member is already battle-rezzing (any
@@ -3598,7 +3604,7 @@ void DispatchInCombat(BotAI& ai,
     if (snapshot.is_casting()) return;
 
     // ---- Group threat discipline: DPS / healer restraint ----
-    // Karrz's MCRaidHoldDamage: a non-tank bot must not out-threat the tank.
+    // chris's MCRaidHoldDamage: a non-tank bot must not out-threat the tank.
     // While held on its victim it stops swinging / shooting / wanding
     // (cancel_cast here only ends the auto-repeat slot - a real cast already
     // returned above), calls its pet off that mob, and over the ratio sheds

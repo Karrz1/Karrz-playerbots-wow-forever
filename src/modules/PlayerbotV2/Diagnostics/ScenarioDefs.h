@@ -69,7 +69,7 @@ struct ScenarioDef
     // damage leg measures. 0 = not a parity scenario.
     std::uint8_t parity = 0;
     std::uint32_t parity_leg_s = 180;
-    // The name of a member played like Karrz's own character: from the start of the run its AI is detached and the runner drives it,
+    // The name of a member played like chris's own character: from the start of the run its AI is detached and the runner drives it,
     // following the main tank and attacking what the tank attacks (a player who only presses "assist"). The group logic still sees a
     // bot-led group. nullptr = every member runs its own AI.
     char const* stand_in = nullptr;
@@ -79,7 +79,7 @@ struct ScenarioDef
     std::vector<ScenarioCheckpoint> checkpoints;
 };
 
-// The party every dungeon scenario uses: the shape of Karrz's own (tank, healer, mage, rogue) plus a hunter for the fifth. The same
+// The party every dungeon scenario uses: the shape of chris's own (tank, healer, mage, rogue) plus a hunter for the fifth. The same
 // five characters are re-levelled and re-geared for each dungeon, so a full run of the set makes five characters, not sixty.
 inline std::vector<ScenarioMember> StandardParty()
 {
@@ -201,6 +201,7 @@ inline constexpr RaidBossRow kMcBosses[] = {
     { "mc_magmadar",  "Molten Core: 40 level 60 raiders to Magmadar",  11982, "Magmadar",  15, 0, 1 },          // Frenzy must be tranquilized
     { "mc_gehennas",  "Molten Core: 40 level 60 raiders to Gehennas",  12259, "Gehennas",  15, 11661, 0, 1 },   // Flamewaker; Gehennas' Curse must be removed
     { "mc_geddon",    "Molten Core: 40 level 60 raiders to Baron Geddon", 12056, "Baron Geddon", 15 },   // Inferno (19698, 20 y): the raid must leave his range; more than 6 deaths fails it
+    { "mc_ragnaros",  "Molten Core: 40 level 60 raiders to Ragnaros",  11502, "Ragnaros",  20 },   // Elemental Fire on the tank, Wrath threat reset and knockback, Magma Blast on a target out of melee reach, submerge at 3 min (Sons of Flame)
 };
 
 inline ScenarioDef MakeMcScenario(RaidBossRow const& r)
@@ -309,7 +310,7 @@ inline std::vector<ScenarioDef> const& ScenarioCatalogue()
                               { "smite", 646, -2.585f, -766.284f, 6.172f },   // [41] the ramp up to the ship
                               { "greenskin", 647, -89.643f, -781.119f, 29.200f },   // [47] the gangway
                               { "vancleef", 639, -49.167f, -795.944f, 38.956f } };   // [50] the deck
-            // The same clear with the rogue played like Karrz's own: it follows the tank and hits the tank's target, nothing else.
+            // The same clear with the rogue played like chris's own: it follows the tank and hits the tank's target, nothing else.
             ScenarioDef p = d;
             p.name = "deadmines_player";
             p.summary = "Deadmines: level 21 party with a rogue played like a player, entrance to Edwin VanCleef";

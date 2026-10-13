@@ -5,7 +5,7 @@
 // Blessings, candles / powder / berries for the group buffs, Rebirth seeds,
 // Ankhs, Flash Powder, soul shards. Every class is also kept in a small stock
 // of vendor food, water (mana users), healing and mana potions and bandages,
-// as Karrz's factory does (PlayerbotFactory::InitFood / InitPotions). ike3's playerbots hand these to bots
+// as chris's factory does (PlayerbotFactory::InitFood / InitPotions). ike3's playerbots hand these to bots
 // (PlayerbotFactory::InitReagents); PlayerbotV2 does the same through
 // PlayerbotAPI::restock_class_supplies when PlayerbotV2.Classic.ClassSupplies
 // is on.
@@ -67,6 +67,15 @@ TC_GAME_API SupplyFamily const* FindSupplyFamily(std::string_view name);
 // Highest rank of `family` usable at `level` that the server knows; 0 when none.
 TC_GAME_API uint32 BestSupplyRank(SupplyFamily const& family, uint8 level);
 
+// ---- Group buff spells ----
+// The party versions of the class buffs (Prayer of Fortitude, Prayer of Shadow Protection, Arcane Brilliance, Gift of the Wild) and
+// their higher ranks: a vanilla player trains them at 48-60, but the Forever trainers do not list them (MC mc_garr 2026-10-12: "spell
+// not known" for every one of them on level 60 bots), so the supplies restock teaches the ones the bot's level allows.
+TC_GAME_API std::span<uint32 const> GroupBuffSpells(uint8 cls);
+// Whether `spell` exists in the spell data, is within a bot of `level`, and has an aura effect (Gift of the Wild has none in Forever's data:
+// learning it would give a bot a buff that buffs nobody).
+TC_GAME_API bool LearnableGroupBuff(uint32 spell, uint8 level);
+
 // ---- Ammo for the equipped bow / crossbow / gun (Playerbot.Behavior.AmmoSupply) ----
 // Kinds match the snapshot's ammo_kind: 1 = arrows (bow, crossbow), 2 = bullets (gun).
 // The restock tops the bags up to AMMO_TARGET (several stacks) once the stock is under
@@ -90,6 +99,7 @@ struct RaidConsumable
     bool   food;     // buff is "Well Fed" (the eating spell triggers it) rather than the item's own spell
     uint8  stock;    // how many a bot is kept stocked with
     bool   flask = false;   // a flask: it fills both elixir slots, so an elixir used on top of it removes it (MC Garr 2026-10-11: Mageblood took the +2000 mana of a Flask of Distilled Wisdom off five healers)
+    bool   combat = false;  // drunk in the fight when the encounter data orders it (RaidRules::resistPotion), never in the pre-pull; only stocked
 };
 
 TC_GAME_API std::span<RaidConsumable const> RaidConsumablesFor(RaidConsumableRole role);
@@ -104,7 +114,7 @@ TC_GAME_API uint8 RaidConsumableStock(uint32 item);
 template <typename Buffed>
 bool ElixirOverFlask(RaidConsumableRole role, RaidConsumable const& c, Buffed buffed)
 {
-    if (c.food || c.flask)
+    if (c.food || c.flask || c.combat)
         return false;
     for (RaidConsumable const& k : RaidConsumablesFor(role))
         if (k.flask && buffed(k))
@@ -119,7 +129,7 @@ template <typename InBags, typename Buffed>
 RaidConsumable const* NextRaidConsumable(RaidConsumableRole role, InBags in_bags, Buffed buffed)
 {
     for (RaidConsumable const& c : RaidConsumablesFor(role))
-        if (!buffed(c) && in_bags(c.item) && !ElixirOverFlask(role, c, buffed))
+        if (!c.combat && !buffed(c) && in_bags(c.item) && !ElixirOverFlask(role, c, buffed))
             return &c;
     return nullptr;
 }

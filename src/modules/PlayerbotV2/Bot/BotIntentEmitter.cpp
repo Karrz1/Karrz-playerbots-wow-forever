@@ -262,9 +262,18 @@ bool BotIntentEmitter::start_attack(ObjectGuid target)
         if (ai_ && school_snap_)
         {
             BotAI::RaidSchoolState& rs = ai_->raid_school();
-            if (rs.hold_target != target)
+            // Once a minute per bot and mob: the bot flips between the immune mob and its fallback target every tick (Rag's submerge,
+            // MC 2026-10-12: 3807 lines in one fight), and the first line already says why (the [raid_school_why] line names the aura).
+            static std::unordered_map<uint64_t, uint32_t> sLogged;
+            uint64_t const lkey = (school_snap_->guid.GetCounter() << 24) ^ target.GetCounter();
+            uint32_t const lnow = school_snap_->published_at_ms;
+            uint32_t& lat = sLogged[lkey];
+            if (rs.hold_target != target && (!lat || lnow - lat > 60000))
+            {
+                lat = lnow;
                 TC_LOG_INFO("playerbot.v2", "[raid_school] {} on {}: immune to every school -> not attacking it",
                     school_snap_->identity.name, target.ToString());
+            }
             rs.hold_target = target;
             rs.hold_mask   = 0;
         }

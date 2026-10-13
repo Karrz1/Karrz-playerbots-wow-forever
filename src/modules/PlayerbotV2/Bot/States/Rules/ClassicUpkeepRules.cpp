@@ -218,6 +218,7 @@ bool RaidBuffsFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     {
         ai.note_action_retry(BotAI::ActionKind::ClassUpkeep, b.key, now_ms);
         ai.note_buff_cast(b.key, now_ms);
+        Classic::NoteAreaBuffCast(s.guid(), b.key, b.area_needy, now_ms);
     }
     // [raid_support] why this class buff goes out (MC Garr 2026-10-10: the druids cast Mark of the Wild over and over): the target's
     // tracked buffs as the group snapshot sees them, once per caster and key per minute.

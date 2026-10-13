@@ -101,7 +101,7 @@ void WarnOversizedInstanceGroups(uint32 now_ms)
             if (open_world)
             {
                 // Open world: any owner whose companions out exceed the cap, grouped with them or not (a player who logged in
-                // with 9 companions still online from before the cap, Karrz 2026-10-08).
+                // with 9 companions still online from before the cap, chris 2026-10-08).
                 // Companions above the open-world cap (called in an instance, or relogged with a big group) are dismissed once
                 // the owner has stood outside for kTrimGraceMs. Invited world bots are not owned, so they are never trimmed.
                 uint32 const open_cap = InstanceGroupCapFor(p, nullptr);
@@ -1134,6 +1134,12 @@ void BotPopulationManager::CompanionUpkeep(BotId id, Player* p)
     GrantCompanionStarterPet(id, p);
     // A companion geared before per-bot gear variety wears the same top pick per slot as every other bot of its class
     // and level; it gets its one re-roll here (or in FinishCompanionSetup when it is called), whichever comes first.
+    // A level-cap companion that has had the first re-roll but not the raid-gear variety pass gets it here (RerollCompanionGear).
+    if (Services::Owners().GearVaried(id) && !Services::Owners().GearVariedRaid(id) && Gear::RaidGearActive(p->GetLevel()))
+    {
+        uint32 changed = 0;
+        RerollCompanionGear(p, changed);
+    }
     if (!Services::Owners().GearVaried(id))
     {
         uint32 changed = 0;
@@ -1682,7 +1688,7 @@ static int32 OwnerGearCap(Player const* bot)
 // where the slot is empty or the pick scores at least kRaidUpgradeRatio above the worn piece (Gear::ScoreItemRaid, the
 // same score the generator ranks by), so existing gear is only ever upgraded. A two-hander replaces a mainhand + offhand
 // pair only when it beats their combined score. Logs one "[gear]" line. Returns the number of slots changed. World thread.
-static uint32 RaidRegearPass(Player* p, bool& refused_any, bool only_over_cap = false, bool reroll_all = false)
+static uint32 RaidRegearPass(Player* p, bool& refused_any, bool only_over_cap = false, bool reroll_all = false, bool vary = false)
 {
     refused_any = false;
     uint8 const lvl = p->GetLevel();
@@ -1703,6 +1709,11 @@ static uint32 RaidRegearPass(Player* p, bool& refused_any, bool only_over_cap = 
             ctx.ilvl_cap = OwnerGearCap(p);
     }
     std::vector<Gear::GearItem> const picks = Gear::GenerateGearFor(ctx);
+    // Variety (an owned level-cap companion, once): the generator picks among the best few pieces by the bot's guid, but the regear only
+    // ever upgraded, so companions geared before variety all still wear the same top piece per slot. A worn piece goes for the bot's own
+    // pick when the pick is the same quality or better and scores within 5% of it; a tier-set or best-in-slot choice is the owner's.
+    bool const vary_ok = vary && !ctx.world_bot() && !Gear::Owned::IsCapMode(ctx.gear_mode);
+    constexpr float kVaryFloor = 0.95f;
 
     auto slot_score = [&](Item const* it, uint8 slot) -> int32
     {
@@ -1768,7 +1779,9 @@ static uint32 RaidRegearPass(Player* p, bool& refused_any, bool only_over_cap = 
                 // An off hand that is not a weapon on a class that must have one (rogue, non-protection warrior, hunter, enhancement shaman) goes for any weapon pick.
                 bool const dead_offhand = ::Playerbot::Gear::OffhandMustBeWeapon(cls, ctx.spec) && g.slot == EQUIPMENT_SLOT_OFFHAND && cur->GetTemplate() &&
                                           cur->GetTemplate()->GetClass() != ITEM_CLASS_WEAPON && gtpl->GetClass() == ITEM_CLASS_WEAPON;
-                bool const better = tier_pick || worn_pvp || dead_offhand || worn_over || (reroll_all && ctx.world_bot()) || (cur_score <= 0 ? pick_score > cur_score
+                bool const vary_swap = vary_ok && cur_score > 0 && !off_for_2h && cur->GetTemplate() &&
+                                       gtpl->GetQuality() >= cur->GetTemplate()->GetQuality() && float(pick_score) >= float(cur_score) * kVaryFloor;
+                bool const better = vary_swap || tier_pick || worn_pvp || dead_offhand || worn_over || (reroll_all && ctx.world_bot()) || (cur_score <= 0 ? pick_score > cur_score
                                                                 : float(pick_score) >= float(cur_score) * Gear::kRaidUpgradeRatio);
                 if (!better)
                     continue;
@@ -1852,6 +1865,19 @@ BotPopulationManager::RerollResult BotPopulationManager::RerollCompanionGear(Pla
     {
         bool refused = false;
         changed_slots = RaidRegearPass(p, refused);
+        // Once per companion: swap the clone-top pieces for the bot's own near-equal picks.
+        bool const first_vary = !Services::Owners().GearVariedRaid(id);
+        if (first_vary)
+        {
+            bool refused_v = false;
+            uint32 const varied = RaidRegearPass(p, refused_v, /*only_over_cap=*/false, /*reroll_all=*/false, /*vary=*/true);
+            changed_slots += varied;
+            if (!refused_v)
+            {
+                Services::Owners().MarkGearVariedRaid(id);
+                TC_LOG_INFO("playerbot.v2", "[gear_vary] {}: {} piece(s) swapped for its own picks", p->GetName(), varied);
+            }
+        }
         if (EnsureShieldTankWeapon(p))
             ++changed_slots;
         return RerollResult::Done;
@@ -1967,7 +1993,7 @@ BotPopulationManager::RerollResult BotPopulationManager::RerollCompanionGear(Pla
     return RerollResult::Done;
 }
 
-// Karrz 2026-10-08 (MC raid): WSG bots (Dascard, Nadoc, Brahad) sat in his raid group while he was dead in Molten Core, and their combat in
+// chris 2026-10-08 (MC raid): WSG bots (Dascard, Nadoc, Brahad) sat in his raid group while he was dead in Molten Core, and their combat in
 // the battleground greyed out his Release Spirit ("a member of your group is in combat"). A pool / JIT bot has no business in a human's
 // regular group while it is in a battleground: its battleground group is the BG group, and an earlier group (the "original group" a
 // battleground restores on leaving, or one it never left) is dropped here. Owned companions keep their owner's group. Every 10 s.
@@ -2003,7 +2029,7 @@ void BotPopulationManager::BgGroupHygiene(uint32 now_ms)
     });
 }
 
-// Karrz 2026-10-08: world, pool and BG bots are T1 at most and mostly blue; bots made before that cap (or logged in with a worn T3 piece)
+// chris 2026-10-08: world, pool and BG bots are T1 at most and mostly blue; bots made before that cap (or logged in with a worn T3 piece)
 // kept their gear until the 5 minute sweep, and then only 25 per sweep. Every 15 s this walks the online bots, and any bot without an owner
 // that wears a piece above the world cap (or an epic beyond its share) is regeared right away under the world rules, up to 8 bots a pass.
 // Covers login (the next pass) and BG entry (the bot is online and in the world by then). Logs one [gear] scrub line per bot.
@@ -4556,7 +4582,7 @@ void BotPopulationManager::TopUpActiveBGs(uint32 now_ms)
             if (!is_prep && !is_running) continue;
             // Only SUSTAIN a RUNNING battleground that has a human in it. A bot-only running match is not refilled: it runs down and ends
             // on its own, so few instances stay alive and real players are put into the ones that are (owner directive 2026-06-17, confirmed
-            // by Karrz 2026-10-11: as few instances as possible, as many real players in each). PREP BGs are left ungated so a forming
+            // by chris 2026-10-11: as few instances as possible, as many real players in each). PREP BGs are left ungated so a forming
             // human match still fills before its gates open (the human is invited but may not have entered m_Players yet).
             bool const has_human = BgHasHumanPlayer(bg);
             if (is_running && !has_human) continue;
