@@ -34,6 +34,8 @@ Whisper and Invite, and a whisper box that works inside battlegrounds). Nothing 
 
 What the buttons and chat orders do: [`src/modules/PlayerbotV2/BOT_COMMANDS.md`](src/modules/PlayerbotV2/BOT_COMMANDS.md).
 
+New to the bots? Read the [player guides](docs/guides/README.md): getting started, your first group, dungeons and raids, trading, gear, battlegrounds and the FAQ.
+
 ## Server owners
 
 This repository contains the bot module, the SQL, the settings, and the files of advocaite's TrinityCore `forever` branch that the
