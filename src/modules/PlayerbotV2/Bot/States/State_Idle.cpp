@@ -528,7 +528,7 @@ static IdleConsumeThresholds GetIdleConsumeThresholds(BotAI const& ai)
     return {60, 50, 30};
 }
 
-// OOC eat / drink to top off HP / mana between pulls (Karrz's
+// OOC eat / drink to top off HP / mana between pulls (chris's
 // UseFoodStrategy): only when it is safe to sit - nothing attacks the bot and
 // nobody is fighting within 45 yards - and never while moving or mounted.
 // Food (health) and drink (mana) are told apart by their spell, so a warrior
@@ -987,7 +987,7 @@ bool MaintainOocHeal(BotSnapshotView const& s, GroupSnapshotView const& g,
     if (effective_role != Role::Healer) return false;
     if (!g.exists()) return false;
     // Classic 1.60 (single-spec class data): the vanilla efficient heal,
-    // Karrz's heal-target scoring (range, LOS, tank first) and downranking
+    // chris's heal-target scoring (range, LOS, tank first) and downranking
     // to the deficit (Combat/Apl/ApClassicHeal.h). The retail ClassOocHeal
     // ids (77472 Healing Wave, ...) do not exist for these bots.
     if (Classic::IsSingleSpecClass(s.cls()))
@@ -1081,7 +1081,7 @@ bool MaintainOocRez(BotSnapshotView const& s, GroupSnapshotView const& g,
     // starting the same 10 s cast (Combat::ClassicHeal::RezTarget).
     // (Mass Resurrection above is self-cast AoE - left ungated.)
     constexpr float kRezCastRange = 28.0f;
-    if (Combat::ClassicHeal::RaidFightLive(g, s.map_id())) return false;   // only a druid raises in a live fight
+    if (Combat::ClassicHeal::RezFightOn(s, g)) return false;   // only a druid raises in a live fight
     const ObjectGuid target = Combat::ClassicHeal::RezTarget(s, g, kRezCastRange,
         [](GroupMemberSummary const& m) { return ClassOocRez(m.cls) != 0 && m.level >= 10; });
     if (target.IsEmpty()) return false;
@@ -1099,7 +1099,7 @@ bool RaidOocRez(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g,
 {
     if (!s.is_in_raid() || s.in_battleground() || !g.exists() || !g.members()) return false;
     const uint32 rez = ClassOocRez(s.cls());
-    // [raid_rez] skip: a rezzer class with a dead member on its map says why it does not rez (Karrz, MC 2026-10-08: the raid stood
+    // [raid_rez] skip: a rezzer class with a dead member on its map says why it does not rez (chris, MC 2026-10-08: the raid stood
     // around his corpse), at most once per 5 s per bot.
     auto skip = [&](char const* why) -> bool
     {
@@ -1123,9 +1123,9 @@ bool RaidOocRez(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g,
     if (s.is_casting())    return skip("busy casting");
     // The core refuses a rez cast from a bot that is in combat at all (AFFECTING_COMBAT; MC Garr 2026-10-10: healers in combat with the adds
     // spent the fight on raid:ooc_rez and were refused each time), so the test is the core's own: any combat, stalker-only included. And a
-    // rez waits for the fight to end while a tank of the group is still in it: the healers heal first (Karrz: rez after the encounter).
+    // rez waits for the fight to end while a tank of the group is still in it: the healers heal first (chris: rez after the encounter).
     if (s.in_combat()) return skip("in combat");
-    if (Combat::ClassicHeal::RaidFightLive(g, s.map_id())) return skip("the fight is still on");
+    if (Combat::ClassicHeal::RezFightOn(s, g)) return skip("the fight is still on");
     if (!rez || s.cls() == CLASS_DRUID) return false;
     if (!s.knows_spell(rez))  return skip("spell not known");
     if (!g.dead_member(s.map_id())) return false;
@@ -2224,7 +2224,7 @@ static NearbyUnit const* UnpulledPackReaching(BotSnapshotView const& s, DungeonA
 // pack's edge may still step along or away from it; it never steps further in.
 bool RaidPointInUnpulledReach(BotSnapshotView const& s, float x, float y, float z)
 {
-    // Raid and 5-man alike (Karrz, Deadmines 2026-10-10: a mage / warlock that was hit ran, and the run took it into the next
+    // Raid and 5-man alike (chris, Deadmines 2026-10-10: a mage / warlock that was hit ran, and the run took it into the next
     // pack, which pulled too).
     if (!s.is_in_instance() || s.in_battleground()) return false;
     const uint32 now_ms = s.published_at_ms();
@@ -2580,9 +2580,12 @@ static char const* RaidRangedSlotInvalid(Player* self, GroupMemberSummary const&
 // mob), and the pre-pull spots kPrePullMinSpacing (6 y) on three (22 / 28 /
 // 34 y behind the anchor, +-90 deg).
 // Defaults at the "close" preset (4 y); the owner's spacing preset (BotAI::formation_spacing_scale: tight .625,
-// close 1, spread 2) scales it. Karrz 2026-10-06: the 5-6 y arcs left the raid far too spread out.
-constexpr float kRaidRangedMinSpacing = 3.5f;
-constexpr float kRaidRangedArcMax     = 2.0944f;   // +-120 deg
+// close 1, spread 2) scales it. Chris 2026-10-06: the 5-6 y arcs left the raid far too spread out.
+constexpr float kRaidRangedMinSpacing = 3.0f;
+// Chris 2026-10-12: the raid spread over a large area in boss fights and pulled extra packs. Three tight rows (22 y, one spacing in, one
+// spacing out) over +-50 deg hold about 33 ranged / healers in a block roughly 30 y wide and 7 deep; the old two rows over +-120 deg
+// put the same raid on a 90 y arc.
+constexpr float kRaidRangedArcMax     = 0.8727f;   // +-50 deg
 static bool GroupRangedOrHealer(GroupMemberSummary const& m)
 {
     if (m.role == Role::Tank) return false;
@@ -2754,8 +2757,43 @@ static bool RaidRangedApproachTank(BotSnapshotView const& s, BotAI& ai,
     // Own slot: 22 y arc first, then the 17 y one (both within 30 y of the
     // tank's mob), neighbours kRaidRangedMinSpacing apart (RaidRangedArcSlot).
     const float ranged_spacing = std::max(2.0f, kRaidRangedMinSpacing * ai.formation_spacing_scale());
-    RaidArcSlot const as = RaidRangedArcSlot(s, g, { kRaidRangedStandOff, kRaidRangedStandOff - ranged_spacing },
-                                             ranged_spacing, kRaidRangedArcMax);
+    // An avoid circle round the fight's enemy (Geddon's 24 y ranged / healer circle, the Inferno in progress) blocks every stand point
+    // inside its radius plus the hazard margin, and the tank stands up to 15 y in front of the enemy, so rows measured from the tank landed
+    // 13-20 y from it (MC Geddon 2026-10-12, 27 Inferno deaths) or inside the circle and were all refused. With such a circle near the tank the
+    // rows are measured from its centre instead and start outside it (boss distance = row radius on the whole arc), as far as the 30 y spells
+    // reach (kRaidSlotSpellReach), on a wider arc (+-70 deg) so two rows still hold the raid.
+    float cx = tk.x, cy = tk.y;
+    float row0 = kRaidRangedStandOff;
+    float arc_max = kRaidRangedArcMax;
+    bool boss_rows = false;
+    if (Services::Config().behavior_avoid_circles())
+    {
+        PveOrder const& po = s.raw().pve_order;
+        if (po.active)
+            for (size_t i = 0; i < std::min<size_t>(po.avoid_circle_count, po.avoid_circles.size()); ++i)
+            {
+                PveOrder::AvoidCircle const& c = po.avoid_circles[i];
+                const float need = c.r + kHazardMargin + 1.0f;
+                if (need <= row0 || need > kRaidSlotSpellReach - 5.0f) continue;
+                const float ctx = c.x - tk.x, cty = c.y - tk.y;
+                if (ctx * ctx + cty * cty > 15.0f * 15.0f) continue;
+                if (fight)
+                {
+                    const float cfx = c.x - fight->x, cfy = c.y - fight->y;
+                    if (cfx * cfx + cfy * cfy > 4.0f * 4.0f) continue;
+                }
+                row0 = need; cx = c.x; cy = c.y; boss_rows = true;
+            }
+    }
+    RaidArcSlot as;
+    if (boss_rows)
+    {
+        arc_max = 1.2217f;
+        as = RaidRangedArcSlot(s, g, { row0, row0 + ranged_spacing }, ranged_spacing, arc_max);
+    }
+    else
+        as = RaidRangedArcSlot(s, g, { kRaidRangedStandOff, kRaidRangedStandOff - ranged_spacing, kRaidRangedStandOff + ranged_spacing },
+                               ranged_spacing, arc_max);
     const float slot = as.angle, step = as.step, ar = as.radius;
     struct Cand { float a, r; bool own; };
     Cand cands[5 + std::size(kRaidStandBearings)];
@@ -2773,8 +2811,8 @@ static bool RaidRangedApproachTank(BotSnapshotView const& s, BotAI& ai,
     auto point = [&](Cand const& c, float& px, float& py)
     {
         const float co = std::cos(c.a), sn = std::sin(c.a);
-        px = tk.x + (dx * co - dy * sn) * c.r;
-        py = tk.y + (dx * sn + dy * co) * c.r;
+        px = cx + (dx * co - dy * sn) * c.r;
+        py = cy + (dx * sn + dy * co) * c.r;
     };
     if (slot_tolerance > 0.0f)
     {
@@ -2875,7 +2913,7 @@ static bool RaidRangedApproachTank(BotSnapshotView const& s, BotAI& ai,
     return false;
 }
 
-// In-fight formation (Karrz, MC Gehennas 2026-10-08: "some way of keeping a formation so we can pull them back and forward"):
+// In-fight formation (chris, MC Gehennas 2026-10-08: "some way of keeping a formation so we can pull them back and forward"):
 // while the anchor tank fights, a raid ranged DPS / healer keeps its own arc slot (RaidRangedArcSlot, kRaidRangedStandOff behind the
 // tank, away from its mob) and re-takes it once the tank (the boss pulled back, kited or repositioned) has moved it more than
 // kFormationSlack away. Slots are spaced like the converge arcs and honour the owner's spacing preset. Returns true when it emitted
@@ -2973,9 +3011,9 @@ bool RaidFormationHold(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView co
 constexpr float kPrePullPackRange = 40.0f;  // a pack this near the tank is the next pull
 constexpr float kPrePullPackClear = 30.0f;  // spot stays this far from the pack (aggro / pull range)
 constexpr float kPrePullInPlace   = 5.0f;   // within this of a spot = in place
-constexpr float kPrePullMinSpacing = 4.0f;  // raid ranged pre-pull slots: neighbours this far apart
-constexpr float kPrePullArcRowGap  = 6.0f;  // ... and the arcs (rows) this far apart radially
-constexpr float kPrePullArcMax     = 1.5708f;   // +-90 deg off straight back (the arcs never wrap toward the pack)
+constexpr float kPrePullMinSpacing = 3.0f;  // raid ranged pre-pull slots: neighbours this far apart
+constexpr float kPrePullArcRowGap  = 4.0f;  // ... and the arcs (rows) this far apart radially
+constexpr float kPrePullArcMax     = 1.0472f;   // +-60 deg off straight back (the arcs never wrap toward the pack)
 constexpr float kPrePullRaidInPlace = 3.5f; // raid ranged: in place within this of its own spot (the walkable
                                             // probe ends within 3 y of it) - tighter than kPrePullInPlace so
                                             // two neighbours "in place" stay apart
@@ -3666,7 +3704,7 @@ bool RaidCastLosStep(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
     dx /= dist; dy /= dist;
     const uint32 now_ms = s.published_at_ms();
     // Ranged DPS and healers hold their spot while the target is in sight; a sight line lost for under kLosGraceMs is a mob
-    // moving past a corner, not a reason to walk (Karrz, Deadmines 2026-10-10: Ulfrico chased the mobs all over the room, 16 y
+    // moving past a corner, not a reason to walk (chris, Deadmines 2026-10-10: Ulfrico chased the mobs all over the room, 16 y
     // steps toward the tank every time the line flickered). Only a sustained loss steps.
     constexpr uint32 kLosGraceMs = 2500u;
     if (uint32 const lost_for = human ? LosLostFor(s.guid(), now_ms) : kLosGraceMs; lost_for < kLosGraceMs)
@@ -5777,7 +5815,7 @@ bool DungeonCombatPositioning(BotSnapshotView const& s, BotAI& ai,
         }
     }
 
-    // (5b2) Raid ranged / healer clump separation (Karrz, MC Molten Giants 2026-10-08: ranged and healers stacked in one
+    // (5b2) Raid ranged / healer clump separation (chris, MC Molten Giants 2026-10-08: ranged and healers stacked in one
     // clump regardless of the follow distance). In a fight, a ranged / healer bot with another group member inside
     // kRaidClumpApart steps ~kRaidClumpStep away from the neighbours' centroid (the pack's spells and the 40y heals still
     // reach). Skipped when the raid brain has a move for this bot (an encounter that stacks or spreads on purpose), mid-cast,
@@ -5978,13 +6016,13 @@ static void BgRouteMove(BotSnapshotView const& s, BotAI const& ai, BotIntentEmit
     float bx = 0.f, by = 0.f, bz = 0.f;
     s.position(bx, by, bz);
     float nx = 0.f, ny = 0.f, nz = 0.f;
-    // Route variety (Karrz: bots ran one straight lane): each bot weighs the recorded paths differently, and the choice shifts with
+    // Route variety (chris: bots ran one straight lane): each bot weighs the recorded paths differently, and the choice shifts with
     // every cap (score total), so flag runs take different tunnels / graveyard jumps / roofs from run to run and bot to bot.
     int const route_variant = int(((uint32(s.guid().GetCounter()) * 2654435761u >> 11) +
                                    (s.raw().bg.score_alliance + s.raw().bg.score_horde) * 3u) % uint32(BgRoutes::Graph::kVariants));
     // A flag carrier always flanks: variant 0 is the plain shortest lane its chasers expect.
     int const carrier_variant = s.bg_friendly_flag_carrier() == s.guid() ? 1 + route_variant % (BgRoutes::Graph::kVariants - 1) : route_variant;
-    // Lane (Karrz, WSG 2026-10-09: "straight out the tunnel and straight back"): every bot takes one of the recorded ways across the
+    // Lane (chris, WSG 2026-10-09: "straight out the tunnel and straight back"): every bot takes one of the recorded ways across the
     // field, picked by a per-bot hash that shifts with each cap. Flag carriers only take the flanking lanes (a defended flag room is
     // not entered through the mid line). The lane is forced through its recorded path by BgRoutes::NextWaypointLane.
     bool const is_carrier = s.bg_friendly_flag_carrier() == s.guid();
@@ -5992,7 +6030,7 @@ static void BgRouteMove(BotSnapshotView const& s, BotAI const& ai, BotIntentEmit
     auto const& lanes_here = BgRoutes::LanesFor(s.raw().bg.current_type_id, x > bx, is_carrier);
     BgRoutes::Lane const* lane = BgRoutes::PickLane(lanes_here, lane_selector);
     // Lane variety is for open travel. A bot on the graveyard ridge with enemy players at the foot of the drop goes over the ledge to
-    // them (Karrz, WSG 2026-10-09: the whole rez wave took the long way round while the fight was below). Carriers keep their flank pick.
+    // them (chris, WSG 2026-10-09: the whole rez wave took the long way round while the fight was below). Carriers keep their flank pick.
     if (!is_carrier && s.in_battleground() && !s.bg_in_prep())
     {
         BgRoutes::LanePoint landing{};
@@ -8417,7 +8455,7 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                 if (m.role == Role::Healer)
                 {
                     if (d2g > ready_heal_y * ready_heal_y) return false;
-                    // Healers drink to ~full before the next pull (Karrz's ready
+                    // Healers drink to ~full before the next pull (chris's ready
                     // check): a healer under 80% mana holds the pull.
                     if (m.max_mana > 0 &&
                         (int64(m.mana) * 100) < (int64(m.max_mana) * kReadyHealerManaPct))
@@ -8500,7 +8538,7 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
             }
             return others_near * 2 >= others;
         };
-        // Buffs (Karrz's ready check): once the group is otherwise ready, the
+        // Buffs (chris's ready check): once the group is otherwise ready, the
         // pull also waits while 3+ living members within 40y lack a raid buff
         // a present bot caster can give (Classic::MissingGroupBuff: Fortitude,
         // Mark of the Wild, Arcane Intellect, Spirit / Shadow Protection,
@@ -12392,10 +12430,10 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
             // Players do not sit mounted in the start room for the whole countdown (and a mount is a 3 s cast): bots stay on foot while
             // they mill about and start the cast only in the last 4..9 s before the gates open (per-bot offset, so the room does not
             // mount in one go). The cast is the normal interruptible one (API::mount -> cast_spell), not an instant aura.
-            // Karrz, WSG test: bots stand around on foot until the last seconds. Once the buff / maintenance rules above have nothing
+            // Chris, WSG test: bots stand around on foot until the last seconds. Once the buff / maintenance rules above have nothing
             // left to do (this code is only reached then) and the bot stands at its gate spot, it mounts and waits mounted; the
             // moment is spread 20..80 s before the gates open so the room does not mount in one go.
-            // 2026-10-08 (Karrz, WSG: "the bots are still mounted in here"): no mounts in the start room at all. A bot that arrived
+            // 2026-10-08 (chris, WSG: "the bots are still mounted in here"): no mounts in the start room at all. A bot that arrived
             // mounted gets off, and none mounts until the gates open (API::mount also refuses during STATUS_WAIT_JOIN).
             if (s.raw().movement.is_mounted && !s.on_vehicle())
             {
@@ -12407,7 +12445,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
             bool const mount_due = false;
             uint32 const now_ms = GameTime::GetGameTimeMS();
             uint32 const bot_salt = uint32(s.guid().GetCounter()) * 2654435761u;
-            // Karrz, AB test: during the two-minute countdown the team waits at its start gate, loosely spread like players, instead
+            // Chris, AB test: during the two-minute countdown the team waits at its start gate, loosely spread like players, instead
             // of wandering the start area. WSG / AB / AV have gate anchors; each bot gets its own spot 3..10 y inside the gate and
             // up to 7 y to either side, walks there once and stays (buff / mount rules above still run).
             bool gate_anchored = false;
@@ -12415,7 +12453,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
             float face_base = 0.0f;     // heading from the bot's spot toward the gate
             bool at_spot = true;        // no gate anchor for this BG: the bot mounts wherever it stands
             // Inside the gate line: the anchored bots' steps (spot, face, fidget) must stay on the room side. The doors only block
-            // by collision, a step that crosses the line walks the bot through the closed gate (Karrz, 2026-10-08, WSG).
+            // by collision, a step that crosses the line walks the bot through the closed gate (chris, 2026-10-08, WSG).
             float gate_gx = 0.f, gate_gy = 0.f, gate_ix = 0.f, gate_iy = 0.f;
             auto inside_gate = [&](float x, float y, float margin) {
                 return (x - gate_gx) * gate_ix + (y - gate_gy) * gate_iy >= margin;
@@ -12428,7 +12466,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                     float const gx = s.bg_gate_x(), gy = s.bg_gate_y();
                     float const ix = s.bg_gate_in_x(), iy = s.bg_gate_in_y();
                     {
-                        // Karrz: "like soldiers in a line". A fan, not an arc: depth 2..17 y with most bots near the gate and a
+                        // Chris: "like soldiers in a line". A fan, not an arc: depth 2..17 y with most bots near the gate and a
                         // tail further back, the sideways spread widening with the depth, and a little extra scatter per bot.
                         float const h1 = float((bot_salt >> 8) % 1000u) / 1000.0f;
                         float const h2 = float((bot_salt >> 18) % 1000u) / 1000.0f;
@@ -12477,7 +12515,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                     return true;
                 }
             }
-            // Karrz: bots at the gate "all face the same way like a parade". At its spot a bot turns, in about one 20 s slot of four, to
+            // Chris: bots at the gate "all face the same way like a parade". At its spot a bot turns, in about one 20 s slot of four, to
             // a heading within +-60 degrees of the gate direction (one bot in six looks anywhere around). The turn is a 1.2 y walk step
             // in that direction (there is no facing-by-angle intent), fired once per slot by the 3 s BgOrderMove lockout on a per-slot key.
             if (gate_anchored && have_face_base && at_spot && !s.is_moving())
@@ -12702,7 +12740,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                 my_role = BgRole::Attacker;       // every roamer pushes
         }
 
-        // Arathi Basin: how many bots defend follows the node count, not the role table (ike3 bots, the ike3-based playerbot code raid10-revamp
+        // Arathi Basin: how many bots defend follows the node count, not the role table (ike3 bots, Karrz1/wow-1.12 raid10-revamp
         // bcc8b9f, BattleGroundTactics.cpp, BATTLEGROUND_AB): the further behind on held bases, the more everybody attacks. Of every
         // ten bots (team rank mod 10) 1 defend when losing, 2 when level or ahead, 3 when two or more bases ahead; the rest attack.
         // Roamers and healers keep their jobs. A held base counts only when it is not being contested.
@@ -12800,7 +12838,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                 if (match) { near_objective_go = true; break; }
             }
         }
-        // A bot never stands still to mount with a live enemy near (Karrz, WSG 2026-10-09: bots ran past him, mounting beside him): the
+        // A bot never stands still to mount with a live enemy near (chris, WSG 2026-10-09: bots ran past him, mounting beside him): the
         // fight rules below get the tick instead, and the bot mounts once nothing hostile is inside its engage range.
         bool enemy_near_for_mount = false;
         {
@@ -12860,7 +12898,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                     return true;
                 }
                 // Standing AT the ordered post for a minute with nothing to fight: the plan keeps a bot where there is nothing left to do
-                // (AV 2026-10-11, Karrz: a pile of bots idle at Stonehearth). Log the order and the rule so the soak shows which orders
+                // (AV 2026-10-11, chris: a pile of bots idle at Stonehearth). Log the order and the rule so the soak shows which orders
                 // park bots; no movement here, the planner owns where a bot goes next.
                 TC_LOG_INFO("playerbot.v2", "[bg_stall] at_post bot={} order={} squad={} entry={} last_rule={} type={}", s.bot_id(),
                             uint32(ord.kind), uint32(ord.squad), ord.target_entry,
@@ -12882,7 +12920,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
             ai.set_last_rule_fired("idle:bg_mount_cast");
             return true;
         }
-        // Mounting drops the flag: the Alliance flag was picked up and dropped by one Horde bot five times running (Karrz, WSG
+        // Mounting drops the flag: the Alliance flag was picked up and dropped by one Horde bot five times running (chris, WSG
         // 2026-10-09), each pickup followed by the 5 s mount retry. A carrier rides on foot.
         bool const carries_objective = s.bg_friendly_flag_carrier() == s.guid();
         if (s.is_alive() && !s.raw().movement.is_mounted && !s.on_vehicle() && !carries_objective &&
@@ -13209,7 +13247,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
             }
         }
 
-        // Flag callouts (FC up/down, EFC, carrying) belong to flag maps only. Karrz, AB 2026-10-11: a bot called "FC down" in Arathi
+        // Flag callouts (FC up/down, EFC, carrying) belong to flag maps only. chris, AB 2026-10-11: a bot called "FC down" in Arathi
         // Basin, which has no flags. A flag map is one whose script names a flag spot; node maps (AB, AV) never do.
         const bool ctf_map = bg_advice.enemy_flag_x != 0.f || bg_advice.enemy_flag_y != 0.f ||
                              bg_advice.own_flag_x != 0.f || bg_advice.own_flag_y != 0.f;
@@ -14140,7 +14178,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
         // gate above meant bots marching to a node, escorting or picking up a flag walked straight past enemy players. A bot on a
         // march / pickup / escort / regroup order now also fights an enemy that is close (12 y); HuntEFC and CarryHome orders keep
         // their own handling. A bot carrying the flag never fights (the role table does not follow a pickup, so check the carrier).
-        // Victim validity (Karrz, WSG 2026-10-09: a priest stood beside him swinging at nothing and ignored him). The engage rule below needs an
+        // Victim validity (chris, WSG 2026-10-09: a priest stood beside him swinging at nothing and ignored him). The engage rule below needs an
         // empty victim, so a victim that is gone, dead, untargetable, unreachable, or a creature that does not fight back while an enemy
         // player is close held the bot for good. Drop it for the nearest enemy player, or release it; same decision as combat:bg_victim_invalid.
         if (s.is_alive() && !s.is_casting() && !s.victim().IsEmpty() && s.bg_friendly_flag_carrier() != s.guid())
@@ -14179,12 +14217,12 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
             my_role != BgRole::FlagCarrier &&
             my_role != BgRole::OrbCarrier)
         {
-            // Karrz, WSG test: bots ran past enemies to the flag. Ordered bots now fight within 25 y as well; only the bot sent to
+            // Chris, WSG test: bots ran past enemies to the flag. Ordered bots now fight within 25 y as well; only the bot sent to
             // pick up a flag stays at 12 y (one runner stays focused, the escorts and everyone else peel off).
             float const eng_range =
                 (eng_has_order && s.raw().bg.order.kind == BgState::BgOrder::PickupFlag) ? 24.0f
                 : (s.raw().bg.current_type_id == 1 && s.raw().bg.status == 3) ? BgAvPlan::AggroRange(s.raw().bg.in_progress_ms)   // ike3 AV aggro 40 -> 10 yd
-                : (my_role == BgRole::Healer ? 36.0f : BgTargetPick::kBgEngageRange);   // Karrz 2026-10-09: bigger radius. The snapshot scans this far in a BG; healers close a bit less
+                : (my_role == BgRole::Healer ? 36.0f : BgTargetPick::kBgEngageRange);   // chris 2026-10-09: bigger radius. The snapshot scans this far in a BG; healers close a bit less
             float self_x = 0.f, self_y = 0.f, self_z = 0.f;
             s.position(self_x, self_y, self_z);
             const bool eng_ranged = IsRangedSpec(s.cls(), uint16(s.spec()));
@@ -14199,13 +14237,13 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                 float dy = e.y - self_y;
                 float dsq = dx * dx + dy * dy;
                 if (dsq > eng_range * eng_range) continue;  // PvP engage range
-                // Players over mobs (AV/IoC creatures): the fight Karrz wants is player vs player. A mob only counts as 'closer'
+                // Players over mobs (AV/IoC creatures): the fight chris wants is player vs player. A mob only counts as 'closer'
                 // by 20 y so a guard next to the bot does not hide a player behind it.
                 float const eng_score = dsq + (e.guid.IsPlayer() ? 0.f : 400.f);
                 if (eng_score < best_dsq) { best_dsq = eng_score; closest = &e; }
             }
             // An enemy below the graveyard ridge: a chase would path the long way round the back (there is no navmesh link down the
-            // ledge). Go over the ledge to the fight by the ridge lane's drop (Karrz, WSG 2026-10-09), then the chase is level.
+            // ledge). Go over the ledge to the fight by the ridge lane's drop (chris, WSG 2026-10-09), then the chase is level.
             if (closest && closest->guid.IsPlayer() && closest->z < self_z - 8.0f && !s.bg_in_prep() &&
                 s.bg_friendly_flag_carrier() != s.guid())
             {
@@ -14542,7 +14580,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                         return true;
                     }
                 }
-                // Individuality (Karrz, AB test: everybody stands at the flag one bot is capping). About a third of the bots on an
+                // Individuality (chris, AB test: everybody stands at the flag one bot is capping). About a third of the bots on an
                 // attack order are scouts: they arrive within 24 y instead of 8 y and, standing on station with nobody to fight,
                 // pace to a spot a few yards from the post every ~7 s, so the group spreads over the node instead of queueing.
                 if (ord.kind == BgOrd::AttackNode && s.is_alive() && !s.is_casting() && !s.in_combat() &&
@@ -15115,7 +15153,7 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                     ai.set_last_rule_fired("idle:bg_defender_hold_home");
                     return true;
                 }
-                // Karrz 2026-10-08 (WSG): two Alliance bots camped ON the flag stand. A defender spawned inside the hold radius never
+                // chris 2026-10-08 (WSG): two Alliance bots camped ON the flag stand. A defender spawned inside the hold radius never
                 // moved at all. Stand off the anchor at a guard spot 9-14 y away (a guid-hashed bearing), and pace to it once.
                 if (!at_defend_post && dx * dx + dy * dy < 8.0f * 8.0f)
                 {

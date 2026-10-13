@@ -69,7 +69,13 @@ bool LootDrainGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     // Told to stay: the corpse can wait until it is released.
     if (ai.is_manual_mode(s.published_at_ms()) && ai.owner_command() == BotAI::OwnerCommand::Stay)
         return false;
-    // Loot etiquette with a human in the group (Karrz's AddLootAction): no
+    // A dungeon healer under the pull-ready mana drinks instead of walking to corpses (the tank's pull waits for that mana, and a
+    // walking healer never sits). The registered rule used to skip this check, which only DungeonLootDrain made: deadmines_full
+    // c82a7e21, Scnpriest under 10% mana at t=383-404 s walked to corpses and back to the tank without drinking.
+    if (s.is_in_instance() && s.max_power(POWER_MANA) > 0 && Classic::IsGroupHealer(s, &g)
+        && s.power_pct(POWER_MANA) < Classic::PullReadyHealerManaPct(s) && Classic::DrinksForPull(s, &g))
+        return false;
+    // Loot etiquette with a human in the group (chris's AddLootAction): no
     // looting while the bot or a human of the group on its map is still
     // fighting. The queue keeps the corpses for after the fight.
     if (auto const* members = g.members())
@@ -357,7 +363,7 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
                         continue;
                     }
                     // A human leads the instance group: the bots follow him (Follow / Stay obeyed), so a corpse far from him waits
-                    // in the queue until he walks near it. Karrz, Deadmines 2026-10-10: he hit Follow and two bots stayed down
+                    // in the queue until he walks near it. Chris, Deadmines 2026-10-10: he hit Follow and two bots stayed down
                     // the tunnel - the loot walk leased the follow-recall away (grant_detour below).
                     if (s.is_in_instance() && !g.leader_is_bot())
                         if (auto const* mems = g.members())

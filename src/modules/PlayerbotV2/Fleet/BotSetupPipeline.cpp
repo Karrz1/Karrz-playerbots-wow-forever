@@ -751,6 +751,9 @@ bool BotSetupPipeline::DoAcquireMount(Player* bot)
     if (bot->GetClass() == CLASS_HUNTER && bot->GetPetGUID().IsEmpty())
     {
         uint32 pet_entry = World::HunterPetEntryForRace(bot->GetRace());
+        // A hunter nobody owns (world / pool bot) gets its own beast, stable per bot, instead of its race's one.
+        if (::Playerbot::Services::Owners().GetOwner(bot->GetGUID().GetCounter()).account_id == 0)
+            pet_entry = World::VariedHunterPetEntry(bot->GetTeam() == ALLIANCE, bot->GetGUID().GetCounter(), pet_entry);
         if (!pet_entry)
         {
             // Unmapped race (allied) — fall back to faction-generic.

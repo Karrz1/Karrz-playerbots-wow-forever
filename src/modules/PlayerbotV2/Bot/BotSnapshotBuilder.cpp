@@ -2034,7 +2034,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 }
             }
             snap->travel.best_mount_spell = best_sid;
-            // [mount_pick] (Karrz, AV 2026-10-11: are the 60s on the 100% mount?). One line when the pick changes: the mount, the riding
+            // [mount_pick] (chris, AV 2026-10-11: are the 60s on the 100% mount?). One line when the pick changes: the mount, the riding
             // skill, and whether the bot holds the two mount-speed passives (86457 = 60%, 86458 = 100%) and its race's epic mount.
             if (mt_ai && best_sid != mt_ai->cached_best_mount_spell() && p->GetLevel() >= 40)
             {
@@ -3316,6 +3316,9 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
     {
         snap->group.group_guid = g->GetGUID();
         snap->owner_in_group = !snap->owner_guid.IsEmpty() && g->IsMember(snap->owner_guid);
+        if (snap->owner_in_group)
+            if (Player const* owner = ObjectAccessor::FindConnectedPlayer(snap->owner_guid); owner && owner->GetMapId() == p->GetMapId())
+                snap->owner_dist = p->GetExactDist2d(owner);
     }
 
     // ---- Spellbook (sorted, binary-searchable in BotSnapshotView::knows_spell) ----
@@ -3796,7 +3799,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         snap->cast.last_cast_spell_id = lc_ai->last_cast_spell_id();
 
     // ---- Threat discipline context ----
-    // Port of Karrz's group threat rules (ike3-based bots MCRaidHoldDamage /
+    // Port of chris's group threat rules (wow-1.12 MCRaidHoldDamage /
     // LooseAttackersTrigger). Resolve the group's live same-map members and
     // tanks once, then stamp every attacker / nearby enemy below with the
     // bot's threat, the best tank threat and who the mob is hitting, read
@@ -7600,7 +7603,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
     // pre-computes whether the roll item is a strict ilvl upgrade for any
     // equipped slot of matching inventory type (or fills an empty slot).
     {
-        // Loot etiquette (Karrz's LootRollAction IsInstanceGroupWithHuman /
+        // Loot etiquette (chris's LootRollAction IsInstanceGroupWithHuman /
         // HumanWouldWantItem): the humans of the bot's group on its map get
         // first claim. Only gathered when a roll is waiting.
         std::vector<Player const*> humans;
@@ -7755,7 +7758,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                         if (eq.entry == 0)
                         {
                             // Empty matching-invtype slot: an upgrade
-                            // (Karrz: need for an empty slot), but never a
+                            // (chris: need for an empty slot), but never a
                             // cosmetic shirt or tabard.
                             // An empty off hand is no reason to need a
                             // one-hander the bot can't wield there (no dual
@@ -7779,7 +7782,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                             if (!eq_tmpl) continue;
                             const float eq_score = score_block(eq.stats, eq.item_level);
                             // A real upgrade beats the worn item by at least
-                            // 5% (Karrz); side-grades are greed.
+                            // 5% (chris); side-grades are greed.
                             const float margin   = std::max(1.f, eq_score * 0.05f);
                             if (roll_score >= eq_score + margin)
                             {

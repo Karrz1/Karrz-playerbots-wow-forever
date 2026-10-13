@@ -57,3 +57,11 @@ TEST_CASE("The clock wrapping around does not make a fresh cast stale", "[Classi
     uint32_t const cast = 0xFFFFFFFFu - 1000u;
     CHECK(BuffCastTrusted(kGreaterKey, cast, cast + 5000u));
 }
+
+TEST_CASE("A caster-centred class buff is trusted only for the snapshot's lag", "[ClassicBuffLedger]")
+{
+    uint64_t const areaKey = (6ull << 48) | 4;
+    CHECK(BuffTrustMs(areaKey) == kAreaBuffTrustMs);
+    CHECK(BuffCastTrusted(areaKey, 1000, 1000 + kAreaBuffTrustMs - 1));
+    CHECK_FALSE(BuffCastTrusted(areaKey, 1000, 1000 + kAreaBuffTrustMs));
+}

@@ -639,8 +639,8 @@ TEST_CASE("ScenarioDefs: the Molten Core scenarios are a 40-man raid with 4 tank
         for (ScenarioMember const& m : d->squad)
             CHECK((m.race == ScnRace::Human || m.race == ScnRace::Dwarf || m.race == ScnRace::NightElf || m.race == ScnRace::Gnome));
     }
-    // The raid set, by name: a boss added to or dropped from it has to be said here (mc_geddon joined the first four).
-    CHECK(found == std::set<std::string>{ "mc_garr", "mc_lucifron", "mc_magmadar", "mc_gehennas", "mc_geddon" });
+    // The raid set, by name: a boss added to or dropped from it has to be said here (mc_geddon joined the first four, mc_ragnaros after it).
+    CHECK(found == std::set<std::string>{ "mc_garr", "mc_lucifron", "mc_magmadar", "mc_gehennas", "mc_geddon", "mc_ragnaros" });
     // Both catalogues share one list, with no clash between a dungeon and a raid name.
     std::set<std::string> all;
     for (ScenarioDef const& d : ScenarioCatalogue())

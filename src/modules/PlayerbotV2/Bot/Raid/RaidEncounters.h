@@ -1,6 +1,6 @@
 // RaidEncounters — data-driven raid encounter rules for the bots.
 //
-// Ported from Karrz's raid10-revamp ike3 playerbots (the ike3-based playerbot code,
+// Ported from chris's raid10-revamp ike3 playerbots (Karrz1/wow-1.12,
 // src/game/PlayerBots/playerbot/strategy/generic/RaidEncounters.h). Forever's
 // raids run the Classic ports of the VMaNGOS scripts (scripts/Custom/Classic),
 // so the creature entries and spell ids carry over unchanged.
@@ -165,6 +165,11 @@ struct FaceAway { uint32_t enemy; float hpMax = 100.0f; float hpMin = 0.0f; };
 // own side. Pair with FaceAway so the tank decides which way "behind" is.
 struct StandBehind { uint32_t enemy; Who who; float minDist; float maxDist; float halfAngleDeg; float hpMax = 100.0f; float hpMin = 0.0f; };
 
+// A resistance potion a matching bot drinks when <enemy> is engaged, without the global Playerbot.Raid.ResistPotions switch (Ragnaros'
+// Elemental Fire: 2400 a tick on the tank, five tank deaths in three minutes, MC 2026-10-12). The kit stocks it (Classic::RaidConsumable::combat).
+// Only Who::Tank and Who::Anyone are read.
+struct ResistPotion { uint32_t enemy; uint32_t item; Who who; };
+
 // Phase windows (hpMax / hpMin on AvoidFrontal, Spread, Stand, AvoidEnemy, StayNear): the rule only applies while the enemy's
 // health percent is within [hpMin, hpMax] (Onyxia's Fireball spread is phase 2: 65..40). Defaults 100 / 0 = always.
 
@@ -200,6 +205,8 @@ struct RaidRules
     std::vector<StayNear> stayNear;
     std::vector<FaceAway> faceAway;
     std::vector<StandBehind> standBehind;
+    std::vector<ResistPotion> resistPotion;
+    std::vector<uint32_t> retaunt;   // bosses whose threat a Blink, a fear or a threat reset (Ragnaros' Wrath) can leave on a non-tank: a tank taunts them back at once (ElectRetaunt)
     std::vector<uint32_t> noDispel;   // auras nobody removes (removing them hurts: Wyvern Sting, Mutating Injection)
     std::vector<uint32_t> noTank;   // summoned adds the DPS burns down: tanks hold every other mob first and never count them as a roster need
     std::vector<uint32_t> interruptFirst;   // casts the PvE coordinator's kick election takes before any other (heals, sheep)

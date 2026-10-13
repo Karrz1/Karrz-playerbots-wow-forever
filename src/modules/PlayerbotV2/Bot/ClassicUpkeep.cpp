@@ -15,6 +15,8 @@
 #include "Services.h"
 #include "Util/ConfigReader.h"
 #include "Log.h"
+#include "World.h"
+#include "fmt/format.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -26,6 +28,7 @@
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Playerbot::Classic {
 
@@ -725,6 +728,11 @@ void ShortClassSupplies(BotSnapshotView const& s, std::vector<uint32>& out)
             out.push_back(ammo);
     if (!Services::Config().classic_class_supplies())
         return;
+    // A party buff spell the bot's level allows and it has not learned: the restock teaches it.
+    for (uint32 spell : GroupBuffSpells(s.cls()))
+        if (!s.knows_spell(spell))
+            if (LearnableGroupBuff(spell, uint8(s.level())))
+                out.push_back(spell);
     for (SupplyFamily const& f : GetSupplyFamilies())
     {
         if (!SupplyFamilyForClass(f, s.cls())) continue;
@@ -1246,7 +1254,7 @@ void NoteConsumableUse(BotSnapshotView const& s, uint32 item, char const* what)
 }
 
 // ======================= Raid support =======================
-// Port of Karrz's ike3 generic raid behaviour (playerbot/strategy: priest /
+// Port of chris's ike3 generic raid behaviour (playerbot/strategy: priest /
 // mage / druid buff strategies with BUFF_PARTY / GREATER_BUFF_PARTY actions,
 // PartyMemberWithoutAuraValue, paladin aura + PallyPower blessings, shaman
 // totems, PartyMemberToDispel / CombatBotBaseAI::SelectDispelTarget, warlock
@@ -1399,6 +1407,67 @@ void BuffCasters(BotSnapshotView const& s, std::vector<GroupMemberSummary> const
     std::sort(out.begin(), out.end(), [](GroupMemberSummary const* a, GroupMemberSummary const* b) { return a->guid < b->guid; });
 }
 
+// Forever's client data leaves some vanilla buff spells without any effect (Mark of the Wild 1126 and its ranks, Gift of the Wild: the
+// [buff_plan] line shows "effect targets" empty and the research diff lists them 0/0), so a cast does nothing and the buff stays missing.
+// The working version is another spell of the same name (Mark of the Wild 364163, level 50). A buff is cast with the spell that applies an
+// aura: the rank 1 id itself, else the highest same-name spell of the class the bot knows and its level allows.
+bool SpellAppliesAura(SpellInfo const* si)
+{
+    if (!si)
+        return false;
+    for (SpellEffectInfo const& e : si->GetEffects())
+        if (e.IsEffect() && e.IsAura())
+            return true;
+    return false;
+}
+
+uint32 EffectiveBuffSpell(BotSnapshotView const& s, uint32 base)
+{
+    static std::mutex mu;
+    static std::unordered_map<uint32, std::vector<std::pair<uint32, uint32>>> cache;   // base -> (spell level, id), ascending
+    std::vector<std::pair<uint32, uint32>> cands;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = cache.find(base);
+        if (it == cache.end())
+        {
+            std::vector<std::pair<uint32, uint32>> built;
+            if (SpellInfo const* bi = sSpellMgr->GetSpellInfo(base, DIFFICULTY_NONE))
+            {
+                if (SpellAppliesAura(bi))
+                    built.emplace_back(bi->SpellLevel, base);
+                else if (bi->SpellName)
+                {
+                    LocaleConstant const loc = sWorld->GetDefaultDbcLocale();
+                    char const* name = (*bi->SpellName)[loc];
+                    sSpellMgr->ForEachSpellInfo([&](SpellInfo const* si)
+                    {
+                        if (!si || si->Id == base || si->SpellFamilyName != bi->SpellFamilyName || !SpellAppliesAura(si))
+                            return;
+                        if (!si->SpellLevel || si->SpellLevel > 60 || si->HasAttribute(SPELL_ATTR0_PASSIVE) || !si->SpellName)
+                            return;
+                        char const* n = (*si->SpellName)[loc];
+                        if (name && n && std::string_view(name) == std::string_view(n))
+                            built.emplace_back(si->SpellLevel, si->Id);
+                    });
+                    std::sort(built.begin(), built.end());
+                    std::string ids;
+                    for (auto const& [lvl, id] : built)
+                        ids += fmt::format(" {}(L{})", id, lvl);
+                    TC_LOG_INFO("playerbot.v2", "[buff_plan] spell {} \"{}\" has no aura effect; same-name spells that do:{}", base, name ? name : "",
+                                ids.empty() ? " none" : ids);
+                }
+            }
+            it = cache.emplace(base, std::move(built)).first;
+        }
+        cands = it->second;
+    }
+    for (auto it = cands.rbegin(); it != cands.rend(); ++it)
+        if (it->first <= s.level() && s.knows_spell(it->second))
+            return it->second;
+    return base;
+}
+
 // The rank of the party version this bot casts: the highest rank it knows
 // whose reagents (spell data of that rank) are in the bags, walking down the
 // chain so a bot with only the lower rank's reagent (Holy Candle, Wild
@@ -1411,8 +1480,8 @@ uint32 GroupBuffRank(BotSnapshotView const& s, ClassBuffDef const& d)
     for (int guard = 0; rank && guard < 32; ++guard, rank = sSpellMgr->GetPrevSpellInChain(rank))
     {
         SpellInfo const* si = sSpellMgr->GetSpellInfo(rank, DIFFICULTY_NONE);
-        if (!si)
-            continue;
+        if (!si || !SpellAppliesAura(si))
+            continue;   // a rank with no effect (Gift of the Wild in Forever's data) buffs nobody
         bool have = true;
         for (size_t i = 0; i < si->Reagent.size() && have; ++i)
             if (si->Reagent[i] > 0 && si->ReagentCount[i] > 0
@@ -1873,6 +1942,66 @@ MissingBuff MissingGroupBuff(BotSnapshotView const& s, GroupSnapshotView const& 
 
 namespace {
 
+// A class buff whose single spell has no explicit unit target (Mark of the Wild in the Forever data: the cast log shows an empty
+// target, whoever the bot aimed at) is cast around the caster: it reaches the caster's party, or its raid, in range, not a chosen
+// member. Picking a target per member for it casts the same spell once per member (MC 2026-10-12: 42 + 40 casts of a 20 mana spell in a
+// 40-man raid, none of the picked targets showing the buff afterwards).
+struct AreaBuff
+{
+    bool area = false;
+    bool party_only = true;   // reaches only the caster's subgroup
+};
+
+AreaBuff AreaBuffOf(uint32 spell)
+{
+    AreaBuff out;
+    SpellInfo const* si = spell ? sSpellMgr->GetSpellInfo(spell, DIFFICULTY_NONE) : nullptr;
+    if (!si)
+        return out;
+    {
+        // Once per spell: how the data targets it (the cast log's target column is empty for such a spell).
+        static std::mutex seen_mu;
+        static std::unordered_set<uint32> seen;
+        bool first;
+        {
+            std::lock_guard<std::mutex> lk(seen_mu);
+            first = seen.insert(spell).second;
+        }
+        if (first)
+        {
+            std::string targets;
+            for (SpellEffectInfo const& e : si->GetEffects())
+                targets += fmt::format(" [{}/{}]", uint32(e.TargetA.GetTarget()), uint32(e.TargetB.GetTarget()));
+            char const* n = si->SpellName ? (*si->SpellName)[sWorld->GetDefaultDbcLocale()] : "";
+            TC_LOG_INFO("playerbot.v2", "[buff_plan] spell {} \"{}\": explicit unit target {}, targets area {}, effect targets A/B{}", spell, n ? n : "",
+                        si->NeedsExplicitUnitTarget() ? "yes" : "no", si->IsTargetingArea() ? "yes" : "no", targets);
+        }
+    }
+    if (si->NeedsExplicitUnitTarget() || !si->IsTargetingArea())
+        return out;
+    out.area = true;
+    for (SpellEffectInfo const& e : si->GetEffects())
+        for (Targets const t : { e.TargetA.GetTarget(), e.TargetB.GetTarget() })
+            if (t == TARGET_UNIT_CASTER_AREA_RAID || t == TARGET_UNIT_TARGET_ALLY_OR_RAID)
+                out.party_only = false;
+    return out;
+}
+
+// Back-off of such a cast that reached nobody: the needy count after a cast was no lower than before it, twice running (the spell
+// does not reach those members: another subgroup, out of its radius, or caster only). The buff then waits kAreaBuffBackoffMs.
+constexpr uint32 kAreaBuffBackoffMs = 5u * 60u * 1000u;
+struct AreaBuffState { uint32 last_needy = 0; uint32 stalls = 0; uint32 backoff_until_ms = 0; };
+std::mutex g_area_buff_mu;
+std::unordered_map<uint64, AreaBuffState> g_area_buff;   // (caster counter << 8) ^ buff index
+
+bool AreaBuffBackedOff(ObjectGuid caster, size_t di)
+{
+    uint32 const now = GameTime::GetGameTimeMS();
+    std::lock_guard<std::mutex> lk(g_area_buff_mu);
+    auto const it = g_area_buff.find((caster.GetCounter() << 8) ^ di);
+    return it != g_area_buff.end() && it->second.backoff_until_ms && int32(it->second.backoff_until_ms - now) > 0;
+}
+
 // The class buff this bot owes, whether or not it is shapeshifted right now
 // (the plan does not depend on the form: see BuffCasters).
 CastPick ClassBuffPick(BotSnapshotView const& s, GroupSnapshotView const& g, PickSkip skip)
@@ -1889,6 +2018,10 @@ CastPick ClassBuffPick(BotSnapshotView const& s, GroupSnapshotView const& g, Pic
         ClassBuffDef const& d = kClassBuffs[di];
         if (d.cls != s.cls() || !s.knows_spell(d.single))
             continue;
+        // The spell this buff is cast with (see EffectiveBuffSpell); a buff with no spell that applies an aura is not cast at all.
+        uint32 const single = EffectiveBuffSpell(s, d.single);
+        if (!SpellAppliesAura(sSpellMgr->GetSpellInfo(single, DIFFICULTY_NONE)))
+            continue;
         if (d.raid_only && !g.is_raid())
             continue;
         if (!InstanceDealsSchool(s.map_id(), d.school))
@@ -1903,8 +2036,8 @@ CastPick ClassBuffPick(BotSnapshotView const& s, GroupSnapshotView const& g, Pic
                 continue;
             // Paced like the group picks: a cast whose aura the snapshot does not show must not repeat every tick.
             uint64 const key = (5ull << 48) | uint64(di);
-            if (!SelfHasBuff(s, d) && s.is_ready(d.single) && !skip(key))
-                return { d.single, s.guid(), key };
+            if (!SelfHasBuff(s, d) && s.is_ready(single) && !skip(key))
+                return { single, s.guid(), key };
             continue;
         }
 
@@ -1913,6 +2046,36 @@ CastPick ClassBuffPick(BotSnapshotView const& s, GroupSnapshotView const& g, Pic
                                      [&s](GroupMemberSummary const* c) { return c->guid == s.guid(); });
         if (me == casters.end())
             continue;
+
+        if (AreaBuff const area = AreaBuffOf(single); area.area)
+        {
+            // One cast from this caster reaches its party (or raid) in range: owed when a member it reaches lacks the buff.
+            GroupMemberSummary const* const mine = *me;
+            if (AreaBuffBackedOff(s.guid(), di))
+                continue;
+            uint32 needy = 0;
+            for (GroupMemberSummary const& m : *members)
+            {
+                if (!NeedsBuff(s, d, m)) continue;
+                if (area.party_only && m.subgroup != mine->subgroup) continue;
+                if (m.guid != s.guid() && MemberDist2(m, bx, by, bz) > kBuffCastRange * kBuffCastRange) continue;
+                ++needy;
+            }
+            if (!needy)
+                continue;
+            // Casters of the same subgroup share the work: the lowest guid casts (a raid-wide spell: every caster that reaches someone).
+            if (area.party_only)
+                if (GroupMemberSummary const* lead = *std::find_if(casters.begin(), casters.end(),
+                        [&](GroupMemberSummary const* c) { return c->subgroup == mine->subgroup; });
+                    lead && lead->guid != s.guid())
+                    continue;
+            uint64 const key = (6ull << 48) | uint64(di);
+            if (!s.is_ready(single) || skip(key))
+                continue;
+            CastPick pick{ single, s.guid(), key };
+            pick.area_needy = needy;
+            return pick;
+        }
 
         uint32 const group_rank = GroupBuffRank(s, d);
         for (uint8 sg = 0; sg < 8; ++sg)
@@ -1955,6 +2118,31 @@ CastPick ClassBuffPick(BotSnapshotView const& s, GroupSnapshotView const& g, Pic
             }
             if (!first)
                 continue;
+            // MC 2026-10-12: 82 single Mark of the Wild and 44 single Power Word: Fortitude casts across two 40-man runs, no Gift of the
+            // Wild or Prayer of Fortitude at all. Name why the party version is not used, once a minute per caster and buff.
+            if (d.group && needy >= 2 && !group_rank)
+            {
+                static std::mutex why_mu;
+                static std::unordered_map<uint64, uint32> why_last;
+                uint32 const now = GameTime::GetGameTimeMS();
+                bool due = false;
+                {
+                    std::lock_guard<std::mutex> lk(why_mu);
+                    uint32& l = why_last[(s.guid().GetCounter() << 20) ^ d.single];
+                    if (!l || now - l >= 60000u) { l = now ? now : 1u; due = true; }
+                }
+                if (due)
+                {
+                    uint32 const known = s.resolve_rank(d.group);
+                    std::string reagents;
+                    if (SpellInfo const* si = known ? sSpellMgr->GetSpellInfo(known, DIFFICULTY_NONE) : nullptr)
+                        for (size_t i = 0; i < si->Reagent.size(); ++i)
+                            if (si->Reagent[i] > 0 && si->ReagentCount[i] > 0)
+                                reagents += fmt::format(" {}x{}(has {})", si->ReagentCount[i], si->Reagent[i], s.item_count(uint32(si->Reagent[i])));
+                    TC_LOG_INFO("playerbot.v2", "[buff_plan] {} casts single {} on {} needy of subgroup {}: no party version ({}; known rank {}, reagents{})",
+                                s.name(), d.single, needy, uint32(sg), known ? "reagents short" : "spell not known", known, reagents.empty() ? " none" : reagents);
+                }
+            }
             if (group_rank && needy >= 2)
             {
                 // The party version covers the subgroup: while it is paced
@@ -1972,8 +2160,8 @@ CastPick ClassBuffPick(BotSnapshotView const& s, GroupSnapshotView const& g, Pic
                 if (m.subgroup != sg || !NeedsBuff(s, d, m)) continue;
                 if (m.guid != s.guid() && MemberDist2(m, bx, by, bz) > kBuffCastRange * kBuffCastRange) continue;
                 uint64 const key = (4ull << 48) | (uint64(di) << 40) | (m.guid.GetCounter() & 0xFFFFFFFFFFull);
-                if (s.is_ready(d.single) && !skip(key))
-                    return { d.single, m.guid, key };
+                if (s.is_ready(single) && !skip(key))
+                    return { single, m.guid, key };
             }
         }
     }
@@ -1991,6 +2179,29 @@ constexpr uint32 kCatForm = 768, kBearForm = 5487, kDireBearForm = 9634;
 constexpr int32 kFormDrinkBelowManaPct = 70;
 
 } // namespace
+
+void NoteAreaBuffCast(ObjectGuid caster, uint64 key, uint32 needy, uint32 now_ms)
+{
+    if ((key >> 48) != 6)
+        return;
+    size_t const di = size_t(key & 0xFFFFu);
+    std::lock_guard<std::mutex> lk(g_area_buff_mu);
+    AreaBuffState& st = g_area_buff[(caster.GetCounter() << 8) ^ di];
+    // This cast comes after the last one's trust window: were that many members, or more, still needy, it reached nobody new.
+    if (st.last_needy && needy >= st.last_needy)
+        ++st.stalls;
+    else
+        st.stalls = 0;
+    st.last_needy = needy;
+    if (st.stalls >= 2)
+    {
+        st.backoff_until_ms = now_ms + kAreaBuffBackoffMs;
+        st.stalls = 0;
+        st.last_needy = 0;
+        TC_LOG_INFO("playerbot.v2", "[buff_plan] caster {} buff index {}: {} members still needy after two caster-centred casts, backing off {} s", caster.GetCounter(), di,
+                    needy, kAreaBuffBackoffMs / 1000u);
+    }
+}
 
 CastPick PickClassBuff(BotSnapshotView const& s, GroupSnapshotView const& g, PickSkip skip)
 {

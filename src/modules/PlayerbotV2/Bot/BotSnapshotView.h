@@ -95,13 +95,19 @@ public:
     bool   tactic_save_mana() const { return s_->tactic_save_mana; }   // owner "save mana"
     // A companion may sit down to eat or drink only when its owner has stopped next to it: otherwise the group follow
     // stands it up again at the next step and the next stop costs another item.
+    // In a raid the group stands spread over 30-40 y round the owner (formation, spacing), so "next to it" is the raid's own reach
+    // (chris, live MC 2026-10-12: raid bots stood waiting on mana regen and never sat; a 10 y mark kept every bot past the first
+    // rank from ever drinking).
     bool   companion_may_sit() const
     {
         if (!s_->owner_in_group) return true;
         float x, y, z; position(x, y, z);
+        float const reach = is_in_raid() ? 45.0f : 10.0f;
+        if (s_->owner_dist >= 0.0f)
+            return s_->owner_dist <= reach;
         for (auto const& u : s_->combat.nearby_friends)
             if (u.guid == s_->owner_guid)
-                return (u.x - x) * (u.x - x) + (u.y - y) * (u.y - y) <= 10.0f * 10.0f;
+                return (u.x - x) * (u.x - x) + (u.y - y) * (u.y - y) <= reach * reach;
         return false;
     }
     bool   has_duel_request()      const { return s_->social_events.has_duel_request; }
@@ -369,7 +375,7 @@ public:
     // threat-grab behavior. Returns nullptr if every nearby enemy is on us.
     NearbyUnit const* untaunted_enemy(float range = 30.f) const;
 
-    // ---- Threat discipline (port of Karrz's ike3-based bots group threat rules) ----
+    // ---- Threat discipline (port of chris's wow-1.12 group threat rules) ----
     // The attacker / nearby-enemy record for `guid` (attackers first), or null.
     NearbyUnit const* hostile_unit(ObjectGuid guid) const;
     // Group's tank as resolved by the builder (may be this bot). Empty when
@@ -389,7 +395,7 @@ public:
     ThreatHold threat_hold(ObjectGuid target, float opening_lead, float max_ratio) const;
     // Tank helper (LooseAttackersTrigger): nearest live enemy within `range`
     // whose victim is a NON-TANK group member - the mobs a tank must taunt
-    // or pick up. loose_attackers_within counts them (Karrz: Challenging
+    // or pick up. loose_attackers_within counts them (chris: Challenging
     // Shout / Roar at 3+ within 10y).
     NearbyUnit const* loose_attacker(float range = 30.f) const;
     size_t loose_attackers_within(float range) const;
