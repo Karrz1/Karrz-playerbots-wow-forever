@@ -13,4 +13,4 @@ Start here:
 - [Trading With Bots](trading-with-bots.md): buy from and sell to bots.
 - [Battlegrounds, Auction House and World Bots](battlegrounds-ah-world-bots.md)
 - [FAQ and Reporting Bugs](faq-and-bug-reports.md)
-- [Server Options for Server Owners](server-options.md): the optional switches (also in [OptionalServerOptions.md](../OptionalServerOptions.md)).
+- [Server Options for Server Owners](server-options.md): the optional switches (also in [OptionalServerOptions.md](../../doc/OptionalServerOptions.md)).
