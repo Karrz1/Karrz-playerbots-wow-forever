@@ -340,8 +340,8 @@ InstanceLock* InstanceLockMgr::UpdateInstanceLockForPlayer(CharacterDatabaseTran
             ASSERT(!sharedDataItr->second.expired());
 
             // The shared data of a fresh instance has InstanceId 0 until the first lock in it is saved. A player without a lock
-            // (a companion bot, or anyone when the first player in is a GM and never binds) confirming a pending bind before that
-            // used to assert here (crash in Molten Core, 2026-10-08); the first saved lock names the instance.
+            // confirming a pending bind before that (e.g. the first player in was a GM who never binds) would assert below;
+            // the first saved lock names the instance.
             std::shared_ptr<SharedInstanceLockData> sharedData = sharedDataItr->second.lock();
             if (!sharedData->InstanceId)
                 sharedData->InstanceId = updateEvent.InstanceId;

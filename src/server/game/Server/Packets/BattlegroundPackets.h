@@ -19,7 +19,6 @@
 #define TRINITYCORE_BATTLEGROUND_PACKETS_H
 
 #include "Packet.h"
-#include "ClassicOpcodes.h"
 #include "LFGPacketsCommon.h"
 #include "ObjectGuid.h"
 #include "Optional.h"
@@ -48,8 +47,6 @@ namespace WorldPackets
             bool WeeklyRewardChestsEnabled = false;
             bool CurrentArenaSeasonUsesTeams = false;
             bool PreviousArenaSeasonUsesTeams = false;
-            bool Classic70291 = ClassicOpcodes::IsBuild70291OrLater();
-            uint64 Classic70291_Leading = 0;    ///< 70291: the client reader starts with a u64 (meaning not known, 0)
         };
 
         class AreaSpiritHealerQuery final : public ClientPacket
@@ -259,30 +256,6 @@ namespace WorldPackets
             std::array<int32, 2> BlacklistMap = { };
         };
 
-        // Join packets of the 70205 client whose layout is not known: the payload is kept as bytes (see
-        // WorldSession::HandleBattlemasterJoinUnknownLayout).
-        class BattlemasterJoinRaw : public ClientPacket
-        {
-        public:
-            using ClientPacket::ClientPacket;
-
-            void Read() override;
-
-            std::vector<uint8> Data;
-        };
-
-        class BattlemasterJoinBlitz final : public BattlemasterJoinRaw
-        {
-        public:
-            explicit BattlemasterJoinBlitz(WorldPacket&& packet) : BattlemasterJoinRaw(CMSG_BATTLEMASTER_JOIN_RATED_BG_BLITZ, std::move(packet)) { }
-        };
-
-        class BattlemasterJoinArenaRaw final : public BattlemasterJoinRaw
-        {
-        public:
-            explicit BattlemasterJoinArenaRaw(WorldPacket&& packet) : BattlemasterJoinRaw(CMSG_BATTLEMASTER_JOIN_ARENA, std::move(packet)) { }
-        };
-
         class BattlemasterJoinArena final : public ClientPacket
         {
         public:
@@ -410,9 +383,8 @@ namespace WorldPackets
             ObjectGuid Guid;
             TaggedPosition<Position::XY> Pos;
             int8 IconID = 0;
-            // The 70291 client (SMSG_BATTLEGROUND_PLAYER_POSITIONS = 0x4D0006, reader 0xA29EF0, handler 0x2B0FA10) reads u32 count, then per
-            // entry packed guid, float x, float y, u8 icon, u8 slot. Its handler draws a battleground flag carrier only for slot 1
-            // (PLAYER_POSITION_ARENA_SLOT_NONE) and treats 2..6 as arena team slots, so slot 0 is never drawn.
+            // The 70291 client draws a battleground flag carrier only for slot 1 (PLAYER_POSITION_ARENA_SLOT_NONE) and treats 2..6 as
+            // arena team slots, so slot 0 is never drawn.
             int8 ArenaSlot = 1;
         };
 

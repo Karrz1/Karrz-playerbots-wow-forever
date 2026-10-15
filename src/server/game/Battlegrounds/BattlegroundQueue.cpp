@@ -28,15 +28,41 @@
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
+#include "ScriptMgr.h"
 #include "World.h"
 #include "WorldSession.h"
 #include <algorithm>
 #include <vector>
 
-// PlayerbotV2: synchronous BG-invite hook so bots port within the same world
-// tick the invite is sent (otherwise the snapshot-poll fallback can miss the
-// 90s INVITE_ACCEPT_WAIT_TIME under load and only the fastest 5-6 bots port).
-#include "Playerbot/PlayerbotHooks.h"
+namespace
+{
+// Bot sessions (WorldSession::IsBot) exist only when a bot module runs. The real-player-first rules below act only when a bot takes
+// part, so a server without bots fills its battlegrounds exactly as before.
+bool IsBotPlayer(ObjectGuid guid)
+{
+    Player const* player = ObjectAccessor::FindConnectedPlayer(guid);
+    return player && player->GetSession() && player->GetSession()->IsBot();
+}
+
+template <typename Queues>
+bool AnyBotQueued(Queues const& queues)
+{
+    for (auto const& groups : queues)
+        for (GroupQueueInfo const* group : groups)
+            for (auto const& [guid, info] : group->Players)
+                if (IsBotPlayer(guid))
+                    return true;
+    return false;
+}
+
+bool AnyBotInside(Battleground const* bg)
+{
+    for (auto const& [guid, player] : bg->GetPlayers())
+        if (IsBotPlayer(guid))
+            return true;
+    return false;
+}
+}
 
 /*********************************************************/
 /***            BATTLEGROUND QUEUE SYSTEM              ***/
@@ -509,10 +535,7 @@ bool BattlegroundQueue::InviteGroupToBG(GroupQueueInfo* ginfo, Battleground* bg,
             BattlegroundMgr::BuildBattlegroundStatusNeedConfirmation(&battlefieldStatus, bg, player, queueSlot, player->GetBattlegroundQueueJoinTime(bgQueueTypeId), INVITE_ACCEPT_WAIT_TIME, bgQueueTypeId);
             player->SendDirectMessage(battlefieldStatus.Write());
 
-            // PlayerbotV2 path: pushes a BgPortIntent into the bot's intent
-            // queue immediately (idempotent for non-bots; inline no-op when
-            // V2 not built).
-            Playerbot::Hooks::OnBGInvitationReceived(player, bg->GetInstanceID(), bg->GetTypeID());
+            sScriptMgr->OnPlayerBattlegroundInvite(player, bg->GetInstanceID(), bg->GetTypeID());
         }
         return true;
     }
@@ -534,7 +557,8 @@ void BattlegroundQueue::FillPlayersToBG(Battleground* bg, BattlegroundBracketId 
 
     // PlayerbotV2: a real player waiting at the head of a team's queue takes any place that is physically free, balance gate or not.
     // AB 2026-10-11: a bot left the Alliance side for Karrz, but the gate (Alliance ahead of Horde) gave Alliance 0 free places, so
-    // nobody was invited into the place and the next bot was asked to leave, nine times over.
+    // nobody was invited into the place and the next bot was asked to leave, nine times over. Only when bots take part.
+    if (AnyBotQueued(m_QueuedGroups[bracket_id]) || AnyBotInside(bg))
     {
         bool humanInvited = false;
         for (uint32 t = 0; t < PVP_TEAMS_COUNT; ++t)
@@ -845,23 +869,27 @@ void BattlegroundQueue::BattlegroundQueueUpdate(uint32 /*diff*/, BattlegroundBra
         return;
     }
 
+    bool const botsQueued = AnyBotQueued(m_QueuedGroups[bracket_id]);
+
     // PlayerbotV2: a real player is invited before a bot that queued earlier (stable: order inside each kind is kept),
     // so a place freed in a running battleground, or a new match, goes to the human first.
-    for (auto& groups : m_QueuedGroups[bracket_id])
-        std::stable_partition(groups.begin(), groups.end(), [](GroupQueueInfo const* g)
-        {
-            for (auto const& [guid, info] : g->Players)
+    if (botsQueued)
+        for (auto& groups : m_QueuedGroups[bracket_id])
+            std::stable_partition(groups.begin(), groups.end(), [](GroupQueueInfo const* g)
             {
-                Player const* pl = ObjectAccessor::FindConnectedPlayer(guid);
-                if (pl && pl->GetSession() && !pl->GetSession()->IsBot())
-                    return true;
-            }
-            return false;
-        });
+                for (auto const& [guid, info] : g->Players)
+                {
+                    Player const* pl = ObjectAccessor::FindConnectedPlayer(guid);
+                    if (pl && pl->GetSession() && !pl->GetSession()->IsBot())
+                        return true;
+                }
+                return false;
+            });
 
     // PlayerbotV2: the queued fill goes to the battleground a real player is in or has been invited to first, not to the
-    // oldest half-empty instance (Karrz, WSG 2026-10-09: his side filled only in the last half minute of the prep timer
+    // oldest half-empty instance (playtest, WSG 2026-10-09: his side filled only in the last half minute of the prep timer
     // because the bots spread over older instances). Instances with a human come first, the order is otherwise kept.
+    // Only when bots take part (queued, or inside one of the instances).
     std::vector<uint32> human_instances;
     for (auto const& groups : m_QueuedGroups[bracket_id])
         for (GroupQueueInfo const* g : groups)
@@ -895,11 +923,12 @@ void BattlegroundQueue::BattlegroundQueueUpdate(uint32 /*diff*/, BattlegroundBra
             }
             return n;
         };
-        bgQueues.sort([&](Battleground const* a, Battleground const* b)
-        {
-            return Battleground::FillsBefore(human_count(a), a->GetPlayersCountByTeam(ALLIANCE) + a->GetPlayersCountByTeam(HORDE),
-                                             human_count(b), b->GetPlayersCountByTeam(ALLIANCE) + b->GetPlayersCountByTeam(HORDE));
-        });
+        if (botsQueued || std::ranges::any_of(bgQueues, AnyBotInside))
+            bgQueues.sort([&](Battleground const* a, Battleground const* b)
+            {
+                return Battleground::FillsBefore(human_count(a), a->GetPlayersCountByTeam(ALLIANCE) + a->GetPlayersCountByTeam(HORDE),
+                                                 human_count(b), b->GetPlayersCountByTeam(ALLIANCE) + b->GetPlayersCountByTeam(HORDE));
+            });
         for (BGFreeSlotQueueContainer::iterator itr = bgQueues.begin(); itr != bgQueues.end();)
         {
             Battleground* bg = *itr; ++itr;
@@ -929,9 +958,7 @@ void BattlegroundQueue::BattlegroundQueueUpdate(uint32 /*diff*/, BattlegroundBra
 
     // finished iterating through the bgs with free slots, maybe we need to create a new bg
 
-    // PlayerbotV2: a real player is about to take a place in a running battleground (a bot is leaving for them): do not
-    // open a second instance for this queue meanwhile.
-    if (!bg_template->IsArena() && Playerbot::Hooks::HoldNewBattleground(m_queueId.BattlemasterListId, uint8(bracket_id)))
+    if (!bg_template->IsArena() && !sScriptMgr->CanCreateBattleground(m_queueId.BattlemasterListId, uint8(bracket_id)))
         return;
 
     // get the min. players per team, properly for larger arenas as well. (must have full teams for arena matches!)
@@ -1147,10 +1174,7 @@ bool BGQueueInviteEvent::Execute(uint64 /*e_time*/, uint32 /*p_time*/)
             BattlegroundMgr::BuildBattlegroundStatusNeedConfirmation(&battlefieldStatus, bg, player, queueSlot, player->GetBattlegroundQueueJoinTime(m_QueueId), INVITE_ACCEPT_WAIT_TIME - INVITATION_REMIND_TIME, m_QueueId);
             player->SendDirectMessage(battlefieldStatus.Write());
 
-            // PlayerbotV2: reminder-event re-fire — handler is idempotent
-            // (the per-bot BgPort cooldown stamped on first invite suppresses
-            // duplicate intent emission within the 5s window).
-            Playerbot::Hooks::OnBGInvitationReceived(player, m_BgInstanceGUID, m_BgTypeId);
+            sScriptMgr->OnPlayerBattlegroundInvite(player, m_BgInstanceGUID, m_BgTypeId);
         }
     }
     return true;                                            //event will be deleted

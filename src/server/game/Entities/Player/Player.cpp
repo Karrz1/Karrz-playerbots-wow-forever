@@ -47,6 +47,7 @@
 #include "ChatPackets.h"
 #include "ChatTextBuilder.h"
 #include "ClassicOpcodes.h"
+#include "ClassicSpellRank.h"
 #include "CinematicMgr.h"
 #include "ClubUtils.h"
 #include "CombatLogPackets.h"
@@ -98,7 +99,6 @@
 #include "MiscPackets.h"
 #include "MotionMaster.h"
 #include "MovementPackets.h"
-#include "ComboTargetRules.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -111,7 +111,6 @@
 #include "PetitionMgr.h"
 #include "PhasingHandler.h"
 #include "PlayerChoice.h"
-#include "Playerbot/PlayerbotHooks.h"
 #include "QueryCallback.h"
 #include "QueryHolder.h"
 #include "QueryResultStructured.h"
@@ -131,7 +130,6 @@
 #include "SpellAuras.h"
 #include "SpellCastRequest.h"
 #include "SpellHistory.h"
-#include "ClassicSpellRank.h"
 #include "SpellMgr.h"
 #include "SpellPackets.h"
 #include "StringConvert.h"
@@ -149,9 +147,9 @@
 #include "Vehicle.h"
 #include "VehiclePackets.h"
 #include "Vignette.h"
+#include "VignettePackets.h"
 #include "VMapFactory.h"
 #include "VMapManager.h"
-#include "VignettePackets.h"
 #include "World.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
@@ -930,31 +928,6 @@ void Player::UpdateInvisibilityDrunkDetect()
         UpdateObjectVisibility();
 }
 
-void Player::SetComboTarget(ObjectGuid const& guid)
-{
-    if (*m_unitData->ClassicComboTarget != guid)
-        SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::ClassicComboTarget), guid);
-}
-
-void Player::GainComboPointsOn(Unit const* victim)
-{
-    ObjectGuid victimGuid = victim ? victim->GetGUID() : ObjectGuid::Empty;
-    if (ComboTargetRules::GainResetsPoints(GetComboTarget(), victimGuid))
-        SetPower(POWER_COMBO_POINTS, 0);        // clears the combo target too
-    SetComboTarget(victimGuid);
-}
-
-void Player::UpdateComboTarget()
-{
-    ObjectGuid comboTarget = GetComboTarget();
-    if (comboTarget.IsEmpty())
-        return;
-
-    Unit* target = ObjectAccessor::GetUnit(*this, comboTarget);
-    if (ComboTargetRules::ShouldDrop(comboTarget, target && target->IsAlive()))
-        SetPower(POWER_COMBO_POINTS, 0);        // clears the combo target too
-}
-
 void Player::Update(uint32 p_time)
 {
     if (!IsInWorld())
@@ -994,7 +967,17 @@ void Player::Update(uint32 p_time)
 
     UpdatePvPFlag(now);
 
-    UpdateComboTarget();
+    // Classic 1.60: combo points are lost when their target dies or is gone
+    if (ObjectGuid comboTarget = GetClassicComboTarget(); !comboTarget.IsEmpty())
+    {
+        Unit* target = ObjectAccessor::GetUnit(*this, comboTarget);
+        if (!target || !target->IsAlive())
+        {
+            SetPower(POWER_COMBO_POINTS, 0);
+            if (!GetClassicComboTarget().IsEmpty())
+                SetClassicComboTarget(ObjectGuid::Empty);
+        }
+    }
 
     UpdateContestedPvP(p_time);
 
@@ -1003,6 +986,7 @@ void Player::Update(uint32 p_time)
     CheckDuelDistance(now);
 
     UpdateAfkReport(now);
+
     UpdateTradeState();
 
     if (GetCombatManager().HasPvPCombat())
@@ -1340,10 +1324,7 @@ bool Player::TeleportTo(TeleportLocation const& teleportLocation, TeleportToOpti
     if (duel && GetMapId() != teleportLocation.Location.GetMapId() && GetMap()->GetGameObject(m_playerData->DuelArbiter))
         DuelComplete(DUEL_FLED);
 
-    // A near teleport needs a player standing in a map's grid. One that is out of the world (removed from its map for a far
-    // teleport that then failed, e.g. the worldport ack porting it to homebind on the map it just left) still reports its old map
-    // id; as a near teleport it would be acked into Map::PlayerRelocation and assert on RemoveFromGrid. It takes the far path,
-    // which already handles "no old map".
+    // a player out of the world (after a failed far teleport) still reports its old map id but is in no grid: take the far path
     if (IsInWorld() && GetMapId() == teleportLocation.Location.GetMapId() && (!teleportLocation.InstanceId || GetInstanceId() == teleportLocation.InstanceId))
     {
         SetTeleportState(TeleportState::Initiated);
@@ -2360,9 +2341,6 @@ void Player::GiveLevel(uint8 level)
     UpdateClassicLegacyUnlock();
 
     sScriptMgr->OnPlayerLevelChanged(this, oldLevel);
-
-    if (level > oldLevel)
-        Playerbot::Hooks::OnLevelUp(this, level);
 
     BattlenetPresence::OnCharacterChanged(this);
 }
@@ -4714,7 +4692,6 @@ void Player::ResurrectPlayer(float restore_percent, bool applySickness)
             }
         }
     }
-
 }
 
 void Player::KillPlayer()
@@ -5055,7 +5032,7 @@ bool Player::SnapBuriedLocToFloor(Map* map, WorldLocation& loc, uint32 safeLocId
     float const terrain = map->GetGridHeight(GetPhaseShift(), x, y);
     if (terrain <= INVALID_HEIGHT)
     {
-        // A battleground floor is WMO only (no terrain grid): the rez rows 771/772 sit ~24 y under it. Raise to the surface found above.
+        // a battleground floor is WMO only (no terrain grid): raise a point under it to the surface found above
         if (!map->IsBattleground())
             return false;
 
@@ -5063,14 +5040,14 @@ bool Player::SnapBuriedLocToFloor(Map* map, WorldLocation& loc, uint32 safeLocId
         if (ground <= INVALID_HEIGHT || ground <= z + 1.0f)
             return false;
 
-        TC_LOG_ERROR("misc", "[graveyard_z] safe loc {} map {} ({:.1f},{:.1f}) z {:.1f} is below the floor ({:.1f}); using the floor. Fix the world_safe_locs row.",
+        TC_LOG_ERROR("misc", "Player::SnapBuriedLocToFloor: safe loc {} map {} ({:.1f}, {:.1f}) z {:.1f} is below the floor ({:.1f}), using the floor. Fix the world_safe_locs row.",
             safeLocId, map->GetId(), x, y, z, ground);
         loc.Relocate(x, y, ground + 0.5f);
         return true;
     }
 
-    // Buried = more than a yard under the terrain and no WMO / model surface within reach of the point (a graveyard inside a building or
-    // a cave under the terrain stands on that surface and is left alone).
+    // buried = more than a yard under the terrain and no WMO / model surface within reach of the point (a graveyard inside a building
+    // or a cave under the terrain stands on that surface and is left alone)
     if (z >= terrain - 1.0f)
         return false;
 
@@ -5080,7 +5057,7 @@ bool Player::SnapBuriedLocToFloor(Map* map, WorldLocation& loc, uint32 safeLocId
 
     float const floor = map->GetHeight(GetPhaseShift(), x, y, terrain + 1.0f, true, 6.0f);
     float const newZ = std::max(floor, terrain) + 0.5f;
-    TC_LOG_ERROR("misc", "[graveyard_z] safe loc {} map {} ({:.1f},{:.1f}) z {:.1f} is under the terrain ({:.1f}); using {:.1f}. Fix the world_safe_locs row.",
+    TC_LOG_ERROR("misc", "Player::SnapBuriedLocToFloor: safe loc {} map {} ({:.1f}, {:.1f}) z {:.1f} is under the terrain ({:.1f}), using {:.1f}. Fix the world_safe_locs row.",
         safeLocId, map->GetId(), x, y, z, terrain, newZ);
     loc.Relocate(x, y, newZ);
     return true;
@@ -5110,13 +5087,6 @@ void Player::RepopAtGraveyard()
     if (!closestGrave)
         closestGrave = sObjectMgr->GetClosestGraveyard(*this, GetTeam(), this);
 
-    if (GetMap()->IsBattlegroundOrArena())
-        TC_LOG_INFO("playerbot.v2", "[bg_repop] {} (team {}) died at map {} ({:.1f},{:.1f},{:.1f}) zone {} -> safe loc {} map {} ({:.1f},{:.1f},{:.1f})",
-            GetName(), uint32(GetTeam()), GetMapId(), GetPositionX(), GetPositionY(), GetPositionZ(), GetZoneId(),
-            closestGrave ? closestGrave->ID : 0u, closestGrave ? closestGrave->Loc.GetMapId() : 0u,
-            closestGrave ? closestGrave->Loc.GetPositionX() : 0.0f, closestGrave ? closestGrave->Loc.GetPositionY() : 0.0f,
-            closestGrave ? closestGrave->Loc.GetPositionZ() : 0.0f);
-
     // stop countdown until repop
     m_deathTimer = 0;
 
@@ -5124,15 +5094,18 @@ void Player::RepopAtGraveyard()
     // and don't show spirit healer location
     if (closestGrave)
     {
-        // A graveyard whose Z lies under the terrain drops the ghost out of the world: the retail world_safe_locs rows keep retail Z values
-        // that the Classic terrain does not match (WSG rows 771/772 sat ~24 y under the floor, Karrz 2026-10-08; Sentinel Hill graveyard 4 on
-        // release from the Deadmines, Karrz 2026-10-10). Same map: raise it to the floor here. Another map (an instance releasing to the
-        // continent) is not loaded yet; the worldport ack does the same once the destination map exists.
+        // Classic 1.60: retail world_safe_locs rows keep retail Z values that the Classic terrain does not always match, and a graveyard
+        // under the terrain drops the ghost out of the world. Same map: raise it to the floor here. Another map (an instance releasing
+        // to the continent) is not loaded yet; the worldport ack does the same once it exists. Transport graveyards are left alone.
         WorldLocation graveLoc = closestGrave->Loc;
-        if (graveLoc.GetMapId() == GetMapId())
-            SnapBuriedLocToFloor(GetMap(), graveLoc, closestGrave->ID);
-        else
-            SetGraveyardTeleportId(closestGrave->ID);
+        if (!closestGrave->TransportSpawnId)
+        {
+            if (graveLoc.GetMapId() == GetMapId())
+                SnapBuriedLocToFloor(GetMap(), graveLoc, closestGrave->ID);
+            else
+                SetGraveyardTeleportId(closestGrave->ID);
+        }
+
         TeleportTo({ .Location = graveLoc, .TransportGuid = closestGrave->TransportSpawnId ? ObjectGuid::Create<HighGuid::Transport>(*closestGrave->TransportSpawnId) : ObjectGuid::Empty }, shouldResurrect ? TELE_REVIVE_AT_TELEPORT : TELE_TO_NONE);
         if (isDead())                                        // not send if alive, because it used in TeleportTo()
         {
@@ -5923,7 +5896,7 @@ bool Player::UpdateFishingSkill(int32 expansion)
         return false;
 
     // Classic 1.60 (vanilla, VMaNGOS UpdateFishingSkill): called on a catch only; 100% below 75 skill, then 2500 / (skill - 50)%
-    (void)GetFishingStepsNeededToLevelUp;
+    // (the retail GetFishingStepsNeededToLevelUp above is not used)
     int32 chance = skillValue < 75 ? 100 : int32(2500 / (skillValue - 50));
     uint32 gatheringSkillGain = sWorld->getIntConfig(CONFIG_SKILL_GAIN_GATHERING);
     return UpdateSkillPro(fishingSkill, chance * 10, gatheringSkillGain);
@@ -6926,9 +6899,22 @@ void Player::UpdateIndoorsOutdoorsAuras()
     if (sWorld->getBoolConfig(CONFIG_VMAP_INDOOR_CHECK))
         RemoveAurasWithAttribute(IsOutdoors() ? SPELL_ATTR0_ONLY_INDOORS : SPELL_ATTR0_ONLY_OUTDOORS);
 
-    // Classic: walking into a building or cave dismounts (see Spell::CheckCast, SPELL_AURA_MOUNTED).
-    if (!IsOutdoors() && HasAuraType(SPELL_AURA_MOUNTED) && VMAP::VMapFactory::createOrGetVMapManager()->isLineOfSightCalcEnabled())
+    // Classic: walking indoors dismounts
+    if (HasAuraType(SPELL_AURA_MOUNTED) && IsMountRestrictedHere(false))
         RemoveAurasByType(SPELL_AURA_MOUNTED);
+}
+
+// Classic.MountIndoorsRules: the mount spells of the client data do not carry SPELL_ATTR0_ONLY_OUTDOORS
+bool Player::IsMountRestrictedHere(bool checkStartArea) const
+{
+    if (!sWorld->getBoolConfig(CONFIG_CLASSIC_MOUNT_INDOORS_RULES))
+        return false;
+
+    if (Battleground const* bg = GetBattleground(); bg && !bg->isArena())
+        return bg->IsMountRefused(this, checkStartArea);
+
+    // the indoor state comes from the wmo data of the vmaps
+    return !IsOutdoors() && VMAP::VMapFactory::createOrGetVMapManager()->isLineOfSightCalcEnabled();
 }
 
 void Player::UpdateTavernRestingState()
@@ -13996,8 +13982,6 @@ void Player::TradeCancel(bool sendback, TradeStatus status /*= TRADE_STATUS_CANC
     if (m_trade)
     {
         Player* trader = m_trade->GetTrader();
-        if (GetSession()->IsBot() || trader->GetSession()->IsBot())
-            TC_LOG_INFO("playerbot.v2", "[trade] cancel {} <-> {} (status {})", GetName(), trader->GetName(), uint32(status));
 
         if (sendback)
             GetSession()->SendCancelTrade(status);
@@ -14012,34 +13996,31 @@ void Player::TradeCancel(bool sendback, TradeStatus status /*= TRADE_STATUS_CANC
     }
 }
 
+// cancels a trade whose partner is gone or out of range, a stale trade would block any new one until relog
 void Player::UpdateTradeState()
 {
     if (!m_trade)
         return;
+
     Player* trader = m_trade->GetTrader();
-    TradeStatus why = TRADE_STATUS_CANCELLED;
-    char const* reason = nullptr;
-    if (!trader || !trader->IsInWorld() || !IsInWorld())
-        reason = "partner gone";
-    else if (!trader->m_trade || trader->m_trade->GetTrader() != this)
-        reason = "partner is not in this trade";
-    else if (!IsWithinDistInMap(trader, TRADE_DISTANCE, false))
-    {
-        reason = "out of range";
-        why = TRADE_STATUS_TOO_FAR_AWAY;
-    }
-    if (!reason)
+
+    // a partner on another map is updated by another thread, a new trade request or a logout clears that trade
+    if (trader->IsInWorld() && trader->GetMap() != GetMap())
         return;
-    TC_LOG_INFO("playerbot.v2", "[trade] closing {}'s trade with {}: {}", GetName(), trader ? trader->GetName() : std::string("?"), reason);
-    if (trader && trader->m_trade && trader->m_trade->GetTrader() == this)
-        TradeCancel(true, why);
-    else
+
+    if (!trader->m_trade || trader->m_trade->GetTrader() != this)
     {
-        // The partner's side is gone or unrelated: drop only ours.
-        GetSession()->SendCancelTrade(why);
+        // the partner is no longer in this trade, only our side is left
+        GetSession()->SendCancelTrade(TRADE_STATUS_CANCELLED);
         delete m_trade;
         m_trade = nullptr;
+        return;
     }
+
+    if (!trader->IsInWorld())
+        TradeCancel(true);
+    else if (!IsWithinDistInMap(trader, TRADE_DISTANCE, false))
+        TradeCancel(true, TRADE_STATUS_TOO_FAR_AWAY);
 }
 
 void Player::InitiateTrade(Player* trader)
@@ -16561,8 +16542,7 @@ bool Player::SatisfyQuestRace(Quest const* qInfo, bool msg) const
 bool Player::SatisfyQuestMinReputation(Quest const* qInfo, bool msg) const
 {
     uint32 fIdMin = qInfo->GetRequiredMinRepFaction();      //Min required rep
-    // Classic 1.60: quest_template carries later-expansion factions (e.g. #922, #967) missing from the
-    // client data; look them up as an entry (unknown = 0 standing, same result) so quest scans don't flood the error log
+    // looked up as an entry: factions missing from the client data count as 0 standing without logging an error
     if (fIdMin && GetReputationMgr().GetReputation(sFactionStore.LookupEntry(fIdMin)) < qInfo->GetRequiredMinRepValue())
     {
         if (msg)
@@ -16863,10 +16843,7 @@ QuestStatus Player::GetQuestStatus(uint32 quest_id) const
 bool Player::CanShareQuest(uint32 quest_id) const
 {
     Quest const* qInfo = sObjectMgr->GetQuestTemplate(quest_id);
-    // Vanilla: every ordinary quest can be shared. The imported Forever quest data does not reliably carry the
-    // SHARABLE flag, which left the Share button (and the bots) without any quest to push, so a quest that is
-    // not repeatable / daily / weekly counts as sharable too.
-    if (qInfo && (qInfo->HasFlag(QUEST_FLAGS_SHARABLE) || (!qInfo->IsRepeatable() && !qInfo->IsDailyOrWeekly())))
+    if (qInfo && qInfo->HasFlag(QUEST_FLAGS_SHARABLE))
     {
         QuestStatusMap::const_iterator itr = m_QuestStatus.find(quest_id);
         return (itr != m_QuestStatus.end());
@@ -19138,6 +19115,8 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
     SetInventorySlotCount(fields.inventorySlots);
     SetBackpackAutoSortDisabled(fields.inventoryBagFlags.HasFlag(BagSlotFlags::DisableAutoSort));
     SetBackpackSellJunkDisabled(fields.inventoryBagFlags.HasFlag(BagSlotFlags::ExcludeJunkSell));
+    SetSortBagsRightToLeft(fields.inventoryBagFlags.HasFlag(BagSlotFlags::SortBagsRightToLeft));
+    SetInsertItemsLeftToRight(fields.inventoryBagFlags.HasFlag(BagSlotFlags::InsertItemsLeftToRight));
     for (uint32 bagIndex = 0; bagIndex < fields.bagSlotFlags.size(); ++bagIndex)
         ReplaceAllBagSlotFlags(bagIndex, fields.bagSlotFlags[bagIndex]);
     SetBankBagSlotCount(fields.bankSlots);
@@ -19456,9 +19435,7 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
 
     if (player_at_bg)
     {
-        // Back in a running battleground after a reconnect: the saved bgTeam was read straight into m_bgData, but the ArenaFaction
-        // update field (which the client uses for friend / foe inside a BG) is only written by SetBGTeam, so it stayed 0 = Horde
-        // (Karrz, WSG 2026-10-08: an Alliance player came back with the Horde shown green and friendly while they killed him).
+        // the loaded bgTeam does not set the ArenaFaction field the client uses for friend / foe
         SetBGTeam(GetBGTeam());
         map->ToBattlegroundMap()->GetBG()->AddPlayer(this, m_bgData.queueId);
     }
@@ -20964,10 +20941,7 @@ void Player::SendRaidInfo()
         lockInfos.Extended = instanceLock->IsExtended();
     }
 
-    WorldPacket const* data = instanceInfo.Write();
-    TC_LOG_INFO("instance.lock", "[raid_info] sending {} lock(s) to {} ({} bytes)", instanceInfo.LockList.size(), GetName(), data->size());
-
-    SendDirectMessage(data);
+    SendDirectMessage(instanceInfo.Write());
 }
 
 bool Player::Satisfy(AccessRequirement const* ar, uint32 target_map, TransferAbortParams* params, bool report)
@@ -21013,7 +20987,6 @@ bool Player::Satisfy(AccessRequirement const* ar, uint32 target_map, TransferAbo
                     LevelMax = ar->levelMax;
             }
 
-            // Instance.IgnoreAttunement: the attunement item and quest of the instance are not required (optional server option)
             if (!sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_ATTUNEMENT))
             {
                 if (ar->item)
@@ -21097,31 +21070,18 @@ bool Player::CheckInstanceValidity(bool /*isLogin*/)
     // raid instances require the player to be in a raid group to be valid
     if (map->IsRaid() && !sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_RAID) && (map->GetEntry()->Expansion() >= sWorld->getIntConfig(CONFIG_EXPANSION)))
         if (!group || !group->isRaidGroup())
-        {
-            TC_LOG_INFO("playerbot.v2", "[raid_lock] {} invalid in map {} instance {}: {}", GetName(), map->GetId(), map->GetInstanceId(),
-                !group ? "not in a group" : "group is not a raid group");
             return false;
-        }
 
     if (group)
     {
         if (group != instance->GetOwningGroup())
-        {
-            Group const* owner = instance->GetOwningGroup();
-            TC_LOG_INFO("playerbot.v2", "[raid_lock] {} invalid in map {} instance {}: group {} is not the owning group ({})", GetName(), map->GetId(),
-                map->GetInstanceId(), group->GetGUID().ToString(), owner ? owner->GetGUID().ToString() : "none");
             return false;
-        }
     }
     else
     {
         // instance is invalid if we are not grouped and there are other players
         if (map->GetPlayersCountExceptGMs() > 1)
-        {
-            TC_LOG_INFO("playerbot.v2", "[raid_lock] {} invalid in map {} instance {}: not grouped with {} other players inside", GetName(), map->GetId(),
-                map->GetInstanceId(), map->GetPlayersCountExceptGMs() - 1);
             return false;
-        }
     }
 
     return true;
@@ -21403,6 +21363,10 @@ void Player::SaveToDB(LoginDatabaseTransaction loginTransaction, CharacterDataba
                 inventoryFlags |= BagSlotFlags::DisableAutoSort;
             if (m_activePlayerData->BackpackSellJunkDisabled)
                 inventoryFlags |= BagSlotFlags::ExcludeJunkSell;
+            if (m_activePlayerData->SortBagsRightToLeft)
+                inventoryFlags |= BagSlotFlags::SortBagsRightToLeft;
+            if (m_activePlayerData->InsertItemsLeftToRight)
+                inventoryFlags |= BagSlotFlags::InsertItemsLeftToRight;
             return AsUnderlyingType(inventoryFlags);
         }());
         for (uint32 bagSlotFlag : m_activePlayerData->BagSlotFlags)
@@ -21528,6 +21492,10 @@ void Player::SaveToDB(LoginDatabaseTransaction loginTransaction, CharacterDataba
                 inventoryFlags |= BagSlotFlags::DisableAutoSort;
             if (m_activePlayerData->BackpackSellJunkDisabled)
                 inventoryFlags |= BagSlotFlags::ExcludeJunkSell;
+            if (m_activePlayerData->SortBagsRightToLeft)
+                inventoryFlags |= BagSlotFlags::SortBagsRightToLeft;
+            if (m_activePlayerData->InsertItemsLeftToRight)
+                inventoryFlags |= BagSlotFlags::InsertItemsLeftToRight;
             return AsUnderlyingType(inventoryFlags);
         }());
         for (uint32 bagSlotFlag : m_activePlayerData->BagSlotFlags)
@@ -22510,11 +22478,7 @@ void Player::_SaveStoredAuraTeleportLocations(CharacterDatabaseTransaction trans
         {
             CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_AURA_STORED_LOCATION);
             stmt->setUInt64(0, GetGUID().GetCounter());
-            // CHAR_DEL_CHARACTER_AURA_STORED_LOCATION is "... WHERE Guid=? AND
-            // Spell=?". The Spell (itr->first) param was never bound, so the
-            // DELETE matched nothing — a removed teleport-aura location lingered
-            // in the DB. Bind it.
-            stmt->setUInt32(1, itr->first);
+            stmt->setUInt32(1, itr->first);         // WHERE Guid = ? AND Spell = ?: without the spell the DELETE matched nothing
             trans->Append(stmt);
             itr = m_storedAuraTeleportLocations.erase(itr);
             continue;
@@ -22524,11 +22488,7 @@ void Player::_SaveStoredAuraTeleportLocations(CharacterDatabaseTransaction trans
         {
             CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_AURA_STORED_LOCATION);
             stmt->setUInt64(0, GetGUID().GetCounter());
-            // Same unbound-Spell bug: without this the DELETE matched nothing, so
-            // the INSERT below collided on the (Guid,Spell) PRIMARY KEY every save
-            // — a [1062] duplicate-key storm (4,176 identical errors in a 4-day
-            // bot run, ~1 per 90s character save).
-            stmt->setUInt32(1, itr->first);
+            stmt->setUInt32(1, itr->first);         // WHERE Guid = ? AND Spell = ?: without the spell the DELETE matched nothing
             trans->Append(stmt);
 
             stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHARACTER_AURA_STORED_LOCATION);
@@ -22541,8 +22501,6 @@ void Player::_SaveStoredAuraTeleportLocations(CharacterDatabaseTransaction trans
             stmt->setFloat(6, storedLocation.Loc.GetOrientation());
             trans->Append(stmt);
 
-            // Mark persisted so an unchanged location isn't DELETE+INSERTed on
-            // every subsequent 90s save (redundant writes amplified fleet-wide).
             storedLocation.State = StoredAuraTeleportLocation::UNCHANGED;
         }
 
@@ -23320,8 +23278,7 @@ void Player::Whisper(std::string_view text, Language language, Player* target, b
 
     WorldPackets::Chat::Chat packet;
     packet.Initialize(CHAT_MSG_WHISPER, language, this, this, _text);
-    // Both names travel with a whisper line (stock leaves them to the client's name cache): the Forever client showed no or
-    // grey whispers with bots (Karrz 2026-10-08); a name in the packet cannot be wrong.
+    // send the names too, the receiver may not have the sender in its name cache
     packet.SenderName = GetName();
     packet.TargetName = GetName();
     target->SendDirectMessage(packet.Write());
@@ -26049,9 +26006,7 @@ void Player::SendInitialPacketsAfterAddToMap()
 
     // Skip LOGINEFFECT for bots - visual effect requires client rendering
     // Bots don't send CMSG_CAST_SPELL ACKs, causing m_spellModTakingSpell assertion failures (Spell.cpp:603)
-#if defined(TRINITY_PLAYERBOT_V2)
     if (!GetSession()->IsBot())
-#endif
         CastSpell(this, 836, true);                         // LOGINEFFECT
 
     WorldPackets::Movement::MoveSetCompoundState setCompoundState;
@@ -27879,6 +27834,16 @@ void Player::AtExitCombat()
 {
     Unit::AtExitCombat();
     m_regenInterruptTimestamp = GameTime::Now();
+
+    // Classic 1.60 (client 70374) warrior talent Lingering Rage 1323964: "Increases the time before your Rage begins to decay after leaving
+    // combat by ${$s1/1000} sec." (2-10 sec by rank). Its entered-combat proc (1323966) is only a marker; on leaving combat the Lingering
+    // Rage buff 1323965 (SPELL_AURA_INTERRUPT_REGEN: rage keeps its combat regen, no decay) runs for the talent value.
+    if (AuraEffect const* lingeringRage = GetAuraEffect(1323964, EFFECT_0))
+    {
+        RemoveAurasDueToSpell(1323966);
+        if (int32 const duration = int32(lingeringRage->GetAmount()); duration > 0)
+            CastSpell(this, 1323965, CastSpellExtraArgs(TRIGGERED_FULL_MASK).AddSpellMod(SPELLVALUE_DURATION, duration));
+    }
 }
 
 float Player::GetBlockPercent(uint8 attackerLevel) const
@@ -28237,7 +28202,7 @@ void Player::StoreLootItem(ObjectGuid lootWorldObjectGuid, uint8 lootSlot, Loot*
 
             Item* newitem = StoreNewItem(dest, item->itemid, true, item->randomBonusListId, item->GetAllowedLooters(), item->context);
             if (newitem)
-                Playerbot::Hooks::OnItemLooted(this, item->itemid);
+                sScriptMgr->OnPlayerLootItem(this, newitem);
 
             if (newitem && (newitem->GetQuality() > ITEM_QUALITY_EPIC || (newitem->GetQuality() == ITEM_QUALITY_EPIC && newitem->GetItemLevel(this) >= MinNewsItemLevel)))
                 if (Guild* guild = GetGuild())
@@ -29496,31 +29461,22 @@ void Player::_SaveTransmogOutfits(CharacterDatabaseTransaction trans)
 
 void Player::_SaveBGData(CharacterDatabaseTransaction trans)
 {
-    // A character not in (or queued for) a battleground has no BG data worth
-    // persisting. Re-writing an all-zeros row every 90s save for a mostly-non-BG
-    // fleet produced a DELETE(of-nonexistent-row, gap-lock)+INSERT storm on
-    // character_battleground_data — 87 of the [1213] deadlocks in a 6-min bot run.
-    // Skip the write entirely when there is nothing to save. A stale row left by a
-    // since-ended BG is harmless: on relog the instance no longer exists and the
-    // load path drops it; and re-entering a BG rewrites the row.
-    // NOTE: BattlegroundQueueTypeId::GetPacked() unconditionally OR's in the
-    // 0x1F10000000000000 protocol tag, so it is NEVER 0 — even for
-    // BATTLEGROUND_QUEUE_NONE. A `GetPacked() != 0` test is therefore always true
-    // and silently defeated this skip, letting the all-zeros DELETE+INSERT deadlock
-    // storm continue. Compare against the NONE sentinel via the defaulted operator==.
-    const bool hasBgData =
-        m_bgData.bgInstanceID != 0 ||
-        m_bgData.joinPos.GetMapId() != MAPID_INVALID ||
-        m_bgData.taxiPath[0] != 0 || m_bgData.taxiPath[1] != 0 ||
-        m_bgData.mountSpell != 0 ||
-        m_bgData.queueId != BATTLEGROUND_QUEUE_NONE;
-    if (!hasBgData)
-        return;
+    bool const hasBgData = m_bgData.bgInstanceID != 0
+        || m_bgData.bgTeam != TEAM_OTHER
+        || m_bgData.joinPos.GetMapId() != MAPID_INVALID
+        || m_bgData.taxiPath[0] || m_bgData.taxiPath[1]
+        || m_bgData.mountSpell
+        || m_bgData.queueId != BATTLEGROUND_QUEUE_NONE;
 
-    // Single atomic upsert (REPLACE INTO, keyed on the guid PK) instead of
-    // DELETE-then-INSERT. The old two-statement form gap-locked the non-existent
-    // row on DELETE and then INSERTed, which under concurrent fleet saves produced
-    // the [1213] deadlock storm. REPLACE collapses both into one lock acquisition.
+    // one statement per save: an all-empty row is never written, a row left by earlier data is removed
+    if (!hasBgData)
+    {
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_PLAYER_BGDATA);
+        stmt->setUInt64(0, GetGUID().GetCounter());
+        trans->Append(stmt);
+        return;
+    }
+
     /* guid, bgInstanceID, bgTeam, x, y, z, o, map, taxi[0], taxi[1], mountSpell */
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_PLAYER_BGDATA);
     stmt->setUInt64(0, GetGUID().GetCounter());
@@ -29863,36 +29819,26 @@ void Player::_SaveTalents(CharacterDatabaseTransaction trans)
         }
     }
 
-    // PvP talents: skip the DELETE+per-group-INSERT entirely for a character with
-    // none in any spec group (the whole leveling fleet) — the unconditional write
-    // of MAX_SPECIALIZATIONS all-zeros rows every save is the same gap-lock
-    // deadlock source as BG data above (23 of the run's [1213] deadlocks). A stale
-    // row is harmless — it's overwritten the moment a real PvP talent is chosen.
-    bool hasPvpTalent = false;
-    for (uint8 group = 0; group < MAX_SPECIALIZATIONS && !hasPvpTalent; ++group)
-    {
-        PlayerPvpTalentMap const& t = GetPvpTalentMap(group);
-        if (t[0] || t[1] || t[2] || t[3])
-            hasPvpTalent = true;
-    }
-    if (hasPvpTalent)
-    {
-        stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_PVP_TALENT);
-        stmt->setUInt64(0, GetGUID().GetCounter());
-        trans->Append(stmt);
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_PVP_TALENT);
+    stmt->setUInt64(0, GetGUID().GetCounter());
+    trans->Append(stmt);
 
-        for (uint8 group = 0; group < MAX_SPECIALIZATIONS; ++group)
-        {
-            PlayerPvpTalentMap const& talents = GetPvpTalentMap(group);
-            stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHAR_PVP_TALENT);
-            stmt->setUInt64(0, GetGUID().GetCounter());
-            stmt->setUInt32(1, talents[0]);
-            stmt->setUInt32(2, talents[1]);
-            stmt->setUInt32(3, talents[2]);
-            stmt->setUInt32(4, talents[3]);
-            stmt->setUInt8(5, group);
-            trans->Append(stmt);
-        }
+    for (uint8 group = 0; group < MAX_SPECIALIZATIONS; ++group)
+    {
+        PlayerPvpTalentMap const& talents = GetPvpTalentMap(group);
+
+        // an empty row loads the same as no row
+        if (std::ranges::all_of(talents, [](uint32 talentId) { return talentId == 0; }))
+            continue;
+
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHAR_PVP_TALENT);
+        stmt->setUInt64(0, GetGUID().GetCounter());
+        stmt->setUInt32(1, talents[0]);
+        stmt->setUInt32(2, talents[1]);
+        stmt->setUInt32(3, talents[2]);
+        stmt->setUInt32(4, talents[3]);
+        stmt->setUInt8(5, group);
+        trans->Append(stmt);
     }
 }
 

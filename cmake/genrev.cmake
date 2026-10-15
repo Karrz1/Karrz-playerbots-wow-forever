@@ -16,6 +16,16 @@ if(NOT BUILDDIR)
   set(BUILDDIR ${CMAKE_BINARY_DIR})
 endif()
 
+# With -DEMBED_BUILD_PATHS=0 the programs carry no folder names of the machine that built them.
+# SourceDirectory (and BuildDirectory) must then be set in the config files, as the database updater and the module migrations read from it.
+if(DEFINED EMBED_BUILD_PATHS AND NOT EMBED_BUILD_PATHS)
+  set(TRINITY_EMBED_SOURCE_DIR "")
+  set(TRINITY_EMBED_BUILD_DIR "")
+else()
+  set(TRINITY_EMBED_SOURCE_DIR "${CMAKE_SOURCE_DIR}")
+  set(TRINITY_EMBED_BUILD_DIR "${BUILDDIR}")
+endif()
+
 if(WITHOUT_GIT)
   set(rev_date "1970-01-01 00:00:00 +0000")
   set(rev_hash "unknown")
@@ -112,17 +122,6 @@ else()
   else()
     # We have valid date from git commit, use that
     set(rev_date_fallback ${rev_date})
-  endif()
-endif()
-
-# The advocaite commit the tree is pinned to (UPSTREAM_PIN, see doc/UPSTREAM.md)
-set(upstream_pin "unpinned")
-if(EXISTS "${CMAKE_SOURCE_DIR}/UPSTREAM_PIN")
-  file(STRINGS "${CMAKE_SOURCE_DIR}/UPSTREAM_PIN" upstream_pin_lines REGEX "^commit:[ \t]*[0-9a-f]+")
-  if(upstream_pin_lines)
-    string(REGEX MATCH "[0-9a-f]+[ \t]*$" upstream_pin_full "${upstream_pin_lines}")
-    string(STRIP "${upstream_pin_full}" upstream_pin_full)
-    string(SUBSTRING "${upstream_pin_full}" 0 12 upstream_pin)
   endif()
 endif()
 

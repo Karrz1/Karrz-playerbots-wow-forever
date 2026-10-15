@@ -18,6 +18,7 @@
 #include "World.h"
 #include "fmt/format.h"
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <atomic>
 #include <initializer_list>
@@ -111,6 +112,37 @@ std::span<Blessing const> MemberBlessingOrder(uint8 cls, uint32 spec, bool raid)
     if (PhysicalClass(cls) || IsMeleeSpec(cls, spec))
         return raid ? std::span<Blessing const>(kMeleeRaidOrder) : std::span<Blessing const>(kMeleeOrder);
     return raid ? std::span<Blessing const>(kCasterRaidOrder) : std::span<Blessing const>(kCasterOrder);
+}
+
+// A Greater Blessing that does something on this server. The Greater Blessing spells of this data carry no effect at all (the spell
+// audit lists effect 0 on 25782, 25890, 25894, 25898, 25899, 25916): the cast spends a Symbol of Kings, applies nothing, and the paladin
+// that sees no aura on the class casts it again on the next tick (MC Magmadar 2026-10-10 and the 14-17 Greater casts per paladin in 14
+// minutes of the 2026-10-12 raid). Such a spell is not used; the paladin blesses the members one by one with the normal blessings, which
+// the same data does apply. Answered once per spell id.
+bool GreaterBlessingWorks(uint32 spell_id)
+{
+    static std::mutex mu;
+    static std::unordered_map<uint32, bool> memo;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (auto it = memo.find(spell_id); it != memo.end())
+            return it->second;
+    }
+    bool works = false;
+    if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE))
+        for (SpellEffectInfo const& eff : si->GetEffects())
+            if (eff.Effect != SPELL_EFFECT_NONE)
+            {
+                works = true;
+                break;
+            }
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        memo.emplace(spell_id, works);
+    }
+    if (!works)
+        TC_LOG_INFO("playerbot.v2", "[bless] Greater Blessing spell {} has no effect in this data: paladins bless member by member instead", spell_id);
+    return works;
 }
 
 // Blessing `b` on a buff list, with more than `min_ms` left, normal or
@@ -351,6 +383,25 @@ bool FearBossEngaged(BotSnapshotView const& s)
     return false;
 }
 
+// Molten Core: one of the bosses whose fire needs resistance (Magmadar, Baron Geddon, Ragnaros) is in combat with the group.
+bool FireResistBossEngaged(BotSnapshotView const& s)
+{
+    for (NearbyUnit const& u : s.raw().combat.nearby_enemies)
+        if (FightingTheGroup(u) && (u.entry == 11982 || u.entry == 12056 || u.entry == 11502))
+            return true;
+    return false;
+}
+
+// The resistance school the fire resistance aura / totem is held for. In Molten Core they are held only against the three fire
+// bosses: the aura puts a gold haze round every player in range (playtest 2026-10-13), so elsewhere the normal aura and totem stand.
+Resist AuraResistance(BotSnapshotView const& s)
+{
+    Resist const r = InstanceResistance(s.map_id());
+    if (r == Resist::Fire && s.map_id() == 409 && !FireResistBossEngaged(s))
+        return Resist::None;
+    return r;
+}
+
 // Raid: the shaman's subgroup (itself included) has a tank in it, as the
 // coordinator counts tanks (role / tank spec / plan main tank).
 bool SubgroupHasTank(BotSnapshotView const& s, GroupSnapshotView const& g)
@@ -369,7 +420,7 @@ uint32 DesiredTotem(BotSnapshotView const& s, GroupSnapshotView const& g, Elemen
     bool const self_melee = !ShamanIsCaster(s.spec());
     auto const melee_mate = [](GroupMemberSummary const& m) { return m.role == Role::Tank || IsMeleeSpec(m.cls, m.spec); };
     size_t const index = ShamanIndexInParty(s, g);
-    Resist const resist = InstanceResistance(s.map_id());
+    Resist const resist = AuraResistance(s);
     switch (e)
     {
         case EARTH:
@@ -533,7 +584,7 @@ CastPick PickBlessing(BotSnapshotView const& s, GroupSnapshotView const& g, bool
         // a tank in it - that one is blessed member by member below.
         ClassPlan const class_plan = plan_for(ClassBlessingOrder(cls, raid), class_has_tank);
         int const bc = BlessingAt(s, class_plan.index, std::span<Blessing const>(class_plan.order.data(), class_plan.n));
-        if (bc >= 0 && greater_ok && s.knows_spell(kBlessings[bc].greater) && !(class_has_tank && bc == SALVATION))
+        if (bc >= 0 && greater_ok && s.knows_spell(kBlessings[bc].greater) && GreaterBlessingWorks(kBlessings[bc].greater) && !(class_has_tank && bc == SALVATION))
         {
             uint64 const key = (1ull << 48) | (uint64(bc) << 8) | cls;
             for (GroupMemberSummary const& m : *members)
@@ -736,6 +787,7 @@ void ShortClassSupplies(BotSnapshotView const& s, std::vector<uint32>& out)
     for (SupplyFamily const& f : GetSupplyFamilies())
     {
         if (!SupplyFamilyForClass(f, s.cls())) continue;
+        if (MageConjuresFamily(s.cls(), f.name, [&](uint32 id) { return s.knows_spell(id); })) continue;
         uint32 const best = BestSupplyRank(f, s.level());
         if (!best) continue;
         uint32 have = 0;
@@ -756,6 +808,13 @@ void ShortClassSupplies(BotSnapshotView const& s, std::vector<uint32>& out)
 namespace {
 
 constexpr uint8 KindBit(ConsumableKind k) { return uint8(1u << uint8(k)); }
+
+// The item data files the Demonic Rune under Trade Goods / Other (class 7, subclass 11), not Consumable (MC Geddon on next-6: "class 7 subclass 11,
+// 1 item effects [trigger 0 spell 16666 effect 30 ...]"): every bag scan and the classification take both classes, and the effects decide the kind.
+constexpr bool IsConsumableClass(uint32 item_class, uint32 item_subclass)
+{
+    return item_class == ITEM_CLASS_CONSUMABLE || (item_class == ITEM_CLASS_TRADE_GOODS && item_subclass == ITEM_SUBCLASS_TRADE_GOODS_OTHER);
+}
 constexpr uint8 kCombatKinds = KindBit(ConsumableKind::Healthstone) | KindBit(ConsumableKind::HealingPotion)
                              | KindBit(ConsumableKind::ManaPotion) | KindBit(ConsumableKind::ManaItem);
 
@@ -764,6 +823,7 @@ struct ConsumableInfo
     uint8  kinds = 0;          // KindBit mask, 0 = not a consumable we use
     bool   conjured = false;
     uint32 spell = 0;          // on-use spell (its cooldown is published under this id)
+    uint32 restore_mana = 0;   // mana the on-use spell gives (its energize effects at their base roll)
     uint32 cooldown_ms = 0;    // full cooldown of that spell
     int32  req_level = 0;
     uint32 item_level = 0;
@@ -775,7 +835,7 @@ ConsumableInfo ClassifyItem(uint32 entry)
 {
     ConsumableInfo info;
     ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(entry);
-    if (!tmpl || tmpl->GetClass() != ITEM_CLASS_CONSUMABLE)
+    if (!tmpl || !IsConsumableClass(tmpl->GetClass(), tmpl->GetSubClass()))
         return info;
     for (ItemEffectEntry const* eff : tmpl->Effects)
     {
@@ -785,6 +845,9 @@ ConsumableInfo ClassifyItem(uint32 entry)
         if (!si)
             continue;
         info.spell = si->Id;
+        for (SpellEffectInfo const& e : si->GetEffects())
+            if (e.IsEffect(SPELL_EFFECT_ENERGIZE) && e.MiscValue == POWER_MANA)
+                info.restore_mana += uint32(std::max(e.CalcValueAsInt(), 0));
         info.cooldown_ms = uint32(std::max({ eff->CoolDownMSec, eff->CategoryCoolDownMSec, 0 }));
         if (!info.cooldown_ms)
             info.cooldown_ms = std::max(si->RecoveryTime, si->CategoryRecoveryTime);
@@ -803,7 +866,16 @@ ConsumableInfo ClassifyItem(uint32 entry)
             }
             // Instant restores: generic consumables (healthstones, runes,
             // mana gems) and potions; elixirs, flasks and scrolls are buffs.
-            if (!info.kinds && (sub == ITEM_SUBCLASS_CONSUMABLE || sub == ITEM_SUBCLASS_POTION))
+            // The 12.1 item data files Demonic Runes and the like under "Other" (subclass 8), not "Consumable" (0): the Ragnaros squad
+            // carried runes the bots never counted or used (0 runes in 76 bag censuses).
+            if (!info.kinds && tmpl->GetClass() == ITEM_CLASS_TRADE_GOODS)
+            {
+                // Only a mana restore: a trade good with a healing on-use is not a healthstone.
+                for (SpellEffectInfo const& e : si->GetEffects())
+                    if (e.IsEffect(SPELL_EFFECT_ENERGIZE) && e.MiscValue == POWER_MANA)
+                        info.kinds |= KindBit(ConsumableKind::ManaItem);
+            }
+            else if (!info.kinds && (sub == ITEM_SUBCLASS_CONSUMABLE || sub == ITEM_SUBCLASS_POTION || sub == ITEM_SUBCLASS_CONSUMABLE_OTHER))
             {
                 for (SpellEffectInfo const& e : si->GetEffects())
                 {
@@ -883,7 +955,7 @@ uint32 BestConsumable(BotSnapshotView const& s, ConsumableKind kind, bool conjur
     ConsumableInfo const* bestInfo = nullptr;
     for (InventoryItem const& it : s.raw().inventory.bag_items)
     {
-        if (it.item_class != ITEM_CLASS_CONSUMABLE || it.entry == best)
+        if (!IsConsumableClass(it.item_class, it.item_subclass) || it.entry == best)
             continue;
         ConsumableInfo const& info = Classify(it.entry);
         if (!(info.kinds & bit) || (conjured_only && !info.conjured) || !UsableNow(s, info))
@@ -904,7 +976,7 @@ bool CombatConsumableUsedRecently(BotSnapshotView const& s, uint32 window_ms)
 {
     for (InventoryItem const& it : s.raw().inventory.bag_items)
     {
-        if (it.item_class != ITEM_CLASS_CONSUMABLE)
+        if (!IsConsumableClass(it.item_class, it.item_subclass))
             continue;
         ConsumableInfo const& info = Classify(it.entry);
         if (!(info.kinds & kCombatKinds) || !info.cooldown_ms)
@@ -929,6 +1001,13 @@ bool HealIncoming(BotSnapshotView const& s, GroupSnapshotView const& g)
 
 bool IsEating(BotSnapshotView const& s)   { return HasRegenAura(s, false); }
 bool IsDrinking(BotSnapshotView const& s) { return HasRegenAura(s, true); }
+
+bool RecoverBeforeWalking(BotSnapshotView const& s)
+{
+    if (s.hp_pct() < 50) return true;
+    if (IsEating(s) || IsDrinking(s)) return true;
+    return s.max_power(POWER_MANA) > 0 && s.power_pct(POWER_MANA) < 20 && BestConsumable(s, ConsumableKind::Drink) != 0;
+}
 
 bool SafeToRecover(BotSnapshotView const& s, GroupSnapshotView const* g)
 {
@@ -1155,27 +1234,41 @@ uint32 PickCombatHealthItem(BotSnapshotView const& s, GroupSnapshotView const& g
     return BestConsumable(s, ConsumableKind::HealingPotion);
 }
 
-uint32 PickCombatManaItem(BotSnapshotView const& s, GroupSnapshotView const* g)
+uint32 PickCombatManaItem(BotSnapshotView const& s, GroupSnapshotView const* g, bool while_casting)
 {
-    if (s.max_power(POWER_MANA) <= 0 || s.is_casting() || !ConsumablesAllowed(s))
+    if (s.max_power(POWER_MANA) <= 0 || (s.is_casting() && !while_casting) || !ConsumablesAllowed(s))
         return 0;
     int32 const mana = s.power_pct(POWER_MANA);
-    if (mana > kBossHealerManaItemPct)
-        return 0;
     // A healer in a boss fight, or in any fight of a raid (the trash packs
     // run for minutes), drinks early (its mana is the raid's health);
     // everyone else at 20%.
-    if (mana > 20 && !(g && IsGroupHealer(s, g) && (BossFight(s) || s.is_in_raid())))
+    bool const raid_healer = g && IsGroupHealer(s, g) && (BossFight(s) || s.is_in_raid());
+    // A raid healer uses an item whenever it is ready and the restore fits in what the pool is missing: the items are limited by their
+    // 2-minute cooldown, not by stock, and a bot that waits for 35% fires them late (MC Geddon n8 run 3: potion and rune both at 33% about
+    // 60 s in, the next ones ready at 180 s, the kill at 159 s, four healers dry for the last 30 s).
+    int32 const ceiling = raid_healer ? kHealerManaItemCeilingPct : 20;
+    if (mana > ceiling)
         return 0;
     if (CombatConsumableUsedRecently(s))
         return 0;
-    if (uint32 const gem = BestConsumable(s, ConsumableKind::ManaItem, /*conjured_only*/ true))
+    int32 const max_mana = s.max_power(POWER_MANA);
+    auto const fits = [&](uint32 item)
+    {
+        if (!item)
+            return false;
+        if (!raid_healer)
+            return true;
+        int64 const room = int64(max_mana) * (100 - mana) / 100;   // mana the pool is missing
+        return mana <= kBossHealerManaItemPct || int64(Classify(item).restore_mana) <= room;
+    };
+    if (uint32 const gem = BestConsumable(s, ConsumableKind::ManaItem, /*conjured_only*/ true); fits(gem))
         return gem;
-    if (uint32 const potion = BestConsumable(s, ConsumableKind::ManaPotion))
+    if (uint32 const potion = BestConsumable(s, ConsumableKind::ManaPotion); fits(potion))
         return potion;
     // Dark / Demonic Rune: 600-1000 damage to the user.
     if (s.hp_pct() > 50)
-        return BestConsumable(s, ConsumableKind::ManaItem);
+        if (uint32 const rune = BestConsumable(s, ConsumableKind::ManaItem); fits(rune))
+            return rune;
     return 0;
 }
 
@@ -1215,7 +1308,7 @@ bool BossFight(BotSnapshotView const& s)
 namespace {
 
 // One [raid_cd] / [raid_consume] line per (bot, spell or item) per 10 s: the
-// rules run on the AI workers, so the pacing map is locked.
+// rules run on the bot workers, so the pacing map is locked.
 bool LogPaced(BotSnapshotView const& s, uint32 id)
 {
     static std::mutex mtx;
@@ -1253,8 +1346,61 @@ void NoteConsumableUse(BotSnapshotView const& s, uint32 item, char const* what)
         BossFight(s) ? 1 : 0);
 }
 
+// A mana user at 20% or less in an instance fight with nothing picked: why, once per 10 s. (MC Ragnaros 2026-10-13 650994ea: 8 mana items in
+// a 4-minute fight for 12 healers, the five holy priests never drank and six healers sat under 10% from 210 s.)
+void NoteManaItemRefused(BotSnapshotView const& s)
+{
+    if (s.max_power(POWER_MANA) <= 0 || !s.in_combat() || !s.is_in_instance() || s.power_pct(POWER_MANA) > 20 || !LogPaced(s, 0x6D616E61u))
+        return;
+    uint32 potions = 0, runes = 0, gems = 0, other = 0, rune_items = 0;
+    for (InventoryItem const& it : s.raw().inventory.bag_items)
+    {
+        if (it.entry == 12662)
+            rune_items += it.count;   // Demonic Rune by entry, whatever the classification below says
+        if (!IsConsumableClass(it.item_class, it.item_subclass))
+            continue;
+        ConsumableInfo const& info = Classify(it.entry);
+        if (info.kinds & KindBit(ConsumableKind::ManaPotion))
+            potions += it.count;
+        else if (info.kinds & KindBit(ConsumableKind::ManaItem))
+            (info.conjured ? gems : runes) += it.count;
+        else if (info.kinds & kCombatKinds)
+            other += it.count;
+    }
+    // Runes in the bag that the classification above does not count: what the item data says about them, once per entry and process. The item's
+    // class and subclass, then each effect with its trigger and the spell's effect types (MC scenarios on af2c045a: 5 Demonic Runes by entry in
+    // every healer bag, 0 classified, 218 refusals).
+    if (rune_items > runes)
+    {
+        static std::atomic<bool> s_runeLogged{ false };
+        if (!s_runeLogged.exchange(true))
+        {
+            ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(12662);
+            std::string effects;
+            if (tmpl)
+                for (ItemEffectEntry const* eff : tmpl->Effects)
+                {
+                    if (!eff)
+                        continue;
+                    SpellInfo const* si = eff->SpellID > 0 ? sSpellMgr->GetSpellInfo(uint32(eff->SpellID), DIFFICULTY_NONE) : nullptr;
+                    effects += fmt::format(" [trigger {} spell {} known {}", int(eff->TriggerType), eff->SpellID, si ? 1 : 0);
+                    if (si)
+                        for (SpellEffectInfo const& e : si->GetEffects())
+                            effects += fmt::format(" effect {} misc {}", int(e.Effect), e.MiscValue);
+                    effects += "]";
+                }
+            TC_LOG_INFO("playerbot.v2", "[raid_consume] Demonic Rune 12662 is not classified as a mana item: template {}, class {} subclass {}, {} item effects{}",
+                        tmpl ? 1 : 0, tmpl ? int(tmpl->GetClass()) : -1, tmpl ? int(tmpl->GetSubClass()) : -1, tmpl ? tmpl->Effects.size() : 0u, effects);
+        }
+    }
+    TC_LOG_INFO("playerbot.v2", "[raid_consume] {} mana {}% and no mana item picked: casting {}, consumables allowed {}, a combat consumable used recently {}, "
+                "usable potion {}, in the bags: {} mana potions, {} runes ({} Demonic Runes by entry), {} gems, {} other combat consumables, hp {}%",
+                s.name(), s.power_pct(POWER_MANA), s.is_casting() ? 1 : 0, ConsumablesAllowed(s) ? 1 : 0, CombatConsumableUsedRecently(s) ? 1 : 0,
+                BestConsumable(s, ConsumableKind::ManaPotion), potions, runes, rune_items, gems, other, s.hp_pct());
+}
+
 // ======================= Raid support =======================
-// Port of chris's ike3 generic raid behaviour (playerbot/strategy: priest /
+// Port of Karrz's ike3 generic raid behaviour (playerbot/strategy: priest /
 // mage / druid buff strategies with BUFF_PARTY / GREATER_BUFF_PARTY actions,
 // PartyMemberWithoutAuraValue, paladin aura + PallyPower blessings, shaman
 // totems, PartyMemberToDispel / CombatBotBaseAI::SelectDispelTarget, warlock
@@ -1450,7 +1596,10 @@ uint32 EffectiveBuffSpell(BotSnapshotView const& s, uint32 base)
                         if (name && n && std::string_view(name) == std::string_view(n))
                             built.emplace_back(si->SpellLevel, si->Id);
                     });
-                    std::sort(built.begin(), built.end());
+                    // Ascending level; at one level the LOWEST id comes last, so the walk from the back takes the vanilla rank (Mark of the
+                    // Wild: 9885, level 60) before the same-name spells added later (24752 a 30 minute variant, 1291335 and 1310503 retail
+                    // versions). MC 2026-10-13 4839bcf3: the druids cast 1310503 and not one of 40 raiders showed the buff.
+                    std::sort(built.begin(), built.end(), [](auto const& a, auto const& b) { return a.first != b.first ? a.first < b.first : a.second > b.second; });
                     std::string ids;
                     for (auto const& [lvl, id] : built)
                         ids += fmt::format(" {}(L{})", id, lvl);
@@ -1653,7 +1802,7 @@ struct OwnedDispel
 // registers its auras (RegisterEncounterOwnedDispel): without it the generic
 // plan must remove everything, Molten Core's curses included.
 //
-// Readers are the AI worker threads, at any time. Each registration builds a
+// Readers are the bot worker threads, at any time. Each registration builds a
 // new immutable list under g_ownedDispelsWrite and publishes it with one
 // release store; readers take one acquire load and walk a list that never
 // changes. Superseded lists are kept alive (registration happens a handful
@@ -1717,7 +1866,12 @@ uint32 ResistPotionItem(Resist r)
 
 uint32 PickResistPotion(BotSnapshotView const& s)
 {
-    uint32 const item = s.raw().pve_order.active ? s.raw().pve_order.resist_potion : 0;
+    uint32 item = s.raw().pve_order.active ? s.raw().pve_order.resist_potion : 0;
+    // A carrier aura on the bot itself (Living Bomb) asks for its potion whatever the boss order says.
+    if (!item)
+        if (Raid::RaidRules const* rules = Raid::RulesForMap(s.map_id()))
+            for (Raid::CarrierPotion const& cp : rules->carrierPotion)
+                if (s.has_aura(cp.aura)) { item = cp.item; break; }
     if (!item || !s.in_combat() || s.is_casting() || s.item_count(item) == 0 || !ConsumablesAllowed(s))
         return 0;
     ConsumableInfo const& info = Classify(item);
@@ -1823,6 +1977,137 @@ uint32 CreateHealthstoneSpell(BotSnapshotView const& s)
     // casts the item-creating spell itself): the base spell.
     constexpr uint32 CREATE_HEALTHSTONE = 6201;
     return s.knows_spell(CREATE_HEALTHSTONE) ? CREATE_HEALTHSTONE : 0;
+}
+
+namespace {
+
+// The item a Conjure Mana Gem spell creates (its Create Item effect), 0 when the spell data has none.
+uint32 ManaGemItemOf(uint32 spell)
+{
+    SpellInfo const* si = sSpellMgr->GetSpellInfo(spell, DIFFICULTY_NONE);
+    if (!si)
+        return 0;
+    for (SpellEffectInfo const& e : si->GetEffects())
+        if (e.IsEffect(SPELL_EFFECT_CREATE_ITEM) && e.ItemType)
+            return e.ItemType;
+    return 0;
+}
+
+} // namespace
+
+bool HasManaGem(BotSnapshotView const& s)
+{
+    for (InventoryItem const& it : s.raw().inventory.bag_items)
+    {
+        // The item the conjure spells create, by entry: whatever the item data's class, subclass or conjured flag say.
+        for (uint32 const spell : { 10054u, 10053u, 3552u, 759u })
+            if (it.entry == ManaGemItemOf(spell))
+                return true;
+        if (it.item_class == ITEM_CLASS_CONSUMABLE)
+        {
+            ConsumableInfo const& info = Classify(it.entry);
+            if (info.conjured && (info.kinds & KindBit(ConsumableKind::ManaItem)))
+                return true;
+        }
+    }
+    return false;
+}
+
+uint32 CreateManaGemSpell(BotSnapshotView const& s)
+{
+    if (s.cls() != CLASS_MAGE)
+        return 0;
+    // Conjure Mana Ruby 10054 (58), Jade 10053 (48), Citrine 3552 (38), Agate 759 (28)
+    for (uint32 const spell : { 10054u, 10053u, 3552u, 759u })
+        if (s.knows_spell(spell))
+            return spell;
+    return 0;
+}
+
+namespace {
+
+// Conjure Water / Conjure Food spells, found like the healthstones: mage-family spells with a
+// Create Item effect whose item is a drink or food (Classify). Scanned once on first use.
+struct ConjureSpell
+{
+    uint32 spell = 0;
+    uint32 item = 0;
+    uint32 level = 0;
+    ConsumableKind kind = ConsumableKind::Food;
+};
+
+std::vector<ConjureSpell> const& MageConjureSpells()
+{
+    static std::vector<ConjureSpell> const spells = []
+    {
+        std::vector<ConjureSpell> out;
+        sSpellMgr->ForEachSpellInfo([&out](SpellInfo const* si)
+        {
+            if (!si || si->SpellFamilyName != SPELLFAMILY_MAGE)
+                return;
+            for (SpellEffectInfo const& e : si->GetEffects())
+            {
+                if (!e.IsEffect(SPELL_EFFECT_CREATE_ITEM) || !e.ItemType)
+                    continue;
+                ConsumableInfo const& info = Classify(e.ItemType);
+                if (!info.conjured)
+                    continue;
+                ConsumableKind kind;
+                if (info.kinds & KindBit(ConsumableKind::Drink))
+                    kind = ConsumableKind::Drink;
+                else if (info.kinds & KindBit(ConsumableKind::Food))
+                    kind = ConsumableKind::Food;
+                else
+                    continue;
+                if (std::none_of(out.begin(), out.end(), [&](ConjureSpell const& c) { return c.spell == si->Id; }))
+                    out.push_back({ si->Id, e.ItemType, si->SpellLevel, kind });
+            }
+        });
+        return out;
+    }();
+    return spells;
+}
+
+} // namespace
+
+uint32 BestMageConjure(ConsumableKind kind, std::function<bool(uint32)> const& knows)
+{
+    ConjureSpell const* best = nullptr;
+    for (ConjureSpell const& c : MageConjureSpells())
+        if (c.kind == kind && knows(c.spell) && (!best || c.level > best->level))
+            best = &c;
+    return best ? best->spell : 0;
+}
+
+bool MageConjuresFamily(uint8 cls, std::string_view family, std::function<bool(uint32)> const& knows)
+{
+    if (cls != CLASS_MAGE)
+        return false;
+    if (family == "Water")
+        return BestMageConjure(ConsumableKind::Drink, knows) != 0;
+    if (family == "Food")
+        return BestMageConjure(ConsumableKind::Food, knows) != 0;
+    return false;
+}
+
+uint32 MageConjureSpell(BotSnapshotView const& s, ConsumableKind kind, uint32 want_below)
+{
+    if (s.cls() != CLASS_MAGE || (kind != ConsumableKind::Drink && kind != ConsumableKind::Food))
+        return 0;
+    uint32 const family_top = BestMageConjure(kind, [&](uint32 id) { return s.knows_spell(id); });
+    if (!family_top)
+        return 0;
+    // knows_spell answers for the whole rank family, so family_top is the highest rank of the data, not of the spellbook (a level 20
+    // mage asked for rank 7 Conjure Food and got API_NOT_KNOWN on every try, 2026-10-14 Deadmines): cast the rank it has learned.
+    uint32 const spell = s.resolve_rank(family_top);
+    if (!spell)
+        return 0;
+    uint32 have = 0;
+    for (InventoryItem const& it : s.raw().inventory.bag_items)
+        if (it.item_class == ITEM_CLASS_CONSUMABLE && Classify(it.entry).conjured
+            && (Classify(it.entry).kinds & KindBit(kind)))
+            have += it.count;
+    return have < want_below ? spell : 0;
 }
 
 bool MemberHasBuff(GroupSnapshotView const& g, ObjectGuid guid, uint32 tracked_id)
@@ -2256,7 +2541,7 @@ uint32 PickPaladinAura(BotSnapshotView const& s, GroupSnapshotView const& g)
 {
     if (!IsVanillaRealm() || s.cls() != CLASS_PALADIN || s.is_mounted())
         return 0;
-    Resist const resist = InstanceResistance(s.map_id());
+    Resist const resist = AuraResistance(s);
     uint32 wishes[8];
     size_t n = 0;
 
@@ -2349,7 +2634,7 @@ bool IsEncounterOwnedDispel(uint32 map_id, uint32 aura_id)
             if (o.map_id == map_id && o.aura == aura_id)
                 return true;
     // The raid layer's own rules for every raid map (Bot/Raid/RaidEncounterData_*.cpp): its dispel jobs, mind-controlled
-    // members and do-not-dispel auras. Read-only after the registry's one-time init, so safe from the AI workers; this is
+    // members and do-not-dispel auras. Read-only after the registry's one-time init, so safe from the bot workers; this is
     // why the raid layer never calls RegisterEncounterOwnedDispel.
     return Raid::OwnsAura(map_id, aura_id);
 }

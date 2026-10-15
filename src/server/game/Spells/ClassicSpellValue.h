@@ -30,8 +30,7 @@
 // damaging / healing / absorbing effect of the VMaNGOS 1.12 spell_template; a legacy spell takes its base value from there whoever
 // casts it (players, bots, pets, totems, creatures). Everything that follows stays as it was: points per level, talent and aura
 // modifiers (ApplyEffectModifiers), the spell power coefficient and the damage / healing done and taken auras. Effects whose type
-// differs from the client's, and spells new to Forever, keep their DB2 value. Pure: no game types, tested in
-// tests/game/ClassicSpellValue.cpp.
+// differs from the client's, and spells new to Forever, keep their DB2 value. Pure: no game types.
 
 namespace ClassicSpellValue
 {

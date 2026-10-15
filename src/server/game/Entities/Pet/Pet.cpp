@@ -2059,8 +2059,7 @@ float Pet::GetFollowAngle() const
 float Pet::GetNativeObjectScale() const
 {
     CreatureFamilyEntry const* creatureFamily = sCreatureFamilyStore.LookupEntry(GetCreatureTemplate()->family);
-    // both ends must be set: a family row with MinScale but no MaxScale (MaxScale 0, MaxScaleLevel 0) would give every hunter pet of
-    // that family ObjectScale 0 - an invisible pet and the client's "Model FileData ... scale:0" assert.
+    // both ends must be set: a family with MinScale but MaxScale 0 would give its pets ObjectScale 0 (invisible, client asserts)
     if (creatureFamily && creatureFamily->MinScale > 0.0f && creatureFamily->MaxScale > 0.0f && getPetType() == HUNTER_PET)
         return PetScaling::FamilyScale(*creatureFamily, GetLevel());
 

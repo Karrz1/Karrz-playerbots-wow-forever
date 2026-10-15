@@ -17,7 +17,7 @@
 
 #include "tc_catch2.h"
 
-#include "../../src/server/game/Playerbot/TradeFlow.h"
+#include "../../src/modules/PlayerbotV2/Api/TradeFlow.h"
 
 using namespace Playerbot::Trade;
 

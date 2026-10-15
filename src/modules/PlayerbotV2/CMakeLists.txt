@@ -12,6 +12,11 @@
 # pulls every sub-lib onto the link line, so circular references between
 # sub-libs are resolved naturally by the multi-archive symbol search.
 
+option(BUILD_PLAYERBOT_V2 "Build the WoW Forever Bots module (Playerbot V2)" 0)
+if(NOT BUILD_PLAYERBOT_V2)
+  return()
+endif()
+
 # ---------------------------------------------------------------------------
 # Helper: apply the shared compile/link settings to a sub-library. Keeps the
 # per-subsystem section short and ensures every lib has identical compile
@@ -21,8 +26,7 @@ function(playerbot_v2_configure_sublib target_name)
   target_include_directories(${target_name}
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}
-      ${CMAKE_SOURCE_DIR}/src/server/game/Playerbot
-      ${CMAKE_SOURCE_DIR}/src/modules/Common
+      ${CMAKE_CURRENT_SOURCE_DIR}/Api
     PRIVATE
       ${CMAKE_SOURCE_DIR}/src/server
       ${CMAKE_SOURCE_DIR}/src/server/shared
@@ -34,7 +38,6 @@ function(playerbot_v2_configure_sublib target_name)
     PUBLIC
       trinity-core-interface
       game-interface
-      modules-common
     PRIVATE
       shared
       common
@@ -61,10 +64,10 @@ function(playerbot_v2_configure_sublib target_name)
 endfunction()
 
 # ---------------------------------------------------------------------------
-# Sub-library: Bot — top-level AI (state machine, snapshot/builder/view,
+# Sub-library: Bot — top-level bot logic (state machine, snapshot/builder/view,
 # personality, RNG, command parser, intent emitter/executor, registries,
 # class tables, recipe difficulty), plus the State_* files under Bot/States/.
-# This is the AI core; it's referenced by Combat / Group / Session.
+# This is the bot logic core; it's referenced by Combat / Group / Session.
 # ---------------------------------------------------------------------------
 add_library(playerbot-v2-bot STATIC)
 CollectAndAddSourceFiles(playerbot-v2-bot ${CMAKE_CURRENT_SOURCE_DIR}/Bot)
@@ -103,7 +106,7 @@ CollectAndAddSourceFiles(playerbot-v2-session ${CMAKE_CURRENT_SOURCE_DIR}/Sessio
 playerbot_v2_configure_sublib(playerbot-v2-session)
 
 # ---------------------------------------------------------------------------
-# Sub-library: Threading — AI worker pool, snapshot publisher, tick scheduler,
+# Sub-library: Threading — bot worker pool, snapshot publisher, tick scheduler,
 # lock hierarchy. The hot path; small but heavily used.
 # ---------------------------------------------------------------------------
 add_library(playerbot-v2-threading STATIC)
@@ -152,12 +155,23 @@ CollectAndAddSourceFiles(playerbot-v2-world ${CMAKE_CURRENT_SOURCE_DIR}/World)
 playerbot_v2_configure_sublib(playerbot-v2-world)
 
 # ---------------------------------------------------------------------------
-# Sub-library: Core — module entry point + Services aggregator.
-# These are the only .cpp files at the V2 root.
+# Sub-library: Api — PlayerbotAPI (the bot's hands on the game: move, cast,
+# loot, trade, queue), bot movement, item scoring and the Classic class/spec,
+# supplies and talent tables.
+# ---------------------------------------------------------------------------
+add_library(playerbot-v2-api STATIC)
+CollectAndAddSourceFiles(playerbot-v2-api ${CMAKE_CURRENT_SOURCE_DIR}/Api)
+playerbot_v2_configure_sublib(playerbot-v2-api)
+
+# ---------------------------------------------------------------------------
+# Sub-library: Core — module entry point, script registration, the commands
+# (.playerbot, .bot, .w) and the Services aggregator.
 # ---------------------------------------------------------------------------
 add_library(playerbot-v2-core STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/PlayerbotV2.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/PlayerbotV2Scripts.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/Services.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/Commands/cs_playerbot_v2.cpp
 )
 target_sources(playerbot-v2-core
   PUBLIC
@@ -197,6 +211,7 @@ set(PLAYERBOT_V2_SUBLIBS
   playerbot-v2-world
   playerbot-v2-diagnostics
   playerbot-v2-util
+  playerbot-v2-api
   playerbot-v2-core
 )
 if(MSVC)
@@ -209,4 +224,8 @@ else()
     "$<LINK_GROUP:RESCAN,${PLAYERBOT_V2_SUBLIBS},game>")
 endif()
 
-message(STATUS "Playerbot V2 module enabled (multi-library: 12 sub-libs)")
+trinity_add_module(playerbot-v2 AddSC_playerbot_v2
+  CONFIGS
+    ${CMAKE_CURRENT_SOURCE_DIR}/conf/playerbot.conf.dist)
+
+message(STATUS "Playerbot V2 module enabled (multi-library: 13 sub-libs)")

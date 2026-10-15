@@ -204,27 +204,8 @@ void MapUpdater::deactivate()
 
 void MapUpdater::wait()
 {
-    // Block until every scheduled map update for this tick has actually
-    // finished. This barrier is load-bearing: TC's whole map model assumes
-    // one thread touches a given Map at a time, and MapManager::Update relies
-    // on this wait to guarantee no worker is still inside Map::Update before
-    // the world thread proceeds to DelayedUpdate / the next tick.
-    //
-    // A previous version used a 30s bounded wait_for() that, on timeout,
-    // force-reset pending_requests and returned WHILE a worker was still
-    // running. AddressSanitizer proved that this is what caused the random
-    // server crashes: the still-running worker and the next tick's main
-    // thread (e.g. a PlayerbotV2 login doing AddPlayerToMap -> terrain query)
-    // both entered DynamicMapTree::balance() on the same map, double-freeing
-    // the BIH's internal vector and corrupting the heap. The corruption then
-    // surfaced later as unrelated-looking crashes (std::any / std::string
-    // move ctors in boss scripts and SmartAI). The "stuck counter" that
-    // motivated the timeout was itself a symptom: a worker whose Map::Update
-    // hit the corruption crashed without calling update_finished().
-    //
-    // So we wait unconditionally. DynamicTree access is additionally guarded
-    // by a mutex (see DynamicTree.cpp) as defense in depth.
     std::unique_lock lock(_lock);
+
     _condition.wait(lock, [&] { return pending_requests == 0; });
 }
 
@@ -257,10 +238,6 @@ void MapUpdater::WorkerThread()
     CharacterDatabase.WarnAboutSyncQueries(true);
     WorldDatabase.WarnAboutSyncQueries(true);
     HotfixDatabase.WarnAboutSyncQueries(true);
-
-    // (SEH translation is handled per-request via SehSafeMapUpdate()
-    // because _set_se_translator only fires on /EHa-compiled frames;
-    // TC builds with /EHsc so the translator never gets invoked.)
 
     while (true)
     {

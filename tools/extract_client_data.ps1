@@ -27,6 +27,12 @@
 .PARAMETER Threads
     Worker count for vmap4extractor and mmaps_generator. Default: 0 (all cores).
 
+.PARAMETER Resume
+    Safe to run again after an interruption. Each finished stage leaves a marker file (.extract-maps.done, .extract-vmaps.done,
+    .extract-mmaps.done) in OutputPath and is skipped next time; an unfinished vmap stage is cleaned and redone; mmaps_generator itself
+    skips tiles it already built, so the long stage continues where it stopped. At the end the intermediate Buildings/ and dir_bin/
+    folders (about 40 GB) are removed and mmaps_generator runs with --silent (no key press at the end).
+
 .PARAMETER Locale
     DBC locale (enUS, deDE, frFR, etc). Default: enUS.
 
@@ -47,6 +53,8 @@ param(
     [switch]$MapsOnly,
 
     [int]$Threads = 0,
+
+    [switch]$Resume,
 
     [string]$Locale = "enUS"
 )
@@ -118,7 +126,7 @@ if (-not (Test-Path $ClientPath)) {
 $buildInfo = Join-Path $ClientPath ".build.info"
 $dataDir   = Join-Path $ClientPath "Data"
 if (-not (Test-Path $buildInfo) -and -not (Test-Path $dataDir)) {
-    Fail "ClientPath '$ClientPath' has no .build.info or Data\ — not a valid WoW install root.
+    Fail "ClientPath '$ClientPath' has no .build.info or Data\ - not a valid WoW install root.
 Did you point at _retail_/Data/ instead of _retail_/ ?"
 }
 
@@ -126,17 +134,25 @@ Write-Host "Client : $ClientPath"
 Write-Host "Output : $OutputPath"
 Write-Host "Locale : $Locale"
 Write-Host "Threads: $(if ($Threads -le 0) { '(all cores)' } else { $Threads })"
-Write-Host "Mode   : $(if ($MapsOnly) { 'MAPS-ONLY (road workflow)' } else { 'FULL' })"
+Write-Host "Mode   : $(if ($MapsOnly) { 'MAPS-ONLY (road workflow)' } else { 'FULL' })$(if ($Resume) { ' (resumable)' })"
+
+function Test-Done($name) { $Resume -and (Test-Path (Join-Path $OutputPath ".extract-$name.done")) }
+function Set-Done($name) { if ($Resume) { Set-Content (Join-Path $OutputPath ".extract-$name.done") (Get-Date -Format s) } }
+$clock = [Diagnostics.Stopwatch]::StartNew()
 
 Push-Location $OutputPath
 try {
     # --- Step 1: mapextractor ----------------------------------------------
     Write-Step "Step 1/4: mapextractor (maps + dbc + Cameras + gt)"
-    $eFlag = if ($MapsOnly) { "3" } else { "15" }
-    & ".\mapextractor.exe" -i "$ClientPath" -o "$OutputPath" -e $eFlag -f 1 -l $Locale
-    if ($LASTEXITCODE -ne 0) {
-        Fail "mapextractor failed with exit code $LASTEXITCODE.
+    if (Test-Done 'maps') { Write-Host "Already done (resuming)." }
+    else {
+        $eFlag = if ($MapsOnly) { "3" } else { "15" }
+        & ".\mapextractor.exe" -i "$ClientPath" -o "$OutputPath" -e $eFlag -f 1 -l $Locale
+        if ($LASTEXITCODE -ne 0) {
+            Fail "mapextractor failed with exit code $LASTEXITCODE.
 Check stdout above; usual culprits: CASC init failure, wrong client path, antivirus."
+        }
+        Set-Done 'maps'
     }
 
     if ($MapsOnly) {
@@ -149,6 +165,9 @@ Check stdout above; usual culprits: CASC init failure, wrong client path, antivi
 
     # --- Step 2: vmap4extractor --------------------------------------------
     Write-Step "Step 2/4: vmap4extractor (CASC -> Buildings/)"
+    if (Test-Done 'vmaps') { Write-Host "Already done (resuming)." }
+    else {
+    if ($Resume) { foreach ($junk in 'Buildings', 'dir_bin') { Remove-Item (Join-Path $OutputPath $junk) -Recurse -Force -ErrorAction SilentlyContinue } }   # a half-finished earlier run
     $vmapArgs = @("-d", "$ClientPath")
     if ($Threads -gt 0) { $vmapArgs += @("--threads", "$Threads") }
     & ".\vmap4extractor.exe" @vmapArgs
@@ -165,16 +184,37 @@ Common cause: leftover Buildings/dir_bin/ from a previous run. Delete it and ret
     if ($LASTEXITCODE -ne 0) {
         Fail "vmap4assembler failed with exit code $LASTEXITCODE."
     }
+    Set-Done 'vmaps'
+    }
 
     # --- Step 4: mmaps_generator -------------------------------------------
     Write-Step "Step 4/4: mmaps_generator (dbc+maps+vmaps -> mmaps/)"
-    $mmapArgs = @("--input", "$OutputPath", "--output", "$OutputPath")
+    $mmapArgs = @("--input", "$OutputPath", "--output", "$OutputPath", "--silent")
     if ($Threads -gt 0) { $mmapArgs += @("--threads", "$Threads") }
     & ".\mmaps_generator.exe" @mmapArgs
     if ($LASTEXITCODE -ne 0) {
         Fail "mmaps_generator failed with exit code $LASTEXITCODE.
 Check that dbc/, maps/, and vmaps/0000/*.vmtree exist in OutputPath."
     }
+    # Safety net: a map that has game files but still no navmesh (the generator skips "junk"/dev maps by default) is built on its own,
+    # because naming a map id builds it whatever the skip options say. Without one the server logs "Could not load MMAP ... result: 2".
+    $ids = @()
+    foreach ($f in Get-ChildItem (Join-Path $OutputPath 'maps') -Filter '*.tilelist' -ErrorAction SilentlyContinue) { if ($f.Name -match '^(\d{4})') { $ids += [int]$Matches[1] } }
+    foreach ($d in Get-ChildItem (Join-Path $OutputPath 'vmaps') -Directory -ErrorAction SilentlyContinue) { if ($d.Name -match '^\d+$') { $ids += [int]$d.Name } }
+    $missing = @($ids | Sort-Object -Unique | Where-Object { -not (Test-Path (Join-Path $OutputPath ('mmaps\{0:D4}.mmap' -f $_))) })
+    foreach ($id in $missing) {
+        Write-Host "Building the navigation mesh of map $id on its own..."
+        $one = @("--input", "$OutputPath", "--output", "$OutputPath", "--silent", "$id")
+        if ($Threads -gt 0) { $one += @("--threads", "$Threads") }
+        & ".\mmaps_generator.exe" @one
+    }
+    $still = @($missing | Where-Object { -not (Test-Path (Join-Path $OutputPath ('mmaps\{0:D4}.mmap' -f $_))) })
+    $have = @(Get-ChildItem (Join-Path $OutputPath 'mmaps') -Filter '*.mmap' -ErrorAction SilentlyContinue).Count
+    Write-Host "Navigation meshes: $have maps built; all steps took $([math]::Round($clock.Elapsed.TotalMinutes)) minutes."
+    if ($still.Count) { Write-Warning ("No navigation mesh could be built for map(s): " + ($still -join ', ') + ". Usually these maps have no ground to walk on.") }
+    if ($have -lt 1) { Fail "No navigation meshes were produced (mmaps/ is empty)." }
+    Set-Done 'mmaps'
+    if ($Resume) { foreach ($junk in 'Buildings', 'dir_bin') { Remove-Item (Join-Path $OutputPath $junk) -Recurse -Force -ErrorAction SilentlyContinue } }
 
     Show-DirSummary $OutputPath @("dbc", "maps", "Cameras", "gt", "vmaps", "mmaps", "Buildings")
     Write-Host ""

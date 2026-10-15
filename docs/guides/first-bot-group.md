@@ -21,28 +21,29 @@ Each bot arrives at your level, geared, and in your group.
 
 ### Passive or Aggressive?
 The **Passive / Aggressive** button flips between two modes.
-- **Passive**: the bots start nothing on their own. They only defend. Safest for dungeons.
-- **Aggressive**: they attack anything hostile within about 10 yards of you. Good for open-world questing.
+- **Passive**: the bots stay close, defend you and do as you tell them. They start nothing on their own. Safest for dungeons.
+- **Aggressive**: the bots may also attack on their own, anything hostile within about 10 yards of you. Good for open-world questing.
 
 ### Starting a fight
-- **Attack**: bots attack the monster you have targeted.
-- **Pull**: your tank opens on your target and everyone else joins once it's engaged. This is the best way to start a dungeon fight.
+- **Attack**: everyone attacks the monster you have targeted, at once.
+- **Pull**: your tank pulls. The damage dealers wait for your **Attack**, or join by themselves after 6 seconds. This is the best way to start a dungeon fight.
 
 ---
 
 ## Part 2 of 2: Marks, pulling back and the rally point
 
 ### Pull back
-Click **Pull back** with a monster targeted. Your tank hits it from range, runs back to your rally point and fights it there. This keeps the rest of the room asleep.
+Click **Pull back** with a monster targeted. It works like Pull, but the tank brings the monster to you (or your rally point) and fights it there. The damage dealers wait for your **Attack**, or join after 6 seconds. This keeps the rest of the room asleep.
 
 ### Set rally
 Stand where you want the group to gather and click **Set rally**. That spot is your safe place. **Fall back** sends everyone running there and re-forms the group: tanks in front, ranged and healers behind.
 
-### Marks (skull and cross)
-Put a raid mark on monsters with the normal target-marker menu:
+### Marks: your marks rule
+Put a raid mark on monsters with the normal target-marker menu. The bots do exactly what your marks say:
 - **Skull** = kill this first.
 - **Cross** = kill this second.
-The bot tanks mark what they pull, and the damage dealers kill skull first, then cross. Marks don't start a fight on their own. You still need to click Attack or Pull.
+- **Moon** (or any icon you assigned to a crowd-controller) = keep that monster controlled.
+Bots only make their own choice about monsters you did not mark: for example, an unmarked monster that a Mage, Warlock, Priest or Rogue can control gets controlled automatically. Marks don't start a fight on their own. You still need to click Attack or Pull.
 
 ### Assign a bot to a mark
 Target a bot, then click one of the eight icons in the **Assign a bot to an icon** section. A tank bot will tank that marked monster. Caster bots can crowd-control it. Right-click an icon to clear it. **Clear all** removes everything.

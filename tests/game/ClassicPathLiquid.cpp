@@ -17,7 +17,7 @@
 
 #include "tc_catch2.h"
 
-#include "../../src/server/game/Playerbot/PathLiquid.h"
+#include "../../src/modules/PlayerbotV2/Api/PathLiquid.h"
 
 using namespace Playerbot::BotMovement;
 

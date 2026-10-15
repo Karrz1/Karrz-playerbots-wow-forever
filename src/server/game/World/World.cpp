@@ -21,9 +21,6 @@
 
 #include "World.h"
 #include "DeathRecap.h"
-#if TRINITY_PLAYERBOT_V2
-#include "PlayerbotV2.h"
-#endif
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
 #include "AreaTriggerDataStore.h"
@@ -79,7 +76,6 @@
 #include "MapManager.h"
 #include "MapUtils.h"
 #include "Metric.h"
-#include "Modules/ModuleManager.h"
 #include "MiscPackets.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
@@ -631,11 +627,11 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "Instance.IgnoreLevel"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_IGNORE_LEVEL },
         { .Name = "Instance.IgnoreAttunement"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_IGNORE_ATTUNEMENT },
         { .Name = "Instance.AhnQirajGatesOpen"sv, .DefaultValue = false, .Index = CONFIG_AQ_GATES_OPEN },
-        { .Name = "Instance.IgnoreRaid"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_IGNORE_RAID },
         { .Name = "Instance.BindOnEntry"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_BIND_ON_ENTRY },
         { .Name = "Instance.PersistRaidTrash"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_PERSIST_RAID_TRASH },
         { .Name = "Instance.MoltenCoreHoundsLinked"sv, .DefaultValue = false, .Index = CONFIG_MC_CORE_HOUNDS_LINKED },
         { .Name = "Instance.MoltenCoreSkipRunes"sv, .DefaultValue = false, .Index = CONFIG_MC_SKIP_RUNES },
+        { .Name = "Instance.IgnoreRaid"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_IGNORE_RAID },
         { .Name = "Instance.CombatResurrectionLimit"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_COMBAT_RES_LIMIT },
         { .Name = "CastUnstuck"sv, .DefaultValue = true, .Index = CONFIG_CAST_UNSTUCK },
         { .Name = "GM.AllowInvite"sv, .DefaultValue = false, .Index = CONFIG_ALLOW_GM_GROUP },
@@ -706,7 +702,9 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "CheckGameObjectLoS"sv, .DefaultValue = true, .Index = CONFIG_CHECK_GOBJECT_LOS },
         { .Name = "AllowLoggingIPAddressesInDatabase"sv, .DefaultValue = true, .Index = CONFIG_ALLOW_LOGGING_IP_ADDRESSES_IN_DATABASE },
         { .Name = "Loot.EnableAELoot"sv, .DefaultValue = true, .Index = CONFIG_ENABLE_AE_LOOT },
+        { .Name = "Loot.SharedEncounterLoot"sv, .DefaultValue = true, .Index = CONFIG_LOOT_SHARED_ENCOUNTER_LOOT },
         { .Name = "Load.Locales"sv, .DefaultValue = true, .Index = CONFIG_LOAD_LOCALES },
+        { .Name = "Classic.MountIndoorsRules"sv, .DefaultValue = true, .Index = CONFIG_CLASSIC_MOUNT_INDOORS_RULES },
     } };
 
     static constexpr ConfigOptionLoadDefinitionArray<uint32, INT_CONFIG_VALUE_COUNT> ints =
@@ -1429,6 +1427,8 @@ bool World::SetInitialWorldSettings()
 
     TC_LOG_INFO("server.loading", "Loading classic spell values...");
     sSpellMgr->LoadClassicSpellInfo();
+    sSpellMgr->LoadClassicTwinChannels();
+    sSpellMgr->LoadClassicSpellEffects();
     sSpellMgr->LoadClassicSpellValues();
     sSpellMgr->LoadClassicSpellCosts();
 
@@ -2382,26 +2382,10 @@ void World::Update(uint32 diff)
         }
     }
 
-    // CRITICAL FIX: Module/script updates MUST happen BEFORE Map updates
-    // to prevent deadlock when bot worker threads try to access Maps that
-    // main thread is currently updating (holding locks on).
-    // See: CELL_VISIT_DEADLOCK_RESOLUTION.md
     {
-        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update world scripts"));
-        sScriptMgr->OnWorldUpdate(diff);
+        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update world scripts before maps"));
+        sScriptMgr->OnWorldBeforeMapsUpdate(diff);
     }
-
-    {
-        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update modules"));
-        ModuleManager::CallOnUpdate(diff);
-    }
-
-#if TRINITY_PLAYERBOT_V2
-    {
-        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update playerbot v2"));
-        Playerbot::V2::Module::instance().OnWorldUpdate(std::chrono::milliseconds{diff});
-    }
-#endif
 
     /// <li> Handle all other objects
     ///- Update objects when the timer has passed (maps, transport, creatures, ...)
@@ -2520,6 +2504,11 @@ void World::Update(uint32 diff)
         TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Process cli commands"));
         // And last, but not least handle the issued cli commands
         ProcessCliCommands();
+    }
+
+    {
+        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update world scripts"));
+        sScriptMgr->OnWorldUpdate(diff);
     }
 
     {

@@ -59,7 +59,7 @@ All time-based fields use `std::chrono::milliseconds` from `<chrono>`. No raw `u
 ```cpp
 namespace Playerbot {
 
-// Immutable. Built on world thread, consumed read-only by AI workers.
+// Immutable. Built on world thread, consumed read-only by bot workers.
 struct BotSnapshot {
     SnapshotVer version;
     BotId       bot_id;
@@ -438,10 +438,10 @@ class BotEventInbox {
     static constexpr size_t kCapacity = 256;
     std::array<BotEvent, kCapacity> ring_;
     std::atomic<uint32> head_{0};   // World thread writes
-    uint32 tail_{0};                 // AI worker reads
+    uint32 tail_{0};                 // bot worker reads
 public:
     void push(BotEvent ev);          // World thread only
-    bool pop(BotEvent& out);         // AI worker only
+    bool pop(BotEvent& out);         // bot worker only
     size_t pending() const;
 };
 ```
@@ -452,7 +452,7 @@ class BotAI {
 public:
     BotAI(BotId id, BotPersonality personality, BotRng rng);
 
-    // Called by AI worker. Pure: snapshot in + events in → intents out.
+    // Called by bot worker. Pure: snapshot in + events in → intents out.
     void tick(BotSnapshotView snapshot,
               GroupSnapshotView group,           // empty if not grouped
               BotEventInbox& events,
@@ -640,7 +640,7 @@ class EncounterScript {
 public:
     virtual ~EncounterScript() = default;
 
-    // Called every AI tick while in combat with the encounter's primary NPC.
+    // Called every bot tick while in combat with the encounter's primary NPC.
     virtual void OnSnapshot(BotSnapshotView, GroupSnapshotView,
                              BotIntentEmitter&) = 0;
 
@@ -669,7 +669,7 @@ struct TargetCandidate {
 };
 
 namespace Playerbot::Combat::TargetSelection {
-    // Utility-AI scoring. Returns top candidate.
+    // Utility-bot logic scoring. Returns top candidate.
     ObjectGuid PickTarget(BotSnapshotView, GroupSnapshotView,
                           uint8 cls, uint8 spec, Role);
 
@@ -686,7 +686,7 @@ namespace Playerbot::Combat::TargetSelection {
 
 ### 5.1 IntentQueue
 ```cpp
-// Lock-free MPSC queue — many AI workers + fleet thread produce, world thread consumes.
+// Lock-free MPSC queue — many bot workers + fleet thread produce, world thread consumes.
 class IntentQueue {
 public:
     void push(Intent intent);            // Producer side, lock-free
@@ -703,7 +703,7 @@ public:
     // Called on world thread at start of each world tick.
     void publish(BotId, std::shared_ptr<BotSnapshot const>);
 
-    // Called by AI worker. Returns latest atomically.
+    // Called by bot worker. Returns latest atomically.
     std::shared_ptr<BotSnapshot const> latest(BotId) const;
 
 private:
@@ -714,7 +714,7 @@ private:
 };
 ```
 
-**Note**: this is the only `std::shared_mutex` permitted by the architecture. It guards *map structure* (insert on bot creation), not per-slot access. AI workers reading a slot never wait for it.
+**Note**: this is the only `std::shared_mutex` permitted by the architecture. It guards *map structure* (insert on bot creation), not per-slot access. bot workers reading a slot never wait for it.
 
 ### 5.3 AiWorkerPool
 ```cpp
@@ -933,7 +933,7 @@ Initialized in `Module::Init`, torn down in `Module::Shutdown`. Tests can swap i
 
 ## 11. Concurrency invariants (compile- and runtime-checked)
 
-- AI worker code paths must not include `Player.h`, `Unit.h`, `Map.h`, etc. — enforced by include-what-you-use linter rule + CI grep.
+- bot worker code paths must not include `Player.h`, `Unit.h`, `Map.h`, etc. — enforced by include-what-you-use linter rule + CI grep.
 - Intent execution paths must run on world thread — enforced by `assert(IsWorldThread())` at `PlayerbotAPI.cpp` entry points.
 - `BotAI::tick` must not mutate any state outside the bot itself — enforced by code review and unit tests checking determinism (same input twice → same output twice).
 - `EncounterScript` and APL rules must be stateless — enforced by `static_assert(std::is_empty_v<T> || /* ... */)` where applicable.

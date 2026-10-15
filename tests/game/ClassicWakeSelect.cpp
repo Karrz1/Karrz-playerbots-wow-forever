@@ -76,3 +76,80 @@ TEST_CASE("WakeSelect never wakes more than wanted", "[wake]")
     CHECK(SelectWake(in, r, 7).size() == 7);
     CHECK(SelectWake(in, r, 500).size() == 50);
 }
+
+// ---- fair share across the zones around the player (SelectWakeShared) ----
+
+TEST_CASE("Waking holds the player's zone near its share and spreads the rest over the neighbours", "[ClassicWakeSelect]")
+{
+    using namespace Playerbot::V2::Fleet;
+    WakeRule r;
+    r.anchor_zone = 15;
+    r.min_dist = 0.0f;
+    std::vector<WakeCandidate> c;
+    for (uint32_t i = 0; i < 40; ++i)
+    {
+        WakeCandidate w;
+        w.guid = 1000 + i;
+        w.dist = 100.0f;
+        w.zone = (i % 3 == 0) ? 15u : (i % 3 == 1 ? 17u : 400u);   // home, Barrens, Thousand Needles
+        c.push_back(w);
+    }
+    auto const picked = SelectWakeShared(c, r, 20, {});
+    REQUIRE(picked.size() == 20);
+    uint32_t home = 0, n17 = 0, n400 = 0;
+    for (uint64_t g : picked)
+    {
+        uint32_t const z = c[g - 1000].zone;
+        if (z == 15u) ++home; else if (z == 17u) ++n17; else ++n400;
+    }
+    CHECK(home >= 11);       // about 60%
+    CHECK(home <= 13);
+    CHECK(n17 >= 3);         // the neighbours both get some
+    CHECK(n400 >= 3);
+}
+
+TEST_CASE("Waking counts the bots already awake and tops up the zone that is behind", "[ClassicWakeSelect]")
+{
+    using namespace Playerbot::V2::Fleet;
+    WakeRule r;
+    r.anchor_zone = 15;
+    r.min_dist = 0.0f;
+    std::vector<WakeCandidate> c;
+    for (uint32_t i = 0; i < 20; ++i)
+    {
+        WakeCandidate w; w.guid = 1 + i; w.dist = 100.0f; w.zone = (i % 2) ? 15u : 17u;
+        c.push_back(w);
+    }
+    // 50 awake in the home zone already, 0 elsewhere: the next ones come from the neighbour
+    auto const picked = SelectWakeShared(c, r, 4, { { 15u, 50u } });
+    for (uint64_t g : picked)
+        CHECK(c[g - 1].zone == 17u);
+}
+
+TEST_CASE("A capital wakes its own zone only, and a wanted group that sleeps nowhere falls back to the other", "[ClassicWakeSelect]")
+{
+    using namespace Playerbot::V2::Fleet;
+    WakeRule r;
+    r.anchor_zone = 1537;
+    r.capital = true;
+    r.min_dist = 0.0f;
+    std::vector<WakeCandidate> c;
+    for (uint32_t i = 0; i < 6; ++i)
+    {
+        WakeCandidate w; w.guid = 1 + i; w.dist = 100.0f; w.zone = (i < 3) ? 1537u : 1u;
+        c.push_back(w);
+    }
+    auto const picked = SelectWakeShared(c, r, 10, {});
+    CHECK(picked.size() == 3);
+
+    WakeRule o;
+    o.anchor_zone = 15;
+    o.min_dist = 0.0f;
+    std::vector<WakeCandidate> n;
+    for (uint32_t i = 0; i < 5; ++i)
+    {
+        WakeCandidate w; w.guid = 1 + i; w.dist = 100.0f; w.zone = 17u;
+        n.push_back(w);
+    }
+    CHECK(SelectWakeShared(n, o, 5, {}).size() == 5);   // nobody sleeps at home: the neighbours fill it
+}

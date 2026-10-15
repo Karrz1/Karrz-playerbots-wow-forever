@@ -40,7 +40,7 @@ This is the **single source of truth** for what V2 must do, what it must not do,
 V1 has crossed the threshold where reduction is harder than replacement. Symptoms (objective):
 
 - ~1,861 source files, ~636K LOC for one module
-- 5 overlapping AI decision layers, 11+ event buses, 30+ subsystems
+- 5 overlapping bot logic decision layers, 11+ event buses, 30+ subsystems
 - 18+ documented deadlock fix attempts; emergency `IMMEDIATE_MUTEX_FIX.cpp` and `THREADPOOL_FIX_*.cpp` at repo root
 - 562 markdown files documenting iterative course-corrections
 - Module-purity rule has produced large amounts of state-mirroring/synchronization code that exists only because the module cannot ask the core a question directly
@@ -109,7 +109,7 @@ Whichever threading approach is selected in the architecture phase MUST satisfy 
 
 A *candidate* implementation that satisfies these invariants:
 - World thread owns all `Player`/`Unit` mutations
-- AI worker pool runs decision-making against immutable per-tick snapshots
+- bot worker pool runs decision-making against immutable per-tick snapshots
 - Lock-free intent queue (MPSC) per bot drains on world thread
 - Snapshots replaced atomically (single pointer swap)
 

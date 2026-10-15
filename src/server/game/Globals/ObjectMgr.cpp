@@ -163,9 +163,8 @@ bool normalizePlayerName(std::string& name)
     if (!Utf8toWStr(name, tmp))
         return false;
 
-    // The Classic client's unit menu passes "Name " (name + empty surname) to invite/whisper/ignore/friend: trim surrounding
-    // blanks so every name lookup that normalizes first finds the player.
-    // (plain, non-breaking and zero-width blanks)
+    // The Classic client's unit menu passes "Name " (name + empty surname) to invite/whisper/ignore/friend:
+    // trim surrounding blanks (plain, non-breaking and zero-width) so every lookup that normalizes first finds the player
     static wchar_t const* const blanks = L" \t\u00A0\u200B\u200C\u200D\u200E\u200F\uFEFF";
     std::wstring::size_type first = tmp.find_first_not_of(blanks);
     if (first == std::wstring::npos)
@@ -1362,9 +1361,8 @@ void ObjectMgr::CheckCreatureTemplate(CreatureTemplate const* cInfo)
         const_cast<CreatureTemplate*>(cInfo)->speed_run = 1.14286f;
     }
 
-    // the scale is the creature's (and its summons', guardians', pets') ObjectScale: 0 draws a zero-sized model (client "Model FileData
-    // ... scale:0" assert) and zeroes its bounding radius and combat reach (VMaNGOS uses 0 for "the display's own scale"; the
-    // creature_template_model DisplayScale already gets the same treatment in LoadCreatureTemplateModels).
+    // the scale is the ObjectScale of the creature and of its summons: 0 draws a zero-sized model (client assert) and zeroes its
+    // bounding radius and combat reach
     if (!(cInfo->scale > 0.0f))
     {
         TC_LOG_ERROR("sql.sql", "Creature (Entry: {}) has wrong value ({}) in scale, set to 1.", cInfo->Entry, cInfo->scale);

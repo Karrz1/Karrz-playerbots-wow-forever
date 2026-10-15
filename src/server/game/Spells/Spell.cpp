@@ -15,9 +15,7 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <unordered_map>
 #include "Spell.h"
-#include "ClassicOpcodes.h"
 #include "DeathRecap.h"
 #include "AzeriteEmpoweredItem.h"
 #include "Battlefield.h"
@@ -26,6 +24,7 @@
 #include "BattlePetMgr.h"
 #include "CellImpl.h"
 #include "CharmInfo.h"
+#include "ClassicOpcodes.h"
 #include "CollectionMgr.h"
 #include "CombatLogPackets.h"
 #include "Common.h"
@@ -72,7 +71,6 @@
 #include "VMapManager.h"
 #include "World.h"
 #include "WorldSession.h"
-#include "Playerbot/PlayerbotHooks.h"
 #include <numeric>
 #include <sstream>
 
@@ -2786,11 +2784,6 @@ void Spell::TargetInfo::PreprocessTarget(Spell* spell)
         {
             if (missInfo != SPELL_MISS_MISS)
                 spell->m_caster->SendSpellMiss(unit, spell->m_spellInfo->Id, missInfo);
-            // PLAYERBOT V2 HOOK (damage_parity scenarios): an avoided spell, tallied by outcome.
-            if (spell->m_caster->IsUnit() && !spell->m_caster->IsFriendlyTo(unit))
-                Playerbot::Hooks::OnHitOutcome(spell->m_caster->ToUnit(), unit, spell->m_spellInfo->Id,
-                                               missInfo == SPELL_MISS_MISS ? 2 : missInfo == SPELL_MISS_DODGE ? 3 : missInfo == SPELL_MISS_PARRY ? 4
-                                               : missInfo == SPELL_MISS_BLOCK ? 5 : missInfo == SPELL_MISS_RESIST ? 8 : 9, 0);
             spell->m_damage = 0;
             spell->m_healing = 0;
             _spellHitTarget = nullptr;
@@ -2979,8 +2972,6 @@ void Spell::TargetInfo::DoDamageAndTriggers(Spell* spell)
                 }
                 spell->m_damage = damageInfo.damage;
 
-                // PLAYERBOT V2 HOOK (damage_parity scenarios): the direct hit's outcome, just before its damage is dealt.
-                Playerbot::Hooks::OnHitOutcome(caster, damageInfo.target, spell->m_spellInfo->Id, IsCrit ? 1 : 0, damageInfo.damage);
                 caster->DealSpellDamage(&damageInfo, true);
 
                 // Send log damage message to client
@@ -3648,7 +3639,6 @@ SpellCastResult Spell::prepare(SpellCastTargets const& targets, AuraEffect const
         if (!(_triggeredCastFlags & TRIGGERED_IGNORE_GCD))
             TriggerGlobalCooldown();
 
-
         // Call CreatureAI hook OnSpellStart
         if (Creature* caster = m_caster->ToCreature())
             if (caster->IsAIEnabled())
@@ -3668,17 +3658,6 @@ void Spell::cancel(SpellCastResult result /*= SPELL_FAILED_INTERRUPTED*/, Option
 
     SpellState oldState = m_spellState;
     m_spellState = SPELL_STATE_FINISHED;
-
-    // [raid_rez] a resurrection cancelled before it landed (Karrz, MC 2026-10-10: bot rez casts run their 10 s down and the owner is never
-    // offered one; the start and the completion refusal were logged, a cancel was not): who, what state, how much cast bar was left.
-    if ((m_spellInfo->HasEffect(SPELL_EFFECT_RESURRECT) || m_spellInfo->HasEffect(SPELL_EFFECT_RESURRECT_NEW)) && m_caster->IsPlayer())
-    {
-        Unit const* uc = m_caster->ToUnit();
-        TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} cancelled: result {} state {} timer {} ms target {} moving={} in_combat={} alive={}",
-            m_caster->GetName(), m_spellInfo->Id, uint32(result), uint32(oldState), m_timer,
-            m_targets.GetUnitTarget() ? m_targets.GetUnitTarget()->GetName() : std::string("-"),
-            uc ? int(uc->isMoving()) : -1, uc ? int(uc->IsInCombat()) : -1, uc ? int(uc->IsAlive()) : -1);
-    }
 
     m_autoRepeat = false;
     switch (oldState)
@@ -3807,12 +3786,6 @@ void Spell::_cast(bool skipCheck)
     {
         auto cleanupSpell = [this, modOwner](SpellCastResult res, int32* p1 = nullptr, int32* p2 = nullptr)
         {
-            // [raid_rez] (Garr test 2026-10-08: rez casts of 10 s that never landed and never failed at the start): the result of a
-            // resurrection that is refused when its cast bar completes.
-            if ((m_spellInfo->HasEffect(SPELL_EFFECT_RESURRECT) || m_spellInfo->HasEffect(SPELL_EFFECT_RESURRECT_NEW)) && m_caster->IsPlayer())
-                TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} refused when the cast bar completed: result {}, target {}",
-                    m_caster->GetName(), m_spellInfo->Id, uint32(res),
-                    m_targets.GetUnitTarget() ? m_targets.GetUnitTarget()->GetName() : std::string("-"));
             SendCastResult(res, p1, p2);
             SendInterrupted(res);
 
@@ -4450,14 +4423,6 @@ void Spell::finish(SpellCastResult result)
     if (!unitCaster)
         return;
 
-    // [raid_rez] how a resurrection ended (Karrz, MC 2026-10-10): the result, and how many targets survived target selection (a target
-    // dropped by CheckTarget / the effect mask leaves a cast that "succeeds" and offers nothing).
-    if ((m_spellInfo->HasEffect(SPELL_EFFECT_RESURRECT) || m_spellInfo->HasEffect(SPELL_EFFECT_RESURRECT_NEW)) && m_caster->IsPlayer())
-        TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} finished: result {} unit targets {} corpse targets {} (first unit mask {:#x} miss {})",
-            m_caster->GetName(), m_spellInfo->Id, uint32(result), m_UniqueTargetInfo.size(), m_UniqueCorpseTargetInfo.size(),
-            m_UniqueTargetInfo.empty() ? 0u : m_UniqueTargetInfo.front().EffectMask,
-            m_UniqueTargetInfo.empty() ? 0u : uint32(m_UniqueTargetInfo.front().MissCondition));
-
     // successful cast of the initial autorepeat spell is moved to idle state so that it is not deleted as long as autorepeat is active
     if (IsAutoRepeat() && unitCaster->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) == this)
         m_spellState = SPELL_STATE_IDLE;
@@ -4534,7 +4499,6 @@ void Spell::finish(SpellCastResult result)
     // Stop Attack for some spells
     if (m_spellInfo->HasAttribute(SPELL_ATTR0_CANCELS_AUTO_ATTACK_COMBAT))
         unitCaster->AttackStop();
-
 }
 
 template<class T>
@@ -5472,10 +5436,9 @@ void Spell::SendResurrectRequest(Player* target)
     resurrectRequest.Name = sentName;
     resurrectRequest.Sickness = m_caster->IsUnit() && m_caster->ToUnit()->IsSpiritHealer(); // "you'll be afflicted with resurrection sickness"
     resurrectRequest.UseTimer = !m_spellInfo->HasAttribute(SPELL_ATTR3_NO_RES_TIMER);
-    // Classic 70291 (Karrz, MC 2026-10-10: a priest bot's Resurrection showed "wants to resurrect you and will be able to in 10 Seconds. You
-    // will be afflicted with resurrection sickness", Accept greyed, from UseTimer=1 / Sickness=0): a player's rez in Classic is accepted at
-    // once and carries no sickness, and the client reads this packet's two flag bits at a different alignment than retail does, so a set bit
-    // lands on the wrong flag. Both clear is read as "no timer, no sickness" at any alignment.
+    // Classic 70291: a player's resurrection is accepted at once and carries no sickness. That client reads the two flag bits of this
+    // packet at a different alignment than retail, so a set UseTimer showed a 10 second wait with resurrection sickness and a greyed
+    // Accept; both bits clear reads as "no timer, no sickness" at any alignment.
     if (ClassicOpcodes::IsBuild70291OrLater() && !resurrectRequest.Sickness)
         resurrectRequest.UseTimer = false;
     if (Pet* pet = target->GetPet())
@@ -5585,19 +5548,6 @@ void Spell::TakePower()
 
     for (SpellPowerCost& cost : m_powerCost)
     {
-        if (cost.Power == POWER_COMBO_POINTS && unitCaster->IsPlayer())
-            TC_LOG_INFO("playerbot.v2", "[combo] finisher {} {} ({}): cost {} power {} max {} target {}", unitCaster->GetName(), m_spellInfo->Id,
-                (*m_spellInfo->SpellName)[sWorld->GetDefaultDbcLocale()], cost.Amount, unitCaster->GetPower(POWER_COMBO_POINTS),
-                unitCaster->GetMaxPower(POWER_COMBO_POINTS), m_targets.GetUnitTargetGUID().ToString());
-        // [mana_cast] every mana payment of a healer-capable class in a group (raid or 5-man) (MC Garr 2026-10-10: healers lost 20 % mana in 30 s while only a
-        // handful of [heal_cast] lines were logged: heals, HoTs, buffs, rezzes and every other spell show here with the mana paid).
-        if (cost.Power == POWER_MANA && cost.Amount > 0 && unitCaster->IsPlayer())
-            if (Player const* castPlayer = unitCaster->ToPlayer())
-                if (castPlayer->GetGroup())
-                    if (uint8 const castClass = castPlayer->GetClass(); castClass == CLASS_PRIEST || castClass == CLASS_PALADIN || castClass == CLASS_DRUID || castClass == CLASS_SHAMAN)
-                        TC_LOG_INFO("playerbot.v2", "[mana_cast] {} {} ({}) cost {} mana {}/{} target {}", castPlayer->GetName(), m_spellInfo->Id,
-                            (*m_spellInfo->SpellName)[sWorld->GetDefaultDbcLocale()], cost.Amount, unitCaster->GetPower(POWER_MANA),
-                            unitCaster->GetMaxPower(POWER_MANA), m_targets.GetUnitTargetGUID().ToString());
         if (!hit)
         {
             // skipping granting power through negative cost only when spell has SPELL_ATTR1_DISCOUNT_POWER_ON_MISS is correct behavior
@@ -5626,7 +5576,8 @@ void Spell::TakePower()
             continue;
         }
 
-        // a finisher's damage, auras and procs read the combo points: they are spent after the effects (SpendPendingComboPoints)
+        // a finisher's damage, durations and procs read the caster's combo points while its effects run (SpellEffectInfo::CalcValue),
+        // so the points are spent after the effects (SpendPendingComboPoints), not here
         if (cost.Power == POWER_COMBO_POINTS && cost.Amount > 0 && unitCaster->IsPlayer())
         {
             m_comboPointsPending += cost.Amount;
@@ -5649,12 +5600,8 @@ void Spell::SpendPendingComboPoints()
 
     int32 const points = m_comboPointsPending;
     m_comboPointsPending = 0;
-    if (Unit* unitCaster = m_caster ? m_caster->ToUnit() : nullptr)
-    {
-        TC_LOG_INFO("playerbot.v2", "[combo] spent {} {} ({}): {} of {} points", unitCaster->GetName(), m_spellInfo->Id,
-            (*m_spellInfo->SpellName)[sWorld->GetDefaultDbcLocale()], points, unitCaster->GetPower(POWER_COMBO_POINTS));
+    if (Unit* unitCaster = m_caster->ToUnit())
         unitCaster->ModifyPower(POWER_COMBO_POINTS, -points);
-    }
 }
 
 void Spell::RefundPower()
@@ -7030,44 +6977,10 @@ SpellCastResult Spell::CheckCast(bool strict, int32* param1 /*= nullptr*/, int32
                     return SPELL_FAILED_DONT_REPORT;
                 }
 
-                // Classic: no mounting indoors (BG start rooms, caves, buildings). The 70205 client spell data does not carry
-                // SPELL_ATTR0_ONLY_OUTDOORS on its mount spells, so the generic check in CheckCast never fired for them.
-                // Battlegrounds are decided by the single rule below (Battleground::GetMountRefusal).
-                if (!IsTriggered() && unitCaster->GetTypeId() == TYPEID_PLAYER && !unitCaster->IsOutdoors() &&
-                    !(unitCaster->ToPlayer()->GetBattleground() && !unitCaster->ToPlayer()->GetBattleground()->isArena()) &&
-                    VMAP::VMapFactory::createOrGetVMapManager()->isLineOfSightCalcEnabled())
-                    return SPELL_FAILED_ONLY_OUTDOORS;
-
-                // Battlegrounds: one rule (Battleground::GetMountRefusal), no distance radius. Every refusal logs its reason.
-                if (!IsTriggered() && unitCaster->GetTypeId() == TYPEID_PLAYER)
-                    if (Battleground const* bg = unitCaster->ToPlayer()->GetBattleground())
-                        if (char const* why = bg->GetMountRefusal(unitCaster->ToPlayer()))
-                        {
-                            thread_local std::unordered_map<uint64, uint32> s_mountLogMs;
-                            uint32& lastLog = s_mountLogMs[unitCaster->GetGUID().GetCounter()];
-                            if (lastLog == 0 || getMSTime() - lastLog >= 20000u)
-                            {
-                                lastLog = getMSTime();
-                                TC_LOG_INFO("playerbot.v2", "[bg_mount] {} refused: {} (at {:.0f},{:.0f},{:.0f}, bg status {}){}", unitCaster->GetName(), why,
-                                            unitCaster->GetPositionX(), unitCaster->GetPositionY(), unitCaster->GetPositionZ(), uint32(bg->GetStatus()),
-                                            !unitCaster->IsOutdoors() ? " - " + bg->DescribeIndoors(unitCaster->ToPlayer()) : std::string());
-                            }
-                            return SPELL_FAILED_ONLY_OUTDOORS;
-                        }
-                        else if (WorldSession const* mountSession = unitCaster->ToPlayer()->GetSession(); mountSession && !mountSession->IsBot())
-                        {
-                            // A real player's mount is allowed here: log the terrain evidence for it (Karrz, WSG 2026-10-11: a mount was
-                            // allowed inside the Horde flag room). One line per 5 s.
-                            thread_local std::unordered_map<uint64, uint32> s_mountOkMs;
-                            uint32& lastOk = s_mountOkMs[unitCaster->GetGUID().GetCounter()];
-                            if (lastOk == 0 || getMSTime() - lastOk >= 5000u)
-                            {
-                                lastOk = getMSTime();
-                                TC_LOG_INFO("playerbot.v2", "[bg_mount_ok] {} mount allowed at ({:.0f},{:.0f},{:.0f}), bg status {}: {}", unitCaster->GetName(),
-                                            unitCaster->GetPositionX(), unitCaster->GetPositionY(), unitCaster->GetPositionZ(), uint32(bg->GetStatus()),
-                                            bg->DescribeIndoors(unitCaster->ToPlayer()));
-                            }
-                        }
+                // Classic: no mounting indoors, nor in a closed battleground start room
+                if (!IsTriggered())
+                    if (Player const* player = unitCaster->ToPlayer(); player && player->IsMountRestrictedHere(true))
+                        return SPELL_FAILED_ONLY_OUTDOORS;
                 break;
             }
             case SPELL_AURA_RANGED_ATTACK_POWER_ATTACKER_BONUS:
@@ -7534,9 +7447,7 @@ void Spell::CheckDst()
 
 SpellCastResult Spell::CheckRange(bool strict) const
 {
-    // A trap object picked its target by its own trigger radius (GameObject::Update). The effect spell's own range is 0 for the Explosive and Frost
-    // Trap effects (the effect is an area around the trap): checking it against the unit that walked in turned every hit that was not on the exact
-    // spot into SPELL_FAILED_OUT_OF_RANGE, and the trap despawned having done nothing.
+    // A trap picked its target by its own trigger radius; the effect spells of some traps have range 0
     if (GameObject const* trap = m_caster->ToGameObject(); trap && trap->GetGoType() == GAMEOBJECT_TYPE_TRAP)
         return SPELL_CAST_OK;
 
@@ -8640,13 +8551,9 @@ SpellEvent::~SpellEvent()
     if (m_Spell->getState() != SPELL_STATE_FINISHED)
         m_Spell->cancel();
 
-
-    // BUGFIX: Clear spell mod taking spell before destruction to prevent assertion failure (Spell.cpp:603)
-    // When KillAllEvents() is called (logout, map change, instance reset), spell events are destroyed
-    // without going through the normal delayed handler that clears m_spellModTakingSpell.
-    // This causes ASSERT(m_caster->ToPlayer()->m_spellModTakingSpell != this) to fail in ~Spell()
-    if (m_Spell->GetCaster() && m_Spell->GetCaster()->GetTypeId() == TYPEID_PLAYER)
-        m_Spell->GetCaster()->ToPlayer()->SetSpellModTakingSpell(m_Spell.get(), false);
+    // events killed on logout or map change skip the handler that clears the spell mod owner's taking spell
+    if (Player* modOwner = m_Spell->GetCaster()->ToPlayer())
+        modOwner->SetSpellModTakingSpell(m_Spell.get(), false);
 
     if (!m_Spell->IsDeletable())
     {

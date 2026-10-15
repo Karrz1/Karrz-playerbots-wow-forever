@@ -1588,4 +1588,4 @@ After this catalog is complete and reviewed, we ask:
 
 > **Given everything in this document, what architectural patterns are sufficient and necessary?**
 
-Not before. The architecture decision (state machines vs APLs vs behavior trees vs utility AI vs hybrid) depends on the full feature surface, and that surface must be locked first.
+Not before. The architecture decision (state machines vs APLs vs behavior trees vs utility bot logic vs hybrid) depends on the full feature surface, and that surface must be locked first.

@@ -17,7 +17,7 @@
 
 #include "tc_catch2.h"
 
-#include "../../src/server/game/Playerbot/BotTrade.h"
+#include "../../src/modules/PlayerbotV2/Api/BotTrade.h"
 #include "../../src/modules/PlayerbotV2/Bot/TradeTalk.h"
 
 using namespace Playerbot::BotTrade;

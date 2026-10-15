@@ -24,14 +24,12 @@
 #include "PathGenerator.h"
 #include "Pet.h"
 #include "Unit.h"
-#if defined(TRINITY_PLAYERBOT_V2)
 #include "Player.h"
 #include "WorldSession.h"
 
 // Target drift (yards) a playerbot follower tolerates before re-pathing a follow spline that is
 // still in flight. 2.5y at run speed is ~0.35 s of leader movement.
 static constexpr float FOLLOW_BOT_REPATH_DIST = 2.5f;
-#endif
 
 static void DoMovementInform(Unit* owner, Unit* target)
 {
@@ -71,10 +69,8 @@ bool FollowMovementGenerator::Initialize(Unit* owner)
     UpdatePetSpeed(owner);
     _path = nullptr;
     _lastTargetPosition.reset();
-#if defined(TRINITY_PLAYERBOT_V2)
     Player const* playerOwner = owner->ToPlayer();
     _throttleRepath = playerOwner && playerOwner->GetSession() && playerOwner->GetSession()->IsBot();
-#endif
     return true;
 }
 
@@ -115,10 +111,6 @@ bool FollowMovementGenerator::Update(Unit* owner, uint32 diff)
         return true;
     }
 
-#if defined(TRINITY_PLAYERBOT_V2)
-    _petSnapCooldownMs = _petSnapCooldownMs > diff ? _petSnapCooldownMs - diff : 0u;
-#endif
-
     float range = _range;
     if (Creature* cOwner = owner->ToCreature())
         if (cOwner->IsIgnoringChaseRange())
@@ -147,7 +139,6 @@ bool FollowMovementGenerator::Update(Unit* owner, uint32 diff)
         DoMovementInform(owner, target);
     }
 
-#if defined(TRINITY_PLAYERBOT_V2)
     // Playerbot followers: while a follow spline is still in flight, re-path only once the
     // target has drifted FOLLOW_BOT_REPATH_DIST from where it stood at the last launch.
     // The stock rule re-paths and re-launches on ANY target movement, i.e. every map update
@@ -158,7 +149,6 @@ bool FollowMovementGenerator::Update(Unit* owner, uint32 diff)
     if (_throttleRepath && _lastTargetPosition && owner->HasUnitState(UNIT_STATE_FOLLOW_MOVE) && !owner->movespline->Finalized()
         && _lastTargetPosition->GetExactDistSq(target->GetPosition()) < FOLLOW_BOT_REPATH_DIST * FOLLOW_BOT_REPATH_DIST)
         return true;
-#endif
 
     if (!_lastTargetPosition || _lastTargetPosition->GetExactDistSq(target->GetPosition()) > 0.0f)
     {
@@ -196,35 +186,6 @@ bool FollowMovementGenerator::Update(Unit* owner, uint32 diff)
             }
 
             bool success = _path->CalculatePath(x, y, z, allowShortcut);
-#if defined(TRINITY_PLAYERBOT_V2)
-            // A pet of an ambient playerbot that cannot walk to its owner (the owner stands on another level of a city, over a ledge the pet
-            // cannot take, or the path stops short): the pet cheat-follows with a straight shortcut through the wall and shakes in place
-            // against it for as long as the owner stays there (chris, Ironforge 2026-10-12: a voidwalker on the Military Ward bridge, its
-            // warlock on a lower level). The way a player's pet ends up beside its owner when it falls behind is a snap to the owner's side,
-            // so: at most every 4 s the pet is set down next to the owner, and no shortcut spline is launched.
-            if (allowShortcut)
-            {
-                Player const* targetPlayer = target->ToPlayer();
-                if (targetPlayer && targetPlayer->GetSession() && targetPlayer->GetSession()->IsBot())
-                {
-                    G3D::Vector3 const& end = _path->GetActualEndPosition();
-                    float const endGap = std::sqrt((end.x - x) * (end.x - x) + (end.y - y) * (end.y - y) + (end.z - z) * (end.z - z));
-                    uint32 const type = _path->GetPathType();
-                    bool const unreachable = !success || (type & (PATHFIND_NOPATH | PATHFIND_SHORTCUT)) || ((type & PATHFIND_INCOMPLETE) && endGap > 4.0f);
-                    if (unreachable)
-                    {
-                        owner->StopMoving();
-                        if (_petSnapCooldownMs == 0)
-                        {
-                            _petSnapCooldownMs = 4000;
-                            owner->NearTeleportTo(Position(x, y, z, target->GetOrientation()));
-                        }
-                        _path = nullptr;
-                        return true;
-                    }
-                }
-            }
-#endif
             if (!success || (_path->GetPathType() & PATHFIND_NOPATH))
             {
                 owner->StopMoving();

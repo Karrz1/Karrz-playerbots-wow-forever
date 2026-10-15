@@ -20,7 +20,6 @@
 #include "Item.h"
 #include "Player.h"
 #include "ClassicManaRegen.h"
-#include "ClassicSpellValue.h"
 #include "Pet.h"
 #include "GameTables.h"
 #include "GameTime.h"
@@ -173,9 +172,8 @@ void Player::ApplySpellPowerBonus(int32 amount, bool apply)
 
 void Player::UpdateSpellDamageAndHealingBonus()
 {
-    // RECURSION GUARD: Prevent infinite loop when player has both
-    // SPELL_AURA_OVERRIDE_ATTACK_POWER_BY_SP_PCT and SPELL_AURA_OVERRIDE_SPELL_POWER_BY_AP_PCT
-    // which causes UpdateSpellDamageAndHealingBonus <-> UpdateAttackPowerAndDamage loop
+    // SPELL_AURA_OVERRIDE_ATTACK_POWER_BY_SP_PCT together with SPELL_AURA_OVERRIDE_SPELL_POWER_BY_AP_PCT make this and
+    // UpdateAttackPowerAndDamage call each other without end
     thread_local bool inSpellDamageUpdate = false;
     if (inSpellDamageUpdate)
         return;
@@ -1067,12 +1065,11 @@ float Player::GetPowerRegen(Powers power) const
 
     if (power == POWER_MANA)
     {
-        // Classic 1.60 (vanilla): five second rule (ClassicManaRegen.h). The window starts when a mana spell is paid (Spell::TakePower)
-        // and the interrupted rate is the share of SPELL_AURA_MOD_MANA_REGEN_INTERRUPT (UpdatePowerRegen), not zero. Combat does
-        // not interrupt the regeneration.
-        // (leaving combat does not start the window, so it has a timestamp of its own)
-        unsigned const msSinceManaSpell = unsigned(std::chrono::duration_cast<Milliseconds>(GameTime::Now() - m_manaSpentTimestamp).count());
-        bool const manaInterrupted = ClassicManaRegen::IsInterrupted(msSinceManaSpell, HasAuraType(SPELL_AURA_INTERRUPT_REGEN));
+        // Classic 1.60 (vanilla): five second rule (ClassicManaRegen.h). The window starts when mana is paid (Spell::TakePower), the
+        // interrupted rate is the share of SPELL_AURA_MOD_MANA_REGEN_INTERRUPT (not zero), and combat does not interrupt the regeneration.
+        // Leaving combat does not start the window, so it has a timestamp of its own.
+        int64 const msSinceManaSpent = std::chrono::duration_cast<Milliseconds>(GameTime::Now() - m_manaSpentTimestamp).count();
+        bool const manaInterrupted = ClassicManaRegen::IsInterrupted(msSinceManaSpent, HasAuraType(SPELL_AURA_INTERRUPT_REGEN));
         return manaInterrupted ? powerType->RegenCombat + m_unitData->PowerRegenInterruptedFlatModifier[powerIndex]
                                : powerType->RegenPeace + m_unitData->PowerRegenFlatModifier[powerIndex];
     }

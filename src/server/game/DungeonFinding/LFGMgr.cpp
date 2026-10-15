@@ -16,7 +16,6 @@
  */
 
 #include "LFGMgr.h"
-#include "Playerbot/PlayerbotHooks.h"
 #include "DatabaseEnv.h"
 #include "DB2Stores.h"
 #include "DisableMgr.h"
@@ -33,6 +32,7 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "ScriptMgr.h"
 #include "RBAC.h"
 #include "SharedDefines.h"
 #include "SocialMgr.h"
@@ -369,11 +369,8 @@ void LFGMgr::Update(uint32 diff)
                 else
                     SendLfgUpdateStatus(guid, LfgUpdateData(LFG_UPDATETYPE_PROPOSAL_BEGIN, GetSelectedDungeons(guid)), false);
                 SendLfgUpdateProposal(guid, proposal);
-                // PlayerbotV2: auto-accept hook for bots — synchronous push of a
-                // deferred LfgProposalRespondIntent so all 5 (or 25) bots ack
-                // well inside LFG_TIME_PROPOSAL without waiting for snapshot poll.
                 if (Player* candidate = ObjectAccessor::FindConnectedPlayer(guid))
-                    Playerbot::Hooks::OnLfgProposalReceived(candidate, proposalId);
+                    sScriptMgr->OnPlayerLfgProposal(candidate, proposalId);
             }
 
             if (proposal.state == LFG_PROPOSAL_SUCCESS)
@@ -1005,14 +1002,8 @@ void LFGMgr::MakeNewGroup(LfgProposal const& proposal)
             grp->ConvertToLFG();
             if (!grp->Create(player))
             {
-                // Unchecked, a failed Create left a half-initialized group
-                // every later member was added to while the "leader"
-                // silently stayed groupless.
-                TC_LOG_ERROR("lfg.group",
-                    "LFGMgr::MakeNewGroup: Group::Create FAILED for leader {} ({}) — group={} invite={}",
-                    player->GetName(), pguid.ToString(),
-                    player->GetGroup() ? player->GetGroup()->GetGUID().ToString() : "none",
-                    player->GetGroupInvite() ? "pending" : "none");
+                // A failed Create left a half-made group the others were added to while the leader stayed groupless
+                TC_LOG_ERROR("lfg.group", "LFGMgr::MakeNewGroup: Group::Create failed for leader {}", pguid.ToString());
                 delete grp;
                 grp = nullptr;
                 playersToTeleport.remove(pguid);
@@ -1027,21 +1018,9 @@ void LFGMgr::MakeNewGroup(LfgProposal const& proposal)
         {
             if (!grp->AddMember(player))
             {
-                // The unchecked call stranded the player: their LFG state
-                // advanced to "in dungeon" and the teleport fired, but they
-                // were in NO group — Player::CheckInstanceValidity then
-                // instantly ejects them from the group-bound instance
-                // (live 2026-06-11: player repeatedly ported out of Ragefire
-                // Chasm on entry, LFG state wedged at "In dungeon"). Log
-                // WHY, skip the teleport, and reset their LFG state so they
-                // can re-queue cleanly.
-                TC_LOG_ERROR("lfg.group",
-                    "LFGMgr::MakeNewGroup: Group::AddMember FAILED for {} ({}) — group={} originalGroup={} invite={} lfgGroupSize={}",
-                    player->GetName(), pguid.ToString(),
-                    player->GetGroup() ? player->GetGroup()->GetGUID().ToString() : "none",
-                    player->GetOriginalGroup() ? player->GetOriginalGroup()->GetGUID().ToString() : "none",
-                    player->GetGroupInvite() ? "pending" : "none",
-                    grp->GetMembersCount());
+                // Not in the group but ported into the group-bound instance: the player was thrown out again on entry
+                // with the LFG state stuck at "in dungeon". Skip the teleport and let the player queue again.
+                TC_LOG_ERROR("lfg.group", "LFGMgr::MakeNewGroup: Group::AddMember failed for {} (group {})", pguid.ToString(), grp->GetGUID().ToString());
                 playersToTeleport.remove(pguid);
                 SetState(pguid, LFG_STATE_NONE);
                 continue;
@@ -1707,13 +1686,7 @@ LfgType LFGMgr::GetDungeonType(uint32 dungeonId)
 
 LfgState LFGMgr::GetState(ObjectGuid guid)
 {
-    // READ-ONLY: use find(), not operator[]. operator[] default-constructs and
-    // INSERTS an entry for any absent guid — so calling this "getter" on an
-    // entity that isn't in LFG silently leaks a junk LfgPlayerData/LfgGroupData
-    // into the store (bloating memory + every LFGMgr::Update iteration) AND emits
-    // a TRACE line. The playerbot snapshot called it per-bot per-build, populating
-    // the stores with the whole fleet. Entries are created explicitly by SetState
-    // on the real join path, so absent==NONE here is correct.
+    // read only: operator[] would insert an empty entry for every guid asked about
     LfgState state = LFG_STATE_NONE;
     if (guid.IsParty())
     {
@@ -1733,7 +1706,7 @@ LfgState LFGMgr::GetState(ObjectGuid guid)
 
 LfgState LFGMgr::GetOldState(ObjectGuid guid)
 {
-    LfgState state = LFG_STATE_NONE;   // read-only (see GetState)
+    LfgState state = LFG_STATE_NONE;    // read only, see GetState
     if (guid.IsParty())
     {
         if (auto it = GroupsStore.find(guid); it != GroupsStore.end())
@@ -1754,7 +1727,7 @@ bool LFGMgr::IsVoteKickActive(ObjectGuid gguid)
 {
     ASSERT(gguid.IsParty());
 
-    bool active = false;   // read-only (see GetState) — no junk-entry insertion
+    bool active = false;                // read only, see GetState
     if (auto it = GroupsStore.find(gguid); it != GroupsStore.end())
         active = it->second.IsVoteKickActive();
     TC_LOG_TRACE("lfg.data.group.votekick.get", "Group: {}, Active: {}", gguid.ToString(), active);

@@ -9,7 +9,6 @@
 
 #include "Creature.h"
 #include "CreatureData.h"
-#include "Log.h"
 #include "Map.h"
 #include "ObjectMgr.h"
 #include "SpawnData.h"
@@ -42,12 +41,9 @@ inline void ClassicRespawnBossPack(Map* map, uint32 bossEntry, std::vector<uint3
             dead.push_back(c);
     }
     for (Creature* c : dead)
-    {
         c->Respawn();
-        c->SaveRespawnTime();   // drops the persisted "dead until the lockout resets" row
-    }
 
-    // Spawns whose object is already unloaded wait as respawn entries (non-compatibility mode).
+    // spawns whose object is already unloaded wait as respawn entries (non-compatibility mode)
     std::vector<RespawnInfo const*> pending;
     map->GetRespawnInfo(pending, SPAWN_TYPEMASK_CREATURE);
     std::vector<ObjectGuid::LowType> due;
@@ -58,9 +54,6 @@ inline void ClassicRespawnBossPack(Map* map, uint32 bossEntry, std::vector<uint3
                     due.push_back(ri->spawnId);
     for (ObjectGuid::LowType spawnId : due)
         map->Respawn(SPAWN_TYPE_CREATURE, spawnId);
-
-    if (!dead.empty() || !due.empty())
-        TC_LOG_INFO("playerbot.v2", "[boss_pack] boss {} reset: {} dead adds respawned, {} unloaded", bossEntry, dead.size(), due.size());
 }
 
 #endif

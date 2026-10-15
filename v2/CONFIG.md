@@ -98,7 +98,7 @@ Playerbot.Population.Floor = 100
 - Loads file, parses keys.
 - Validates types and ranges per a hard-coded schema in `ConfigReader.cpp`.
 - Reports errors line-numbered to the log; refuses to start with malformed config.
-- For HR-yes keys, supports `.playerbot reload`. Updates atomic config snapshot. AI workers see new values on next tick.
+- For HR-yes keys, supports `.playerbot reload`. Updates atomic config snapshot. bot workers see new values on next tick.
 - For HR-no keys, reload logs a warning and ignores.
 
 ## 6. What's locked vs open

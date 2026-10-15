@@ -165,7 +165,7 @@ void OwnerRegistry::SetOwner(BotId bot, uint32 account_id, uint64 player_guid)
         if (account_id == 0 && player_guid == 0)
         {
             owners_.erase(bot);
-            // The declared role stays with the character through a dismissal: re-added, it plays what it played (chris
+            // The declared role stays with the character through a dismissal: re-added, it plays what it played (the owner
             // 2026-10-08: dismissed paladins and druids came back as tanks from a talent inference).
         }
         else

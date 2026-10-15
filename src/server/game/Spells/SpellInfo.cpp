@@ -418,7 +418,7 @@ SpellEffectInfo::SpellEffectInfo(SpellInfo const* spellInfo, SpellEffectEntry co
     _spellInfo = spellInfo;
     EffectIndex = SpellEffIndex(_effect.EffectIndex);
     Effect = SpellEffects(_effect.Effect);
-    ApplyAuraName = AuraType(_effect.EffectAura);
+    ApplyAuraName = AuraType(GetClassicAuraType(_effect.EffectAura));
     ApplyAuraPeriod = _effect.EffectAuraPeriod;
     BasePoints = _effect.EffectBasePoints;
     RealPointsPerLevel = _effect.EffectRealPointsPerLevel;
@@ -687,18 +687,16 @@ SpellEffectValue SpellEffectInfo::CalcValue(WorldObject const* caster /*= nullpt
 }
 
 // Classic 1.60: spells of players and of what they control (pets, totems, traps) use their base points as flat values.
-// So do the legacy creature spells: the 1.60 client's SpellEffect.db2 still carries their vanilla flat values (Molten Giant
-// Smash 18944: 900 +-20%, Firesworn Blast Wave 20229: 750 +-15%), and reading those as a percentage of the expected creature
-// spell damage made Smash hit for 7.7k-25.7k (MC, 2026-10-06). Only the spells new to Forever carry percentages (Living
-// Storm Shock 1259652: 10 -> 16..18 on the official beta); they all sit in the modern id range, while vanilla and Classic Era
-// spells stay below it (the Forever creature scripts in sql/custom cast 1250053..1317755 for new content and < 415000 for
-// the rest).
+// So do the legacy creature spells: SpellEffect.db2 still carries their vanilla flat values (Molten Giant Smash 18944:
+// 900 +-20%), reading them as a percentage of the expected creature spell damage made them hit for many times that.
+// Only the spells new to Forever carry percentages (Living Storm Shock 1259652: 10 -> 16..18), all in the modern id range.
 static constexpr uint32 CLASSIC_FIRST_SCALED_SPELL_ID = 1000000;
 
 bool SpellEffectInfo::UsesClassicFlatBasePoints(WorldObject const* caster) const
 {
     if (caster && caster->GetAffectingPlayer())
         return true;
+
     return _spellInfo->Id < CLASSIC_FIRST_SCALED_SPELL_ID;
 }
 
@@ -771,9 +769,9 @@ SpellEffectValue SpellEffectInfo::CalcBaseValue(WorldObject const* caster, Unit 
     {
         float value = BasePoints;
         ExpectedStatType stat = GetScalingExpectedStat();
-        // Classic 1.60: base points of player spells are flat vanilla values (Fireball rank 1: 18 +-22% = 14..22); only creature
-        // spells are a percentage of the expected stat (Living Storm Shock: 10 -> 16..18 on the official beta). Scaling Scorch made
-        // it hit for 7-8k.
+        // Classic 1.60: base points of player and legacy creature spells are flat vanilla values (Fireball rank 1: 18 +-22% =
+        // 14..22); only the new creature spells are a percentage of the expected stat (Living Storm Shock: 10 -> 16..18 on the
+        // official beta). Scaling Scorch made it hit for 7-8k.
         if (stat != ExpectedStatType::None && !UsesClassicFlatBasePoints(caster))
         {
             if (_spellInfo->HasAttribute(SPELL_ATTR0_SCALES_WITH_CREATURE_LEVEL))

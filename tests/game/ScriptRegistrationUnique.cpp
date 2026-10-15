@@ -28,16 +28,14 @@
 // ScriptMgr asserts at startup when two scripts of one kind share a name ("Script 'x' already assigned with the same script name"),
 // which took the go-live install down twice (go_classic_wsg_flag, go_classic_ab_banner registered by advocaite's script and ours).
 // This reads the script sources and checks that every game object AI / battleground map script / single-name spell script name is
-// registered once. It skips when the source tree is not next to the test binary's compile-time path.
+// registered once. It needs the source tree at the CMake source folder (TC_SOURCE_DIR) and fails when it is not there.
 TEST_CASE("Script registration: every game object AI, battleground map script and spell script name is registered once", "[scripts][registration]")
 {
     namespace fs = std::filesystem;
-    fs::path const scripts = fs::path(__FILE__).parent_path().parent_path().parent_path() / "src" / "server" / "scripts";
+    fs::path const scripts = fs::path(TC_SOURCE_DIR) / "src" / "server" / "scripts";   // TC_SOURCE_DIR comes from CMake (tests/CMakeLists.txt); __FILE__ is trimmed in release builds
     std::error_code ec;
-    if (!fs::is_directory(scripts, ec))
-    {
-        SKIP("script sources not available at " << scripts.string());
-    }
+    INFO("script sources expected at " << scripts.string());
+    REQUIRE(fs::is_directory(scripts, ec));   // a missing source folder is a failure, not a skip: the check would silently never run
 
     std::regex const reg(R"(^\s*(RegisterGameObjectAI|RegisterBattlegroundMapScript|RegisterSpellScript|RegisterAuraScript)\(\s*(\w+))");
     std::map<std::string, std::vector<std::string>> sites;   // "<macro family>:<name>" -> files

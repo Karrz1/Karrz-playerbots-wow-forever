@@ -67,7 +67,7 @@ void HandcraftedRoadGraph::EnsureConfig()
 {
     std::call_once(_configOnce, [this]()
     {
-        _enabled         = sConfigMgr->GetBoolDefault("RoadGraph.Enable", true);
+        _enabled         = sConfigMgr->GetBoolDefault("RoadGraph.Enable", false);
         _minDistance     = sConfigMgr->GetFloatDefault("RoadGraph.MinDistance", 150.0f);
         _maxDetourRatio  = sConfigMgr->GetFloatDefault("RoadGraph.MaxDetourRatio", 1.6f);
         _maxEntryDistance = sConfigMgr->GetFloatDefault("RoadGraph.MaxEntryDistance", 120.0f);

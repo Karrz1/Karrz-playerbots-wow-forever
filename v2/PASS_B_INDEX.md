@@ -36,7 +36,7 @@ Pass B is done when:
 ## Iteration 2 — threading + types + first end-to-end loop (landed 2026-05-01)
 
 The bootstrap commit now extends with the foundational threading layer, the
-core data types, and a complete world-tick → snapshot publish → AI worker tick
+core data types, and a complete world-tick → snapshot publish → bot worker tick
 loop. Bot logic is still empty (Idle is a no-op), but the wiring is end-to-end:
 on player login, a bot character registers; every world tick its snapshot is
 published; the worker pool ticks BotAI; `Idle` runs and emits no intents.
@@ -77,7 +77,7 @@ CMake refinement:
 
 ## Iteration 3 — migrations, intent execution, first real API bodies (landed 2026-05-01)
 
-Intents emitted by AI workers are now drained on the world thread and dispatched
+Intents emitted by bot workers are now drained on the world thread and dispatched
 to `PlayerbotAPI`. Three commands have real bodies: `cast_spell`, `move_to`,
 `hearth`. The remaining ~32 intent variants no-op via the visitor's catch-all
 template. Schema migrations now run at init via `PlayerbotMigrationMgr`.
@@ -94,7 +94,7 @@ Files modified:
 
 Files added:
 - `Util/ConfigReader.{h,cpp}` — typed accessors over TrinityCore's `sConfigMgr`,
-  loading `playerbot.conf` at module init. AI worker count now driven by config.
+  loading `playerbot.conf` at module init. bot worker count now driven by config.
 
 Files modified:
 - `Services.{h,cpp}` — owns and exposes `ConfigReader`; `AiWorkerPool` reads
@@ -102,7 +102,7 @@ Files modified:
 
 Remaining work toward V1.0 acceptance criteria:
 - ~32 more intent variants need real `PlayerbotAPI` bodies (vendor, loot, quest accept/turn-in, group ops, AH, mail, talents, pets, housing)
-- `Group/GroupSnapshotBuilder` (currently AI sees an empty group view)
+- `Group/GroupSnapshotBuilder` (currently bot logic sees an empty group view)
 - The remaining ≤27 hook insertion sites (combat events, group changes, quest progress, instance enter/exit, BG progress, encounter phase, mail, AH, LFG, housing purchase)
 - `Fleet/PopulationManager` + `BotLifecycleManager` so bots actually exist (right now any logged-in player gets a registry entry)
 - One real `Combat/Apl/Apl_Hunter_BeastMastery.cpp` (validate the rotation pipeline end-to-end with a single class)

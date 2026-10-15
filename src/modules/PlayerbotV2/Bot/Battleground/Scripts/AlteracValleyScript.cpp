@@ -5,7 +5,7 @@
 // Vandar Stormpike ends the BG.
 //
 // Authoritative data from V1 (production-tested):
-//   src/modules/Playerbot/AI/Coordination/Battleground/Scripts/Siege/
+//   src/modules/Playerbot/bot logic/Coordination/Battleground/Scripts/Siege/
 //     AlteracValleyData.h:35 (REINF_GAIN_PER_CAPTAIN), :128-130 (Vandar),
 //     :134-136 (Drek'Thar), :149-164 (Captains), :191+ (towers),
 //     :451-457 (spawns).

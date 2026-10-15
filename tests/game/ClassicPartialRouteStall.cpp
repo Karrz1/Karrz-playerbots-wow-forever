@@ -17,7 +17,7 @@
 
 #include "tc_catch2.h"
 
-#include "../../src/server/game/Playerbot/PartialRouteStall.h"
+#include "../../src/modules/PlayerbotV2/Api/PartialRouteStall.h"
 
 using namespace Playerbot::BotMovement;
 

@@ -196,12 +196,12 @@ struct RouteRequest
     // only route that can never be executed and masking the real bridge
     // route (elevator / teleport) out of the pocket. Used by the snapshot
     // builder's wedged-objective probe. WORLD THREAD ONLY (PathGenerator
-    // queries the live navmesh); requires `bot`. Default off: AI-worker
+    // queries the live navmesh); requires `bot`. Default off: bot-worker
     // callers must not set this.
     bool          validate_source_walk = false;
     // Skip the trivial same-map direct-walk branch and force graph A*.
     // Set by callers whose previously-planted direct walk WEDGED (the
-    // AI thread can't navmesh-validate, and geometry alone can't tell a
+    // Bot logic thread can't navmesh-validate, and geometry alone can't tell a
     // 540y/95z ramp from an elevator-only interior — Somi's UC→Brill
     // "trivial" walk was mesh-impossible).
     bool          skip_trivial = false;

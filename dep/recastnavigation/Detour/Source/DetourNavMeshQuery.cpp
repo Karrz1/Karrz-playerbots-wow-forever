@@ -1150,17 +1150,14 @@ dtStatus dtNavMeshQuery::getPathToNode(dtNode* endNode, dtPolyRef* path, int* pa
 	// Find the length of the entire path.
 	dtNode* curNode = endNode;
 	int length = 0;
-	// Guard against infinite loops from parent-chain cycles. A cycle can form
-	// when findPath updates a CLOSED node's parent (prevented above), or from
-	// navmesh data corruption. The chain can never be longer than the pool.
+	// TRINITYCORE FIX: guard against an endless loop on a parent-chain cycle (A.pidx=B while B.pidx=A), which an
+	// inadmissible area cost or corrupt navmesh data can produce. The chain can never be longer than the node pool.
 	int const maxChainLen = m_nodePool->getMaxNodes() + 1;
 	do
 	{
 		length++;
 		if (length > maxChainLen)
 		{
-			// Cycle detected — return failure so PathGenerator treats this as
-			// PATHFIND_NOPATH rather than hanging the world thread.
 			*pathCount = 0;
 			return DT_FAILURE;
 		}

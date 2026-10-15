@@ -62,8 +62,8 @@ inline std::vector<Lane> BuildWsgLanes(bool east, bool flank_only)
     // (their own code marks that lane "BUGGED"; ours does not path it, so the NOPATH that made it unusable cannot occur).
     char const* const names[6] = { "tunnel>tunnel", "tunnel>ramp", "ridge>tunnel", "ridge>ramp", "ramp>tunnel", "ramp>ramp" };
     bool const flank[6]        = { false, false, true, true, true, true };      // a base tunnel is not a flank
-    // Weights (Karrz, WSG 2026-10-09 playtest: bots ran the long way round the ramp where players drop off the ridge): the ridge
-    // lanes carry the drop and are the players' shortcut, so they weigh most. Karrz, same playtest: "still running up and down the middle":
+    // Weights (playtest, WSG 2026-10-09 playtest: bots ran the long way round the ramp where players drop off the ridge): the ridge
+    // lanes carry the drop and are the players' shortcut, so they weigh most. The owner, same playtest: "still running up and down the middle":
     // the tunnel lanes and the two plain middle lines are the middle, about a quarter of the picks now; the ramp-out lanes end on the side of
     // the field their ramp leads to and no longer cut back through the middle (eastbound they used to go on to the middle point).
     int const weight[6] = { 6, 6, 34, 34, 10, 10 };

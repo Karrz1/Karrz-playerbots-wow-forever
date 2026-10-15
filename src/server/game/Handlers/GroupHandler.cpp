@@ -24,12 +24,12 @@
 #include "GroupMgr.h"
 #include "LFG.h"
 #include "Log.h"
-#include "Playerbot/DiagProbes.h"
 #include "Loot.h"
 #include "MiscPackets.h"
 #include "ObjectAccessor.h"
 #include "PartyPackets.h"
 #include "Player.h"
+#include "ScriptMgr.h"
 #include "SocialMgr.h"
 #include "World.h"
 
@@ -67,7 +67,7 @@ void WorldSession::HandlePartyInviteOpcode(WorldPackets::Party::PartyInviteClien
     // The unit menu / portrait Invite can send the target by guid (empty name) or as "Name-Realm"; typed /invite sends the plain name.
     Player* invitedPlayer = nullptr;
     if (!packet.TargetGUID.IsEmpty() && packet.TargetGUID.IsPlayer())
-        invitedPlayer = ObjectAccessor::FindConnectedPlayer(packet.TargetGUID);
+        invitedPlayer = ObjectAccessor::FindPlayer(packet.TargetGUID);
     if (!invitedPlayer && !packet.TargetName.empty())
     {
         invitedPlayer = ObjectAccessor::FindPlayerByName(packet.TargetName);
@@ -75,9 +75,6 @@ void WorldSession::HandlePartyInviteOpcode(WorldPackets::Party::PartyInviteClien
             if (size_t const dash = packet.TargetName.find('-'); dash != std::string::npos && dash > 0)
                 invitedPlayer = ObjectAccessor::FindPlayerByName(std::string_view(packet.TargetName).substr(0, dash));
     }
-    PROBE_LOG("[invite_probe] {} invites name '{}' realm '{}' guid {}: {}", invitingPlayer ? invitingPlayer->GetName() : "?", packet.TargetName,
-                packet.TargetRealm, packet.TargetGUID.ToString(),
-                invitedPlayer ? (invitedPlayer->GetSession()->IsBot() ? "found, a bot" : "found, a player") : "NOT FOUND");
 
     // no player
     if (!invitedPlayer)
@@ -383,10 +380,7 @@ void WorldSession::HandleSetLootMethodOpcode(WorldPackets::Party::SetLootMethod&
         return;
 
     if (!group->IsLeader(GetPlayer()->GetGUID()))
-    {
-        TC_LOG_INFO("playerbot.v2", "[loot_method] {} is not the leader of its group, request ignored", GetPlayer()->GetName());
         return;
-    }
 
     if (group->isLFGGroup())
         return;
@@ -398,25 +392,19 @@ void WorldSession::HandleSetLootMethodOpcode(WorldPackets::Party::SetLootMethod&
         case MASTER_LOOT:
         case GROUP_LOOT:
         case NEED_BEFORE_GREED:
+        case PERSONAL_LOOT:
             break;
         default:
-            TC_LOG_INFO("playerbot.v2", "[loot_method] {} sent unsupported loot method {}", GetPlayer()->GetName(), uint32(packet.LootMethod));
             return;
     }
 
     if (packet.LootThreshold < ITEM_QUALITY_UNCOMMON || packet.LootThreshold > ITEM_QUALITY_ARTIFACT)
-    {
-        TC_LOG_INFO("playerbot.v2", "[loot_method] {} sent loot threshold {} out of range", GetPlayer()->GetName(), packet.LootThreshold);
         return;
-    }
 
     if (packet.LootMethod == MASTER_LOOT && !group->IsMember(packet.LootMasterGUID))
-    {
-        TC_LOG_INFO("playerbot.v2", "[loot_method] {} chose a master looter outside the group", GetPlayer()->GetName());
         return;
-    }
 
-    TC_LOG_INFO("playerbot.v2", "[loot_method] {} sets loot method {} threshold {}", GetPlayer()->GetName(), uint32(packet.LootMethod), packet.LootThreshold);
+    // everything's fine, do it
     group->SetLootMethod(static_cast<LootMethod>(packet.LootMethod));
     group->SetMasterLooterGuid(packet.LootMethod == MASTER_LOOT ? packet.LootMasterGUID : ObjectGuid::Empty);
     group->SetLootThreshold(static_cast<ItemQualities>(packet.LootThreshold));
@@ -622,7 +610,6 @@ void WorldSession::HandleRequestPartyMemberStatsOpcode(WorldPackets::Party::Requ
 void WorldSession::HandleRequestRaidInfoOpcode(WorldPackets::Party::RequestRaidInfo& /*packet*/)
 {
     // every time the player checks the character screen
-    TC_LOG_INFO("instance.lock", "[raid_info] client requested raid info ({})", _player->GetName());
     _player->SendRaidInfo();
 }
 
@@ -759,6 +746,8 @@ void WorldSession::HandleSendPingUnit(WorldPackets::Party::SendPingUnit const& p
 
         member->SendDirectMessage(broadcastPingUnit.GetRawPacket());
     }
+
+    sScriptMgr->OnPlayerPingUnit(_player, const_cast<Group*>(group), const_cast<Unit*>(target), static_cast<uint8>(pingUnit.Type));
 }
 
 void WorldSession::HandleSendPingWorldPoint(WorldPackets::Party::SendPingWorldPoint const& pingWorldPoint)
@@ -788,6 +777,8 @@ void WorldSession::HandleSendPingWorldPoint(WorldPackets::Party::SendPingWorldPo
 
         member->SendDirectMessage(broadcastPingWorldPoint.GetRawPacket());
     }
+
+    sScriptMgr->OnPlayerPingWorldPoint(_player, const_cast<Group*>(group), pingWorldPoint.Point.Pos, static_cast<uint8>(pingWorldPoint.Type));
 }
 
 void WorldSession::HandleSendPingCooldown(WorldPackets::Party::SendPingCooldown const& pingCooldown)

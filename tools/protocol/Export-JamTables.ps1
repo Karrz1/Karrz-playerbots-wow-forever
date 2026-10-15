@@ -3,7 +3,7 @@
   Reads WowB.exe (read-only) and writes a small jamre export: the switch jump tables of the client's message dispatch and
   the code at their case targets. No install needed (PowerShell 5.1 + the .NET compiler that ships with Windows).
 .EXAMPLE
-  .\Export-JamTables.ps1 -Exe "C:\wow wowowo\_classic_beta_\WowB.exe" -Out "$env:TEMP\wowb-70291.json.gz" -Build 70291
+  .\Export-JamTables.ps1 -Exe "D:\wow\_classic_beta_\WowB.exe" -Out "$env:TEMP\wowb-70291.json.gz" -Build 70291
   .\Export-JamTables.ps1 -Exe "F:\WowForeverClient-backup\_classic_beta_\WowB.exe" -Out "$env:TEMP\wowb-70205.json.gz" -Build 70205
   The two .json.gz files (a few MB each) are what the analysis needs; the executables themselves do not leave the PC.
 #>

@@ -484,7 +484,7 @@ bool BotSetupPipeline::DoApplyTalents(Player* bot)
 {
     // Retail: no-op at the pipeline layer. The existing
     // `idle:apply_context_talents` State_Idle rule applies the right talent
-    // context (Raid / Leveling) automatically on the bot's first AI tick.
+    // context (Raid / Leveling) automatically on the bot's first bot tick.
     if (!bot || !::Playerbot::IsVanillaRealm())
         return true;
 

@@ -106,7 +106,7 @@ done
 # --- Validate client install -----------------------------------------------
 [[ -d "$CLIENT_PATH" ]] || die "ClientPath does not exist: $CLIENT_PATH"
 if [[ ! -f "$CLIENT_PATH/.build.info" && ! -d "$CLIENT_PATH/Data" ]]; then
-    die "ClientPath '$CLIENT_PATH' has no .build.info or Data/ — not a valid WoW install root.
+    die "ClientPath '$CLIENT_PATH' has no .build.info or Data/ - not a valid WoW install root.
 Did you point at _retail_/Data/ instead of _retail_/ ?"
 fi
 

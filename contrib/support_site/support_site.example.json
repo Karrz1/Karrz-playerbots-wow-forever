@@ -1,0 +1,63 @@
+{
+  "server_name": "Forever",
+  "listen": "0.0.0.0",
+  "port": 443,
+  "public_host": "trinity.actual.battle.net",
+  "cert": "/path/to/certs/trinity_forever.cert.pem",
+  "key": "/path/to/certs/trinity_forever.key.pem",
+  "db": {
+    "host": "127.0.0.1",
+    "port": 3307,
+    "user": "trinity",
+    "password": "trinity",
+    "auth": "auth",
+    "world": "world"
+  },
+  "realms": {
+    "70": {
+      "characters": "characters",
+      "ra_port": 3443
+    },
+    "71": {
+      "characters": "characters_pvp",
+      "ra_port": 3444
+    },
+    "72": {
+      "characters": "characters_rp",
+      "ra_port": 3445
+    },
+    "73": {
+      "characters": "characters_hc",
+      "ra_port": 3446
+    }
+  },
+  "ra": {
+    "host": "127.0.0.1",
+    "user": "",
+    "password": ""
+  },
+  "staff_min_level": 2,
+  "unstuck_cooldown_minutes": 15,
+  "notify_by_mail": true,
+  "news_html": "",
+  "faq": [
+    [
+      "My character is stuck, what can I do?",
+      "Use <a href=\"/unstuck\">Unstuck</a>. If that does not help, <a href=\"/ticket/new?category=stuck\">ask a game master</a>."
+    ],
+    [
+      "How do I report a bug?",
+      "Use <a href=\"/ticket/new?category=bug\">Report a bug</a> while logged in with the character that saw it; its position is attached for us."
+    ],
+    [
+      "How do I know staff answered?",
+      "You get an in-game mail, and the ticket shows up as \"Staff replied\" under <a href=\"/tickets\">My tickets</a>."
+    ]
+  ],
+  "icon_cdn": "https://wow.zamimg.com/images/wow/icons",
+  "armory_search_per_minute": 20,
+  "armory_pages_per_minute": 60,
+  "shop_admin_level": 3,
+  "gold_market_max_listings": 10,
+  "shop_points_text": "Points come from supporting the server."
+}

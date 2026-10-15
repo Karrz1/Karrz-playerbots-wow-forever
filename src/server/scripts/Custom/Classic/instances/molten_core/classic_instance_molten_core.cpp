@@ -32,7 +32,6 @@
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "TemporarySummon.h"
-#include "World.h"
 #include "classic_boss_pack.h"
 #include "classic_molten_core.h"
 #include "classic_script_text.h"
@@ -283,7 +282,7 @@ public:
         }
 
         // Classic: a boss that is not killed resets with his pack - the adds the raid killed during the failed attempt come
-        // back (Karrz, MC Gehennas wipe 2026-10-08). Instance.PersistRaidTrash otherwise keeps every killed spawn dead until
+        // back (playtest, MC Gehennas wipe 2026-10-08). Instance.PersistRaidTrash otherwise keeps every killed spawn dead until
         // the lockout resets. Packs are plain spawns (creature_formations is empty), so they are found by entry within
         // 80 y of the boss's home position.
         void RespawnBossPack(uint32 bossType)
@@ -435,7 +434,54 @@ public:
             }
         }
 
-        void Update(uint32 /*uiDiff*/) override
+        // Instance.MoltenCoreSkipRunes: Majordomo and Ragnaros are summoned creatures (not in the world data), put down once at the first
+        // update of an instance session far from the raid. A summoned creature in a grid nobody is near is unloaded with it and does not
+        // come back, so by the time the raid walked to his hall Majordomo was gone and nothing summoned him again (MC 2026-10-13: "why
+        // isn't Majordomo spawning"). Now each is put back while a player is within reach of his post, in a loaded grid, until he is dead.
+        void EnsureSkipRunesBosses(uint32 diff)
+        {
+            if (m_ensureTimer > diff)
+            {
+                m_ensureTimer -= diff;
+                return;
+            }
+            m_ensureTimer = 3000;
+
+            if (GetBossState(CLASSIC_MC_TYPE_RAGNAROS) == DONE)
+                return;
+
+            struct Post { float x, y; };
+            auto nearPlayer = [this](Post p) -> Player*
+            {
+                for (MapReference const& ref : instance->GetPlayers())
+                    if (Player* player = ref.GetSource())
+                        if (player->IsAlive() && player->GetExactDist2d(p.x, p.y) < 120.0f)
+                            return player;
+                return nullptr;
+            };
+
+            if (GetBossState(CLASSIC_MC_TYPE_MAJORDOMO) != DONE && !instance->GetCreature(m_uiMajorDomoGUID))
+                if (Player* player = nearPlayer({ 758.089f, -1176.71f }))
+                {
+                    TC_LOG_INFO("scripts", "[MoltenCore] Majordomo Executus is not in instance {}, summoning him in his hall", instance->GetInstanceId());
+                    player->SummonCreature(CLASSIC_MC_NPC_MAJORDOMO, 758.089f, -1176.71f, -118.640f, 3.12414f, TEMPSUMMON_MANUAL_DESPAWN,
+                        Milliseconds(2 * HOUR * IN_MILLISECONDS));
+                }
+
+            if (!instance->GetCreature(m_uiRagnarosGUID))
+                if (Player* player = nearPlayer({ 838.308f, -831.466f }))
+                    if (Creature* rag = player->SummonCreature(CLASSIC_MC_NPC_RAGNAROS, 838.308f, -831.466f, -232.185f, 2.19911f,
+                            TEMPSUMMON_TIMED_OR_DEAD_DESPAWN, Milliseconds(2 * HOUR * IN_MILLISECONDS)))
+                    {
+                        TC_LOG_INFO("scripts", "[MoltenCore] Ragnaros is not in instance {}, summoning him in his lair", instance->GetInstanceId());
+                        rag->SetImmuneToPC(false);
+                        rag->SetUninteractible(false);
+                    }
+        }
+
+        uint32 m_ensureTimer = 0;
+
+        void Update(uint32 uiDiff) override
         {
             // VMaNGOS RemoveAllObjectsInRemoveList(): TC map processes its remove list itself
 
@@ -458,6 +504,8 @@ public:
                 if (sWorld->getBoolConfig(CONFIG_MC_SKIP_RUNES))
                     RaiseBosses(firstPlayer);
             }
+            else if (sWorld->getBoolConfig(CONFIG_MC_SKIP_RUNES))
+                EnsureSkipRunesBosses(uiDiff);
 
             for (ObjectGuid& guid : m_GOUseGuidList)
             {
