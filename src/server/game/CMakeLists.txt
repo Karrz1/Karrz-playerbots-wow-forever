@@ -41,33 +41,6 @@ target_include_directories(game
   PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR})
 
-# Add modules-common include path for Update/ModuleUpdateManager.h
-# This is required for World.cpp to access the shared module update system
-if(TARGET modules-common)
-  target_link_libraries(game
-    PRIVATE
-      modules-common)
-endif()
-
-
-# Playerbot V2 — single core modification per v2/REQUIREMENTS.md §3.
-# Always expose the API header path so core code can include
-# Playerbot/PlayerbotHooks.h without conditionals (the header itself selects
-# real vs inline-empty bodies via TRINITY_PLAYERBOT_V2).
-target_include_directories(game
-  PUBLIC
-    ${CMAKE_SOURCE_DIR}/src/server/game/Playerbot)
-
-# When V2 is on: enable real bodies and expose the module include path.
-if(BUILD_PLAYERBOT_V2)
-  target_compile_definitions(game
-    PUBLIC
-      TRINITY_PLAYERBOT_V2=1)
-  target_include_directories(game
-    PRIVATE
-      ${CMAKE_SOURCE_DIR}/src/modules/PlayerbotV2)
-endif()
-
 target_link_libraries(game
   PRIVATE
     trinity-core-interface
@@ -83,8 +56,8 @@ target_link_libraries(game
 # `add_subdirectory(tools)`, which means `if(TARGET extractor_common)` is
 # ALWAYS false at this point — the tools subtree hasn't been visited yet.
 # Gate on the build option instead so the define is set and the apply path
-# actually compiles in.  Linking is deferred to a CMAKE_DIRECTORY scope hook
-# (or relies on a transitive dep) — see end of file.
+# actually compiles in.  The link itself is added in src/CMakeLists.txt once
+# both subtrees are configured.
 if(TOOLS)
   target_include_directories(game
     PRIVATE

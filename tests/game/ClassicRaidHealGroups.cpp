@@ -108,3 +108,18 @@ TEST_CASE("No healers or no groups gives an empty plan", "[ClassicRaidHealGroups
     CHECK(AssignHealGroups({}, kEightGroups, {}).empty());
     CHECK(AssignHealGroups(Healers({ 1, 2 }), {}, {}).empty());
 }
+
+TEST_CASE("A healer at the mana mark does not drop out and rejoin on every plan", "[ClassicRaidHealGroups]")
+{
+    auto const first = AssignHealGroups(Healers({ 1, 2, 3, 4 }), { 0, 1, 2, 3 }, {});
+    std::vector<GroupHealer> healers = Healers({ 1, 3, 4 });
+    healers.push_back({ 2, kHealGroupOutManaPct + 5 });
+    CHECK(AssignHealGroups(healers, { 0, 1, 2, 3 }, first).count(2) == 1);   // in the plan: stays above the out mark
+
+    auto const dropped = AssignHealGroups(Healers({ 1, 3, 4 }), { 0, 1, 2, 3 }, first);
+    std::vector<GroupHealer> back = Healers({ 1, 3, 4 });
+    back.push_back({ 2, kHealGroupBackManaPct - 1 });
+    CHECK(AssignHealGroups(back, { 0, 1, 2, 3 }, dropped).count(2) == 0);    // out of the plan: needs the back mark
+    back.back().mana_pct = kHealGroupBackManaPct;
+    CHECK(AssignHealGroups(back, { 0, 1, 2, 3 }, dropped).count(2) == 1);
+}

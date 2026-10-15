@@ -27,19 +27,9 @@
 
 class WorldObject;
 
-// number_of_points*interval = max_path_len. Stock 74 → smooth-path cap 74*4.0f =
-// 296y; any longer path returns PATHFIND_INCOMPLETE (PathGenerator.cpp:609).
-// HISTORY: raising this to 256 (2026-06-16) to fix the travel-graph from_attach=0
-// (FMs at 300-600y came back INCOMPLETE) WORKED for route_ok (18%→~52% with the
-// flight-learn fix) BUT caused a WORLD-THREAD FREEZE: the snapshot-build phase
-// runs UnifiedTravelGraph::FindRoute → sourceWalkable per-node Detour path builds,
-// and at 256 polys each build does ~3.5x more navmesh A* work; under sustained
-// load a single map's build task exceeded the 60s FreezeDetector and crashed the
-// server (run_and_wait hang; 21:22 dump). REVERTED to stock 74 for stability —
-// the global cap was the wrong lever (it makes EVERY build-phase route probe
-// expensive). The from_attach fix belongs in a CHEAP reachability check inside
-// sourceWalkable (e.g. navmesh raycast / bounded poly probe), NOT a global cap
-// raise. Do NOT re-raise this without bounding the build-phase probe cost.
+// 74*4.0f=296y number_of_points*interval = max_path_len
+// this is way more than actual evade range
+// I think we can safely cut those down even more
 #define MAX_PATH_LENGTH         74
 #define MAX_POINT_PATH_LENGTH   74
 
@@ -77,10 +67,14 @@ class TC_GAME_API PathGenerator
         // Calculate the path from owner to given destination
         // return: true if new path was calculated, false otherwise (no change needed)
         bool CalculatePath(float srcX, float srcY, float srcZ, float destX, float destY, float destZ, bool forceDest = false);
-        // Bot sources in a capital (module policy, Playerbot/PathLiquid.h): the last CalculatePath found only a route through liquid,
-        // no land route exists. Every ground move of a bot goes through CalculatePath (move_to, follow, chase), so this is the one
-        // place that keeps town movement out of canals.
+        // Sources that keep out of liquid (see SetLiquidRouteCheck): the last CalculatePath found only a route through liquid,
+        // no land route exists.
         bool IsWetRoute() const { return _wetRoute; }
+
+        // Optional check (set by a module): returns true when `source` should keep out of liquid and `path` touches liquid.
+        // CalculatePath then searches a land-only route and keeps it when it is dry, else keeps the first route (IsWetRoute).
+        using LiquidRouteCheck = bool(*)(WorldObject const* source, Movement::PointsArray const& path);
+        static void SetLiquidRouteCheck(LiquidRouteCheck check) { _liquidRouteCheck = check; }
         bool CalculatePath(float destX, float destY, float destZ, bool forceDest = false);
         bool IsInvalidDestinationZ(WorldObject const* target) const;
 
@@ -147,7 +141,7 @@ class TC_GAME_API PathGenerator
         bool _avoidWater = false;
         bool _wetRoute = false;
         bool CalculatePathImpl(float srcX, float srcY, float srcZ, float destX, float destY, float destZ, bool forceDest);
-        bool PathTouchesLiquid() const;
+        static LiquidRouteCheck _liquidRouteCheck;
 
     public:
         // Per-pathfind opt-out from the road-cost bonus. When set, this
@@ -191,10 +185,6 @@ class TC_GAME_API PathGenerator
         void BuildPolyPath(G3D::Vector3 const& startPos, G3D::Vector3 const& endPos);
         void BuildPointPath(float const* startPoint, float const* endPoint);
         void BuildShortcut();
-        // Drop near-coincident consecutive path points (< 0.1y). A sub-0.1y
-        // INTERIOR segment makes MoveSplineInitArgs::_checkPathLengths() reject
-        // the ENTIRE spline (unit never moves). Applied to BOTH the complete and
-        // the INCOMPLETE (partial-corridor) path so a partial path stays walkable.
         void RemoveNearCoincidentPathPoints();
 
         NavTerrainFlag GetNavTerrain(float x, float y, float z) const;

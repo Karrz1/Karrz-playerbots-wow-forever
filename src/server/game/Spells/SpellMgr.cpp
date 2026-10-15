@@ -2511,12 +2511,13 @@ void SpellMgr::LoadSpellInfoStore()
     for (SpellEffectEntry const* effect : sSpellEffectStore)
     {
         ASSERT(effect->EffectIndex < MAX_SPELL_EFFECTS, "MAX_SPELL_EFFECTS must be at least %d", effect->EffectIndex + 1);
-        if (effect->Effect >= TOTAL_SPELL_EFFECTS || effect->EffectAura < 0 || effect->EffectAura >= int32(TOTAL_AURAS)
+        int32 const effectAura = GetClassicAuraType(effect->EffectAura);
+        if (effect->Effect >= TOTAL_SPELL_EFFECTS || effectAura < 0 || effectAura >= int32(TOTAL_AURAS)
             || effect->ImplicitTarget[0] >= TOTAL_SPELL_TARGETS || effect->ImplicitTarget[1] >= TOTAL_SPELL_TARGETS)
         {
             if (effect->Effect >= TOTAL_SPELL_EFFECTS)
                 ++unknownEffectValues["Effect"][effect->Effect];
-            if (effect->EffectAura < 0 || effect->EffectAura >= int32(TOTAL_AURAS))
+            if (effectAura < 0 || effectAura >= int32(TOTAL_AURAS))
                 ++unknownEffectValues["EffectAura"][effect->EffectAura];
             for (int32 target : { int32(effect->ImplicitTarget[0]), int32(effect->ImplicitTarget[1]) })
                 if (target >= TOTAL_SPELL_TARGETS)
@@ -3443,9 +3444,15 @@ void SpellMgr::LoadClassicSpellInfo()
                 spellInfo.CastTimeEntry = &row;
             }
             if (!fields[2].IsNull())
+            {
+                spellInfo.ClassicCooldownOverridden |= spellInfo.RecoveryTime != fields[2].GetUInt32();
                 spellInfo.RecoveryTime = fields[2].GetUInt32();
+            }
             if (!fields[3].IsNull())
+            {
+                spellInfo.ClassicCooldownOverridden |= spellInfo.CategoryRecoveryTime != fields[3].GetUInt32();
                 spellInfo.CategoryRecoveryTime = fields[3].GetUInt32();
+            }
             if (!fields[4].IsNull())
             {
                 SpellDurationEntry& row = mClassicDurations.emplace_back();
@@ -3468,6 +3475,95 @@ void SpellMgr::LoadClassicSpellInfo()
     } while (result->NextRow());
 
     TC_LOG_INFO("server.loading", ">> Loaded {} classic spell infos in {} ms", count, GetMSTimeDiffToNow(oldMSTime));
+}
+
+// Classic 1.60: a Forever twin of a channeled vanilla spell (Drain Life 403677-403689 is an instant 15 s aura in the client data, vanilla Drain Life is a
+// 5 s channel that ends when the warlock moves) is a channel too: it takes the channel attributes and the channel interrupt flags of the vanilla spell, the
+// duration comes from classic_spell_info. A twin that is already channeled, or whose vanilla spell is not, is left alone.
+void SpellMgr::LoadClassicTwinChannels()
+{
+    uint32 oldMSTime = getMSTime();
+
+    QueryResult result = WorldDatabase.Query("SELECT spell_id, vanilla_spell_id FROM classic_spell_twin");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 classic twin channels. DB table `classic_spell_twin` is empty.");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 const twinId = fields[0].GetUInt32();
+        uint32 const vanillaId = fields[1].GetUInt32();
+
+        SpellInfo const* vanilla = GetSpellInfo(vanillaId, DIFFICULTY_NONE);
+        if (!vanilla || !vanilla->IsChanneled())
+            continue;
+
+        auto range = _GetSpellInfo(twinId);
+        for (SpellInfo const& constInfo : range)
+        {
+            SpellInfo& twin = const_cast<SpellInfo&>(constInfo);
+            if (twin.IsChanneled())
+                continue;
+
+            twin.AttributesEx |= vanilla->AttributesEx & (SPELL_ATTR1_IS_CHANNELLED | SPELL_ATTR1_IS_SELF_CHANNELLED);
+            twin.ChannelInterruptFlags = vanilla->ChannelInterruptFlags;
+            twin.ChannelInterruptFlags2 = vanilla->ChannelInterruptFlags2;
+            ++count;
+        }
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} classic twin channels in {} ms", count, GetMSTimeDiffToNow(oldMSTime));
+}
+
+// Classic 1.60: effects the client reworked into another aura or modifier operation, or whose school mask / class mask is not the vanilla one (table
+// classic_spell_effect, written by tools/classic_spell_values/gen_spell_effects.py or by hand): the aura, the misc value and, when it is not all zero, the class mask
+// replace the client's, so the vanilla value (classic_spell_value) can be taken across. Runs before LoadClassicSpellValues, which matches on them.
+void SpellMgr::LoadClassicSpellEffects()
+{
+    uint32 oldMSTime = getMSTime();
+
+    //                                               0         1             2           3           4           5           6           7
+    QueryResult result = WorldDatabase.Query("SELECT spell_id, effect_index, apply_aura, misc_value, class_mask0, class_mask1, class_mask2, class_mask3 FROM classic_spell_effect");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 classic spell effects. DB table `classic_spell_effect` is empty.");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 const spellId = fields[0].GetUInt32();
+        uint8 const effectIndex = fields[1].GetUInt8();
+
+        auto range = _GetSpellInfo(spellId);
+        if (range.begin() == range.end())
+            continue;   // a vanilla spell this client does not have
+
+        flag128 const mask(fields[4].GetUInt32(), fields[5].GetUInt32(), fields[6].GetUInt32(), fields[7].GetUInt32());
+        for (SpellInfo const& constInfo : range)
+        {
+            if (constInfo.GetEffects().size() <= effectIndex)
+            {
+                TC_LOG_ERROR("server.loading", "classic_spell_effect: spell {} has no effect {}", spellId, uint32(effectIndex));
+                continue;
+            }
+
+            SpellEffectInfo& effect = const_cast<SpellEffectInfo&>(constInfo.GetEffect(SpellEffIndex(effectIndex)));
+            effect.ApplyAuraName = AuraType(fields[2].GetUInt16());
+            effect.MiscValue = fields[3].GetInt32();
+            if (mask)
+                effect.SpellClassMask = mask;
+            ++count;
+        }
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} classic spell effects in {} ms", count, GetMSTimeDiffToNow(oldMSTime));
 }
 
 void SpellMgr::LoadClassicSpellValues()

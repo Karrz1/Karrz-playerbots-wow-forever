@@ -23,9 +23,6 @@
 #define TRINITY_GIT_COMMIT_DATE     "@rev_date@"
 #define TRINITY_GIT_COMMIT_BRANCH   R"(@rev_branch@)"
 
-// advocaite commit this tree is pinned to (UPSTREAM_PIN)
-#define FOREVER_UPSTREAM_PIN        "@upstream_pin@"
-
 // Build OS information
 #define TRINITY_BUILD_HOST_SYSTEM                   R"(@TRINITY_BUILD_HOST_SYSTEM@)"
 #define TRINITY_BUILD_HOST_SYSTEM_VERSION           R"(@TRINITY_BUILD_HOST_SYSTEM_RELEASE@)"
@@ -38,13 +35,15 @@
 // CMake build information
 #define TRINITY_BUILD_CMAKE_COMMAND             R"(@CMAKE_COMMAND@)"
 #define TRINITY_BUILD_CMAKE_VERSION             R"(@CMAKE_VERSION@)"
-#define TRINITY_BUILD_CMAKE_SOURCE_DIRECTORY    R"(@CMAKE_SOURCE_DIR@)"
-#define TRINITY_BUILD_CMAKE_BUILD_DIRECTORY     R"(@BUILDDIR@)"
+#define TRINITY_BUILD_CMAKE_SOURCE_DIRECTORY    R"(@TRINITY_EMBED_SOURCE_DIR@)"
+#define TRINITY_BUILD_CMAKE_BUILD_DIRECTORY     R"(@TRINITY_EMBED_BUILD_DIR@)"
 
 // Database updater base information
 #define DATABASE_MYSQL_EXECUTABLE   R"(@MYSQL_EXECUTABLE@)"
-#define DATABASE_FULL_DATABASE      "TDB_full_world_1210.26091_2026_09_09.sql"
-#define DATABASE_HOTFIXES_DATABASE  "TDB_full_hotfixes_1210.26091_2026_09_09.sql"
+// Classic 1.60 fork: the Forever database release (TrinityCore TDB 1210.26091 + all updates + sql/custom, built from source),
+// https://github.com/advocaite/TrinityCore/releases/tag/forever-tdb-2026-10-14
+#define DATABASE_FULL_DATABASE      "TDB_full_world_forever_2026_10_14.sql"
+#define DATABASE_HOTFIXES_DATABASE  "TDB_full_hotfixes_forever_2026_10_14.sql"
 
 // Windows resource defines
 #define TRINITY_COMPANYNAME_STR         "TrinityCore Developers"

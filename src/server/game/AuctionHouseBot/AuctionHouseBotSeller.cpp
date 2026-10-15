@@ -907,7 +907,8 @@ void AuctionBotSeller::AddNewAuctions(SellerConfiguration& config)
         if (!auction.IsCommodity())
             auction.MinBid = bidPrice;
 
-        auction.BuyoutOrUnitPrice = buyoutPrice;
+        // SetPricesOfItem prices the whole stack, a stackable listing stores the price per item
+        auction.BuyoutOrUnitPrice = auction.IsCommodity() ? std::max<uint32>(buyoutPrice / std::max<uint32>(stackCount, 1), 1) : buyoutPrice;
         auction.StartTime = GameTime::GetSystemTime();
         auction.EndTime = auction.StartTime + Hours(urand(config.GetMinTime(), config.GetMaxTime()));
 

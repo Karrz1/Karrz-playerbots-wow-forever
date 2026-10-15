@@ -190,9 +190,6 @@ namespace WorldPackets
         class PVPLogDataRequest;
         class BattlemasterJoin;
         class BattlemasterJoinArena;
-        class BattlemasterJoinRaw;
-        class BattlemasterJoinBlitz;
-        class BattlemasterJoinArenaRaw;
         class BattlefieldLeave;
         class BattlefieldPort;
         class BattlefieldListRequest;
@@ -1010,12 +1007,9 @@ class TC_GAME_API WorldSession
     public:
         WorldSession(uint32 id, std::string&& name, uint32 battlenetAccountId, std::string&& battlenetAccountEmail,
             std::shared_ptr<WorldSocket>&& sock, AccountTypes sec, uint8 expansion, time_t mute_time, std::string&& os, Minutes timezoneOffset,
-            uint32 build, ClientBuild::VariantId clientBuildVariant, LocaleConstant locale, uint32 recruiter, bool isARecruiter
-#if defined(TRINITY_PLAYERBOT_V2)
-            , bool is_bot = false
-#endif
-            );
-        virtual ~WorldSession();  // Virtual for BotSession inheritance
+            uint32 build, ClientBuild::VariantId clientBuildVariant, LocaleConstant locale, uint32 recruiter, bool isARecruiter,
+            bool isBot = false);
+        virtual ~WorldSession();  // virtual: a module may run sessions without a client (bots)
 
         bool PlayerLoading() const { return !m_playerLoading.IsEmpty(); }
         bool PlayerLogout() const { return m_playerLogout; }
@@ -1066,25 +1060,8 @@ class TC_GAME_API WorldSession
         uint32 GetClientBuild() const { return _clientBuild; }
         ClientBuild::VariantId const& GetClientBuildVariant() const { return _clientBuildVariant; }
 
-        // Battleground type of the last battlemaster list the player opened (see _lastBattlemasterBgType).
-        void SetLastBattlemasterBgType(uint32 bgType) { _lastBattlemasterBgType = bgType; }
-
-#if defined(TRINITY_PLAYERBOT_V2)
+        // A session without a client, run by a module (bots): no socket, shares its owner's account.
         bool IsBot() const { return _isBot; }
-#else
-        // Bot module not built: no session is a bot.
-        constexpr bool IsBot() const { return false; }
-#endif
-
-#if defined(TRINITY_PLAYERBOT_V2)
-
-        // [netstat] outgoing packet accounting for human (non-bot) sessions, gated by
-        // Playerbot.NetStat.Enable (read once at session creation). Counters are relaxed
-        // atomics because map threads and the world thread can send to one session at once.
-        bool IsNetStatEnabled() const { return _netStat != nullptr; }
-        // Map thread: attribute SMSG_UPDATE_OBJECT value-update bytes to their source object.
-        void NetStatAddUpdateSource(ObjectGuid const& source, uint32 bytes);
-#endif
 
         bool CanAccessAlliedRaces() const;
 
@@ -1647,6 +1624,7 @@ class TC_GAME_API WorldSession
         void HandleSetBankAutosortDisabled(WorldPackets::Item::SetBankAutosortDisabled const& setBankAutosortDisabled);
         void HandleSetSortBagsRightToLeft(WorldPackets::Item::SetSortBagsRightToLeft const& setSortBagsRightToLeft);
         void HandleSetInsertItemsLeftToRight(WorldPackets::Item::SetInsertItemsLeftToRight const& setInsertItemsLeftToRight);
+
         void HandleAttackSwingOpcode(WorldPackets::Combat::AttackSwing& packet);
         void HandleAttackStopOpcode(WorldPackets::Combat::AttackStop& packet);
         void HandleSetSheathedOpcode(WorldPackets::Combat::SetSheathed& packet);
@@ -1766,9 +1744,6 @@ class TC_GAME_API WorldSession
         //Battleground
         void HandleBattlemasterHelloOpcode(WorldPackets::NPC::Hello& hello);
         void HandleBattlemasterJoinOpcode(WorldPackets::Battleground::BattlemasterJoin& battlemasterJoin);
-        void HandleBattlemasterJoinBlitz(WorldPackets::Battleground::BattlemasterJoinBlitz& packet);
-        void HandleBattlemasterJoinArenaRaw(WorldPackets::Battleground::BattlemasterJoinArenaRaw& packet);
-        void HandleBattlemasterJoinUnknownLayout(WorldPackets::Battleground::BattlemasterJoinRaw& packet);
         // Queues the player (or, as leader, the group) for the battleground a queue id names; shared by the packet handlers and .playerbot bgjoin.
         void JoinBattlegroundQueue(BattlegroundQueueTypeId bgQueueTypeId);
         void HandlePVPLogDataOpcode(WorldPackets::Battleground::PVPLogDataRequest& pvpLogDataRequest);
@@ -2165,23 +2140,10 @@ class TC_GAME_API WorldSession
 
         ConnectToKey _instanceConnectKey;
 
-        // Battleground type of the last battlemaster list the player opened: the 70205 client's join packets do not say which
-        // battleground they are for, and the client has closed the battlemaster interaction by the time they arrive.
-        uint32 _lastBattlemasterBgType = 0;
-
-#if defined(TRINITY_PLAYERBOT_V2)
         bool _isBot;
-
-
-        struct NetStatCounters;
-        std::unique_ptr<NetStatCounters> _netStat;   // null for bot sessions or when disabled
-        uint32 _netStatTimer = 0;
-        void NetStatFlush(uint32 elapsedMs);
-#endif
 
         WorldSession(WorldSession const& right) = delete;
         WorldSession& operator=(WorldSession const& right) = delete;
 };
-
 
 #endif

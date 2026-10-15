@@ -10,7 +10,7 @@
 ## 0. Architectural principles (load-bearing — every section below honors these)
 
 1. **Bots use systems as players do** (`REQUIREMENTS.md` §1.1 #7). Every in-world action goes through the same code paths a player would trigger. No backdoors.
-2. **Single-writer for game state**. The world thread owns all mutations to `Player`/`Unit`/`Item`/`Map`. AI runs on read-only snapshots.
+2. **Single-writer for game state**. The world thread owns all mutations to `Player`/`Unit`/`Item`/`Map`. bot logic runs on read-only snapshots.
 3. **Deadlock-free by construction, not convention**. The threading topology must make deadlock structurally impossible — not "we'll be careful."
 4. **Architecture follows requirements**. Each pattern below is justified by *what the catalogs demand*, not by elegance.
 5. **Crash isolation**. One bot's bug cannot cascade. Per-bot try/catch is the only acceptable pattern; no shared exception state.
@@ -38,7 +38,7 @@ Three thread classes, one direction of data flow:
                   immutable snapshot      │       │   typed intents
                   pointer (atomic swap)   ▼       │   (lock-free MPSC)
                           ┌───────────────────────────────────────┐
-                          │          AI WORKER POOL                │
+                          │          bot logic WORKER POOL                │
                           │  (N threads, default min(8, hwc))      │
                           │                                        │
                           │  For each bot scheduled this tick:     │
@@ -67,22 +67,22 @@ Three thread classes, one direction of data flow:
 ```
 
 **Why this works (and why deadlocks are structurally impossible)**:
-- AI workers and fleet thread *only read* shared state, via immutable snapshots replaced atomically.
-- World thread *only writes* through PlayerbotAPI, never holds a lock that AI workers wait on.
-- Intent queues are MPSC lock-free (one consumer = world thread; many producers = AI workers + fleet thread).
+- bot workers and fleet thread *only read* shared state, via immutable snapshots replaced atomically.
+- World thread *only writes* through PlayerbotAPI, never holds a lock that bot workers wait on.
+- Intent queues are MPSC lock-free (one consumer = world thread; many producers = bot workers + fleet thread).
 - There is no path where thread A holds resource X waiting for resource Y while thread B holds Y waiting for X. Wait-for graph has no cycle.
 
 ### 1.2 The snapshot
 Per-bot, immutable, ref-counted, replaced atomically (single pointer `std::atomic<std::shared_ptr<BotSnapshot const>>` swap on world tick).
 
-A snapshot contains exactly what the AI needs — derived from `FEATURES.md`'s state surface:
+A snapshot contains exactly what the bot logic needs — derived from `FEATURES.md`'s state surface:
 - Identity, stats, position, combat state, auras, cooldowns, inventory summary, equipment summary, known spells, group summary, quest log summary, movement state.
-- Plus pointers (raw, valid until next snapshot) into TrinityCore data the AI may dereference *read-only* (e.g., `Map const*`, nearest enemies' minimal projections).
+- Plus pointers (raw, valid until next snapshot) into TrinityCore data the bot logic may dereference *read-only* (e.g., `Map const*`, nearest enemies' minimal projections).
 
 **Snapshot size budget**: ≤ 8 KB per bot. At 5K bots, ≈ 40 MB total snapshot footprint per tick — acceptable.
 
 ### 1.3 The intent
-A typed message representing one game action the AI wants performed. Examples:
+A typed message representing one game action the bot logic wants performed. Examples:
 
 ```cpp
 struct CastSpellIntent { uint32 spell_id; ObjectGuid target; };
@@ -94,24 +94,24 @@ struct QueueLfgIntent  { LfgQueueId queue; LfgRole role; };
 
 Intents are POD structs in a `std::variant` (or tagged union). Each maps 1:1 to a `PlayerbotAPI` action command.
 
-**Rule**: an intent is the only way for AI code to influence game state. AI code that calls `Player::*` directly is a build error (enforced by `friend`-only access pattern).
+**Rule**: an intent is the only way for bot logic code to influence game state. bot logic code that calls `Player::*` directly is a build error (enforced by `friend`-only access pattern).
 
 ### 1.4 Tick scheduling
-- AI workers process bots at a rate determined by bot's *activity tier*:
+- bot workers process bots at a rate determined by bot's *activity tier*:
   - **Combat tier**: ≥10 Hz (every world tick if needed)
   - **Active tier**: 5 Hz (questing, travelling, etc.)
   - **Idle tier**: 1 Hz (parked at inn, waiting on group)
   - **Hibernate tier**: 0.05 Hz (long-idle, just maintaining presence)
 - Tier transitions driven by snapshot state. Promoted to combat tier on `OnDamageTaken`/`OnDamageDealt`/`in_combat=true`.
-- Tick budget enforcement: if AI worker pool falls behind, lowest-tier bots skip ticks (graceful degradation).
+- Tick budget enforcement: if bot worker pool falls behind, lowest-tier bots skip ticks (graceful degradation).
 
 ### 1.5 Why not pure world-thread?
-At 5K bots, even cheap per-bot decision-making at 200µs per tick = 1 second of CPU, blowing the world tick budget. AI workers are necessary.
+At 5K bots, even cheap per-bot decision-making at 200µs per tick = 1 second of CPU, blowing the world tick budget. bot workers are necessary.
 
 ### 1.6 Why not actor model / fibers / coroutines?
 - Actors require a message-bus framework — adds 1000+ LOC of infrastructure for no expressivity gain over snapshot+intent.
 - Fibers require careful stack management; harder to reason about under crash isolation requirement.
-- Coroutines (C++20) are fine *inside* an AI worker (e.g., for multi-step decisions) but not as the inter-thread mechanism.
+- Coroutines (C++20) are fine *inside* an bot worker (e.g., for multi-step decisions) but not as the inter-thread mechanism.
 
 The model above is the simplest topology that satisfies CORE constraints. Locked.
 
@@ -139,9 +139,9 @@ Owns: shared state across the bots in a single group.
 Components:
 - `GroupSnapshot` — read-only summary of all members, threat, marks, ready-check state, loot rules.
 - `GroupRoleResolver` — pure function `(member, group) → Role` (Tank/Healer/DPS/Off-tank).
-- `GroupTacticsPolicy` — per-content tactics (e.g., dungeon vs raid vs delve vs BG vs world-quest), referenced by per-bot AI.
+- `GroupTacticsPolicy` — per-content tactics (e.g., dungeon vs raid vs delve vs BG vs world-quest), referenced by per-bot bot logic.
 
-Each AI worker reads its bot's group snapshot from the same atomically-published snapshot bundle — no cross-bot synchronization.
+Each bot worker reads its bot's group snapshot from the same atomically-published snapshot bundle — no cross-bot synchronization.
 
 ### 2.3 Fleet layer (`src/modules/PlayerbotV2/Fleet/`)
 Owns: ecosystem-level decisions (`SYSTEM_FEATURES.md` surface).
@@ -150,18 +150,18 @@ Components:
 - `PopulationManager` — sets/maintains target bot count by faction/level/class/role/zone.
 - `LfgMediator` — when player queues, selects bots to fill remaining roles.
 - `BgFiller` — fills both factions for BG queues per `SYSTEM_FEATURES.md` §5.3.
-- `NeighborhoodPopulator` — schedules bot housing acquisition + decoration to meet density quotas, **routing all actions through the per-bot AI** (no shortcut writes).
+- `NeighborhoodPopulator` — schedules bot housing acquisition + decoration to meet density quotas, **routing all actions through the per-bot bot logic** (no shortcut writes).
 - `BotLifecycleManager` — spawn, despawn, mid-content protection, persistence.
 - `AdminCommandHandler` — `.playerbot` GM commands.
 
-Fleet layer **emits control intents** into bot intent queues (`QueueLfgIntent`, `BuyPlotIntent`, `JoinNeighborhoodIntent`). It does not bypass the per-bot AI; it *requests* and the AI responds.
+Fleet layer **emits control intents** into bot intent queues (`QueueLfgIntent`, `BuyPlotIntent`, `JoinNeighborhoodIntent`). It does not bypass the per-bot bot logic; it *requests* and the bot logic responds.
 
 This is the architectural expression of `REQUIREMENTS.md` §1.1 #7: even fleet-level decisions go through the player-equivalent path.
 
 ### 2.4 Why three layers (and not two or four)?
 - Two layers (bot + system) collapses group coordination into either, producing the V1 entanglement.
 - Four layers (bot + role + group + fleet) over-decomposes; role lives inside group naturally.
-- Three is the minimum that keeps cross-bot logic from leaking into per-bot AI. Validated against V1's failure mode (cross-bot logic in `BehaviorManager` calling `BehaviorPriorityManager` calling per-bot strategies).
+- Three is the minimum that keeps cross-bot logic from leaking into per-bot bot logic. Validated against V1's failure mode (cross-bot logic in `BehaviorManager` calling `BehaviorPriorityManager` calling per-bot strategies).
 
 ---
 
@@ -213,11 +213,11 @@ Example — Beast Mastery Hunter (sketch, not final):
 
 **Encoding**: a `std::array<RotationRule, N>` per spec, evaluated top-to-bottom each tick. Each rule is `{ predicate(snapshot) → bool, intent(snapshot) → CastSpellIntent }`.
 
-**Why APL, not BT or utility AI**:
+**Why APL, not BT or utility bot logic**:
 - APL is empirically optimal for WoW rotations (validated by 15 years of SimC theorycrafting).
 - APL is 1:1 readable as theorycrafter notes — class designers can author them.
 - APL is trivially testable (snapshot in, intent out, no hidden state).
-- BT and utility AI for rotation are isomorphic to APL with extra ceremony; V1 had both, neither helped.
+- BT and utility bot logic for rotation are isomorphic to APL with extra ceremony; V1 had both, neither helped.
 
 **Where APL is NOT used**: target *selection* (covered separately — see §6), encounter mechanics (see §5), goal selection (see §6). APL only picks the next ability given a target and intent to act.
 
@@ -270,7 +270,7 @@ Each script is ≈ 50–150 lines. One file per encounter. Registered at startup
 
 ---
 
-## 6. Goal selection — Utility AI
+## 6. Goal selection — Utility bot logic
 
 Used when the bot must choose *what to do* among multiple options. Examples:
 - BG: which objective to pursue (defend flag, attack node, kill priority target, escort payload)
@@ -288,12 +288,12 @@ score(KillEnemy)       = base + (target.hp_pct < 30 ? 25 : 0) + (target_priority
 score(GuardGY)         = base + (gy.contested ? 40 : 0)
 ```
 
-**Why utility AI here, not state machine or BT**:
+**Why utility bot logic here, not state machine or BT**:
 - Choice space is wide and continuously rebalancing — utility scoring expresses tradeoffs natively.
 - Number of options is bounded (≤ 10 per decision) — scoring is fast.
 - Tuning is by-eye via score weights — no recompile to rebalance.
 
-**Where utility AI is NOT used**: rotation (APL), encounter mechanics (scripts), state machine (it's the substrate).
+**Where utility bot logic is NOT used**: rotation (APL), encounter mechanics (scripts), state machine (it's the substrate).
 
 ---
 
@@ -305,7 +305,7 @@ Per group: one `GroupSnapshot` published alongside per-bot snapshots each world 
 - Group leader, assist flags
 - Active content (overworld, dungeon, raid, BG)
 
-Each bot's AI reads its group snapshot **read-only** and acts on it.
+Each bot's bot logic reads its group snapshot **read-only** and acts on it.
 
 **Role-specific functions**:
 ```cpp
@@ -316,7 +316,7 @@ namespace GroupTactics {
 }
 ```
 
-Each function is pure: snapshot in, intents out, no state. The bot's AI dispatches to one based on `GroupRoleResolver`.
+Each function is pure: snapshot in, intents out, no state. The bot's bot logic dispatches to one based on `GroupRoleResolver`.
 
 This is the architectural answer to V1's `BehaviorManager` calling `BehaviorPriorityManager` calling per-strategy. Three pure functions replace a registry.
 
@@ -324,11 +324,11 @@ This is the architectural answer to V1's `BehaviorManager` calling `BehaviorPrio
 
 ## 8. Movement
 
-Movement intents flow from AI → world thread, executed via `PlayerbotAPI::move_to(...)`, `move_path(...)`, `mount(...)`, etc. The actual pathfinding is **TrinityCore's MMaps**, called on the world thread from the API. AI decides *where*; the engine decides *how*.
+Movement intents flow from bot logic → world thread, executed via `PlayerbotAPI::move_to(...)`, `move_path(...)`, `mount(...)`, etc. The actual pathfinding is **TrinityCore's MMaps**, called on the world thread from the API. bot logic decides *where*; the engine decides *how*.
 
 **No bot-specific pathfinding code exists.** V1 had multiple competing pathfinders; V2 uses the engine's. Period.
 
-**Movement-affecting effects** (roots, snares, knockbacks, fear) are tracked in the snapshot's aura list; AI reacts via intents (cleanse, trinket, alternate path).
+**Movement-affecting effects** (roots, snares, knockbacks, fear) are tracked in the snapshot's aura list; bot logic reacts via intents (cleanse, trinket, alternate path).
 
 **Mount logic**: a small table of "mount appropriate for this map/zone/level/altitude" → emitting `MountIntent(id)`. Same as a player macro.
 
@@ -354,7 +354,7 @@ Each bot then queues *as a player would* via `PlayerbotAPI::lfg_queue(...)` — 
 Watches BG queues. When real-player BG queue is filling but short of pop, recruits idle bots to queue for that BG (both factions, balanced). Same player-equivalent path: bots queue, the BG matchmaker pairs them.
 
 ### 9.4 NeighborhoodPopulator
-Reads neighborhood occupancy from world state. For under-populated public neighborhoods, identifies bots that *would naturally be ready* to buy a plot (sufficient gold, level/quest/currency prerequisites met), and sends a `ConsiderBuyingPlotIntent` (a *suggestion*, not a command). The bot's per-bot AI evaluates it against personality (does this bot *want* a house?), available gold reserve, current activity, and either acts on it or not.
+Reads neighborhood occupancy from world state. For under-populated public neighborhoods, identifies bots that *would naturally be ready* to buy a plot (sufficient gold, level/quest/currency prerequisites met), and sends a `ConsiderBuyingPlotIntent` (a *suggestion*, not a command). The bot's per-bot bot logic evaluates it against personality (does this bot *want* a house?), available gold reserve, current activity, and either acts on it or not.
 
 This is the strongest expression of `REQUIREMENTS.md` §1.1 #7: even fleet-level "we need more houses bought" goes through the bot's normal decision path.
 
@@ -370,9 +370,9 @@ Each maps to an internal function that *requests* lifecycle actions; commands re
 ## 10. PlayerbotAPI surface
 
 The single allowed core modification (`REQUIREMENTS.md` §3). Final contents derived mechanically from feature categories — every feature in `FEATURES.md`/`SYSTEM_FEATURES.md` maps to either:
-- A read accessor on the snapshot (a value the AI needs to see), or
-- An action command (an intent the AI emits, executed on world thread), or
-- A hook (an event the AI subscribes to via the inbox).
+- A read accessor on the snapshot (a value the bot logic needs to see), or
+- An action command (an intent the bot logic emits, executed on world thread), or
+- A hook (an event the bot logic subscribes to via the inbox).
 
 Pass B will produce the actual `.h` file with full signatures. Pass A guarantee: **the API is comprehensive enough that V2 code never includes `Player.h` directly**.
 
@@ -424,7 +424,7 @@ src/modules/PlayerbotV2/
 │   ├── Encounters/                  # one file per scripted encounter
 │   │   ├── DefaultEncounter.cpp
 │   │   └── ...
-│   └── TargetSelector.cpp           # utility-AI target selection
+│   └── TargetSelector.cpp           # utility-bot logic target selection
 ├── Group/
 │   ├── GroupSnapshot.{cpp,h}
 │   ├── GroupRoleResolver.{cpp,h}
@@ -458,7 +458,7 @@ src/server/game/Playerbot/
 
 ## 13. Testing strategy (locked invariants from §2.3)
 
-Every AI decision is `(snapshot, rng) → intents`. Pure function. Testable without a server.
+Every bot logic decision is `(snapshot, rng) → intents`. Pure function. Testable without a server.
 
 - **Unit tests**: one per APL spec, one per encounter script, one per state-dispatch. Synthetic snapshot in, expected intents out.
 - **Integration tests**: spin up a minimal world with N bots, replay scripted scenarios, assert behavioral invariants (e.g., "tank never breaks CC," "healer triages by HP%").
@@ -473,7 +473,7 @@ Every AI decision is `(snapshot, rng) → intents`. Pure function. Testable with
 3. **Encounter script discovery**: hand-registered per-boss vs. data-driven from a registry table? Default assumption: hand-registered for V1, table-driven later if a critical mass of scripts emerges.
 4. **Activity tier transitions**: pure snapshot-driven, or event-driven? Default: snapshot-driven (simpler, more deterministic), event hooks only as transition triggers.
 5. **Fleet thread or fleet-on-world-thread?** Default: separate fleet thread for clarity; if it adds zero value at 5K-bot scale, collapse onto world thread in Pass B.
-6. **Group snapshot ownership**: published per group by world thread, or built on demand by AI worker? Default: per-group published on world thread (consistency over micro-perf).
+6. **Group snapshot ownership**: published per group by world thread, or built on demand by bot worker? Default: per-group published on world thread (consistency over micro-perf).
 7. **APL hot-reload**: should APLs reload from disk without server restart for class tuning? Default: yes, behind config flag (cheap to implement, big quality-of-life).
 
 ---

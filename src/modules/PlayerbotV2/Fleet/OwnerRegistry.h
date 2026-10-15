@@ -10,7 +10,7 @@
 // changes are infrequent and command authority depends on durability.
 //
 // World-thread mutations (mark / adopt / disown). Reads from any thread
-// (whisper handler, AI workers, snapshot builder).
+// (whisper handler, bot workers, snapshot builder).
 
 #pragma once
 

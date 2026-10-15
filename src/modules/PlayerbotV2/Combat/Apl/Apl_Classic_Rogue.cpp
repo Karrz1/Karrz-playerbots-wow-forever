@@ -252,7 +252,7 @@ bool ShouldSliceAndDice(ApPredicateContext const& ctx)
     if (VictimHpPct(ctx) < 25 && !VictimIsBossLike(ctx)) return false;
     return (Ready(ctx, SLICE_AND_DICE) && ctx.bot.victim_in_spell_range(SLICE_AND_DICE)) && !SliceAndDiceUp(ctx);
 }
-// Cast at the victim like a finishing move (Karrz's PartyBotAI does the same): in the
+// Cast at the victim like a finishing move (the owner's PartyBotAI does the same): in the
 // Classic data a finishing move is bound to the combo target, and the self cast
 // (empty target) failed SPELL_FAILED_BAD_TARGETS on every attempt (MC wipe 2026-10-06).
 void DoSliceAndDice(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(SLICE_AND_DICE, ctx.bot.victim()); }

@@ -56,7 +56,7 @@ Known BWL gaps: Chromaggus' Bronze affliction needs Hourglass Sand; the other cl
 form, hunter bow, rogue paralyze) have no counter a bot could play. Untested: whether Forever's spell data lets a
 possessed Razorgore cast Destroy Egg on an egg, and the Blessing of Protection ids the paladin call uses.
 
-Not done: 10-player scaling (Karrz chose 40 only). Untested in game: the Naxx scripted mechanics, in particular
+Not done: 10-player scaling (the owner chose 40 only). Untested in game: the Naxx scripted mechanics, in particular
 whether a possessed creature follows MoveChase for a bot controller and whether the understudy template spells
 (Taunt 29060, Shield Wall 29061) are castable from Forever's data.
 
@@ -64,7 +64,7 @@ whether a possessed creature follows MoveChase for a bot controller and whether 
 
 - Branch head f93ecd4f, pushed, builds clean on Linux (-DBUILD_PLAYERBOT_V2=1). It includes trial 513e126b.
 - Batch 1 (MC/BWL/Onyxia port, threat hold) and batch 2 (Garr no-AoE, Heigan, Sapphiron, Razuvious, Four Horsemen,
-  Patchwerk) are untested in game. Karrz's first MC trash pull ran on df756243 and wiped: one Molten Giant had no tank,
+  Patchwerk) are untested in game. the owner's first MC trash pull ran on df756243 and wiped: one Molten Giant had no tank,
   which the trial thread is fixing in pvecoord (one mob per tank in raids).
 - The raid layer logs a "[raid] <raid> group N: ... main tank <name>" header when it plans a fight, plus one line
   per changed bot decision.

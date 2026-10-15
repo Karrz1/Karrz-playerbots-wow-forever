@@ -783,6 +783,8 @@ class TC_GAME_API SpellMgr
         void LoadSpellInfoCustomAttributes();
         void LoadSpellInfoCorrections();
         void LoadClassicSpellInfo();                        // must be after LoadSpellInfoCorrections (table classic_spell_info: cast time, cooldowns, duration, range)
+        void LoadClassicSpellEffects();                     // must be after LoadClassicSpellInfo and before LoadClassicSpellValues (table classic_spell_effect: aura, misc value, class mask)
+        void LoadClassicTwinChannels();                     // must be after LoadClassicSpellInfo (table classic_spell_twin: a twin of a channeled vanilla spell is channeled too)
         void LoadClassicSpellValues();                      // must be after LoadSpellInfoStore
         void LoadClassicSpellCosts();                       // must be after LoadSpellInfoStore
         void LoadSpellInfoSpellSpecificAndAuraState();

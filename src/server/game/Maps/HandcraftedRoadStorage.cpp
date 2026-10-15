@@ -26,12 +26,18 @@ void HandcraftedRoadStorage::LoadFromDB()
     // than its last-built generation and rebuilds again on the next request.
     _generation.fetch_add(1, std::memory_order_acq_rel);
 
-    // Shared playerbot DB (Playerbot.SharedDatabase, default wowc_playerbot) so
+    // Shared playerbot DB (Playerbot.SharedDatabase, set by the bot module's playerbot.conf) so
     // road data is authored once and reused across every world-DB variant — it
     // does NOT live in the swappable world DB. Cross-DB qualified read on the
     // WorldDatabase connection (the configured user has access to all schemas).
+    // Without that database (no bot module) there are no handcrafted roads.
     // SELECT order matches the column ordinals used below; keep them in lock-step.
-    std::string const sharedDb = sConfigMgr->GetStringDefault("Playerbot.SharedDatabase", "playerbot");
+    std::string const sharedDb = sConfigMgr->GetStringDefault("Playerbot.SharedDatabase", "");
+    if (sharedDb.empty())
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 handcrafted road segments (no Playerbot.SharedDatabase configured).");
+        return;
+    }
     QueryResult result = WorldDatabase.Query(Trinity::StringFormat(
         "SELECT id, mapId, fromX, fromY, toX, toY, width, "
         "COALESCE(comment, ''), verified "

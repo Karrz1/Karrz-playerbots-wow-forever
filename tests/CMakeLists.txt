@@ -13,6 +13,8 @@ GroupSources(${CMAKE_CURRENT_SOURCE_DIR})
 option(HEADLESS_TESTS "Build the headless packet-level client tests (tests/headless), run against a test realm" 0)
 
 add_executable(tests)
+# The source folder, for tests that read source files (the compiler trims __FILE__ in release builds, so it cannot be derived from there).
+target_compile_definitions(tests PRIVATE TC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 CollectAndAddSourceFiles(
   tests
@@ -20,6 +22,22 @@ CollectAndAddSourceFiles(
   EXCLUDE
   ${CMAKE_CURRENT_SOURCE_DIR}/tools
   ${CMAKE_CURRENT_SOURCE_DIR}/headless)
+
+# Tests of code that lives in the Playerbot V2 module's own sources (they call functions defined in the module's .cpp files, or include
+# headers that exist only under src/modules/PlayerbotV2). A build without the module has neither, so they are not compiled there.
+if(NOT BUILD_PLAYERBOT_V2)
+  set(TESTS_MODULE_ONLY_SOURCES
+    ClassicAddonHint.cpp
+    ClassicBotConversation.cpp
+    ClassicGroupOrderText.cpp
+    ClassicRaidConsumables.cpp
+    ClassicRaidDispel.cpp
+    ClassicRaidGeometry.cpp
+    ClassicRaidRagnaros.cpp)
+  foreach(_test_source ${TESTS_MODULE_ONLY_SOURCES})
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/game/${_test_source} PROPERTIES HEADER_FILE_ONLY TRUE)
+  endforeach()
+endif()
 
 target_link_libraries(tests
   PRIVATE

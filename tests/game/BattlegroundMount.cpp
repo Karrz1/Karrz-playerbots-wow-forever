@@ -33,7 +33,7 @@ TEST_CASE("Battleground mount rule: WMO group indoor test", "[battleground][moun
     CHECK_FALSE(Battleground::IsIndoorWmoGroup(0x2008));
 }
 
-// Karrz, Arathi Basin 2026-10-11: "Can only use outside" at the Alliance start (Trollbane Hall) during the preparation phase.
+// Playtest Arathi Basin 2026-10-11: "Can only use outside" at the Alliance start (Trollbane Hall) during the preparation phase.
 TEST_CASE("Battleground mount rule: only the Warsong Gulch start room refuses a mount during preparation", "[battleground][mount]")
 {
     CHECK(Battleground::IsEnclosedStartArea(489));      // Warsong Gulch
@@ -56,7 +56,7 @@ TEST_CASE("Battleground balance gate: players inside count as invited", "[battle
     CHECK(Battleground::BalancedFreeSlots(15, 15, 15, 15, 15, 5) == 0);
 }
 
-// Karrz 2026-10-11: five Warsong Gulch, five Arathi Basin and five Alterac Valley instances up at once, none stealing bots from another.
+// Playtest 2026-10-11: five Warsong Gulch, five Arathi Basin and five Alterac Valley instances up at once, none stealing bots from another.
 TEST_CASE("Battleground fill: two live instances of one battleground are filled independently", "[battleground][balance]")
 {
     // instance 5 is 15 v 15 (full): it asks for nothing
@@ -74,7 +74,7 @@ TEST_CASE("Battleground fill: two live instances of one battleground are filled 
     CHECK_FALSE(Battleground::FillsBefore(0, 14, false, 14));   // equal: the order is kept (stable sort)
 }
 
-// Karrz 2026-10-11: as few instances as possible, as many real players in each. A real player who queues is put into a running instance
+// Playtest 2026-10-11: as few instances as possible, as many real players in each. A real player who queues is put into a running instance
 // (bot-only or mixed) even when a new one could be opened; a bot of the player's team is swapped out when that team is full.
 TEST_CASE("Battleground placement: a real player goes to the instance with the most real players", "[battleground][placement]")
 {
@@ -91,7 +91,7 @@ TEST_CASE("Battleground placement: a real player goes to the instance with the m
     CHECK(Battleground::BalancedFreeSlots(14, 15, 14, 15, 15, 5) == 1);
 }
 
-// Karrz 2026-10-11: any level gets a full battleground, a level 12 twink as well as a level 60. A bot created on demand lands inside the bracket.
+// Playtest 2026-10-11: any level gets a full battleground, a level 12 twink as well as a level 60. A bot created on demand lands inside the bracket.
 TEST_CASE("Battleground fill: a bot created for a bracket has a level inside it", "[battleground][bracket]")
 {
     struct Bracket { uint32 lo, hi; };

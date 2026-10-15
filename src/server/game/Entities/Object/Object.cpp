@@ -19,7 +19,6 @@
 #include "BattlefieldMgr.h"
 #include "CellImpl.h"
 #include "CinematicMgr.h"
-#include "ClassicSpellHit.h"
 #include "CombatLogPackets.h"
 #include "Corpse.h"
 #include "CreatureGroups.h"
@@ -1914,6 +1913,8 @@ SpellMissInfo WorldObject::MagicSpellHitResult(Unit* victim, SpellInfo const* sp
             return 0.0f;
 
         SpellSchoolMask schoolMask = spellInfo->GetSchoolMask();
+        // PvP - PvE spell misschances per leveldif > 2
+        int32 lchance = victim->GetTypeId() == TYPEID_PLAYER ? 7 : 11;
         int32 thisLevel = GetLevelForTarget(victim);
         if (GetTypeId() == TYPEID_UNIT && ToCreature()->IsTrigger())
             thisLevel = std::max<int32>(thisLevel, spellInfo->SpellLevel);
@@ -1921,7 +1922,6 @@ SpellMissInfo WorldObject::MagicSpellHitResult(Unit* victim, SpellInfo const* sp
 
         // Classic 1.60 (vanilla, VMaNGOS SpellCaster::MagicSpellHitChance): 96% against the same level, -1% per level up to +2,
         // then -11% per level against creatures (-7% against players): 96 / 95 / 94 / 83 / 72; never below 22%
-        int32 lchance = victim->GetTypeId() == TYPEID_PLAYER ? 7 : 11;
         float modHitChance;
         if (leveldif < 3)
             modHitChance = float(96 - leveldif);

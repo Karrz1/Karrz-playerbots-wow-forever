@@ -208,7 +208,7 @@ TEST_CASE("Warsong Gulch lanes: the last stretch to a ledge is walked straight, 
 
 TEST_CASE("Warsong Gulch lanes: the middle of the field is a minority, the side lanes carry most bots", "[battleground][route]")
 {
-    // Karrz, WSG 2026-10-09: "still running up and down the middle". Tunnel-out lanes and the two plain middle lines are the middle.
+    // Playtest, WSG 2026-10-09: "still running up and down the middle". Tunnel-out lanes and the two plain middle lines are the middle.
     for (bool east : { true, false })
         for (bool carrier : { false, true })
         {

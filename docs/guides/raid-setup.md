@@ -32,22 +32,22 @@ All of these are buttons in the /fb window. You can also type them in party or r
 - **Fall back**: everyone runs to the rally point and re-forms there.
 
 ### Fighting
-- **Attack**: bots attack your target. They wait for this (or Pull) before starting a fight.
-- **Pull**: tanks open on your target, everyone else joins once it's engaged.
-- **Pull back**: your main tank pulls from range and drags the mob back to the rally point, so nothing else wakes up.
+- **Attack**: everyone attacks your target at once.
+- **Pull**: the tank pulls. The damage dealers wait for your **Attack**, or join by themselves after 6 seconds.
+- **Pull back**: the same, but the tank brings the monster back to you, so nothing else wakes up.
 - **Resume**: hand the fight back to the bots after Follow or Stay.
 
 ### Marks and tanks
-- Put a **skull** on the first kill target and a **cross** on the next. The DPS kill skull first, then cross.
+- Put a **skull** on the first kill target and a **cross** on the next. The bots do exactly what your marks say: skull first, then cross, and a crowd-control mark (such as moon) is kept controlled. Bots only choose on monsters you did not mark.
 - **Main tank**: target a player, click it, and they become the raid's Main Tank.
-- **Passive / Aggressive**: the button flips between the two. Passive bots only defend, Aggressive bots go after nearby enemies.
+- **Passive / Aggressive**: the button flips between the two. Passive bots stay close, defend you and do as told; Aggressive bots may also attack on their own.
 - **Release**: after a wipe, dead bots release and run back to their bodies.
 
 ---
 
 ## Part 3 of 3: Tips
 
-- **Wait for healer mana before you pull.** The raid now warns you when the healers are low. The main tank won't start the next pull while anyone is dead or a healer is under 80% mana, but if you pull yourself, check first.
+- **Watch the healers' mana before you pull.** The bots do not hold a pull back for mana when you are in the group, so it is up to you to wait until the healers have drunk.
 - **Set the rally point well back from the boss.** Stand where you want the raid to gather, click **Set rally**, and use Pull back or Fall back from there. A rally point too close to the boss pulls extra mobs.
 - **Use Fall back when things go wrong.** Everyone runs to the rally point and re-forms, with tanks in front and healers behind.
 - **Check your groups** before a fight. Healers spread across groups 1-8 keep the raid alive.

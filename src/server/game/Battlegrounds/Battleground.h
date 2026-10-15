@@ -314,12 +314,11 @@ class TC_GAME_API Battleground
         void RemoveFromBGFreeSlotQueue();                   //this method could delete whole BG instance, if another free is available
         void RemoveFromBGFreeSlotQueueOnShutdown() { m_InBGFreeSlotQueue = false; }
 
-        // never below zero: a player who came in without a queue invitation (a bot's direct port, a claimed running match) was never counted,
-        // and his leaving wrapped the counter to 4294967295 (AV 2026-10-11 'invA -1', WSG 'invA -7'), which closed the team for good
-        void DecreaseInvitedCount(Team team)      { uint32& n = (team == ALLIANCE) ? m_InvitedAlliance : m_InvitedHorde; n = AfterLeave(n); }
-        static constexpr uint32 AfterLeave(uint32 invited) { return invited ? invited - 1u : 0u; }
         // a player who entered without being invited counts as invited from then on (his leaving decrements it)
         void RaiseInvitedCountTo(Team team, uint32 n) { uint32& c = (team == ALLIANCE) ? m_InvitedAlliance : m_InvitedHorde; if (c < n) c = n; }
+        // never below zero: a player who entered without a queue invitation was never counted, a wrapped counter closes the team for good
+        void DecreaseInvitedCount(Team team)      { uint32& invited = (team == ALLIANCE) ? m_InvitedAlliance : m_InvitedHorde; invited = AfterLeave(invited); }
+        static constexpr uint32 AfterLeave(uint32 invited) { return invited ? invited - 1 : 0; }
         void IncreaseInvitedCount(Team team)      { (team == ALLIANCE) ? ++m_InvitedAlliance : ++m_InvitedHorde; }
 
         uint32 GetInvitedCount(Team team) const   { return (team == ALLIANCE) ? m_InvitedAlliance : m_InvitedHorde; }
@@ -410,14 +409,15 @@ class TC_GAME_API Battleground
         // The single rule for mounting in a battleground: nullptr when a mount is allowed, otherwise the reason it is refused
         // (the start doors are closed / the area is indoors). Spell.cpp and the playerbot API both ask this.
         char const* GetMountRefusal(Player const* player) const;
-        // The client's indoor test on a WMO group's MOGP flags: interior (0x2000) and not exterior (0x8).
-        // Warsong Gulch's start area is the flag room behind the closed doors (no mounts there before the start). The Arathi Basin and
-        // Alterac Valley start areas are open ground where vanilla lets players mount during the preparation phase.
-        static constexpr bool IsEnclosedStartArea(uint32 mapId) { return mapId == 489; }
-        static constexpr bool IsIndoorWmoGroup(uint32 mogpFlags) { return (mogpFlags & 0x2000) != 0 && (mogpFlags & 0x8) == 0; }
         // Why the terrain data says "indoors" at the player's position (wmo group flags, the WMOAreaTable row that applied, the
         // area flags): the evidence for a wrong indoor answer. Diagnostics only; not cheap, call from throttled logs.
         std::string DescribeIndoors(Player const* player) const;
+        // Classic.MountIndoorsRules: mounting is refused in an enclosed start area while the doors are closed (checkStartArea) and indoors
+        bool IsMountRefused(Player const* player, bool checkStartArea) const;
+        // Warsong Gulch starts in the closed flag rooms, the Arathi Basin and Alterac Valley start areas are open ground
+        static constexpr bool IsEnclosedStartArea(uint32 mapId) { return mapId == 489; }
+        // the client's indoor test on the MOGP flags of the wmo group: interior (0x2000) and not exterior (0x8)
+        static constexpr bool IsIndoorWmoGroup(uint32 mogpFlags) { return (mogpFlags & 0x2000) != 0 && (mogpFlags & 0x8) == 0; }
 
         float GetStartMaxDist() const;
 

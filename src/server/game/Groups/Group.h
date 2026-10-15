@@ -472,5 +472,4 @@ class TC_GAME_API Group
         struct NoopGroupDeleter { void operator()(Group*) const { /*noop - not managed*/ } };
         Trinity::unique_trackable_ptr<Group> m_scriptRef;
 };
-
 #endif

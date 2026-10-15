@@ -28,8 +28,6 @@
 #include "Metric.h"
 #include "PhasingHandler.h"
 #include "Player.h"
-#include "PlayerbotMovement.h"
-#include "WorldSession.h"
 #include <array>
 #include <mutex>
 
@@ -87,43 +85,24 @@ PathGenerator::~PathGenerator()
     TC_LOG_DEBUG("maps.mmaps", "++ PathGenerator::~PathGenerator() for {}", _source->GetGUID().ToString());
 }
 
-// A bot in a capital keeps out of canals: when the first route touches liquid, a land-only route is searched (water polygons
-// excluded) and used when it exists and is dry; otherwise the first route is kept and IsWetRoute() says so (the caller refuses
-// it for town life and lets a follower go on). Sampling is along the whole path, not only its corners.
+PathGenerator::LiquidRouteCheck PathGenerator::_liquidRouteCheck = nullptr;
+
+// A source that keeps out of liquid (the LiquidRouteCheck says so): when the first route touches liquid, a land-only route is
+// searched (water polygons excluded) and used when it exists and is dry; otherwise the first route is kept and IsWetRoute() says so.
 bool PathGenerator::CalculatePath(float srcX, float srcY, float srcZ, float destX, float destY, float destZ, bool forceDest)
 {
     _wetRoute = false;
     bool ok = CalculatePathImpl(srcX, srcY, srcZ, destX, destY, destZ, forceDest);
-    if (!ok || (_type & PATHFIND_NOPATH) || !Playerbot::BotMovement::g_LiquidPathPolicy)
-        return ok;
-    Player* player = const_cast<Player*>(_source->ToPlayer());
-    if (!player || !player->GetSession() || !player->GetSession()->IsBot())
-        return ok;
-    if (Playerbot::BotMovement::g_LiquidPathPolicy(player) == Playerbot::BotMovement::LiquidPolicy::None || !PathTouchesLiquid())
+    if (!ok || (_type & PATHFIND_NOPATH) || !_liquidRouteCheck || !_liquidRouteCheck(_source, _pathPoints))
         return ok;
     _avoidWater = true;
-    bool const dry = CalculatePathImpl(srcX, srcY, srcZ, destX, destY, destZ, forceDest) && !(_type & PATHFIND_NOPATH) && !PathTouchesLiquid();
+    bool const dry = CalculatePathImpl(srcX, srcY, srcZ, destX, destY, destZ, forceDest) && !(_type & PATHFIND_NOPATH) && !_liquidRouteCheck(_source, _pathPoints);
     _avoidWater = false;
     if (dry)
         return true;
     ok = CalculatePathImpl(srcX, srcY, srcZ, destX, destY, destZ, forceDest);   // restore the first route
     _wetRoute = true;
     return ok;
-}
-
-bool PathGenerator::PathTouchesLiquid() const
-{
-    Player* player = const_cast<Player*>(_source->ToPlayer());
-    if (!player)
-        return false;
-    std::vector<Playerbot::BotMovement::PathPoint> pts;
-    pts.reserve(_pathPoints.size());
-    for (G3D::Vector3 const& v : _pathPoints)
-        pts.push_back({ v.x, v.y, v.z });
-    return Playerbot::BotMovement::PathTouchesLiquid(pts, [player](float x, float y, float z)
-    {
-        return Playerbot::BotMovement::ClassifyDestinationLiquid(player, x, y, z) != Playerbot::BotMovement::LiquidVerdict::Dry;
-    });
 }
 
 bool PathGenerator::CalculatePathImpl(float srcX, float srcY, float srcZ, float destX, float destY, float destZ, bool forceDest)
@@ -629,42 +608,6 @@ void PathGenerator::BuildPolyPath(G3D::Vector3 const& startPos, G3D::Vector3 con
     BuildPointPath(startPoint, endPoint);
 }
 
-// Drop near-coincident consecutive points (< 0.1y). The smooth-path walker and
-// off-mesh-connection handling can emit two points within rounding distance of each
-// other (typically at an off-mesh entry, but also after Z-normalization snaps two
-// near points to the same height); a sub-0.1y INTERIOR segment makes
-// MoveSplineInitArgs::_checkPathLengths() reject the ENTIRE spline, so
-// MoveSplineInit::Launch() silently returns 0 and the unit never moves -- the root
-// cause of units (bots, creatures AND vehicles) wedged at off-mesh bridge mouths and
-// at the entrance of dungeons whose route comes back as a partial (INCOMPLETE)
-// corridor on freshly-regenerated mmaps. Endpoints are always preserved so the true
-// start/destination are never dropped, and a 2-point path is never collapsed.
-void PathGenerator::RemoveNearCoincidentPathPoints()
-{
-    if (_pathPoints.size() <= 2)
-        return;
-    // In-place compaction (no per-pathfind allocation -- this is a fleet-hot path).
-    // Keep point 0, skip interior points coincident with the last kept point, always
-    // keep the final point.
-    size_t w = 1;
-    for (size_t r = 1; r < _pathPoints.size(); ++r)
-    {
-        const bool isLast = (r + 1 == _pathPoints.size());
-        if (!isLast && (_pathPoints[r] - _pathPoints[w - 1]).squaredLength() < 0.01f)
-            continue;
-        _pathPoints[w++] = _pathPoints[r];
-    }
-    // If the kept endpoint collapsed onto its predecessor, drop the predecessor
-    // (preserve the true destination).
-    if (w >= 3 && (_pathPoints[w - 1] - _pathPoints[w - 2]).squaredLength() < 0.01f)
-    {
-        _pathPoints[w - 2] = _pathPoints[w - 1];
-        --w;
-    }
-    if (w >= 2 && w < _pathPoints.size())
-        _pathPoints.resize(w);
-}
-
 void PathGenerator::BuildPointPath(const float *startPoint, const float *endPoint)
 {
     float pathPoints[MAX_POINT_PATH_LENGTH*VERTEX_SIZE];
@@ -754,9 +697,6 @@ void PathGenerator::BuildPointPath(const float *startPoint, const float *endPoin
 
     NormalizePath();
 
-    // Drop near-coincident consecutive points so MoveSplineInitArgs::
-    // _checkPathLengths() accepts the spline (see RemoveNearCoincidentPathPoints;
-    // the same dedupe is applied to the INCOMPLETE partial-corridor branch above).
     RemoveNearCoincidentPathPoints();
     pointCount = uint32(_pathPoints.size());
 
@@ -789,6 +729,33 @@ void PathGenerator::NormalizePath()
 {
     for (uint32 i = 0; i < _pathPoints.size(); ++i)
         _source->UpdateAllowedPositionZ(_pathPoints[i].x, _pathPoints[i].y, _pathPoints[i].z);
+}
+
+// A segment shorter than 0.1 y makes MoveSplineInitArgs::_checkPathLengths() reject the whole spline and the unit does not move.
+// The smooth path walker and off-mesh links can emit such points, and NormalizePath() can move two near points onto each other.
+// The start and the destination are kept, a 2-point path is left alone.
+void PathGenerator::RemoveNearCoincidentPathPoints()
+{
+    if (_pathPoints.size() <= 2)
+        return;
+
+    size_t kept = 1;
+    for (size_t i = 1; i < _pathPoints.size(); ++i)
+    {
+        bool const isLast = i + 1 == _pathPoints.size();
+        if (!isLast && (_pathPoints[i] - _pathPoints[kept - 1]).squaredLength() < 0.01f)
+            continue;
+        _pathPoints[kept++] = _pathPoints[i];
+    }
+
+    // the destination landed on the point before it: drop that point instead
+    if (kept >= 3 && (_pathPoints[kept - 1] - _pathPoints[kept - 2]).squaredLength() < 0.01f)
+    {
+        _pathPoints[kept - 2] = _pathPoints[kept - 1];
+        --kept;
+    }
+
+    _pathPoints.resize(kept);
 }
 
 void PathGenerator::BuildShortcut()
@@ -882,10 +849,10 @@ void PathGenerator::CreateFilter()
 
     // Phase 3: slope-aware cost penalty. A 30° slope costs 1.30× a flat
     // segment; tempers raw road preference so paths don't switchback up
-    // a hill for the road bonus alone. Default coefficient 1.0; tune via
-    // worldserver.conf:
-    //   Pathfinding.SlopeCoefficient = 1.0   (0.0 = disabled)
-    float slopeCoef = sConfigMgr->GetFloatDefault("Pathfinding.SlopeCoefficient", 1.0f);
+    // a hill for the road bonus alone. Default 0.0 (disabled, stock pathing);
+    // the bot module's playerbot.conf sets 1.0:
+    //   Pathfinding.SlopeCoefficient = 1.0
+    float slopeCoef = sConfigMgr->GetFloatDefault("Pathfinding.SlopeCoefficient", 0.0f);
     _filter.SetSlopeCoefficient(slopeCoef);
 
     // Map-type gate: dungeon/raid instances have spurious "road" tags on
@@ -1067,14 +1034,6 @@ dtStatus PathGenerator::FindSmoothPath(float const* startPos, float const* endPo
     // (regressed the Deadmines Gap-1 bridge: tank parked off-mesh at the z51 hole).
     bool sawOffMesh = false;
 
-    // Diagnostic gate: the Deadmines (map 36) foundry->ship corridor up to Admiral
-    // Ripsnarl (~ -62,-823,42.8). endPos is detour-order (y,z,x): [2]=x,[0]=y. Used to
-    // log WHY the Ripsnarl corridor smoothing fails; the route crosses an off-mesh
-    // descent bridge, so the smoother fails at the off-mesh (sawOffMesh path) — handled
-    // by the bot-layer off-mesh-cross machinery, NOT by a pure-mesh straight fallback.
-    const bool ripDbg = _source && _source->GetMapId() == 36 &&
-        std::fabs(endPos[2] - (-62.0f)) < 12.0f && std::fabs(endPos[0] - (-823.0f)) < 12.0f;
-
     dtPolyRef polys[MAX_PATH_LENGTH];
     memcpy(polys, polyPath, sizeof(dtPolyRef)*polyPathSize);
     uint32 npolys = polyPathSize;
@@ -1141,11 +1100,7 @@ dtStatus PathGenerator::FindSmoothPath(float const* startPos, float const* endPo
             // stop but KEEP the partial path built so far (handled after the loop)
             // rather than discarding a valid long route as a straight-line NOPATH.
             if (sawOffMesh)
-            {
-                if (ripDbg)
-                    TC_LOG_DEBUG("maps.mmaps", "[rip_dbg] FindSmoothPath FAIL@moveSurface-postOffmesh nsmooth={} polyN={}", nsmoothPath, polyPathSize);
                 return DT_FAILURE;
-            }
             surfaceFail = true;
             break;
         }
@@ -1214,19 +1169,13 @@ dtStatus PathGenerator::FindSmoothPath(float const* startPos, float const* endPo
                 // authoritative far endpoint) lands on the landing poly's EDGE. The old
                 // code returned DT_FAILURE here, discarding the ENTIRE route so a path
                 // CROSSING this off-mesh always NOPATH'd and the bot wedged on the near
-                // side — the Deadmines HARBOR bridge to Admiral Ripsnarl (live 06-26:
-                // [rip_dbg] offmesh getPolyHeight FAIL nsmooth=9-11, tank pinned ~290y
-                // out, reach=0). Recover the SAME way the raycast branch does (clamp to
+                // side (the Deadmines harbor bridge to Admiral Ripsnarl). Recover the SAME way the raycast branch does (clamp to
                 // poly boundary on a height miss) and CONTINUE the crossing natively onto
                 // the landing poly (solid ground, never the void). SAFE for the Gap-1
                 // bridge: its off-mesh getPolyHeight SUCCEEDS, so this branch never fires
                 // there (verified across Gap-1 runs — clamp count stayed 0).
                 if (dtStatusFailed(_navMeshQuery->getPolyHeight(polys[0], iterPos, &iterPos[1])))
-                {
                     _navMeshQuery->closestPointOnPolyBoundary(polys[0], iterPos, iterPos);
-                    if (ripDbg)
-                        TC_LOG_DEBUG("maps.mmaps", "[rip_dbg] FindSmoothPath offmesh getPolyHeight FAIL -> clamped to landing poly + continue, nsmooth={}", nsmoothPath);
-                }
                 iterPos[1] += 0.5f;
             }
         }
@@ -1289,10 +1238,6 @@ dtStatus PathGenerator::FindSmoothPath(float const* startPos, float const* endPo
         if (dtVdot(disp, disp) > minProgress * minProgress)
             return DT_SUCCESS | DT_PARTIAL_RESULT;
     }
-
-    if (ripDbg)
-        TC_LOG_DEBUG("maps.mmaps", "[rip_dbg] FindSmoothPath exit nsmooth={} polyN={} reachedEnd={} surfaceFail={} sawOff={}",
-            nsmoothPath, polyPathSize, reachedEnd, surfaceFail, sawOffMesh);
 
     return DT_SUCCESS;
 }
@@ -1378,15 +1323,7 @@ void PathGenerator::ShortenPathUntilDist(G3D::Vector3 const& target, float dist)
     //   ... settle for a guesstimate since i'm not confident in doing trig on every chase motion tick...
     // (@todo review this)
     _pathPoints[i] += (_pathPoints[i - 1] - _pathPoints[i]).direction() * (dist - (_pathPoints[i] - target).length());
-    // The shortened endpoint can land within <0.1y of its predecessor when the
-    // "too far" vertex [i-1] sits right at the `dist` boundary (the move amount
-    // then ~= the entire last segment). A sub-0.1y final segment makes
-    // MoveSplineInitArgs::_checkPathLengths() reject the WHOLE spline, so the unit
-    // never moves -- root cause of bots/creatures/vehicles wedged mid-chase and
-    // during boss approach on 12.0.7 (a flood of "_checkPathLengths() failed").
-    // Drop the collapsed endpoint, keeping its predecessor as the path end (still
-    // >= 2 points). A 2-point path is never affected: _checkPathLengths only
-    // inspects paths with > 2 points.
+    // the new end can land on _pathPoints[i - 1]; a segment shorter than 0.1 y makes _checkPathLengths() reject the spline
     if (i >= 2 && (_pathPoints[i] - _pathPoints[i - 1]).squaredLength() < 0.01f)
         --i;
     _pathPoints.resize(i+1);

@@ -208,8 +208,6 @@ namespace Trainer
             if (tally)
                 ++tally->taught;
 
-            TC_LOG_DEBUG("playerbot.api", "[levelup] {} learns trainer spell {} (trainer {}, class mask {:#x})",
-                player->GetName(), trainerSpell.SpellId, _id, GetClassMask());
             if (trainerSpell.IsCastable())
                 player->CastSpell(player, trainerSpell.SpellId, true);
             else

@@ -16,7 +16,6 @@
  */
 
 #include "WorldSession.h"
-#include "Playerbot/PlayerbotHooks.h"
 #include "AccountMgr.h"
 #include "ArenaTeam.h"
 #include "ArenaTeamMgr.h"
@@ -1538,14 +1537,12 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     stmt->setUInt64(0, pCurrChar->GetGUID().GetCounter());
     CharacterDatabase.Execute(stmt);
 
-#if defined(TRINITY_PLAYERBOT_V2)
     // Bot sessions share the owner's account id. Setting account.online=1
     // here would (in auto-resume mode where the GM is offline) block them
     // from later logging into their own account — the login server treats
     // online=1 as "another session active". The character.online flag above
     // is per-character and correctly reflects the bot's in-world state.
     if (!IsBot())
-#endif
     {
         LoginDatabasePreparedStatement* loginStmt = LoginDatabase.GetPreparedStatement(LOGIN_UPD_ACCOUNT_ONLINE);
         loginStmt->setUInt32(0, GetAccountId());
@@ -1736,8 +1733,6 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
 
     sScriptMgr->OnPlayerLogin(pCurrChar, firstLogin);
 
-    Playerbot::Hooks::OnPlayerLogin(pCurrChar);
-
     // Battle.net presence: the client takes the account's BattleTag from it (Social window, Battle.net friends); online friends are told
     BattlenetPresence::OnLogin(this);
 
@@ -1835,93 +1830,74 @@ void WorldSession::SendFeatureSystemStatus()
     features.GroupChatThrottle.TriesRestoredPerSecond = 20;
 
     // Classic 1.60: every flag as the official server sends it (sniffs 70205 and 70235 are identical). Field names follow the
-    // retail order, which is not the Classic meaning of each bit.
-    features.VoiceEnabled = true;
-    features.BpayStoreAvailable = true;
-    features.ItemRestorationButtonEnabled = false;
-    features.SessionAlert.reset();
-    features.RAFSystem.Enabled = false;
-    features.RAFSystem.RecruitingEnabled = false;
-    features.CharUndeleteEnabled = true;
-    features.RestrictedAccount = false;
-    features.CommerceServerEnabled = false;
-    features.TutorialEnabled = true;
-    features.VeteranTokenRedeemWillKick = true;
-    features.WorldTokenRedeemWillKick = false;
-    features.KioskModeEnabled = false;
-    features.CompetitiveModeEnabled = true;
-    features.RedeemForBalanceAvailable = true;
-    features.WarModeEnabled = true;
-    features.CommunitiesEnabled = true;
-    features.BnetGroupsEnabled = true;
-    features.CharacterCommunitiesEnabled = false;
-    features.ClubPresenceAllowSubscribeAll = false;
-    features.VoiceChatParentalDisabled = true;
-    features.VoiceChatParentalMuted = false;
-    features.QuestSessionEnabled = false;
-    features.ClubFinderEnabled = true;
-    features.CommunityFinderEnabled = true;
-    features.BrowserCrashReporterEnabled = false;
-    features.SpeakForMeAllowed = false;
-    // official sends this bit on; in Classic it is the group finder "attach an Authenticator and SMS Protect" requirement
-    // (official accounts there were secured). Off until accounts can have an authenticator here.
-    features.DoesAccountNeedAADCPrompt = false;
-    features.IsAccountOptedInToAADC = false;
-    features.LfgRequireAuthenticatorEnabled = false;
-    features.ScriptsDisallowedForBeta = false;
-    features.TimerunningEnabled = true;
-    features.PlayerIdentityOptionsEnabled = false;
-    features.IsPlayerContentTrackingEnabled = false;
-    features.LfdEnabled = true;
-    features.LfrEnabled = false;
-    features.PetHappinessEnabled = false;
-    features.ClassicFlagsAfterLength = 2;
-    features.IsAccountCurrencyTransferEnabled = false;
-    features.NetEaseChatTelemetryEnabled = false;
-    features.LobbyMatchmakerQueueFromMainlineEnabled = true;
-    features.CanSendLobbyMatchmakerPartyCustomizations = false;
-    features.AddonProfilingEnabled = false;
-    features.GlobalUserGeneratedContentMuteEnabled = false;
-    features.AccountUserGeneratedContentIsRisky = false;
-    features.FriendsDisabled = false;
-
-    features.EuropaTicketSystemStatus->TicketsEnabled = false;
-    features.EuropaTicketSystemStatus->BugsEnabled = true;
-    features.EuropaTicketSystemStatus->ComplaintsEnabled = true;
-    features.EuropaTicketSystemStatus->SuggestionsEnabled = true;
-    features.EuropaTicketSystemStatus->ThrottleState = { .MaxTries = 10, .PerMilliseconds = 60000, .TryCount = 0, .LastResetTimeBeforeNow = 130929 };
-    features.EuropaTicketSystemStatus->ExpensiveThrottleState = { .MaxTries = 1, .PerMilliseconds = 60000, .TryCount = 0, .LastResetTimeBeforeNow = 130929 };
-
-    features.QuickJoinConfig = { false, 7.0f, 10.0f, 1.0f, 1.0f, 5.0f, 1.0f, 0.0f, 60.0f, 20.0f, 0.0f, 50.0f, 1.0f, 10.0f, 50.0f, 100.0f,
-        50.0f, 1.0f, 1.0f, 100.0f, 1.0f, 850.0f, 80.0f };
-    features.RemainingTimerunningSeasonSeconds = 32767;
-    features.MaxPlayerGuidLookupsPerRequest = 32;
-    features.NameLookupTelemetryInterval = 32;
-    features.DisabledGameModes = { { .GameMode = 3, .ContentSetID = 13, .GameModeRecordID = 0 }, { .GameMode = 2, .ContentSetID = 5, .GameModeRecordID = 0 } };
-
-    // Classic 1.60 diagnostics: each chat/social related field can be overridden from the config without a rebuild (read at every
-    // login, so ".reload config" plus a relog is enough). Unset keys keep the value chosen above. Used to find which field makes
-    // the 70291 client drop its own /w handler (Classic.Feature.* in worldserver.conf.d, see doc/whisper-feature-bisect.md).
-    auto overrideBool = [](char const* key, bool& field)
+    // retail order, which is not the Classic meaning of each bit. Classic.OfficialFeatureFlags = 0 goes back to the values above.
+    if (sConfigMgr->GetBoolDefault("Classic.OfficialFeatureFlags", true))
     {
-        field = sConfigMgr->GetBoolDefault(key, field);
-    };
-    overrideBool("Classic.Feature.VoiceEnabled", features.VoiceEnabled);
-    overrideBool("Classic.Feature.VoiceChatParentalDisabled", features.VoiceChatParentalDisabled);
-    overrideBool("Classic.Feature.VoiceChatParentalMuted", features.VoiceChatParentalMuted);
-    overrideBool("Classic.Feature.SpeakForMeAllowed", features.SpeakForMeAllowed);
-    overrideBool("Classic.Feature.NetEaseChatTelemetryEnabled", features.NetEaseChatTelemetryEnabled);
-    overrideBool("Classic.Feature.GlobalUserGeneratedContentMuteEnabled", features.GlobalUserGeneratedContentMuteEnabled);
-    overrideBool("Classic.Feature.AccountUserGeneratedContentIsRisky", features.AccountUserGeneratedContentIsRisky);
-    overrideBool("Classic.Feature.FriendsDisabled", features.FriendsDisabled);
-    overrideBool("Classic.Feature.DoesAccountNeedAADCPrompt", features.DoesAccountNeedAADCPrompt);
-    overrideBool("Classic.Feature.IsAccountOptedInToAADC", features.IsAccountOptedInToAADC);
-    features.SocialRestriction = sConfigMgr->GetIntDefault("Classic.Feature.SocialRestriction", features.SocialRestriction);
-    TC_LOG_INFO("playerbot.v2", "[feature_status] VoiceEnabled={} VoiceParentalDisabled={} VoiceParentalMuted={} SpeakForMe={} NetEaseChat={} GlobalUGCMute={} UGCRisky={} FriendsDisabled={} AADCPrompt={} AADCOptIn={} SocialRestriction={} ChatMuted={}",
-        features.VoiceEnabled, features.VoiceChatParentalDisabled, features.VoiceChatParentalMuted, features.SpeakForMeAllowed,
-        features.NetEaseChatTelemetryEnabled, features.GlobalUserGeneratedContentMuteEnabled, features.AccountUserGeneratedContentIsRisky,
-        features.FriendsDisabled, features.DoesAccountNeedAADCPrompt, features.IsAccountOptedInToAADC,
-        features.SocialRestriction, features.IsChatMuted);
+        features.VoiceEnabled = true;
+        features.BpayStoreAvailable = true;
+        features.ItemRestorationButtonEnabled = false;
+        features.SessionAlert.reset();
+        features.RAFSystem.Enabled = false;
+        features.RAFSystem.RecruitingEnabled = false;
+        features.CharUndeleteEnabled = true;
+        features.RestrictedAccount = false;
+        features.CommerceServerEnabled = false;
+        features.TutorialEnabled = true;
+        features.VeteranTokenRedeemWillKick = true;
+        features.WorldTokenRedeemWillKick = false;
+        features.KioskModeEnabled = false;
+        features.CompetitiveModeEnabled = true;
+        features.RedeemForBalanceAvailable = true;
+        features.WarModeEnabled = true;
+        features.CommunitiesEnabled = true;
+        features.BnetGroupsEnabled = true;
+        features.CharacterCommunitiesEnabled = false;
+        features.ClubPresenceAllowSubscribeAll = false;
+        features.VoiceChatParentalDisabled = true;
+        features.VoiceChatParentalMuted = false;
+        features.QuestSessionEnabled = false;
+        features.ClubFinderEnabled = true;
+        features.CommunityFinderEnabled = true;
+        features.BrowserCrashReporterEnabled = false;
+        features.SpeakForMeAllowed = false;
+        // official sends this bit on; in Classic it is the group finder "attach an Authenticator and SMS Protect" requirement
+        // (official accounts there were secured). Off until accounts can have an authenticator here.
+        features.DoesAccountNeedAADCPrompt = false;
+        features.IsAccountOptedInToAADC = false;
+        features.LfgRequireAuthenticatorEnabled = false;
+        features.ScriptsDisallowedForBeta = false;
+        features.TimerunningEnabled = true;
+        features.PlayerIdentityOptionsEnabled = false;
+        features.IsPlayerContentTrackingEnabled = false;
+        features.LfdEnabled = true;
+        features.LfrEnabled = false;
+        features.PetHappinessEnabled = false;
+        features.GuildEventsEditsEnabled = false;
+        features.GuildTradeSkillsEnabled = false;
+        features.ClassicFlagBits10 = 2;
+        features.IsAccountCurrencyTransferEnabled = false;
+        features.NetEaseChatTelemetryEnabled = false;
+        features.LobbyMatchmakerQueueFromMainlineEnabled = true;
+        features.CanSendLobbyMatchmakerPartyCustomizations = false;
+        features.AddonProfilingEnabled = false;
+        features.GlobalUserGeneratedContentMuteEnabled = false;
+        features.AccountUserGeneratedContentIsRisky = false;
+        features.FriendsDisabled = false;
+
+        features.EuropaTicketSystemStatus->TicketsEnabled = false;
+        features.EuropaTicketSystemStatus->BugsEnabled = true;
+        features.EuropaTicketSystemStatus->ComplaintsEnabled = true;
+        features.EuropaTicketSystemStatus->SuggestionsEnabled = true;
+        features.EuropaTicketSystemStatus->ThrottleState = { .MaxTries = 10, .PerMilliseconds = 60000, .TryCount = 0, .LastResetTimeBeforeNow = 130929 };
+        features.EuropaTicketSystemStatus->ExpensiveThrottleState = { .MaxTries = 1, .PerMilliseconds = 60000, .TryCount = 0, .LastResetTimeBeforeNow = 130929 };
+
+        features.QuickJoinConfig = { false, 7.0f, 10.0f, 1.0f, 1.0f, 5.0f, 1.0f, 0.0f, 60.0f, 20.0f, 0.0f, 50.0f, 1.0f, 10.0f, 50.0f, 100.0f,
+            50.0f, 1.0f, 1.0f, 100.0f, 1.0f, 850.0f, 80.0f };
+        features.RemainingTimerunningSeasonSeconds = 32767;
+        features.MaxPlayerGuidLookupsPerRequest = 32;
+        features.NameLookupTelemetryInterval = 32;
+        features.DisabledGameModes = { { .GameMode = 3, .ContentSetID = 13, .GameModeRecordID = 0 }, { .GameMode = 2, .ContentSetID = 5, .GameModeRecordID = 0 } };
+    }
 
     SendPacket(features.Write());
 }

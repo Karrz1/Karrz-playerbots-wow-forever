@@ -538,7 +538,7 @@
 - Tick budget enforcement (skip frame rather than blow budget)
 
 ### 9.2 Level-of-detail
-- Far-from-real-player bots simplified (no detailed AI, just movement)
+- Far-from-real-player bots simplified (no detailed bot logic, just movement)
 - Empty-zone bots minimal (no expensive checks)
 - Distance-based detail tiers
 - Auto-LOD switching based on observers

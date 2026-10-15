@@ -146,8 +146,16 @@ TEST_CASE("a combat potion is stocked but never used before the pull", "[classic
     stock = NextRaidConsumableToStock(RaidConsumableRole::Tank, holds_all_but_potion, flask_buffed);
     REQUIRE(stock != nullptr);
     CHECK(stock->item == 13457);
-    // The other roles carry none.
+    // Every role carries one (Ragnaros' Might hits 20 y round a random mana user), and only that one is a combat potion.
     for (RaidConsumableRole role : { RaidConsumableRole::Melee, RaidConsumableRole::Caster, RaidConsumableRole::Healer, RaidConsumableRole::Hunter })
+    {
+        int combat = 0;
         for (RaidConsumable const& c : RaidConsumablesFor(role))
-            CHECK_FALSE(c.combat);
+            if (c.combat)
+            {
+                ++combat;
+                CHECK(c.item == 13457);
+            }
+        CHECK(combat == 1);
+    }
 }

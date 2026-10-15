@@ -5,8 +5,8 @@
 //
 // Commands (whyidle, follow, ...) never reach this: the command parser and the ;-prefix path run first.
 //
-// An optional ReplyProvider can answer lines the rule set does not understand (Intent::Unknown) - for example a local model
-// behind an OpenAI-style API. None ships here; with no provider registered Unknown simply returns false and the caller's
+// An optional ReplyProvider can answer lines the rule set does not understand (Intent::Unknown) - for example an external
+// chat service. None ships here; with no provider registered Unknown simply returns false and the caller's
 // existing fallback (ike3 text pools) applies.
 
 #pragma once

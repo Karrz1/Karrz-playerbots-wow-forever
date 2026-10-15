@@ -21,6 +21,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cmath>
 #include <set>
 #include <string>
 
@@ -444,6 +445,24 @@ ScenarioLimits RaidLimits()
     return l;
 }
 
+// The pass bar of the raid scenarios: the boss's death passes the run however many die.
+ScenarioLimits KillPassLimits()
+{
+    ScenarioLimits l;
+    l.expected_map = 409;
+    l.kill_is_pass = true;
+    l.dps_hold_ms = 20000;
+    return l;
+}
+
+bool HasWarning(ScenarioMonitor const& m, ScenarioFailKind k, char const* bot = nullptr)
+{
+    for (ScenarioFailure const& f : m.warnings())
+        if (f.kind == k && (!bot || f.bot == bot))
+            return true;
+    return false;
+}
+
 ScenarioDeath Died(std::uint64_t id, char const* name)
 {
     ScenarioDeath d;
@@ -473,6 +492,108 @@ TEST_CASE("ScenarioMonitor raid: up to five deaths are noted, the sixth fails th
     CHECK(m.terminal());
     CHECK_FALSE(m.passed(true));
     CHECK(m.deaths() == 6);
+}
+
+TEST_CASE("ScenarioMonitor raid, kill is the pass bar: deaths are warnings, never end the run, and a kill passes", "[scenariomonitor]")
+{
+    ScenarioMonitor m(KillPassLimits());
+    auto raid = Raid40(1000.f, -600.f);
+    m.Feed(1000, raid, true);
+    for (int i = 0; i < 20; ++i)
+    {
+        char name[16];
+        std::snprintf(name, sizeof(name), "Raider%02d", 20 + i);
+        m.NoteDeath(2000u + 1000u * std::uint32_t(i), Died(std::uint64_t(120 + i), name));
+    }
+    CHECK(m.failures().empty());
+    CHECK(m.warnings().size() == 20);
+    CHECK(HasWarning(m, ScenarioFailKind::Death, "Raider25"));
+    CHECK_FALSE(m.terminal());
+    CHECK(m.deaths() == 20);
+    CHECK(m.passed(true));
+    CHECK_FALSE(m.passed(false));                 // no kill, no pass
+}
+
+TEST_CASE("ScenarioMonitor raid, kill is the pass bar: dead tanks do not end the run, a full wipe, a reset and a timeout do", "[scenariomonitor]")
+{
+    {
+        ScenarioMonitor m(KillPassLimits());
+        auto raid = Raid40(1000.f, -600.f);
+        for (int i = 0; i < 4; ++i)
+            raid[std::size_t(i)].alive = false;
+        CHECK_FALSE(m.Feed(1000, raid, true));
+        CHECK(m.failures().empty());
+        for (ScenarioSample& s : raid)
+            s.alive = false;
+        CHECK(m.Feed(2000, raid, true));
+        CHECK(Has(m, ScenarioFailKind::Wipe));
+        CHECK_FALSE(m.passed(true));
+    }
+    {
+        ScenarioMonitor m(KillPassLimits());
+        m.NoteTimeout(900000, "goal not met");
+        CHECK(Has(m, ScenarioFailKind::Timeout));
+        CHECK_FALSE(m.passed(false));
+    }
+}
+
+TEST_CASE("ScenarioMonitor raid, kill is the pass bar: a squad with nobody left in the fight, or a tenth alive, is wiped", "[scenariomonitor]")
+{
+    {
+        // One raider alive and out of combat after a fight: over after 15 s, not at the timeout.
+        ScenarioMonitor m(KillPassLimits());
+        auto raid = Raid40(1000.f, -600.f);
+        for (ScenarioSample& s : raid)
+            s.in_combat = true;
+        CHECK_FALSE(m.Feed(1000, raid, true));
+        for (std::size_t i = 1; i < raid.size(); ++i)
+            raid[i].alive = false;
+        raid[0].in_combat = false;
+        CHECK_FALSE(m.Feed(2000, raid, true));
+        CHECK_FALSE(m.Feed(16000, raid, true));
+        CHECK(m.Feed(17000, raid, true));
+        CHECK(Has(m, ScenarioFailKind::Wipe));
+    }
+    {
+        // Four of 40 alive and still in combat: a wipe after 30 s of it.
+        ScenarioMonitor m(KillPassLimits());
+        auto raid = Raid40(1000.f, -600.f);
+        for (ScenarioSample& s : raid)
+            s.in_combat = true;
+        m.Feed(1000, raid, true);
+        for (std::size_t i = 4; i < raid.size(); ++i)
+            raid[i].alive = false;
+        CHECK_FALSE(m.Feed(2000, raid, true));
+        CHECK_FALSE(m.Feed(31000, raid, true));
+        CHECK(m.Feed(32000, raid, true));
+        CHECK(Has(m, ScenarioFailKind::Wipe));
+    }
+    {
+        // Before any fight, a squad standing out of combat is not a wipe.
+        ScenarioMonitor m(KillPassLimits());
+        auto raid = Raid40(1000.f, -600.f);
+        for (std::uint32_t t = 1000; t <= 60000; t += 1000)
+            CHECK_FALSE(m.Feed(t, raid, true));
+        CHECK_FALSE(Has(m, ScenarioFailKind::Wipe));
+    }
+}
+
+TEST_CASE("ScenarioMonitor raid, kill is the pass bar: a DPS hold and a missing support job are warnings", "[scenariomonitor]")
+{
+    ScenarioMonitor m(KillPassLimits());
+    for (std::uint32_t t = 0; t <= 25000; t += 1000)
+    {
+        auto raid = Raid40(1000.f, -600.f);
+        for (ScenarioSample& s : raid)
+            s.in_combat = true;
+        raid[30].rule = "combat:threat_hold";
+        m.Feed(t, raid, true);
+    }
+    m.NoteSupportMissing(30000, "0 Tranquilizing Shot(s) cast");
+    CHECK(HasWarning(m, ScenarioFailKind::DpsHold, "Raider30"));
+    CHECK(HasWarning(m, ScenarioFailKind::SupportMissing));
+    CHECK(m.failures().empty());
+    CHECK(m.passed(true));
 }
 
 TEST_CASE("ScenarioMonitor raid: every tank dead is a wipe even with the rest alive", "[scenariomonitor]")
@@ -607,8 +728,9 @@ TEST_CASE("ScenarioDefs: the Molten Core scenarios are a 40-man raid with 4 tank
         CHECK(d->arrive_near_entry == r.boss_entry);
         CHECK(d->order_attack);
         CHECK(d->limits.expected_group == 40);
-        CHECK(d->limits.tolerated_deaths == 5);
-        CHECK(d->limits.max_deaths == 6);
+        CHECK(d->limits.kill_is_pass);
+        CHECK(d->limits.max_deaths == 0);
+        CHECK_FALSE(d->limits.tanks_dead_is_wipe);
         CHECK(d->limits.dps_hold_ms == 20000);
         CHECK(d->limits.bounds.enabled);
         CHECK(d->x >= d->limits.bounds.min_x);
@@ -640,7 +762,7 @@ TEST_CASE("ScenarioDefs: the Molten Core scenarios are a 40-man raid with 4 tank
             CHECK((m.race == ScnRace::Human || m.race == ScnRace::Dwarf || m.race == ScnRace::NightElf || m.race == ScnRace::Gnome));
     }
     // The raid set, by name: a boss added to or dropped from it has to be said here (mc_geddon joined the first four, mc_ragnaros after it).
-    CHECK(found == std::set<std::string>{ "mc_garr", "mc_lucifron", "mc_magmadar", "mc_gehennas", "mc_geddon", "mc_ragnaros" });
+    CHECK(found == std::set<std::string>{ "mc_garr", "mc_lucifron", "mc_magmadar", "mc_gehennas", "mc_sulfuron", "mc_golemagg", "mc_majordomo", "mc_geddon", "mc_ragnaros" });
     // Both catalogues share one list, with no clash between a dungeon and a raid name.
     std::set<std::string> all;
     for (ScenarioDef const& d : ScenarioCatalogue())
@@ -777,4 +899,22 @@ TEST_CASE("ScenarioDefs: Magmadar needs a Tranquilizing Shot, Lucifron and Gehen
     }
     CHECK(hunter);
     CHECK(mage);
+}
+
+TEST_CASE("ScenarioDefs: a Molten Core boss with no creature row carries the lair its script summons it at", "[scenariomonitor]")
+{
+    // Ragnaros has no spawn row in the world (Majordomo's script summons him at 838.3,-831.5,-232.2); the runner summons him there.
+    ScenarioDef const* rag = FindScenario("mc_ragnaros");
+    REQUIRE(rag != nullptr);
+    CHECK(rag->goal_entry == 11502u);
+    CHECK(rag->lair_z != 0.f);
+    CHECK(std::fabs(rag->lair_x - 838.308f) < 0.01f);
+    CHECK(std::fabs(rag->lair_y + 831.466f) < 0.01f);
+    // The bosses the world spawns have none: they are found from their rows.
+    for (char const* name : { "mc_garr", "mc_lucifron", "mc_magmadar", "mc_gehennas", "mc_geddon" })
+    {
+        ScenarioDef const* d = FindScenario(name);
+        REQUIRE(d != nullptr);
+        CHECK(d->lair_z == 0.f);
+    }
 }

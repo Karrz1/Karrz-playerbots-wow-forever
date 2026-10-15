@@ -70,7 +70,7 @@ src/modules/PlayerbotV2/
 │   ├── ApRotation.{cpp,h}                  # APL evaluator
 │   ├── ApRule.{cpp,h}                      # Single rule type
 │   ├── ApRegistry.{cpp,h}                  # (class,spec) → APL lookup
-│   ├── TargetSelector.{cpp,h}              # Utility-AI target choice
+│   ├── TargetSelector.{cpp,h}              # Utility-bot logic target choice
 │   ├── ThreatModel.{cpp,h}                 # Read threat from snapshot
 │   ├── DispelDecisions.{cpp,h}             # Pure functions for dispel/decurse
 │   ├── InterruptDecisions.{cpp,h}          # Pure functions for interrupt
@@ -142,7 +142,7 @@ src/modules/PlayerbotV2/
 │   └── FollowController.{cpp,h}            # Follow-leader logic with hysteresis
 │
 ├── Quest/
-│   ├── QuestPicker.{cpp,h}                 # Utility-AI: which quest to do next
+│   ├── QuestPicker.{cpp,h}                 # Utility-bot logic: which quest to do next
 │   ├── QuestObjectiveRouter.{cpp,h}        # Dispatch by objective type
 │   ├── ObjectiveKill.cpp
 │   ├── ObjectiveGather.cpp
@@ -205,7 +205,7 @@ src/modules/PlayerbotV2/
 │   └── ReleaseDecision.{cpp,h}             # When to release vs. wait for res
 │
 ├── PvP/
-│   ├── BgObjectiveScorer.{cpp,h}           # Utility AI per BG type
+│   ├── BgObjectiveScorer.{cpp,h}           # Utility bot logic per BG type
 │   ├── BgAlteracValley.cpp
 │   ├── BgArathiBasin.cpp
 │   ├── BgEyeOfTheStorm.cpp
@@ -329,7 +329,7 @@ Hooks are inline-noop calls when V2 is not compiled. Total insertion sites in co
 | `OnDamageDealt` | `Unit.cpp:Unit::DealDamage` | Threat/snapshot trigger |
 | `OnDamageTaken` | `Unit.cpp:Unit::DealDamage` (target side) | Combat tier promotion |
 | `OnHealReceived` | `Unit.cpp:Unit::Heal` | Healer feedback |
-| `OnAuraApplied` | `SpellAuras.cpp:Aura::HandleApply` | Reactive AI |
+| `OnAuraApplied` | `SpellAuras.cpp:Aura::HandleApply` | Reactive bot logic |
 | `OnAuraRemoved` | `SpellAuras.cpp:Aura::HandleRemove` | Same |
 | `OnSpellCastStart` | `Spell.cpp:Spell::cast` | Interrupt opportunities |
 | `OnSpellCastSuccess` | `Spell.cpp:Spell::finish` | Resource/cooldown updates |

@@ -18,16 +18,13 @@
 #include "MoveSplineInit.h"
 #include "Log.h"
 #include "Creature.h"
-#include "Map.h"
 #include "MoveSpline.h"
 #include "MovementPackets.h"
 #include "PathGenerator.h"
 #include "Timer.h"
 #include "Unit.h"
 #include "VehicleDefines.h"
-#include <algorithm>
 #include <cmath>
-#include <unordered_map>
 
 namespace Movement
 {
@@ -39,36 +36,6 @@ namespace Movement
         bool PlayerSideUnit(Unit const* unit)
         {
             return unit->IsPlayer() || unit->GetCharmerOrOwnerGUID().IsPlayer();
-        }
-
-        // A steep path segment is a walkable slope, not a cliff or a jump between two levels, when the ground under it follows the line
-        // from one end to the other: the terrain at every sample point lies within a step's height of the straight line. Stairs and
-        // ramps (Zephras Isle, Thendal: dz 3.2 over 3 yards of ground, a bot froze at the foot of each) pass; a drop where the line
-        // runs through air above the lower level does not.
-        bool SegmentFollowsGround(Unit const* unit, Vector3 const& from, Vector3 const& to)
-        {
-            Map* map = unit->GetMap();
-            if (!map)
-                return false;
-
-            constexpr float kSampleSpacing = 1.0f;
-            constexpr int kMinSamples = 3;
-            constexpr int kMaxSamples = 16;
-            constexpr float kGroundTolerance = 1.25f;
-
-            float const flat = std::sqrt((to.x - from.x) * (to.x - from.x) + (to.y - from.y) * (to.y - from.y));
-            int const samples = std::clamp(int(flat / kSampleSpacing), kMinSamples, kMaxSamples);
-            for (int s = 1; s <= samples; ++s)
-            {
-                float const t = float(s) / float(samples + 1);
-                float const x = from.x + (to.x - from.x) * t;
-                float const y = from.y + (to.y - from.y) * t;
-                float const z = from.z + (to.z - from.z) * t;
-                float const ground = map->GetHeight(unit->GetPhaseShift(), x, y, z + 2.0f, true, 6.0f);
-                if (ground <= INVALID_HEIGHT || std::fabs(ground - z) > kGroundTolerance)
-                    return false;
-            }
-            return true;
         }
     }
 
@@ -161,11 +128,10 @@ namespace Movement
         args.path[0] = real_position;
         args.initialOrientation = real_position.orientation;
 
-        // The client asserts ("BadSpline: node N of M") on a path with a non-finite point or a zero-length segment, and Validate() only
-        // checks the segments after the first one: the corrected start point can coincide with path[1] when a unit re-paths while it
-        // is already standing at the next waypoint (hundreds of bots do this in town). Drop such points before the path is sent; if
-        // nothing but the start is left there is nothing to move to. Cyclic, Catmullrom, Parabolic and Falling paths and spell
-        // effect paths index their points, so they are left alone.
+        // The client rejects a path with a non-finite point or a segment shorter than 0.1 y (BadSpline / FLT_DIVIDE_BY_ZERO) and
+        // Validate() does not check the first segment: the corrected start can coincide with path[1]. Drop such points so the server
+        // spline has no zero-length segment either. Paths whose points are indexed (cyclic, catmullrom, parabolic, falling, spell
+        // effect) are left alone.
         if (!args.flags.Cyclic && !args.flags.Catmullrom && !args.flags.Parabolic && !args.flags.Falling &&
             !args.spellEffectExtra && args.effect_start_point == 0)
         {
@@ -186,87 +152,17 @@ namespace Movement
             args.path.resize(kept);
             if (args.path.size() < 2)
             {
-                // A pure turn: the path is the unit's own position (twice) and a facing is set - SetFacingToPoint / SetFacingToObject /
-                // SetFacingTo (MoveSpline::splineIsFacingOnly, which the client takes). Dropping its second point made every turn a
-                // no-op, so a bot that stood with its back to its victim never turned (MC Garr 2026-10-10: 2745 "[facing] refaced" with
-                // the angle unchanged, melee behind the boss and casters side-on, no swings, no casts).
-                if (args.facing.type == MONSTER_MOVE_NORMAL)
+                // facing only (MoveSpline::splineIsFacingOnly), turn, animation and transport enter/exit splines in place keep the
+                // unit's own position twice
+                if (args.facing.type != MONSTER_MOVE_NORMAL || args.turnData || args.animTier || args.flags.TransportEnter || args.flags.TransportExit)
+                    args.path.push_back(args.path[0]);
+                else
+                {
+                    // nothing to move to, end the current movement instead
+                    if (!move_spline.Finalized())
+                        MoveSplineInit(unit).Stop(true);
                     return 0;
-                args.path.push_back(args.path[0]);
-            }
-
-            // Player units (bots): the client merges a new path into a spline still running on its side and asserts when it does not fit
-            // (Unit_C.cpp(9651) mergePathResult(12), count(21) index(9): a 21-point path with the unit 28 y from point 9). Long, dense
-            // paths make that mismatch likely, so simplify them first: Douglas-Peucker with a small tolerance (collinear and near-collinear
-            // points go, corners stay) and a hard cap of 12 points, the tolerance growing until the path fits.
-            if (PlayerSideUnit(unit) && args.path.size() > 6)
-            {
-                auto const simplify = [](std::vector<Vector3> const& in, float eps)
-                {
-                    std::vector<bool> keep(in.size(), false);
-                    keep.front() = keep.back() = true;
-                    std::vector<std::pair<size_t, size_t>> stack{ { 0, in.size() - 1 } };
-                    while (!stack.empty())
-                    {
-                        auto [a, b] = stack.back();
-                        stack.pop_back();
-                        if (b <= a + 1)
-                            continue;
-                        Vector3 const ab = in[b] - in[a];
-                        float const len2 = ab.squaredLength();
-                        float worst = -1.0f;
-                        size_t worstIdx = a;
-                        for (size_t i = a + 1; i < b; ++i)
-                        {
-                            Vector3 const ap = in[i] - in[a];
-                            float t = len2 > 0.0001f ? std::clamp((ap.x * ab.x + ap.y * ab.y + ap.z * ab.z) / len2, 0.0f, 1.0f) : 0.0f;
-                            float const d = (ap - ab * t).length();
-                            if (d > worst) { worst = d; worstIdx = i; }
-                        }
-                        if (worst > eps)
-                        {
-                            keep[worstIdx] = true;
-                            stack.emplace_back(a, worstIdx);
-                            stack.emplace_back(worstIdx, b);
-                        }
-                    }
-                    std::vector<Vector3> out;
-                    for (size_t i = 0; i < in.size(); ++i)
-                        if (keep[i])
-                            out.push_back(in[i]);
-                    return out;
-                };
-                std::vector<Vector3> simplified = simplify(args.path, 0.6f);
-                for (float eps = 1.2f; simplified.size() > 12 && eps < 20.0f; eps *= 1.6f)
-                    simplified = simplify(args.path, eps);
-                if (simplified.size() >= 2)
-                    args.path = std::move(simplified);
-            }
-
-            // A bot path must be walkable: a segment that climbs or drops more than 3 yards over less than 1.5 yards of ground per yard
-            // of height is a cliff or a path through two levels (Alliance flag room, WSG: (1508,1462,350) toward (1504,1491,352), two
-            // client crashes at the same spot). Cut the path before that segment; the bot re-paths from where it stands.
-            if (PlayerSideUnit(unit))
-            {
-                // Segment 1 is exempt: it joins the unit's own position to the first path point (the navmesh polygon under it), which can
-                // sit a few yards above or below a unit standing on a door sill or a ramp lip. Cutting there left a single point, the move
-                // was dropped and the unit re-requested it every tick without ever leaving ([spline_cut] x1078 at the Horde start gates).
-                for (size_t i = 2; i < args.path.size(); ++i)
-                {
-                    Vector3 const d = args.path[i] - args.path[i - 1];
-                    float const flat = std::sqrt(d.x * d.x + d.y * d.y);
-                    if (std::fabs(d.z) > 3.0f && flat < 1.5f * std::fabs(d.z) &&
-                        !SegmentFollowsGround(unit, args.path[i - 1], args.path[i]))
-                    {
-                        TC_LOG_INFO("playerbot.v2", "[spline_cut] unit={} segment {}/{} dz={:.1f} flat={:.1f} at ({:.1f},{:.1f},{:.1f})",
-                                    unit->GetGUID().GetCounter(), i, args.path.size(), d.z, flat,
-                                    args.path[i - 1].x, args.path[i - 1].y, args.path[i - 1].z);
-                        args.path.resize(i);
-                        break;
-                    }
                 }
-                if (args.path.size() < 2)
-                    return 0;
             }
         }
 

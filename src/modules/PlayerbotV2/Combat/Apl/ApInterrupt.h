@@ -258,7 +258,7 @@ inline void Cast(ApPredicateContext const& ctx, BotIntentEmitter& e, uint32 spel
         a.spell, a.pet ? " (pet)" : "", uint32(c.rank), int64(c.unit->cast_remaining.count()));
 }
 
-// ---- Purge duty (chris: ike3 DecideRaidCast purge election) ----
+// ---- Purge duty (the owner: ike3 DecideRaidCast purge election) ----
 // Strips Magic buffs from an elite / boss engaged with a dungeon / raid
 // group. One bot at a time: every bot computes the same election from the
 // group snapshot - bot shamans with Purge first, then bot priests with
@@ -455,7 +455,7 @@ inline uint32 ClassicWarlockPet(BotSnapshotView const& s, GroupSnapshotView cons
         if (!s.is_in_raid() && s.knows_spell(SUMMON_FELHUNTER) && FelhunterDuty(s, *g)) return SUMMON_FELHUNTER;
         if (s.knows_spell(SUMMON_IMP)) return SUMMON_IMP;
     }
-    // An ambient (world / pool) warlock has its own demon out, stable per bot: a street full of voidwalkers looked uniform (chris,
+    // An ambient (world / pool) warlock has its own demon out, stable per bot: a street full of voidwalkers looked uniform (the owner,
     // Ironforge 2026-10-12). One of the demons it has learned, picked by its guid (Imp L1, Voidwalker L10, Succubus L20, Felhunter L30).
     // Without the soul shard the Succubus / Felhunter / Voidwalker cost, and with no demon out, the Imp comes out instead; a demon already
     // out is kept. Owned companions keep the rule above and below.

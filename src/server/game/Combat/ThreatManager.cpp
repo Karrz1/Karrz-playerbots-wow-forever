@@ -39,7 +39,6 @@ void ThreatReference::AddThreat(float amount)
 {
     if (amount == 0.0f)
         return;
-    float oldThreat = _baseAmount;
     _baseAmount = std::max<float>(_baseAmount + amount, 0.0f);
     if (amount > 0.0f)
         HeapNotifyIncreased();

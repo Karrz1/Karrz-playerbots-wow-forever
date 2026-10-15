@@ -21,8 +21,6 @@
 #include "CharacterCache.h"
 #include "DatabaseEnv.h"
 #include "DB2Stores.h"
-#include "ClassicOpcodes.h"
-#include "Config.h"
 #include "Formulas.h"
 #include "GameObject.h"
 #include "GameTime.h"
@@ -30,8 +28,6 @@
 #include "Item.h"
 #include "LFGMgr.h"
 #include "Log.h"
-#include "Playerbot/DiagProbes.h"
-#include "Util.h"
 #include "Loot.h"
 #include "MapManager.h"
 #include "MiscPackets.h"
@@ -42,8 +38,8 @@
 #include "Pet.h"
 #include "Player.h"
 #include "UpdateData.h"
+#include "World.h"
 #include "WorldSession.h"
-#include "Playerbot/PlayerbotHooks.h"
 
 Seconds Group::CountdownInfo::GetTimeLeft() const
 {
@@ -163,6 +159,11 @@ bool Group::Create(Player* leader)
 
     if (m_groupFlags & GROUP_FLAG_RAID)
         _initRaidSubGroupsCounter();
+
+    // Classic 1.60 (vanilla): with shared boss loot a new group starts on group loot, as in vanilla; personal loot would make the
+    // shared boss corpse free for all
+    if (sWorld->getBoolConfig(CONFIG_LOOT_SHARED_ENCOUNTER_LOOT) && !isBGGroup() && !isBFGroup())
+        m_lootMethod = GROUP_LOOT;
 
     m_lootThreshold = ITEM_QUALITY_UNCOMMON;
     m_looterGuid = leaderGuid;
@@ -289,7 +290,8 @@ void Group::ConvertToLFG()
 {
     m_groupFlags = GroupFlags(m_groupFlags | GROUP_FLAG_LFG | GROUP_FLAG_LFG_RESTRICTED);
     m_groupCategory = GROUP_CATEGORY_INSTANCE;
-    m_lootMethod = PERSONAL_LOOT;
+    // dungeon finder groups cannot change the method: group loot with shared boss loot (see Group::Create)
+    m_lootMethod = sWorld->getBoolConfig(CONFIG_LOOT_SHARED_ENCOUNTER_LOOT) ? GROUP_LOOT : PERSONAL_LOOT;
     if (!isBGGroup() && !isBFGroup())
     {
         CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_GROUP_TYPE);
@@ -920,15 +922,7 @@ void Group::SendUpdateToPlayer(Player* player, MemberSlot const* slot /*= nullpt
         partyUpdate.LfgInfos->MyKickVoteCount = 0;
     }
 
-    WorldPacket const* packet = partyUpdate.Write();
-    // human recipients only: a raid would log 40 lines per bot per update
-    if (!player->GetSession()->IsBot())
-        PROBE_LOG("[party_update] to {}: flags {:#x} index {} type {} myIndex {} seq {} members {} leader {} loot {} difficulty {} bytes {} wire opcode {:#x} (build70291 {})",
-                    player->GetName(), uint32(partyUpdate.PartyFlags), uint32(partyUpdate.PartyIndex), uint32(partyUpdate.PartyType), partyUpdate.MyIndex,
-                    partyUpdate.SequenceNum, uint32(partyUpdate.PlayerList.size()), partyUpdate.LeaderGUID.ToString(), partyUpdate.LootSettings.has_value(),
-                    partyUpdate.DifficultySettings.has_value(), packet->size(), ClassicOpcodes::TranslateServerOpcode(SMSG_PARTY_UPDATE),
-                    ClassicOpcodes::IsBuild70291OrLater());
-    player->SendDirectMessage(packet);
+    player->SendDirectMessage(partyUpdate.Write());
 }
 
 void Group::SendUpdateDestroyGroupToPlayer(Player* player) const
@@ -1074,7 +1068,7 @@ void Group::ChangeMembersGroup(ObjectGuid guid, uint8 group)
 
     // Broadcast the changes to the group
     SendUpdate();
-    Playerbot::Hooks::OnRaidSubgroupChanged(this, guid, group);
+    sScriptMgr->OnGroupSubgroupChange(this, guid, group);
 }
 
 void Group::ReorderMembers(std::vector<ObjectGuid> const& order)
@@ -1134,8 +1128,8 @@ void Group::SwapMembersGroups(ObjectGuid firstGuid, ObjectGuid secondGuid)
     CharacterDatabase.CommitTransaction(trans);
 
     SendUpdate();
-    Playerbot::Hooks::OnRaidSubgroupChanged(this, slots[0]->guid, slots[0]->group);
-    Playerbot::Hooks::OnRaidSubgroupChanged(this, slots[1]->guid, slots[1]->group);
+    sScriptMgr->OnGroupSubgroupChange(this, slots[0]->guid, slots[0]->group);
+    sScriptMgr->OnGroupSubgroupChange(this, slots[1]->guid, slots[1]->group);
 }
 
 // Retrieve the next Round-Roubin player for the group
@@ -1466,8 +1460,7 @@ void Group::SetLfgRoles(ObjectGuid guid, uint8 roles)
     if (slot == m_memberSlots.end())
         return;
 
-    // Unchanged roles need no SMSG_PARTY_UPDATE: every send makes each member's
-    // client rebuild its whole party/raid frame roster.
+    // unchanged roles need no party update
     if (slot->roles == roles)
         return;
 

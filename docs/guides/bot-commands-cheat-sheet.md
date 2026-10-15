@@ -10,10 +10,10 @@ Only the **owner** of a bot can order it. Orders are plain words, not case-sensi
 - **Buttons**: **/fb** sends the same words for you.
 
 ### Move and stance (party/raid chat)
-`follow` · `stay` · `hold` (stay but fight what attacks) · `resume` (act on their own again) · `come` (bot teleports to you) · `flee` (run back to you) · `passive` (start nothing, only defend) · `defensive` · `aggressive` · `disengage` (stop attacking)
+`follow` · `stay` · `hold` (stay but fight what attacks) · `resume` (act on their own again) · `come` (bot teleports to you) · `flee` (run back to you) · `passive` (stay close, defend you, do as told) · `defensive` · `aggressive` (may attack on their own) · `disengage` (stop attacking)
 
 ### Fighting (party/raid chat)
-`attack` (your target) · `assist` (same as attack) · `pull` (tanks open, rest join) · `pull back` · `fall back` · `back` · `rally here` (set rally point)
+`attack` (everyone attacks your target at once) · `assist` (same as attack) · `pull` (tank pulls, damage dealers wait for your attack or join after 6 s) · `pull back` (same, tank brings the monster to you) · `fall back` · `back` · `rally here` (set rally point)
 
 ### After a wipe
 `release` (dead bots release and run to their bodies)
@@ -60,6 +60,9 @@ Window buttons: **Call saved**, **Save group**, **Dismiss all**, **Unsave all**,
 ### Address a group of bots
 Start a whisper or `;` party line with a prefix: `tank:`, `healer:`, `dps:`, `all:`, a class such as `mage:`, or a bot's name.  
 Example: `;mage: attack`
+
+### Key bindings
+The add-on adds keys you can set under **Esc > Options > Key Bindings > AddOns > WoW Forever Bots**. They include **Attack (mouseover)**, which orders an attack on the monster under your mouse. Bots also react to the Attack and On-my-way pings.
 
 ### Tips
 - If a bot ignores you, check you are its owner and that it is in your group.

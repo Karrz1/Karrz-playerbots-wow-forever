@@ -18,6 +18,7 @@
 #include "tc_catch2.h"
 
 #include "../../src/modules/PlayerbotV2/Bot/ClassicHealCover.h"
+#include "../../src/modules/PlayerbotV2/Combat/Apl/HealClaimStore.h"
 
 using namespace Playerbot::Combat::ClassicHeal;
 
@@ -50,7 +51,7 @@ TEST_CASE("The tank's healers ask for a margin", "[ClassicHealCover]")
     CHECK_FALSE(CoveredByHealsInFlight(max_hp, hp, 0, 1700, 60, kHealTankTroubleCover));
 }
 
-// Karrz, live MC 2026-10-10: a Life Tapping warlock drew heals and HoTs from every healer.
+// Playtest live MC 2026-10-10: a Life Tapping warlock drew heals and HoTs from every healer.
 TEST_CASE("A warlock's own Life Tap is not healed until he is low", "[ClassicHealCover]")
 {
     CHECK(LifeTapSkip(true, false, 80, 0));
@@ -97,4 +98,27 @@ TEST_CASE("A refused cast releases this tick's claim on the same patient and no 
     CHECK(ClaimReleasable(true, false, 10000, 10300));      // the cast named no patient
     CHECK_FALSE(ClaimReleasable(false, false, 10000, 10300));   // a claim on someone else stays
     CHECK_FALSE(ClaimReleasable(false, true, 10000, 12600));    // a heal still running (2.6 s old) stays
+}
+
+// The claim book is one per process: a claim written through one WithHealClaims call site must be visible to every other.
+TEST_CASE("A heal claim written through one call site is read through another and released", "[ClassicHealCover]")
+{
+    uint32 const now = 1000;
+    WithHealClaims(now, [&](std::unordered_map<uint64, HealClaim>& claims)
+    {
+        HealClaim& c = claims[42];
+        c.patient  = ObjectGuid::Create<HighGuid::Player>(7);
+        c.spell    = 635;
+        c.amount   = 500.0f;
+        c.start_ms = now;
+        c.land_ms  = now + 2500;
+        return 0;
+    });
+
+    size_t const seen = WithHealClaims(now, [](std::unordered_map<uint64, HealClaim> const& c) { return c.count(42); });
+    CHECK(seen == 1);
+
+    ReleaseHealClaim(42, ObjectGuid::Create<HighGuid::Player>(7), now);
+    size_t const left = WithHealClaims(now, [](std::unordered_map<uint64, HealClaim> const& c) { return c.count(42); });
+    CHECK(left == 0);
 }

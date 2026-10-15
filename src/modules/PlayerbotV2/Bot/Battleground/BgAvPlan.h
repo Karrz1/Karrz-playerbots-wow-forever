@@ -10,7 +10,7 @@ namespace Playerbot::BgAvPlan
 {
     // The captain squad goes in once this many of the team stand at the waiting spot (ike3: attackers near the waiting spot >= 5).
     constexpr int kCaptainGatherCount = 5;
-    // Time cap (Karrz, AV 2026-10-11: a pile of bots waited at the Stonehearth staging spot for a quorum): after kCaptainGatherMaxMs of waiting the squad
+    // Time cap (playtest, AV 2026-10-11: a pile of bots waited at the Stonehearth staging spot for a quorum): after kCaptainGatherMaxMs of waiting the squad
     // goes with whoever is there (at least one), so bots arriving one at a time never park for good.
     constexpr uint32_t kCaptainGatherMaxMs = 75000;
     constexpr bool CaptainGather(int at_stage, bool latched, uint32_t waited_ms = 0)

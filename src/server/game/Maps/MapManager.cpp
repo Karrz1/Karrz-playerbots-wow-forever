@@ -33,6 +33,7 @@
 #include "ScenarioMgr.h"
 #include "ScriptMgr.h"
 #include "World.h"
+#include "WorldSession.h"
 #include "WorldStateMgr.h"
 
 #include <boost/dynamic_bitset.hpp>
@@ -189,6 +190,22 @@ GarrisonMap* MapManager::CreateGarrison(uint32 mapId, uint32 instanceId, Player*
 - create the instance if it's not created already
 - the player is not actually added to the instance (only in InstanceMap::Add)
 */
+// The group's recent instance owner decides the instance. When that owner holds no active save for the map (a companion, which never
+// saves) and the entering player holds one, the player's own save names the instance: otherwise a player saved to instance 46 is sent
+// to a fresh instance of the same map that his save does not name.
+static ObjectGuid GetInstanceOwner(Player const* player, Group const* group, MapDb2Entries const& entries)
+{
+    if (!group)
+        return player->GetGUID();
+
+    ObjectGuid owner = group->GetRecentInstanceOwner(entries.Map->ID);
+    if (owner != player->GetGUID() && !player->GetSession()->IsBot() && !sInstanceLockMgr.FindActiveInstanceLock(owner, entries)
+        && sInstanceLockMgr.FindActiveInstanceLock(player->GetGUID(), entries))
+        return player->GetGUID();
+
+    return owner;
+}
+
 Map* MapManager::CreateMap(uint32 mapId, Player* player, Optional<uint32> lfgDungeonsId /*= {}*/)
 {
     if (!player)
@@ -228,7 +245,7 @@ Map* MapManager::CreateMap(uint32 mapId, Player* player, Optional<uint32> lfgDun
         Group* group = player->GetGroup();
         Difficulty difficulty = group ? group->GetDifficultyID(entry) : player->GetDifficultyID(entry);
         MapDb2Entries entries{ entry, sDB2Manager.GetDownscaledMapDifficultyData(mapId, difficulty) };
-        ObjectGuid instanceOwnerGuid = group ? group->GetRecentInstanceOwner(mapId) : player->GetGUID();
+        ObjectGuid instanceOwnerGuid = GetInstanceOwner(player, group, entries);
         InstanceLock* instanceLock = sInstanceLockMgr.FindActiveInstanceLock(instanceOwnerGuid, entries);
         if (instanceLock)
         {
@@ -272,10 +289,9 @@ Map* MapManager::CreateMap(uint32 mapId, Player* player, Optional<uint32> lfgDun
             else
                 player->SetRecentInstance(mapId, newInstanceId);
         }
-        // A map that outlives its group (raid disbanded or re-formed while the map is still loaded: the lock keeps the instance id and
-        // the unload delay keeps the map) has no owning group any more. The owner is otherwise only set when the map is created, so the
-        // next group to walk in would fail Player::CheckInstanceValidity ("not in this instance's group") and be sent to the graveyard
-        // after 60 s. A group entering an unowned map becomes its owner; a map whose owner is alive is not touched.
+        // A map can outlive its group (raid disbanded or re-formed while the map is still loaded) and the owner is otherwise only
+        // set on creation, so the next group would fail Player::CheckInstanceValidity and be ported out. A group entering an
+        // unowned map becomes its owner; a map whose owner still exists is not touched.
         else if (group)
             if (InstanceMap* instanceMap = map->ToInstanceMap())
                 instanceMap->TrySetOwningGroup(group);
@@ -334,7 +350,7 @@ uint32 MapManager::FindInstanceIdForPlayer(uint32 mapId, Player const* player) c
         Group const* group = player->GetGroup();
         Difficulty difficulty = group ? group->GetDifficultyID(entry) : player->GetDifficultyID(entry);
         MapDb2Entries entries{ entry, sDB2Manager.GetDownscaledMapDifficultyData(mapId, difficulty) };
-        ObjectGuid instanceOwnerGuid = group ? group->GetRecentInstanceOwner(mapId) : player->GetGUID();
+        ObjectGuid instanceOwnerGuid = GetInstanceOwner(player, group, entries);
         InstanceLock* instanceLock = sInstanceLockMgr.FindActiveInstanceLock(instanceOwnerGuid, entries);
         uint32 newInstanceId = 0;
         if (instanceLock)

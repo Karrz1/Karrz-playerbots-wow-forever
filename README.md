@@ -34,8 +34,6 @@ Whisper and Invite, and a whisper box that works inside battlegrounds). Nothing 
 
 What the buttons and chat orders do: [`src/modules/PlayerbotV2/BOT_COMMANDS.md`](src/modules/PlayerbotV2/BOT_COMMANDS.md).
 
-New to the bots? Read the [player guides](docs/guides/README.md): getting started, your first group, dungeons and raids, trading, gear, battlegrounds and the FAQ.
-
 ## Server owners
 
 This repository contains the bot module, the SQL, the settings, and the files of advocaite's TrinityCore `forever` branch that the
@@ -70,13 +68,13 @@ Anyone can build the server Karrz plays on. These are the steps in order; the re
 
 1. **Build.** `cmake -S . -B build -DSERVERS=1 -DTOOLS=1 -DSCRIPTS=static -DBUILD_PLAYERBOT_V2=1`, then build `worldserver`, `bnetserver` and the tools. Details: [`INSTALL-BOTS.md`](INSTALL-BOTS.md).
 2. **Vanilla data.** Download the VMaNGOS world dump (`world_full_14_june_2021`) yourself and run `python3 tools/classic_spell_values/build_vanilla_data.py --dump <file>`. It writes the vanilla (1.12) spell, creature and boss numbers as SQL files that the server applies at start. See [`tools/classic_spell_values/README.md`](tools/classic_spell_values/README.md).
-3. **Maps.** Extract the maps, vmaps and mmaps from your own client with the tools built in step 1: `tools/extract_client_data.sh` (Linux) or `tools/extract_client_data.ps1` (Windows) runs `mapextractor`, `vmap4extractor`, `vmap4assembler` and `mmaps_generator` in order. Put the result in `DataDir`. No map files are included, and the map format is the stock TrinityCore one.
+3. **Maps.** Extract the maps, vmaps and mmaps from your own client with the tools built in step 1: `tools/extract_client_data.sh` (Linux) or `tools/extract_client_data.ps1` (Windows) runs `mapextractor`, `vmap4extractor`, `vmap4assembler` and `mmaps_generator` in order. Put the result in `DataDir`. No map files are included, and the map format is the stock TrinityCore one. The mmaps (pathfinding data) are REQUIRED for the bots: without them they cannot walk, and the server logs "Could not load MMAP ... result: 2". The full run takes a few hours and about 45 GB of free disk while it works (about 2 GB are left); the Windows script can be started again after an interruption with `-Resume`. Never copy someone else's mmaps: they are made from your own client.
 4. **Config.** Create the bot database (`INSTALL-BOTS.md`, step 3), rename `playerbot.conf.dist` to `playerbot.conf` in `worldserver.conf.d`, and copy [`examples/karrz-realm.conf`](examples/karrz-realm.conf) into the same folder. It holds the realm's world bots and 50/50 faction balance, the battleground rules, the raid switches (solo raid entry, saved on entry, trash stays dead, no Molten Core runes, no attunements, open Ahn'Qiraj gates), the auction house bot and the logging. Lower the bot numbers in it on a smaller machine. The first start creates a few thousand roster characters, which takes about two hours.
 5. **Add-on.** Copy `src/modules/PlayerbotV2/Addon/ForeverBots` into `<WoW folder>/_classic_beta_/Interface/AddOns/` (the public repository also has it ready as `ForeverBots-addon.zip`). Type `/fb` in game.
 
 ## Credits and licenses
 
-Karrz (Karrz1).: WoW Forever Bots. agatho: PlayerbotV2, the base of the bot module. advocaite: the Forever
+Karrz (Karrz1): WoW Forever Bots. agatho: PlayerbotV2, the base of the bot module. advocaite: the Forever
 TrinityCore core. TrinityCore: the server. Also credited in [`NOTICE.md`](NOTICE.md): ike3 / cmangos playerbots, VMaNGOS, cMaNGOS,
 mod-playerbots (AzerothCore, reference only), SimulationCraft.
 License: GPL-2.0 ([`LICENSE`](LICENSE)), like TrinityCore. Details in [`NOTICE.md`](NOTICE.md) and [`BOTS.md`](BOTS.md).

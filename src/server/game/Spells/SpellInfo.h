@@ -376,6 +376,7 @@ class TC_GAME_API SpellInfo
         SpellCastTimesEntry const* CastTimeEntry = nullptr;
         uint32 RecoveryTime = 0;
         uint32 CategoryRecoveryTime = 0;
+        bool ClassicCooldownOverridden = false;   // Classic 1.60: classic_spell_info changed the cooldown; the client still predicts the one in its own data until told
         uint32 StartRecoveryCategory = 0;
         uint32 StartRecoveryTime = 0;
         uint32 CooldownAuraSpellId = 0;

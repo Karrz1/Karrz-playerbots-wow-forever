@@ -17,7 +17,7 @@
 
 #include "tc_catch2.h"
 
-#include "../../src/server/game/Playerbot/JunkDrop.h"
+#include "../../src/modules/PlayerbotV2/Api/JunkDrop.h"
 
 using namespace Playerbot;
 

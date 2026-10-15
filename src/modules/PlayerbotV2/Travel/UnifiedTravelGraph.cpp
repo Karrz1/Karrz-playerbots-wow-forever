@@ -1254,7 +1254,7 @@ Route UnifiedTravelGraph::FindRoute(RouteRequest const& req) const
     // walk, so weight it heavily; the elevator-stop nodes on the bot's
     // own level then win the attach and the lift edge enters the route.
     // (validate_source_walk does this properly with live navmesh checks
-    // but is world-thread-only; this heuristic covers AI-thread callers.)
+    // but is world-thread-only; this heuristic covers bot logic-thread callers.)
     auto attach_cost = [](float d2, float dz) -> float
     { return (d2 + 4.0f * std::fabs(dz)) / kWalkSpeedYds; };
     if (auto it = _nodes_by_map.find(req.from_map); it != _nodes_by_map.end())

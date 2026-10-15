@@ -54,7 +54,7 @@ LOCK_HIERARCHY = {
     "BOT_SCHEDULER": 3100,
     "DEATH_RECOVERY": 3200,
 
-    # Layer 5: Bot AI
+    # Layer 5: Bot logic
     "BOT_AI_STATE": 4000,
     "BEHAVIOR_MANAGER": 4100,
     "ACTION_PRIORITY": 4200,

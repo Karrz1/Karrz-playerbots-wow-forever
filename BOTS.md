@@ -12,7 +12,7 @@ Base: `advocaite/TrinityCore` branch `forever` at `440d365e`. With `-DBUILD_PLAY
 
 | Part | Where |
 |---|---|
-| Bot module (AI, raid brain, BG scripts, world bots, fleet, travel) | `src/modules/PlayerbotV2/` |
+| Bot module (bot logic, raid brain, BG scripts, world bots, fleet, travel) | `src/modules/PlayerbotV2/` |
 | Core side: a small API plus hooks | `src/server/game/Playerbot/`, `src/server/game/Modules/`, `src/server/scripts/Commands/cs_playerbot_v2.cpp`, hooks in login, group, chat, spell, threat, BG/LFG queue, map, session |
 | Bot database migrations and seed data | `sql/playerbot_v2/`, `sql/playerbot_shared/` |
 | Settings | `src/modules/PlayerbotV2/conf/playerbot.conf.dist` (every key documented), `examples/zz-forever-bots.conf` (optional extras, off unless you copy it in) |
@@ -72,7 +72,7 @@ Step by step: `INSTALL-BOTS.md`. More: `src/modules/PlayerbotV2/INSTALL.md`, `WO
 | Key | Default | What it does |
 |---|---|---|
 | `Playerbot.SharedDatabase` | `playerbot` | name of the shared database |
-| `Playerbot.AiWorkerThreads` | `0` | AI worker threads (0 = automatic) |
+| `Playerbot.AiWorkerThreads` | `0` | bot worker threads (0 = automatic) |
 | `Playerbot.World.Enable` | `0` | ambient bots around real players |
 | `Playerbot.World.MaxBots` / `BotsPerPlayer` / `ActivityRadius` | `100` / `25` / `300` | size and reach of that population |
 | `Playerbot.World.RssBudgetMb` | `0` | memory cap for the spawner (0 = off) |
@@ -85,11 +85,11 @@ Without a player summoning bots nothing spawns, and with `World.Enable = 0` no a
 
 ## Credits
 
-- **Karrz (Karrz1)**.: WoW Forever Bots, i.e. the Classic adaptation, raid, battleground, world
+- **Karrz (Karrz1)**: WoW Forever Bots, i.e. the Classic adaptation, raid, battleground, world
   population and auction house work, and the Classic data and core fixes in this tree.
 - **agatho**: PlayerbotV2, the base of the module (https://github.com/agatho/TrinityCore, branch `playerbot-v2`).
 - **advocaite**: the Forever TrinityCore core this is built on.
-- **ike3 / cmangos playerbots**, **VMaNGOS** and **cMaNGOS**: behaviour that was ported, and the 1.12 numbers the builder reads from the VMaNGOS database (see `NOTICE.md`).
+- **ike3 / cmangos playerbots** (https://github.com/ike3/mangosbot-bots), **VMaNGOS** and **cMaNGOS**: behaviour that was ported, and the 1.12 numbers the builder reads from the VMaNGOS database (see `NOTICE.md`).
 - **mod-playerbots (AzerothCore)**: read as a reference for behaviour ideas only; no code copied.
 - **SimulationCraft**: reference for rotation and talent data.
 

@@ -77,7 +77,7 @@ namespace
     void ApplyHandcraftedRoadsIfNeeded(uint32 mapId, uint32 instanceId)
     {
 #if defined(TRINITY_HANDCRAFTED_ROADS)
-        if (!sConfigMgr->GetBoolDefault("HandcraftedRoads.Enable", true))
+        if (!sConfigMgr->GetBoolDefault("HandcraftedRoads.Enable", false))
             return;
 
         std::vector<HandcraftedRoadSegment> const& segs = HandcraftedRoadStorage::GetForMap(mapId);
@@ -151,7 +151,7 @@ namespace TerrainMgrDetail
     std::size_t ApplyHandcraftedRoadsToAllLoadedMaps()
     {
 #if defined(TRINITY_HANDCRAFTED_ROADS)
-        if (!sConfigMgr->GetBoolDefault("HandcraftedRoads.Enable", true))
+        if (!sConfigMgr->GetBoolDefault("HandcraftedRoads.Enable", false))
             return 0;
 
         // We collect mapIds first (deduplicated) so the inner apply pass
@@ -206,38 +206,14 @@ namespace TerrainMgrDetail
     {
 #if defined(TRINITY_HANDCRAFTED_ROADS)
         std::vector<HandcraftedRoadSegment> const& segs = HandcraftedRoadStorage::GetForMap(mapId);
-        TC_LOG_ERROR("misc",
-            "[handcrafted-road] apply diag: mapId={} segments_in_storage={}",
-            mapId, uint32(segs.size()));
         if (segs.empty())
             return 0;
 
-        // Diagnostic: probe every plausible instanceId so we can see whether the
-        // shared-mesh assumption (instance 0) is correct on the live worldserver.
         dtNavMesh* navMesh = MMAP::MMapManager::instance()->GetNavMesh(mapId, 0);
-        TC_LOG_ERROR("misc",
-            "[handcrafted-road] apply diag: GetNavMesh(mapId={}, instance=0) returned {}",
-            mapId, navMesh ? "non-null" : "nullptr");
         if (!navMesh)
-            return 0;
-
-        TC_LOG_ERROR("misc",
-            "[handcrafted-road] apply diag: navmesh maxTiles={} (count of tiles populated may be smaller)",
-            navMesh->getMaxTiles());
-
-        // Per-segment diagnostic: scan the first 3 segments to surface
-        // tilesScanned/polysExamined/found so we can pinpoint where the
-        // corridor algorithm rejects everything.
-        for (std::size_t i = 0; i < std::min<std::size_t>(3, segs.size()); ++i)
         {
-            HandcraftedRoadSegment const& s = segs[i];
-            Road::Segment rs{ s.fromX, s.fromY, s.toX, s.toY, s.width };
-            Road::CorridorResult const r = Road::ScanCorridor(*navMesh, rs);
-            TC_LOG_ERROR("misc",
-                "[handcrafted-road] apply diag seg #{}: tc=({}, {})->({}, {}) width={} "
-                "tilesScanned={} polysExamined={} polysFound={}",
-                uint32(s.id), s.fromX, s.fromY, s.toX, s.toY, s.width,
-                r.tilesScanned, r.polysExamined, uint32(r.polyRefs.size()));
+            TC_LOG_DEBUG("misc", "[handcrafted-road] map {}: no navmesh loaded, {} segments not applied", mapId, uint32(segs.size()));
+            return 0;
         }
 
         std::vector<Road::Segment> roadSegs;
@@ -246,9 +222,8 @@ namespace TerrainMgrDetail
             roadSegs.push_back({ s.fromX, s.fromY, s.toX, s.toY, s.width });
 
         std::size_t const tagged = Road::ApplyCorridorsToNavmesh(*navMesh, roadSegs);
-        TC_LOG_ERROR("misc",
-            "[handcrafted-road] apply diag: total tagged={} polys across {} segments",
-            uint32(tagged), uint32(roadSegs.size()));
+        TC_LOG_DEBUG("misc", "[handcrafted-road] map {}: tagged {} polys across {} segments",
+            mapId, uint32(tagged), uint32(roadSegs.size()));
 
         // Mark as applied so the next first-tile-load on this map
         // doesn't re-walk the corridor for nothing.
@@ -468,9 +443,12 @@ void TerrainInfo::LoadVMap(int32 gx, int32 gy)
             break;
         case VMAP::LoadResult::VersionMismatch:
         case VMAP::LoadResult::ReadFromFileFailed:
-            // PLAYERBOT FIX: Cache the failure to prevent repeated load attempts
-            _vmapLoadFailed[GetBitsetIndex(gx, gy)] = true;
-            TC_LOG_DEBUG("maps", "VMAP not available name:{}, id:{}, x:{}, y:{} (vmap rep.: x:{}, y:{}) - will not retry", GetMapName(), GetId(), gx, gy, gx, gy);
+            // the tile is still loaded (and unloaded) every time so the vmap tile refs stay balanced, only the error is reported once
+            if (!_vmapLoadFailed[GetBitsetIndex(gx, gy)])
+            {
+                _vmapLoadFailed[GetBitsetIndex(gx, gy)] = true;
+                TC_LOG_ERROR("maps", "Could not load VMAP name:{}, id:{}, x:{}, y:{} (vmap rep.: x:{}, y:{})", GetMapName(), GetId(), gx, gy, gx, gy);
+            }
             break;
         case VMAP::LoadResult::DisabledInConfig:
             TC_LOG_DEBUG("maps", "Ignored VMAP name:{}, id:{}, x:{}, y:{} (vmap rep.: x:{}, y:{})", GetMapName(), GetId(), gx, gy, gx, gy);
@@ -485,49 +463,36 @@ void TerrainInfo::LoadMMapImpl(uint32 instanceId, int32 gx, int32 gy)
     if (!DisableMgr::IsPathfindingEnabled(GetId()))
         return;
 
-    // PLAYERBOT FIX: Skip loading if we already know this tile failed (prevents repeated file access attempts)
-    if (_mmapLoadFailed[GetBitsetIndex(gx, gy)])
-        return;
+    // a missing or broken tile is not retried (every instance of the map would try it again)
+    {
+        std::scoped_lock lock(_loadMutex);
+        if (_mmapLoadFailed[GetBitsetIndex(gx, gy)])
+            return;
+    }
 
-    switch (MMAP::LoadResult mmapLoadResult = MMAP::MMapManager::instance()->loadMap(sWorld->GetDataPath(), GetId(), instanceId, gx, gy))
+    MMAP::LoadResult mmapLoadResult = MMAP::MMapManager::instance()->loadMap(sWorld->GetDataPath(), GetId(), instanceId, gx, gy);
+    switch (mmapLoadResult)
     {
         case MMAP::LoadResult::Success:
             TC_LOG_DEBUG("mmaps.tiles", "MMAP loaded name:{}, id:{}, x:{}, y:{} (mmap rep.: x:{}, y:{})", GetMapName(), GetId(), gx, gy, gx, gy);
-            // Apply handcrafted road segments to this map's navmesh on the
-            // FIRST successful tile load. The helper is idempotent per
-            // (mapId, instanceId). Tiles loaded LATER (e.g. when a player
-            // crosses into a previously-untouched grid hours into uptime)
-            // will not be retagged — see the comment above
-            // ApplyHandcraftedRoadsIfNeeded for the trade-off.
-            ApplyHandcraftedRoadsIfNeeded(GetId(), instanceId);
-            break;
+            ApplyHandcraftedRoadsIfNeeded(GetId(), instanceId);    // idempotent per (map, instance), see its comment
+            return;
         case MMAP::LoadResult::AlreadyLoaded:
-            // The hook ALSO fires here, so a navmesh that was preloaded
-            // (via MMapManager::loadMap during early-server prewarm) before
-            // HandcraftedRoadStorage::LoadFromDB finished still gets
-            // retagged the next time *any* tile is touched for it. The
-            // apply set inside ApplyHandcraftedRoadsIfNeeded guards against
-            // re-walking the corridor on every subsequent tile load.
-            ApplyHandcraftedRoadsIfNeeded(GetId(), instanceId);
-            break;
-        case MMAP::LoadResult::FileNotFound:
-            // PLAYERBOT FIX: Cache the failure to prevent repeated load attempts
-            _mmapLoadFailed[GetBitsetIndex(gx, gy)] = true;
-            if (_parentTerrain)
-                break; // don't log tile not found errors for child maps
-            TC_LOG_DEBUG("mmaps.tiles", "MMAP not available name:{}, id:{}, x:{}, y:{} (mmap rep.: x:{}, y:{}) - will not retry", GetMapName(), GetId(), gx, gy, gx, gy);
-            break;
-        case MMAP::LoadResult::VersionMismatch:
-        case MMAP::LoadResult::ReadFromFileFailed:
-        case MMAP::LoadResult::LibraryError:
-            // PLAYERBOT FIX: Cache these failures too - they won't succeed on retry
-            _mmapLoadFailed[GetBitsetIndex(gx, gy)] = true;
-            TC_LOG_WARN("mmaps.tiles", "MMAP failed name:{}, id:{}, x:{}, y:{} (mmap rep.: x:{}, y:{}) result: {} - will not retry", GetMapName(), GetId(), gx, gy, gx, gy, AsUnderlyingType(mmapLoadResult));
-            break;
+            ApplyHandcraftedRoadsIfNeeded(GetId(), instanceId);    // a navmesh preloaded before the road storage loaded
+            return;
         default:
-            TC_LOG_WARN("mmaps.tiles", "Could not load MMAP name:{}, id:{}, x:{}, y:{} (mmap rep.: x:{}, y:{}) result: {}", GetMapName(), GetId(), gx, gy, gx, gy, AsUnderlyingType(mmapLoadResult));
             break;
     }
+
+    {
+        std::scoped_lock lock(_loadMutex);
+        _mmapLoadFailed[GetBitsetIndex(gx, gy)] = true;
+    }
+
+    if (mmapLoadResult == MMAP::LoadResult::FileNotFound && _parentTerrain)
+        return; // don't log tile not found errors for child maps
+
+    TC_LOG_WARN("mmaps.tiles", "Could not load MMAP name:{}, id:{}, x:{}, y:{} (mmap rep.: x:{}, y:{}) result: {}", GetMapName(), GetId(), gx, gy, gx, gy, AsUnderlyingType(mmapLoadResult));
 }
 
 void TerrainInfo::UnloadMap(int32 gx, int32 gy)

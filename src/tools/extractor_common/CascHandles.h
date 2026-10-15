@@ -51,8 +51,8 @@ namespace CASC
         File* OpenFile(uint32 fileDataId, uint32 localeMask, bool printErrors = false, bool zerofillEncryptedParts = false) const;
 
         // Raw CascLib HANDLE used by CascFindFirstFile / CascFindNextFile.
-        // Exposed for tooling that needs to enumerate the root catalog
-        // (e.g. world_editor minimap path discovery).  Do not close.
+        // Exposed for tooling that needs to enumerate the root catalog.
+        // Do not close.
         HANDLE GetHandle() const { return _handle; }
 
     private:

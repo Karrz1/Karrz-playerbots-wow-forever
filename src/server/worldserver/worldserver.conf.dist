@@ -434,7 +434,6 @@ mmap.enablePathFinding = 1
 #                     each <map>_<y>_<x>.map). Polygons without a road
 #                     tag are unaffected — old extracted mmaps without
 #                     .road files behave identically to before.
-#                     See src/modules/PlayerbotV2/docs/ROAD_AWARE_PATHFINDING_PLAN.md.
 #        Default:     0 - (Disabled, neutral cost for road polygons)
 #                     1 - (Enabled, road polygons cost less to traverse)
 
@@ -475,12 +474,14 @@ Pathfinding.RoadCostMounted = 0.35
 #                     1.3×, 60° costs 1.6×. The slope term tempers raw
 #                     road preference so bots don't switchback up a
 #                     mountain just because there's a road on it.
-#                     Set to 0.0 to disable the slope penalty entirely.
+#                     Set to 0.0 to disable the slope penalty entirely (stock
+#                     pathing for every creature). The bot module's
+#                     playerbot.conf sets 1.0.
 #                     The dtQueryFilterTC subclass implements this; see
 #                     src/server/game/Movement/dtQueryFilterTC.cpp.
-#        Default:     1.0
+#        Default:     0.0
 
-Pathfinding.SlopeCoefficient = 1.0
+Pathfinding.SlopeCoefficient = 0.0
 
 ###################################################################################################
 # Handcrafted road segments
@@ -488,10 +489,11 @@ Pathfinding.SlopeCoefficient = 1.0
 #    HandcraftedRoads.Enable
 #        Description: Apply operator-curated road segments from the handcrafted_road table
 #                     to each map's navmesh at load time.  Tagged polys get the road-bias in
-#                     PathGenerator (slope-aware road bonus). Set to 0 to disable for debugging.
-#        Default:     1
+#                     PathGenerator (slope-aware road bonus). The bot module's playerbot.conf sets 1.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
 ###################################################################################################
-HandcraftedRoads.Enable = 1
+HandcraftedRoads.Enable = 0
 
 ###################################################################################################
 # Handcrafted road centerline routing (bots)
@@ -501,7 +503,9 @@ HandcraftedRoads.Enable = 1
 #                     bots FOLLOW the authored road polylines for long ground trips (via a waypoint
 #                     spline) instead of only getting the NAV_AREA_ROAD area-cost nudge. The
 #                     area-cost bias (HandcraftedRoads.Enable above) remains the fallback.
-#        Default:     1 (enabled)
+#                     The bot module's playerbot.conf sets 1.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
 #
 #    RoadGraph.MinDistance
 #        Description: Minimum straight-line distance (yards) before road routing is considered.
@@ -524,7 +528,7 @@ HandcraftedRoads.Enable = 1
 #                     shared junction node when building the graph.
 #        Default:     3.0
 ###################################################################################################
-RoadGraph.Enable = 1
+RoadGraph.Enable = 0
 RoadGraph.MinDistance = 150.0
 RoadGraph.MaxDetourRatio = 1.6
 RoadGraph.MaxEntryDistance = 120.0
@@ -1175,6 +1179,15 @@ CastUnstuck = 1
 Instance.IgnoreLevel = 0
 
 #
+#    Instance.IgnoreAttunement
+#        Description: Ignore attunement item and quest requirements when entering instances
+#                     (access_requirement item and quest columns).
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+Instance.IgnoreAttunement = 0
+
+#
 #    Instance.IgnoreRaid
 #        Description: Ignore raid group requirement when entering instances.
 #        Default:     0 - (Disabled)
@@ -1205,16 +1218,6 @@ Instance.BindOnEntry = 0
 #                     1 - (Enabled)
 
 Instance.PersistRaidTrash = 0
-
-#
-#    Instance.IgnoreAttunement
-#        Description: Optional server-owner option. The attunement item and quest of an instance
-#                     (access_requirement item / quest columns: Molten Core, Onyxia, Blackwing Lair,
-#                     Naxxramas ...) are not required to enter. Level limits are Instance.IgnoreLevel.
-#        Default:     0 - (Disabled, Blizzlike)
-#                     1 - (Enabled)
-
-Instance.IgnoreAttunement = 0
 
 #
 #    Instance.AhnQirajGatesOpen
@@ -1250,10 +1253,9 @@ Instance.MoltenCoreSkipRunes = 0
 
 #
 #    Instance.CombatResurrectionLimit
-#        Description: Retail rule: during a raid boss encounter a resurrection spell needs a combat
-#                     resurrection charge (one charge, refilled on a timer). Classic has no such limit:
-#                     off, any resurrection works at any time, also with the boss still in combat.
-#        Default:     0 - (Disabled, the classic way)
+#        Description: Limit resurrections during a boss encounter to the encounter's combat
+#                     resurrection charges. Classic has no such limit.
+#        Default:     0 - (Disabled, resurrection works at any time)
 #                     1 - (Enabled)
 
 Instance.CombatResurrectionLimit = 0
@@ -3732,6 +3734,16 @@ GameObject.CheckInvalidPosition = 0
 Loot.EnableAELoot = 1
 
 #
+#     Loot.SharedEncounterLoot
+#        Description: Dungeon and raid bosses drop their whole loot table on one corpse that the group loots
+#                     under its loot method, like vanilla. Disabled: retail personal encounter loot, where each
+#                     roll of the loot table goes to one random player.
+#        Default:     1  - (Shared encounter loot enabled)
+#                     0  - (Personal encounter loot)
+
+Loot.SharedEncounterLoot = 1
+
+#
 ###################################################################################################
 
 ###################################################################################################
@@ -3744,6 +3756,16 @@ Loot.EnableAELoot = 1
 #
 
 AuctionHouseBot.Account = 0
+
+#
+#    AuctionHouseBot.Sellers.Count
+#       Description: With AuctionHouseBot.Account set, make sure that account owns this many named
+#                    level-60 characters at startup (bare character rows, never logged in), so bot
+#                    listings show a seller name. Existing characters on the account count.
+#                    The account id must be below 2147483648.
+#       Default:     0 - (Disabled, no characters are created)
+
+AuctionHouseBot.Sellers.Count = 0
 
 #
 #    AuctionHouseBot.Update.Interval
@@ -3760,6 +3782,26 @@ AuctionHouseBot.Update.Interval = 20
 #                    1 - (Enabled)
 
 AuctionHouseBot.Seller.Enabled = 0
+
+#
+#    AuctionHouseBot.Vanilla.Only
+#       Description: Only list vanilla-era items: no items of a later expansion, no gems or glyphs,
+#                    quality up to epic, required level and item level within the limits below.
+#                    Items in AuctionHouseBot.forceIncludeItems are listed regardless.
+#       Default:     0 - (Disabled, every item that passes the other filters can be listed)
+#                    1 - (Enabled)
+
+AuctionHouseBot.Vanilla.Only = 0
+
+#
+#    AuctionHouseBot.Vanilla.MaxReqLevel
+#    AuctionHouseBot.Vanilla.MaxItemLevel
+#       Description: Highest required level and item level listed with AuctionHouseBot.Vanilla.Only = 1.
+#       Default:     60  - (MaxReqLevel)
+#                    100 - (MaxItemLevel)
+
+AuctionHouseBot.Vanilla.MaxReqLevel = 60
+AuctionHouseBot.Vanilla.MaxItemLevel = 100
 
 #
 #    AuctionHouseBot.Alliance.Items.Amount.Ratio
@@ -4223,6 +4265,66 @@ AuctionHouseBot.Buyer.ChanceMultiplier.Yellow = 100
 AuctionHouseBot.Buyer.Recheck.Interval = 20
 
 #
+#    AuctionHouseBot.Buyer.Stacks
+#       Description: Also buy stackable listings (herbs, ore, cloth...), always the whole listing.
+#       Default:     0 - (Disabled, only single items are bought)
+#                    1 - (Enabled)
+
+AuctionHouseBot.Buyer.Stacks = 0
+
+#
+#    AuctionHouseBot.Buyer.MaxPriceMultiplier
+#       Description: Never pay more per item than this times its fair price (vendor buy price, or four
+#                    times the vendor sell price, at least 1 silver).
+#       Default:     0 - (No cap)
+
+AuctionHouseBot.Buyer.MaxPriceMultiplier = 0
+
+#
+#    AuctionHouseBot.Buyer.MinDelay
+#    AuctionHouseBot.Buyer.MaxDelay
+#       Description: Leave a new listing alone for a delay (in seconds) between these two values. The delay
+#                    differs per listing but never changes for one.
+#       Default:     0 - (MinDelay, no delay)
+#                    0 - (MaxDelay, no delay)
+
+AuctionHouseBot.Buyer.MinDelay = 0
+AuctionHouseBot.Buyer.MaxDelay = 0
+
+#
+#    AuctionHouseBot.Buyer.DailyBudgetGold
+#       Description: Gold the buyer may spend on buyouts per day.
+#       Default:     0 - (Unlimited)
+
+AuctionHouseBot.Buyer.DailyBudgetGold = 0
+
+#
+#    AuctionHouseBot.Buyer.MaxBuysPerHour
+#       Description: Buyouts the buyer may make per hour.
+#       Default:     0 - (Unlimited)
+
+AuctionHouseBot.Buyer.MaxBuysPerHour = 0
+
+#
+#    AuctionHouseBot.Buyer.FairPricing
+#       Description: Roll by fair price instead of AuctionHouseBot.Buyer.ChanceFactor: a listing at or under
+#                    the fair price is always bought, above it the chance falls linearly to
+#                    AuctionHouseBot.Buyer.FairMinChance percent at the price cap (MaxPriceMultiplier times
+#                    the fair price, or three times it when MaxPriceMultiplier is 0); nothing above the cap.
+#                    AuctionHouseBot.Buyer.ChanceMultiplier.QUALITY still applies.
+#       Default:     0 - (Disabled)
+#                    1 - (Enabled)
+
+AuctionHouseBot.Buyer.FairPricing = 0
+
+#
+#    AuctionHouseBot.Buyer.FairMinChance
+#       Description: Chance (in percent) to buy a listing priced at the cap with AuctionHouseBot.Buyer.FairPricing = 1.
+#       Default:     35
+
+AuctionHouseBot.Buyer.FairMinChance = 35
+
+#
 ###################################################################################################
 
 ###################################################################################################
@@ -4329,14 +4431,13 @@ BlackMarket.UpdatePeriod = 24
 #
 #                     CrashRing (Type = 4): keeps the last N log lines in memory for the crash report (the .log file next to the
 #                     .dmp and .txt in the Crashes folder). optional1 = N (default 200, at most 1024). Link it to the loggers whose
-#                     lines should appear, as done for root, server and playerbot below.
+#                     lines should appear, as done for root and server below.
 #
 
 Appender.Console=1,3,0
 Appender.Server=2,2,0,Server.log,w,104857600,3
 Appender.GM=2,2,1,GM.log
 Appender.DBErrors=2,2,0,DBErrors.log,w
-Appender.Playerbot=2,3,0,Playerbot.log,w,67108864,5
 Appender.CrashRing=4,3,7,300
 
 #  Logger config values: Given a logger "name"
@@ -4364,9 +4465,6 @@ Logger.scripts.hotswap=3,Console Server
 Logger.sql.sql=5,Console DBErrors
 Logger.sql.updates=3,Console Server
 Logger.mmaps=3,Server
-# PlayerbotV2 diagnostics ([wedge], [move_lock], [path_fail] ...) go to Playerbot.log only; add Console to watch them live
-Logger.playerbot.v2=3,Playerbot CrashRing
-Logger.playerbot.api=3,Playerbot CrashRing
 
 #Logger.addon=3,Console Server
 #Logger.ahbot=3,Console Server
@@ -4675,14 +4773,22 @@ Recap.Announce = 3
 
 Classic.GuildFinder = 0
 
-#    Classic.SharedEncounterLoot
-#        Description: Bosses (dungeon encounters) drop their whole loot table on one shared corpse under the group's
-#                     loot rules, like vanilla (Molten Core: 2-3 epics per boss). Off: retail personal loot, where each
-#                     table roll goes to one random player.
-#        Default:     1 - (Enabled)
-#                     0 - (Disabled)
+#    Classic.OpcodeGroupShift
+#        Description: Client 1.60.1.70291 numbers the message groups one higher than 70245 (and changed some packet and
+#                     update field layouts). -1 picks it from the realm's game build (realmlist.gamebuild >= 70291).
+#        Default:     -1 - (From the realm build)
+#                      0 - (70245 and older)
+#                      1 - (70291 and newer)
 
-Classic.SharedEncounterLoot = 1
+Classic.OpcodeGroupShift = -1
+
+#    Classic.MainGroupInsertIndex
+#        Description: Client 70291+: first 70245 index (decimal) of the main server message group that moved up by one.
+#                     152 (0x98): the official 70338 sniff has the party update (0x97) unchanged; with a lower value the
+#                     party frame never appeared.
+#        Default:     152
+
+Classic.MainGroupInsertIndex = 152
 
 #    Classic.ClientMainGroupInsertIndex
 #        Description: Client 70291+: 70291 index (decimal) of the message added to the main client group; the client messages
@@ -4691,20 +4797,27 @@ Classic.SharedEncounterLoot = 1
 
 Classic.ClientMainGroupInsertIndex = 315
 
-#    Classic.Feature.*
-#        Description: Per-field overrides for SMSG_FEATURE_SYSTEM_STATUS, read at every
-#                     login (".reload config" and relog, no restart). Unset = the value the server chose. For bisecting which flag
-#                     makes the 70291 client lose its own /w handler (doc/whisper-feature-bisect.md).
-#        Keys (bool unless noted): VoiceEnabled, VoiceChatParentalDisabled, VoiceChatParentalMuted, SpeakForMeAllowed,
-#                     NetEaseChatTelemetryEnabled, GlobalUserGeneratedContentMuteEnabled, AccountUserGeneratedContentIsRisky,
-#                     FriendsDisabled, DoesAccountNeedAADCPrompt, IsAccountOptedInToAADC;
-#                     SocialRestriction (int, 0 = none; 2 = age verification, blocks chat).
-#        Example:     Classic.Feature.VoiceChatParentalDisabled = 0
-#
+#    Classic.OfficialFeatureFlags
+#        Description: Send the client feature flags exactly as the official server does (sniffs 70205/70235).
+#                     0 goes back to the older hand-picked flags.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+
+Classic.OfficialFeatureFlags = 1
+
+#    Classic.MountIndoorsRules
+#        Description: Vanilla mount rules: no mounting indoors (buildings, caves), walking indoors dismounts, and no mounting
+#                     in the Warsong Gulch start rooms while the doors are closed. The indoor test uses the WMO flags of
+#                     the vmaps (needs vmap.enableLOS).
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+
+Classic.MountIndoorsRules = 1
 
 #    Classic.Shop.Enabled
-#        Description: In-game Store (work in progress). 0 answers like the official server (store has nothing for sale);
-#                     1 sends a test product.
+#        Description: In-game Store: shop points, products from world.shop_* (.shop reload), the Gold Market, character
+#                     services, realm transfers and the character screen boost. 0 answers like the official server
+#                     (the store has nothing for sale).
 #        Default:     0 - (Disabled)
 #                     1 - (Enabled)
 
@@ -4723,8 +4836,8 @@ Classic.Shop.GoldMarketFee = 10
 Classic.Shop.BoostGold = 250
 
 #    Classic.Shop.VasTest
-#        Description: Character services work in progress: send a test Hardcore Character Transfer token to the character
-#                     screen. Purchases of character services are refused for now.
+#        Description: Testing only: always send the Hardcore Character Transfer token to the character screen, even when
+#                     the realm's transfer rules (auth.character_transfer_rule) and the account's characters would not.
 #        Default:     0 - (Disabled)
 #                     1 - (Enabled)
 
@@ -4746,6 +4859,3 @@ Discord.Channel.Enable = 0
 #        Default:     "Discord"
 
 Discord.Channel.Name = "Discord"
-#
-###################################################################################################
-

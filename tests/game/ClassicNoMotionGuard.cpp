@@ -17,7 +17,7 @@
 
 #include "tc_catch2.h"
 
-#include "../../src/server/game/Playerbot/NoMotionGuard.h"
+#include "../../src/modules/PlayerbotV2/Api/NoMotionGuard.h"
 
 using namespace Playerbot::BotMovement;
 

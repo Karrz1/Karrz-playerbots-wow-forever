@@ -27,12 +27,10 @@
 #include "DB2Stores.h"
 #include "Formulas.h"
 #include "GameEventSender.h"
+#include "GameObject.h"
 #include "GameTime.h"
 #include "GridNotifiersImpl.h"
-#include "GameObject.h"
 #include "Group.h"
-#include "StringFormat.h"
-#include "TerrainMgr.h"
 #include "GroupMgr.h"
 #include "Guild.h"
 #include "GuildMgr.h"
@@ -47,9 +45,13 @@
 #include "Player.h"
 #include "ReputationMgr.h"
 #include "SpellAuras.h"
+#include "StringFormat.h"
 #include "TemporarySummon.h"
+#include "TerrainMgr.h"
 #include "Transport.h"
 #include "Util.h"
+#include "VMapFactory.h"
+#include "VMapManager.h"
 #include "WorldStateMgr.h"
 #include <algorithm>
 #include <cstdarg>
@@ -252,14 +254,6 @@ void Battleground::_ProcessPlayerPositionBroadcast(uint32 diff)
             playerPositions.FlagCarriers.push_back(playerPosition);
         }
 
-        // Only an empty list is skipped; the log line lets the PC confirm what the client is sent (map / minimap flag carrier icons).
-        if (!playerPositions.FlagCarriers.empty())
-        {
-            auto const& first = playerPositions.FlagCarriers.front();
-            TC_LOG_INFO("playerbot.v2", "[bg_positions] bg={} instance={} carriers={} first={} icon={} slot={} at ({:.0f},{:.0f}) players={}",
-                GetTypeID(), GetInstanceID(), playerPositions.FlagCarriers.size(), first.Guid.ToString(), int32(first.IconID), int32(first.ArenaSlot),
-                first.Pos.Pos.GetPositionX(), first.Pos.Pos.GetPositionY(), GetPlayersSize());
-        }
         SendPacketToAll(playerPositions.Write());
     }
 }
@@ -612,6 +606,22 @@ char const* Battleground::GetMountRefusal(Player const* player) const
         if (IsIndoorWmoGroup(mogp))
             return "the area is indoors";
     return nullptr;
+}
+
+bool Battleground::IsMountRefused(Player const* player, bool checkStartArea) const
+{
+    if (checkStartArea && GetStatus() == STATUS_WAIT_JOIN && IsEnclosedStartArea(GetMapId()))
+        return true;
+
+    if (!VMAP::VMapFactory::createOrGetVMapManager()->isLineOfSightCalcEnabled())
+        return false;
+
+    // the wmo group under the player decides like on the client, not IsOutdoors(): its WMOAreaTable indoor override hits the wrong groups here
+    Map* map = player->GetMap();
+    uint32 mogpFlags = 0;
+    int32 adtId = 0, rootId = 0, groupId = 0;
+    return map->GetTerrain()->GetAreaInfo(player->GetPhaseShift(), map->GetId(), player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(),
+        mogpFlags, adtId, rootId, groupId) && IsIndoorWmoGroup(mogpFlags);
 }
 
 float Battleground::GetStartMaxDist() const
@@ -995,14 +1005,10 @@ void Battleground::RemovePlayerAtLeave(ObjectGuid guid, bool Transport, bool Sen
                 player->ResummonPetTemporaryUnSummonedIfAny();
             }
 
-            // The match state we opened (Initialize / Engaged, then Complete at the end) is closed on every way out of the battleground:
-            // leave, abandon, kick, bg jump, teleport to another map, GM removal and the leave after the final scoreboard. The 70291 client
-            // keeps its PvP match (restricted addon environment) active until told otherwise and leaves the chat box broken (audit F-3).
+            // close the match state opened at the start on every way out (leave, kick, teleport away, the leave after the scoreboard);
+            // the client keeps its PvP match (restricted addon environment) active until told otherwise and the chat box stays broken
             if (SendPacket && player->GetSession() && !player->GetSession()->IsBot())
-            {
-                TC_LOG_INFO("playerbot.v2", "[bg_leave] {} leaves the battleground (status {}): PVP_MATCH_SET_STATE(Inactive)", player->GetName(), uint32(GetStatus()));
                 player->SendDirectMessage(WorldPackets::Battleground::PVPMatchSetState(WorldPackets::Battleground::PVPMatchState::Inactive).Write());
-            }
 
             if (SendPacket && bgQueueTypeId)
             {
@@ -1047,21 +1053,10 @@ void Battleground::RemovePlayerAtLeave(ObjectGuid guid, bool Transport, bool Sen
         // remove all criterias on bg leave
         player->FailCriteria(CriteriaFailEvent::LeaveBattleground, 0);
 
-        if (Transport)
-        {
-            // The exit teleport CAN fail transiently (player mid-teleport /
-            // session loading) — and this object is deleted regardless, so a
-            // missed exit strands the player on the dead BG map with nothing
-            // left to remove them (observed 2026-06-11: 3 players brawling
-            // indefinitely on a post-match Eye of the Storm map). Surface it
-            // loudly; the playerbot module additionally self-recovers via its
-            // bg-orphan rules, and real players can /hearth out.
-            if (!player->TeleportToBGEntryPoint())
-                TC_LOG_ERROR("bg.battleground",
-                    "Battleground::RemovePlayerAtLeave: exit teleport FAILED for {} ({}) — "
-                    "player remains on BG map {} (instance {}) after battleground teardown!",
-                    player->GetName(), guid.ToString(), GetMapId(), m_InstanceID);
-        }
+        // a failed exit teleport strands the player on the battleground map once this object is deleted
+        if (Transport && !player->TeleportToBGEntryPoint())
+            TC_LOG_ERROR("bg.battleground", "Battleground::RemovePlayerAtLeave: exit teleport failed for {} ({}), player remains on battleground map {} (instance {})",
+                player->GetName(), guid.ToString(), GetMapId(), m_InstanceID);
 
         TC_LOG_DEBUG("bg.battleground", "Removed player {} from Battleground.", player->GetName());
     }
@@ -1496,10 +1491,10 @@ void Battleground::SendMessageToAll(uint32 entry, ChatMsg msgType, Player const*
 
 void Battleground::AddPlayerPosition(WorldPackets::Battleground::BattlegroundPlayerPosition const& position)
 {
-    // One entry per player: a script that adds the carrier explicitly (classic WSG) and the position aura must not duplicate it.
+    // one entry per player: a script that registers the carrier itself and the position aura must not duplicate it
     RemovePlayerPosition(position.Guid);
     _playerPositions.push_back(position);
-    m_LastPlayerPositionBroadcast = PLAYER_POSITION_UPDATE_INTERVAL;   // the next update sends it, not up to 5 s later
+    m_LastPlayerPositionBroadcast = PLAYER_POSITION_UPDATE_INTERVAL;   // sent on the next update, not up to 5 s later
 }
 
 void Battleground::RemovePlayerPosition(ObjectGuid guid)

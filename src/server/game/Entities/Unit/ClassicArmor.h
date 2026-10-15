@@ -22,7 +22,7 @@
 
 // Classic 1.60 (vanilla 1.12, VMaNGOS SpellCaster::CalcArmorReducedDamage): physical damage reduction of armor.
 // mitigation = armor / (armor + 400 + 85 * attacker level), at most 75%. The client's retail ArmorConstant expected-stat table
-// (and its 85% cap) made every melee and ranged hit differ from vanilla. Pure: no game types, tested in tests/game/ClassicArmor.cpp.
+// (and its 85% cap) made every melee and ranged hit differ from vanilla. Pure: no game types.
 namespace ClassicArmor
 {
     inline float Constant(unsigned attackerLevel)

@@ -3,7 +3,7 @@
 # =========================================================================
 # Purpose: Capture comprehensive baseline metrics for PriestAI before refactoring
 # Date: 2025-10-17
-# Author: Karrz
+# Author: Karrz1 (Phase 3A Week 1)
 # =========================================================================
 
 $ErrorActionPreference = "Stop"

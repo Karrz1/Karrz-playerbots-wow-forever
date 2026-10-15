@@ -17,7 +17,7 @@
 
 #include "tc_catch2.h"
 
-#include "../../src/server/game/Playerbot/ClassicBotSkills.h"
+#include "../../src/modules/PlayerbotV2/Api/ClassicBotSkills.h"
 
 TEST_CASE("A bot's combat skills are five per level", "[ClassicBotSkills]")
 {

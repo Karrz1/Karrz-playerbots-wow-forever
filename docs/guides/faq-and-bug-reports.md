@@ -12,7 +12,7 @@
 
 **How do I get my bots back after a log-out?** Click **Call saved**. Use **Save group** first so they're on your list.
 
-**Bots run out of mana or die a lot.** Make sure you have a healer, wait for healer mana before each pull, and put the bots on **Passive** in dungeons.
+**Bots run out of mana or die a lot.** Make sure you have a healer, watch the healers' mana before each pull (the bots do not hold a pull back for it), and put the bots on **Passive** in dungeons.
 
 ---
 

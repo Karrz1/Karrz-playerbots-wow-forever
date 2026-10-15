@@ -16,7 +16,6 @@
  */
 
 #include "Creature.h"
-#include "ClassicSpellValue.h"
 #include "BattlegroundMgr.h"
 #include "CellImpl.h"
 #include "CharmInfo.h"
@@ -53,13 +52,9 @@
 #include "TemporarySummon.h"
 #include "Vehicle.h"
 #include "World.h"
-#include "WorldSession.h"
 #include "ZoneScript.h"
 #include <G3D/g3dmath.h>
-#include <atomic>
-#include <mutex>
 #include <sstream>
-#include <unordered_set>
 
 CreatureMovementData::CreatureMovementData() : HoverInitiallyEnabled(false), Chase(CreatureChaseMovementType::Run),
 Random(CreatureRandomMovementType::Walk), InteractionPauseTimer(sWorld->getIntConfig(CONFIG_CREATURE_STOP_FOR_PLAYER)) { }
@@ -4064,92 +4059,8 @@ void Creature::InitializeInteractSpellId()
         SetInteractSpellId(0);
 }
 
-// [bad_unit] diagnostic for the values the Classic client asserts on (each assert writes a 32 MB dump and hitches the client):
-// a zero scale ("Model FileData <id> scale:0") and a race-less unit it has to draw through a character model ("Missing ChrModel for
-// raceID 0, gender 2/-1, class 4"). Only for a human receiver, one line per creature entry and reason for the life of the process.
-static void LogBadUnitValuesForClient(Creature const* unit, Player const* target, char const* what)
-{
-    if (!target || !target->GetSession() || target->GetSession()->IsBot())
-        return;
-
-    enum : uint8 { BAD_SCALE = 0x1, RACELESS_ROGUE = 0x2, RACELESS_CHARACTER_MODEL = 0x4 };
-    uint8 reasons = 0;
-    if (!(unit->GetObjectScale() > 0.0f) || !(unit->GetDisplayScale() > 0.0f) || !(unit->GetNativeDisplayScale() > 0.0f))
-        reasons |= BAD_SCALE;
-    if (unit->GetRace() == RACE_NONE)
-    {
-        if (unit->GetClass() == CLASS_ROGUE)
-            reasons |= RACELESS_ROGUE;
-
-        // the race and gender character models (display ids of ChrModel), drawn from the unit's own race, sex and class
-        static std::unordered_set<uint32> const characterModelDisplays = []
-        {
-            std::unordered_set<uint32> displays;
-            for (ChrRacesEntry const* race : sChrRacesStore)
-                for (uint8 gender = GENDER_MALE; gender <= GENDER_FEMALE; ++gender)
-                    if (ChrModelEntry const* model = sDB2Manager.GetChrModel(race->ID, gender))
-                        displays.insert(model->DisplayID);
-            return displays;
-        }();
-        if (unit->HasUnitFlag2(UNIT_FLAG2_MIRROR_IMAGE) || characterModelDisplays.contains(unit->GetDisplayId())
-            || characterModelDisplays.contains(unit->GetNativeDisplayId()))
-            reasons |= RACELESS_CHARACTER_MODEL;
-    }
-    if (!reasons)
-        return;
-
-    {
-        static std::mutex lock;
-        static std::unordered_set<uint64> logged;
-        std::lock_guard guard(lock);
-        if (logged.size() >= 4096 || !logged.insert(uint64(unit->GetEntry()) << 8 | reasons).second)
-            return;
-    }
-
-    TC_LOG_ERROR("entities.unit", "[bad_unit] {} {} to {}: entry {} '{}' reasons 0x{:X} (1 scale, 2 raceless rogue class, 4 raceless character model) "
-        "race {} class {} sex {} display {} native {} mount {} form {} scale {} displayScale {} nativeDisplayScale {} "
-        "pet {} totem {} guardian {} summon {} createdBySpell {} owner {} creator {} map {} ({:.1f} {:.1f} {:.1f})",
-        what, unit->GetGUID().ToString(), target->GetName(), unit->GetEntry(), unit->GetName(), reasons,
-        unit->GetRace(), unit->GetClass(), unit->GetGender(), unit->GetDisplayId(), unit->GetNativeDisplayId(), unit->GetMountDisplayId(),
-        uint32(unit->GetShapeshiftForm()), unit->GetObjectScale(), unit->GetDisplayScale(), unit->GetNativeDisplayScale(),
-        unit->IsPet(), unit->IsTotem(), unit->IsGuardian(), unit->IsSummon(), *unit->m_unitData->CreatedBySpell,
-        unit->GetOwnerGUID().ToString(), unit->GetCreatorGUID().ToString(), unit->GetMapId(), unit->GetPositionX(), unit->GetPositionY(),
-        unit->GetPositionZ());
-}
-
-// [ext_display] every creature create sent to a human whose display (current or native) is drawn through CreatureDisplayInfoExtra, the
-// character-model path of the client: a unit with race 0 that takes that path is what the client's "Incorrect chrModelID ChrModelID: 0,
-// RaceID: 0" lines and the "Model FileData ... scale: 0" assert are about (2026-10-08, Stormwind). Not throttled per entry, capped at
-// 2000 lines per process.
-static void LogExtendedDisplayForClient(Creature const* unit, Player const* target)
-{
-    if (!target || !target->GetSession() || target->GetSession()->IsBot())
-        return;
-
-    for (uint32 displayId : { unit->GetDisplayId(), unit->GetNativeDisplayId() })
-    {
-        CreatureDisplayInfoEntry const* display = sCreatureDisplayInfoStore.LookupEntry(displayId);
-        if (!display || !display->ExtendedDisplayInfoID)
-            continue;
-
-        static std::atomic<uint32> logged{ 0 };
-        if (logged.fetch_add(1, std::memory_order_relaxed) >= 2000)
-            return;
-
-        TC_LOG_ERROR("entities.unit", "[ext_display] {} to {}: entry {} '{}' display {} native {} extended {} race {} class {} sex {} pet {} summon {} "
-            "mirror {} owner {} creator {} map {} ({:.1f} {:.1f} {:.1f})",
-            unit->GetGUID().ToString(), target->GetName(), unit->GetEntry(), unit->GetName(), unit->GetDisplayId(), unit->GetNativeDisplayId(),
-            display->ExtendedDisplayInfoID, unit->GetRace(), unit->GetClass(), unit->GetGender(), unit->IsPet(), unit->IsSummon(),
-            unit->HasUnitFlag2(UNIT_FLAG2_MIRROR_IMAGE), unit->GetOwnerGUID().ToString(), unit->GetCreatorGUID().ToString(), unit->GetMapId(),
-            unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ());
-        return;
-    }
-}
-
 void Creature::BuildValuesCreate(UF::UpdateFieldFlag flags, ByteBuffer& data, Player const* target) const
 {
-    LogBadUnitValuesForClient(this, target, "create");
-    LogExtendedDisplayForClient(this, target);
     m_objectData->WriteCreate(flags, data, target, this);
     m_unitData->WriteCreate(flags, data, target, this);
 }
@@ -4162,10 +4073,7 @@ void Creature::BuildValuesUpdate(UF::UpdateFieldFlag flags, ByteBuffer& data, Pl
         m_objectData->WriteUpdate(flags, data, target, this);
 
     if (m_values.HasChanged(TYPEID_UNIT))
-    {
-        LogBadUnitValuesForClient(this, target, "update");
         m_unitData->WriteUpdate(flags, data, target, this);
-    }
 }
 
 void Creature::BuildValuesUpdateWithFlag(UF::UpdateFieldFlag flags, ByteBuffer& data, Player const* target) const

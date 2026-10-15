@@ -210,7 +210,7 @@ AboutDialog::AboutDialog(db::MySqlClient const* worldDb,
     auto* credLbl = new QLabel(
         tr("<ul style='margin:0'>"
            "<li>TrinityCore project - core server, data primitives, navmesh tools</li>"
-           "<li>Playerbot module - AI extension this branch ships with</li>"
+           "<li>Playerbot module - bot extension this branch ships with</li>"
            "<li>world_editor - native desktop editor for spawn / path / area / "
            "annotation data, built on the same standalone IO primitives as "
            "<code>mmap_world_dump</code></li>"
