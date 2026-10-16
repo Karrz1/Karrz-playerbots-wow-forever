@@ -22,6 +22,9 @@
 #include "../Threading/SnapshotPublisher.h"
 #include "../Bot/BotRegistry.h"
 #include "../Bot/IdleRule.h"
+#include "../Bot/IdleWatch.h"
+#include <format>
+#include "MotionMaster.h"
 #include "../Bot/World/ZonePicker.h"
 #include "../Bot/World/SpreadSpot.h"
 #include "Config.h"
@@ -1251,6 +1254,72 @@ void WorldBotSpawner::DriveStranded(uint32 now_ms, std::vector<Anchor> const& an
             it = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(it->first)) ? std::next(it) : stranded_.erase(it);
 }
 
+// The stuck ledger. The idle watch (Bot/IdleWatch.h) finds a bot standing for 45 s again and again and sends it to a new place each
+// time; a bot that still never moves (Dexie: 44 strikes) cannot be helped by a new place. Here, on the world thread, the facts the bot
+// worker cannot see are written down once a minute per bot: where it stands against the navmesh, what holds it (root, stun, a
+// movement generator), and whether the place it was sent to can be reached from where it stands. A bot standing off the navmesh is
+// put onto the nearest walkable ground (the same fix a sleeper gets at wake): every path from a spot with no polygon fails in place.
+void WorldBotSpawner::DriveStuckLedger(uint32 now_ms)
+{
+    constexpr uint32 kPassMs = 5000u, kPerBotMs = 60000u, kMinStrikes = 3u, kBotsPerPass = 3u;
+    if (last_ledger_ms_ && getMSTimeDiff(last_ledger_ms_, now_ms) < kPassMs)
+        return;
+    last_ledger_ms_ = now_ms;
+    uint32 done = 0;
+    Services::Registry().for_each([&](BotId id, BotRegistryEntry const& entry)
+    {
+        if (done >= kBotsPerPass || !entry.ai)
+            return;
+        ::Playerbot::V2::IdleWatch const w = entry.ai->idle_watch();   // a copy: the bot worker writes it
+        if (w.strikes < kMinStrikes)
+            return;
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
+        if (!p || !p->IsInWorld() || !p->IsAlive() || !p->GetMap() || p->IsBeingTeleported() || p->IsInFlight() || p->GetTransport())
+            return;
+        if (!owner_.IsAmbientBot(id, p) || p->GetGroup() || p->IsInCombat() || p->InBattleground() || p->InBattlegroundQueue()
+            || p->GetMap()->IsDungeon() || p->GetMap()->IsBattlegroundOrArena())
+            return;
+        auto it = ledger_ms_.find(uint64(id));
+        if (it != ledger_ms_.end() && getMSTimeDiff(it->second, now_ms) < kPerBotMs)
+            return;
+        ledger_ms_[uint64(id)] = now_ms;
+        ++done;
+
+        float const px = p->GetPositionX(), py = p->GetPositionY(), pz = p->GetPositionZ();
+        Position near_mesh, wide_mesh;
+        bool const on_mesh = ::Playerbot::BotMovement::NearestNavPoint(p, px, py, pz, 3.0f, 4.0f, near_mesh);
+        bool wide = false;
+        if (!on_mesh)
+            wide = ::Playerbot::BotMovement::NearestNavPoint(p, px, py, pz, 40.0f, 12.0f, wide_mesh);
+        char const* reach = "no_target";
+        if (w.has_target)
+        {
+            uint32 used = 0;
+            reach = ReachableChain(p, w.tx, w.ty, w.tz, 4u, used) ? "reachable" : "unreachable";
+        }
+        float const ground = p->GetMap()->GetHeight(p->GetPhaseShift(), px, py, pz + 3.0f, true, 20.0f);
+        TC_LOG_INFO("playerbot.v2",
+            "[stuck_ledger] {} ({}) zone {} at ({:.1f},{:.1f},{:.1f}) strikes={} on_mesh={} {} ground_z={:.1f} rooted={} stunned={} held_state={} "
+            "falling={} swimming={} move_gen={} run_speed={:.1f} target=({:.0f},{:.0f},{:.0f}) {} last_rule={}",
+            p->GetName(), uint64(id), p->GetZoneId(), px, py, pz, w.strikes, on_mesh ? "yes" : "NO",
+            on_mesh ? "" : (wide ? std::format("(walkable ground {:.0f} y away)", std::hypot(wide_mesh.GetPositionX() - px, wide_mesh.GetPositionY() - py)) : std::string("(none within 40 y)")),
+            ground > INVALID_HEIGHT ? ground : -999.f, p->HasUnitMovementFlag(MOVEMENTFLAG_ROOT) ? 1 : 0, p->HasUnitState(UNIT_STATE_STUNNED) ? 1 : 0,
+            p->HasUnitState(UNIT_STATE_ROOT | UNIT_STATE_CONFUSED | UNIT_STATE_FLEEING | UNIT_STATE_CONTROLLED) ? 1 : 0,
+            p->IsFalling() ? 1 : 0, p->IsInWater() ? 1 : 0, uint32(p->GetMotionMaster()->GetCurrentMovementGeneratorType()),
+            p->GetSpeed(MOVE_RUN), w.tx, w.ty, w.tz, reach,
+            entry.ai->last_rule_fired() ? entry.ai->last_rule_fired() : "-");
+        if (!on_mesh && wide)
+        {
+            Playerbot::BotMovement::SafeNearTeleport(p, wide_mesh.GetPositionX(), wide_mesh.GetPositionY(), wide_mesh.GetPositionZ() + 0.3f,
+                                                     p->GetOrientation(), /*navmesh_point*/ true);
+            TC_LOG_INFO("playerbot.v2", "[stuck_ledger] {} was off the navmesh, moved onto walkable ground", p->GetName());
+        }
+    });
+    if (ledger_ms_.size() > 2048u)
+        for (auto it = ledger_ms_.begin(); it != ledger_ms_.end();)
+            it = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(it->first)) ? std::next(it) : ledger_ms_.erase(it);
+}
+
 void WorldBotSpawner::DriveGraduation(uint32 now_ms)
 {
     // Every few seconds, at most two bots per pass: a bot reaching level 10 on the isle is moved the way a new level-10 bot is
@@ -1697,6 +1766,7 @@ void WorldBotSpawner::OnWorldTick(uint32 now_ms)
     DriveSeed(now_ms);
     DriveGraduation(now_ms);
     DriveStranded(now_ms, anchors);
+    DriveStuckLedger(now_ms);
     DriveLeaving(now_ms, anchors);
     DriveCrowd(now_ms, anchors);
 

@@ -994,7 +994,7 @@ bool PullBackTick(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
         {
             opener_unavail = true;
             ai.edit_pull_back([](BotAI::PullBackPlan& q) { q.opener_unavail = true; });
-            TC_LOG_INFO("playerbot.v2", "[pull_back] {} ranged opener unavailable (NO_AMMO): taunt / plain engage instead", s.name());
+            TC_LOG_INFO("playerbot.v2", "[pull_back] {} ranged opener refused (no ammo or no usable ranged weapon): taunt / plain engage instead", s.name());
         }
         // Opener: first ready ranged spell of the class whose window holds d; none (or it did not take) = plain engage.
         struct Opener { uint32 spell; float min_d, max_d; };

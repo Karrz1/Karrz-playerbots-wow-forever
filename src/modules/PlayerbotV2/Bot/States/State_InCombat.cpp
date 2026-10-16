@@ -635,6 +635,9 @@ bool PartyOverThreatExpired(BotSnapshotView const& s, ObjectGuid target)
     return HoldClockExpired(g_party_hold_mu, g_party_hold, s, target, kPartyOverThreatMaxMs, kPartyOverThreatGapMs);
 }
 
+// Majordomo Executus' Damage Shield, on himself and his Flamewakers (the Magic Reflection twin, 20619, is refused by the cast API).
+constexpr uint32 kDamageShieldAura = 21075;
+
 ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid target,
                               GroupSnapshotView const* g = nullptr)
 {
@@ -645,6 +648,17 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
     if (ai.effective_role(s) == Role::Tank) return ThreatHold::None;
     NearbyUnit const* u = s.hostile_unit(target);
     if (!u) return ThreatHold::None;
+
+    // Majordomo's Damage Shield (21075) sends every melee swing back at the swinger (n71 Majordomo wipe: two melee DPS at 35-39 % died
+    // to their own hits, and the melee kept swinging at the shielded adds for the whole fight). Melee wait the 10 s out, or until a
+    // purge strips it; casters are not hit by it. Not a tank: its swings are the threat, and it has a healer.
+    if (s.is_in_raid() && u->magic_buff_spell == kDamageShieldAura && IsMeleeSpec(s.cls(), s.spec()))
+    {
+        if (RaidLogDue(RaidLogKey(s, RaidLogKind::ThreatHold), s.published_at_ms(), 5000u))
+            TC_LOG_INFO("playerbot.v2", "[raid_threat] {} holds melee on entry {} ({}): Damage Shield up",
+                s.name(), u->entry, target.GetCounter());
+        return ThreatHold::ShieldUp;
+    }
 
     if (s.is_in_raid() && LooseRaidEliteOnMember(s, *u, g) && !LooseHoldExpired(s, target, Raid::Retaunts(s.map_id(), u->entry)))
     {
@@ -1199,6 +1213,7 @@ bool ThreatHoldWait(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& emit,
             }
         }
     ai.set_last_rule_fired(h == ThreatHold::OverThreat ? "combat:threat_hold"
+                           : h == ThreatHold::ShieldUp ? "combat:shield_hold"
                                                        : "combat:threat_wait_tank");
     return true;
 }
@@ -3768,6 +3783,7 @@ void DispatchInCombat(BotAI& ai,
             if (snapshot.has_pet() && snapshot.pet_victim() == hv)
                 emit.pet_set_command_state(1 /*COMMAND_FOLLOW*/);
             ai.set_last_rule_fired(hold == ThreatHold::OverThreat ? "combat:threat_hold"
+                                   : hold == ThreatHold::ShieldUp ? "combat:shield_hold"
                                                                   : "combat:threat_wait_tank");
             return;
         }

@@ -421,11 +421,12 @@ bool MagmaAt(Map* map, PhaseShift const& phase, float x, float y, float z, float
 bool Usable(Player* bot, float x, float y, float zHint, float& outZ, bool urgent, bool hazard)
 {
     g_usableWhy = 0;
-    if (InsideAny(g_keepOut, x, y, 0.0f))
+    if (!hazard && InsideAny(g_keepOut, x, y, 0.0f))   // a way out of a hazard may use the cave rim: a whelp pack can be survived, a breath cannot
         return g_usableWhy = 1, false;
     // Nor walk across one on the way (a flank re-post from one side of a cave mouth to the other). Open floor: the straight line stands
     // in for the path. A bot already inside is leaving and may cross its own circle.
-    for (Circle const& k : g_keepOut)
+    if (!hazard)
+      for (Circle const& k : g_keepOut)
         if (Dist2D(bot->GetPositionX(), bot->GetPositionY(), k.x, k.y) >= k.r &&
             SegmentDist2D(bot->GetPositionX(), bot->GetPositionY(), x, y, k.x, k.y) < k.r)
             return g_usableWhy = 1, false;
@@ -473,6 +474,9 @@ bool Usable(Player* bot, float x, float y, float zHint, float& outZ, bool urgent
 void ApplyKeepOut(Plan const& plan, Member const& self, std::vector<Circle> const& circles, RaidOrder& out)
 {
     if (!out.move || plan.rules->keepOut.empty())
+        return;
+    // A way out of a hazard is not clamped: the cave rim is survivable, the breath is not.
+    if (out.move_reason && (std::strcmp(out.move_reason, "leave hazard") == 0 || std::strcmp(out.move_reason, "leave cone") == 0))
         return;
     for (KeepOut const& zone : plan.rules->keepOut)
     {
@@ -602,6 +606,10 @@ bool Escape(Player* bot, std::vector<Circle> const& circles, RaidOrder& out, std
     };
     // Rings out to 20 y past the deepest circle and every 15 degrees: with the live circle, the origin circle and the predicted one open
     // together (Geddon walking), the first rings are mostly inside another circle (6 of 7 probes in MC Geddon 650994ea).
+    // First without the keep-out circles, then with them allowed: leaving a breath outranks staying out of the caves.
+    for (int pass = 0; pass < 2; ++pass)
+    {
+    pathChecks = 0;
     for (float extra : { 2.0f, 5.0f, 9.0f, 14.0f, 20.0f })
         for (int k = 0; k < 24; ++k)
         {
@@ -613,7 +621,7 @@ bool Escape(Player* bot, std::vector<Circle> const& circles, RaidOrder& out, std
                 ++inOther;
                 continue;
             }
-            if (InsideAny(g_keepOut, px, py, 0.0f))
+            if (pass == 0 && InsideAny(g_keepOut, px, py, 0.0f))
                 continue;   // out of bounds (RaidRules::keepOut): the next way out, before a path probe is spent
             // A way out that runs through the middle of the circle is no way out: the walk passes the boss at under 70 percent of the bot's
             // own distance (a point on the far side of the ring is a walk across it, at the heaviest ticks).
@@ -627,10 +635,7 @@ bool Escape(Player* bot, std::vector<Circle> const& circles, RaidOrder& out, std
                     continue;
             }
             if (++pathChecks > 20)
-            {
-                tally();
-                return false;
-            }
+                break;   // this pass's probe budget is spent
             float pz = 0.0f;
             if (!Usable(bot, px, py, bot->GetPositionZ(), pz, /*urgent*/ true, /*hazard*/ true))
             {
@@ -639,6 +644,7 @@ bool Escape(Player* bot, std::vector<Circle> const& circles, RaidOrder& out, std
             }
             return SetMove(out, px, py, pz, "leave hazard");
         }
+    }
     tally();
     return false;
 }
@@ -865,12 +871,15 @@ uint32_t g_auraCircleOpenedMs = 0;                              // when the late
 std::unordered_map<uint64_t, uint32_t> g_auraCircleLeaveLogged;  // bot -> g_auraCircleOpenedMs it was logged for
 std::unordered_map<uint64_t, AuraCircleOrigin> g_auraCircleOrigin;
 
+uint32_t g_breathEnemy = 0, g_breathCast = 0;   // the fixed-path breath whose corridor HazardsFor just opened for this member (0 for none)
+
 // Every avoid-circle that applies to this member right now.
 std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t now)
 {
     RaidRules const& rules = *plan.rules;
     Player* bot = self.p;
     std::vector<Circle> circles;
+    g_breathCast = 0;
     for (AvoidEnemyAura const& rule : rules.avoidEnemyAura)
         if (Matches(rule.who, self, plan.mainTank))
             for (Unit* enemy : plan.enemies)
@@ -1034,6 +1043,8 @@ std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t no
                     if (path.enemy == rule.enemy && path.fixedPath && path.castSpell == latch.spell && Matches(path.who, self, plan.mainTank))
                     {
                         breathAdded.push_back(rule.enemy);
+                        g_breathEnemy = rule.enemy;
+                        g_breathCast = path.castSpell;
                         float const dx = path.bx - path.ax, dy = path.by - path.ay;
                         float const len = std::sqrt(dx * dx + dy * dy);
                         float const step = std::max(path.halfWidth * 0.8f, 2.0f);
@@ -1183,8 +1194,13 @@ std::unordered_map<uint64_t, FaceAxisLock> g_faceAxis;
 constexpr float kAxisDrift = 8.0f;
 constexpr uint32_t kAxisStaleMs = 30000;
 
-bool FaceAxisFor(Plan const& plan, Unit* enemy, uint32_t now, float& axis)
+bool FaceAxisFor(Plan const& plan, Unit* enemy, uint32_t now, float& axis, float fixedBearingDeg = kNoBearing)
 {
+    if (fixedBearingDeg != kNoBearing)
+    {
+        axis = fixedBearingDeg * (float(M_PI) / 180.0f);
+        return true;
+    }
     uint64_t const key = (plan.groupLow << 32) ^ enemy->GetEntry();
     float const ex = enemy->GetPositionX(), ey = enemy->GetPositionY();
     FaceAxisLock& lock = g_faceAxis[key];
@@ -1398,6 +1414,28 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
     // 2. Hazards (circles computed by the caller, which also publishes them in the order).
     if (!circles.empty() && InsideAny(circles, bot->GetPositionX(), bot->GetPositionY(), 0.0f))
     {
+        // A breath with listed safe points: walk to the nearest usable one (it may lie inside the corridor's padding, so it is not tested
+        // against the circles), and stay on it while the corridor is open.
+        if (g_breathCast)
+        {
+            std::vector<BreathSafe const*> spots;
+            for (BreathSafe const& s : rules.breathSafe)
+                if (s.enemy == g_breathEnemy && s.castSpell == g_breathCast)
+                    spots.push_back(&s);
+            std::sort(spots.begin(), spots.end(), [&](BreathSafe const* a, BreathSafe const* b)
+            {
+                return Dist2D(bot->GetPositionX(), bot->GetPositionY(), a->x, a->y) < Dist2D(bot->GetPositionX(), bot->GetPositionY(), b->x, b->y);
+            });
+            for (BreathSafe const* s : spots)
+            {
+                float pz = 0.0f;
+                if (!Usable(bot, s->x, s->y, bot->GetPositionZ(), pz, /*urgent*/ true, /*hazard*/ true))
+                    continue;
+                SetMove(out, s->x, s->y, pz, "leave hazard");
+                Remember(bot, out, now);
+                return;
+            }
+        }
         if (UseSticky(bot, circles, now, out)) return;
         if (Escape(bot, circles, out, self.tank ? &others : nullptr))
         {
@@ -1562,7 +1600,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                     continue;
                 float const ex = enemy->GetPositionX(), ey = enemy->GetPositionY();
                 float axis;
-                if (!FaceAxisFor(plan, enemy, now, axis))
+                if (!FaceAxisFor(plan, enemy, now, axis, rule.bearingDeg))
                     continue;
                 if (geo::TankOnAxis(ex, ey, bot->GetPositionX(), bot->GetPositionY(), axis, 30.0f * (float(M_PI) / 180.0f)))
                     continue;
@@ -1621,7 +1659,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                     if (fa.enemy == rule.enemy)
                     {
                         float axis;
-                        if (FaceAxisFor(plan, enemy, now, axis))
+                        if (FaceAxisFor(plan, enemy, now, axis, fa.bearingDeg))
                             eo = axis;
                         break;
                     }
@@ -1660,14 +1698,33 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             // Which flank: the side of its facing the bot is on. The rear-sector helpers measure from the line straight behind a facing, so the
             // flank is handed to them as the "rear" of a facing turned a quarter round the other way.
             float const side = geo::NormalizeAngle(geo::Bearing(ex, ey, bot->GetPositionX(), bot->GetPositionY()) - eo) >= 0.0f ? 1.0f : -1.0f;
-            float const flankFacing = eo + side * centre - float(M_PI);
-            if (geo::InRearSector(ex, ey, flankFacing, bot->GetPositionX(), bot->GetPositionY(), half, rule.minDist, rule.maxDist))
+            // One slot per bot: the matching members on the same side, in guid order (plan.members is sorted), share the wedge as a grid
+            // of rows (distance) and columns (angle). A bot only walks to its own slot, so nothing else moves it and nobody lands on the
+            // same edge point (phase 3 live 2026-10-15: the raid in one clump beside her).
+            uint32_t index = 0, count = 0;
+            for (Member const& other : plan.members)
+            {
+                if (!Matches(rule.who, other, plan.mainTank) || other.tank)
+                    continue;
+                float const otherSide = geo::NormalizeAngle(geo::Bearing(ex, ey, other.p->GetPositionX(), other.p->GetPositionY()) - eo) >= 0.0f ? 1.0f : -1.0f;
+                if (otherSide != side)
+                    continue;
+                if (other.p == self.p)
+                    index = count;
+                ++count;
+            }
+            float const depth = std::max(rule.maxDist - rule.minDist, 1.0f);
+            uint32_t const rows = std::clamp(uint32_t(std::ceil(depth / 5.0f)), 1u, 4u);
+            uint32_t const cols = std::max(1u, (count + rows - 1) / rows);
+            uint32_t const row = index % rows, col = index / rows;
+            float const angle = centre - half + (float(col) + 0.5f) / float(cols) * 2.0f * half;
+            float const dist = rule.minDist + (float(row) + 0.5f) / float(rows) * depth;
+            float const px = ex + dist * std::cos(eo + side * angle), py = ey + dist * std::sin(eo + side * angle);
+            if (Dist2D(bot->GetPositionX(), bot->GetPositionY(), px, py) <= 3.0f)
                 break;
             uint32_t& at = g_lastRearStep[bot->GetGUID().GetCounter()];
             if (now - at < 4000)
                 break;
-            float px, py;
-            geo::RearSpot(ex, ey, flankFacing, bot->GetPositionX(), bot->GetPositionY(), half, rule.minDist, rule.maxDist, px, py);
             if (!circles.empty() && InsideAny(circles, px, py, 1.0f))
                 break;
             float pz = 0.0f;
@@ -2385,7 +2442,9 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
         if (trailsHolder(enemy))
             continue;   // within the spread but not the healthiest: no focus on it
         bool const reflecting = enemy->HasAura(kMagicReflection) || enemy->HasAura(kDamageShield);
-        if (Controlled(enemy) || reflecting)
+        // The owner's skull on a sheeped mob is the call to kill it (Majordomo: he rotates the skull onto each sheeped Healer).
+        bool const skulled_hold = Controlled(enemy) && !coordFocus.IsEmpty() && enemy->GetGUID() == coordFocus;
+        if ((Controlled(enemy) && !skulled_hold) || reflecting)
         {
             forbiddenAll.push_back(enemy->GetGUID());
             continue;
@@ -2468,10 +2527,18 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
             if (pick)
                 o.fallback_target = pick->GetGUID();
         }
-        else if (m.tank && m.p != plan.mainTank)
+        else if (m.tank)
         {
-            if (Unit* best = bestFor(m))
-                o.tank_fallback_target = best->GetGUID();
+            // A tank whose enemy is airborne (Onyxia in phase 2) cannot hold it: the enemy is forbidden for it and it takes the best ground
+            // target (the whelps, Priority) so they do not reach the healers. The main tank keeps its enemy while it is on the ground.
+            Unit* victim = m.p->GetVictim();
+            bool const airborne = victim && victim->IsFlying();
+            if (m.p != plan.mainTank || airborne || !victim)
+                if (Unit* best = bestFor(m))
+                    if (!best->IsFlying())
+                        o.tank_fallback_target = best->GetGUID();
+            if (airborne)
+                o.forbidden_targets.push_back(victim->GetGUID());
         }
     }
 }
@@ -3167,6 +3234,128 @@ static void LogReleaseState(Group const* group, Map const* map, uint32_t now_ms)
     }
 }
 
+// An encounter nobody is alive to fight is over (Onyxia 2026-10-15: the pull was judged at the instant one bot still lived, the wipe end
+// above never ran, and the boss stayed IN_PROGRESS with the whole raid dead). With a human of a dungeon group dead and no living player
+// left on his instance for 3 s: fail the bosses still IN_PROGRESS (that sends the encounter end to the client) and send the mobs in
+// combat to evade.
+static void EndAbandonedEncounters(uint32_t now_ms)
+{
+    static std::unordered_map<uint32_t, uint32_t> since;
+    std::unordered_set<uint32_t> seen;
+    for (auto const& [guid, h] : ObjectAccessor::GetPlayers())
+    {
+        if (!h || !h->IsInWorld() || h->IsAlive() || Services::Lifecycle().is_bot(h->GetGUID().GetCounter()))
+            continue;
+        Map* map = h->GetMap();
+        InstanceMap* im = map ? map->ToInstanceMap() : nullptr;
+        InstanceScript* script = im ? im->GetInstanceScript() : nullptr;
+        if (!script || !script->IsEncounterInProgress() || !seen.insert(im->GetInstanceId()).second)
+            continue;
+        bool anyAlive = false;
+        for (MapReference const& ref : im->GetPlayers())
+            if (Player* p = ref.GetSource(); p && p->IsAlive() && !p->IsGameMaster())
+            {
+                anyAlive = true;
+                break;
+            }
+        uint32_t& s = since[im->GetInstanceId()];
+        if (anyAlive)
+        {
+            s = 0;
+            continue;
+        }
+        if (!s)
+        {
+            s = now_ms ? now_ms : 1u;
+            continue;
+        }
+        if (now_ms - s < 3000u)
+            continue;
+        s = 0;
+        uint32_t failed = 0, evaded = 0;
+        for (uint32 id = 0; id < script->GetEncounterCount(); ++id)
+            if (script->GetBossState(id) == IN_PROGRESS && script->SetBossState(id, FAIL))
+                ++failed;
+        for (auto const& [spawnId, c] : im->GetCreatureBySpawnIdStore())
+            if (c && c->IsInWorld() && c->IsAlive() && c->IsInCombat() && !c->IsControlledByPlayer() && c->AI())
+            {
+                c->AI()->EnterEvadeMode(EvadeReason::NoHostiles);
+                ++evaded;
+            }
+        TC_LOG_INFO("playerbot.v2.raid", "[raid_wipe] encounter abandoned: map={} instance={} nobody alive on it: {} boss state(s) failed, {} mob(s) sent to evade",
+            im->GetId(), im->GetInstanceId(), failed, evaded);
+    }
+}
+
+// [release_state] (playtest 2026-10-15, MC Majordomo wipe: Release Spirit stayed greyed out, "a member of your group is in combat", for
+// about two minutes after every bot had left the instance and the bosses had reset; [release] above stops once the raid is off the map).
+// While a human of a dungeon group lies dead, every 5 s and wherever the raid is: his own combat flags, every group member's combat and
+// pet-combat flags on any map, the creatures of his map still in combat, and the map's boss states. The first line names what is left.
+static void LogDeadHumanReleaseState(uint32_t now_ms)
+{
+    static std::unordered_map<uint64_t, uint32_t> last;
+    for (auto const& [guid, h] : ObjectAccessor::GetPlayers())
+    {
+        if (!h || !h->IsInWorld() || h->IsAlive() || Services::Lifecycle().is_bot(h->GetGUID().GetCounter()))
+            continue;
+        Group const* group = h->GetGroup();
+        Map const* map = h->GetMap();
+        if (!group || !map || !map->IsDungeon())
+            continue;
+        uint32_t& l = last[h->GetGUID().GetCounter()];
+        if (l && now_ms - l < 5000u)
+            continue;
+        l = now_ms ? now_ms : 1u;
+
+        uint32_t members = 0, onMap = 0, dead = 0, combat = 0, petCombat = 0, otherMap = 0;
+        std::string names;
+        for (GroupReference const& ref : group->GetMembers())
+        {
+            Player const* m = ref.GetSource();
+            if (!m || m == h)
+                continue;
+            ++members;
+            if (m->IsInWorld() && m->GetMap() == map)
+                ++onMap;
+            else
+                ++otherMap;
+            if (!m->IsAlive())
+                ++dead;
+            bool const c = m->IsInCombat(), pc = m->HasUnitFlag(UNIT_FLAG_PET_IN_COMBAT);
+            if (c)
+                ++combat;
+            if (pc)
+                ++petCombat;
+            if ((c || pc) && names.size() < 160)
+                names += (names.empty() ? "" : ", ") + m->GetName() + "[map " + std::to_string(m->GetMapId()) + (m->IsAlive() ? "" : " dead") +
+                         (c ? " combat" : "") + (pc ? " pet" : "") + "]";
+        }
+
+        uint32_t mobsCombat = 0;
+        std::string mobNames;
+        for (auto const& [spawnId, c] : map->GetCreatureBySpawnIdStore())
+            if (c && c->IsInWorld() && c->IsAlive() && c->IsInCombat() && !c->IsControlledByPlayer())
+            {
+                ++mobsCombat;
+                if (mobNames.size() < 160)
+                    mobNames += (mobNames.empty() ? "" : ", ") + c->GetName() + (c->HasUnitState(UNIT_STATE_EVADE) ? "[evade]" : "");
+            }
+
+        InstanceScript const* script = map->ToInstanceMap() ? map->ToInstanceMap()->GetInstanceScript() : nullptr;
+        std::string bosses;
+        if (script)
+            for (uint32 id = 0; id < script->GetEncounterCount(); ++id)
+                if (script->GetBossState(id) != NOT_STARTED)
+                    bosses += (bosses.empty() ? "" : ", ") + std::to_string(id) + ":" + std::to_string(int(script->GetBossState(id)));
+
+        TC_LOG_INFO("playerbot.v2.raid",
+            "[release_state] {} dead map={} ghost={} self_combat={} self_pet_combat={} offer_pending={} | group {} others: {} on map, {} elsewhere, {} dead, {} in combat, {} pet in combat: {} | creatures in combat on map: {}: {} | encounter in progress: {} boss states (id:state, not NOT_STARTED): {}",
+            h->GetName(), h->GetMapId(), int(h->HasPlayerFlag(PLAYER_FLAGS_GHOST)), int(h->IsInCombat()), int(h->HasUnitFlag(UNIT_FLAG_PET_IN_COMBAT)),
+            int(h->IsResurrectRequested()), members, onMap, otherMap, dead, combat, petCombat, names.empty() ? "-" : names, mobsCombat,
+            mobNames.empty() ? "-" : mobNames, script ? int(script->IsEncounterInProgress()) : -1, bosses.empty() ? "-" : bosses);
+    }
+}
+
 // A resurrection a group bot cast on a human member sits as a pending offer until the client answers. The 70205 client has shown
 // no "X wants to resurrect you" popup (MC 2026-10-08: the first healer's Resurrection landed, the offer stayed pending, every
 // other rezzer saw the corpse as being raised and the owner stayed dead). A pending offer from a bot of the group is accepted
@@ -3270,6 +3459,9 @@ void Brain::Update(uint32_t now_ms)
         last_dump_ = "raid brain disabled (Playerbot.Raid.Enable = 0)";
         return;
     }
+
+    LogDeadHumanReleaseState(now_ms);
+    EndAbandonedEncounters(now_ms);
 
     // Bucket bots on raid maps that have rules by (group, map).
     struct Bucket { Group* group = nullptr; uint32_t mapId = 0; uint64_t refBot = 0; Player* ref = nullptr; };
