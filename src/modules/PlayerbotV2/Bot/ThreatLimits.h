@@ -47,4 +47,14 @@ constexpr float ThreatEarlyHoldRatio(float base, bool melee, float tank_threat, 
     return lowered > floor ? lowered : floor;
 }
 
+// How long a raid's DPS wait after the tank's first hit on a boss before they open by themselves (the owner's Attack still releases them at
+// once). The tank runs in from the room's edge and builds its lead in that time; the dungeons' parties keep their own, shorter wait. The one
+// number for the generic boss opening and for every boss fight script (Raid::Script::Fight::startWaitMs).
+constexpr unsigned kRaidBossOpenWaitMs = 8000;
+
+// The "a forgotten Attack must not wipe the raid" release (Playerbot.Raid.DpsWaitTimeoutMs): after the tanks have fought this long without the
+// owner's Attack the DPS go anyway. A raid's, limited to the same eight seconds and defaulting to it; a party keeps its six.
+constexpr unsigned kRaidDpsWaitTimeoutMaxMs = kRaidBossOpenWaitMs;
+constexpr unsigned kPartyDpsWaitTimeoutMs   = 6000;
+
 }  // namespace Playerbot

@@ -1226,6 +1226,14 @@ void UnitData::WriteCreate(EnumFlag<UpdateFieldFlag> fieldVisibilityFlags, ByteB
     data << int32(LookAtControllerID);
     data << int32(PerksVendorItemID);
     data << int32(TaxiNodesID);
+    // client 70425: three int32 after TaxiNodesID, for every viewer (client UnitData +0x280/+0x284/+0x288, create reader rva 0x37CD0ED;
+    // GuildGUID moved from +0x280 to +0x290)
+    if (ClassicOpcodes::IsBuild70425OrLater())
+    {
+        data << int32(0);
+        data << int32(0);
+        data << int32(0);
+    }
     data << *GuildGUID;
     data << uint32(PassiveSpells.size());
     data << uint32(WorldEffects.size());
@@ -1340,6 +1348,10 @@ static uint32 ClassicUnitDataBit(uint32 bit)
     uint32 classicBit = ClassicUnitDataBit70009(bit);
     if (classicBit >= 140 && ClassicOpcodes::IsBuild70291OrLater())
         ++classicBit;
+    // client 70425 (update reader rva 0x37CE7A0 vs 70291 0x458D7F0): the three int32 after TaxiNodesID (70291 bit 131) are bits
+    // 132..134, every 70291 bit from 132 (GuildGUID) on, group bits too, is three higher
+    if (classicBit >= 132 && ClassicOpcodes::IsBuild70425OrLater())
+        classicBit += 3;
     return classicBit;
 }
 
@@ -1351,6 +1363,10 @@ static constexpr std::array<std::pair<uint32, uint32>, 10> ClassicUnitDataGroups
 static constexpr std::array<std::pair<uint32, uint32>, 10> ClassicUnitDataGroups70291 =
 { {
     { 0, 31 }, { 32, 63 }, { 64, 95 }, { 96, 127 }, { 128, 148 }, { 149, 189 }, { 190, 193 }, { 194, 196 }, { 197, 217 }, { 218, 239 }
+} };
+static constexpr std::array<std::pair<uint32, uint32>, 10> ClassicUnitDataGroups70425 =
+{ {
+    { 0, 31 }, { 32, 63 }, { 64, 95 }, { 96, 127 }, { 128, 151 }, { 152, 192 }, { 193, 196 }, { 197, 199 }, { 200, 220 }, { 221, 242 }
 } };
 
 // Renumbers a retail changes mask to Classic bits, recomputes the Classic group bits and writes the blocks header
@@ -1389,6 +1405,7 @@ static std::array<uint32, ClassicBlockCount> WriteClassicChangesMaskHeader(ByteB
 void UnitData::WriteUpdate(Mask const& changesMask, ByteBuffer& data, Player const* receiver, Unit const* owner, bool ignoreNestedChangesMask) const
 {
     std::array<uint32, 8> classicBlocks = WriteClassicChangesMaskHeader<8>(data, changesMask, &ClassicUnitDataBit,
+        ClassicOpcodes::IsBuild70425OrLater() ? ClassicUnitDataGroups70425 :
         ClassicOpcodes::IsBuild70291OrLater() ? ClassicUnitDataGroups70291 : ClassicUnitDataGroups70009);
     bool classicGroup128 = (classicBlocks[4] & 1) != 0;
     // client 70291 reads one bit right after the mask blocks (rva 0x458D92E, kept in r13d and passed to the new list reader at bit 140,
@@ -5384,7 +5401,7 @@ void ActivePlayerData::WriteCreate(EnumFlag<UpdateFieldFlag> fieldVisibilityFlag
     {
         data << InvSlots[i];
     }
-    // Classic 1.60.1.70009 has 145 InvSlots (client ActivePlayerData create reader rva 0xA882E0, count at rva 0x4E417E0)
+    // Classic 1.60.1.70009 has 145 InvSlots (client ActivePlayerData create reader rva 0xA882E0, count at rva 0x4E417E0; 70425 too)
     for (uint32 i = 108; i < 145; ++i)
         data << ObjectGuid::Empty;
     data << *FarsightObject;
@@ -5488,6 +5505,8 @@ void ActivePlayerData::WriteCreate(EnumFlag<UpdateFieldFlag> fieldVisibilityFlag
     data << float(UiHitModifier);
     data << float(UiSpellHitModifier);
     data << float(0.0f);                        // Classic 1.60.1.70009: third float before HomeRealmTimeOffset (client +0x1560)
+    if (ClassicOpcodes::IsBuild70425OrLater())
+        data << float(0.0f);                    // client 70425: fourth float (client +0x1564, create reader rva 0x795A15)
     data << int32(HomeRealmTimeOffset);
     data << float(ModPetHaste);
     data << int8(JailersTowerLevelMax);
@@ -5766,6 +5785,9 @@ void ActivePlayerData::WriteCreate(EnumFlag<UpdateFieldFlag> fieldVisibilityFlag
     data.WriteBits(AccountBankTabSettings.size(), 3);
     data.WriteBit(WalkInData.has_value());
     data.WriteBit(ChallengeModeData.has_value());
+    // client 70425: a fifth optional (client +0x20E8, has-value +0x20F0, create reader rva 0x79BB89), its data after ChallengeModeData
+    if (ClassicOpcodes::IsBuild70425OrLater())
+        data.WriteBit(false);
     data.FlushBits();
     if (QuestSession.has_value())
     {
@@ -5805,7 +5827,7 @@ void ActivePlayerData::WriteUpdate(EnumFlag<UpdateFieldFlag> fieldVisibilityFlag
 //   PetSpellPower (TC 116) removed, so NumBankSlots/NumCharacterBankTabs (TC 132/133) move into group 134
 // - TransmogMetadata has its own group: bit 166 (group) + 167 (client rva 0xA9BFF2 reads it only when both are set)
 // - InvSlots has 145 entries (group 168, entries 169..313), every array after it is shifted by 45
-static uint32 ClassicActivePlayerDataBit(uint32 bit)
+static uint32 ClassicActivePlayerDataBit70291(uint32 bit)
 {
     if (bit == 401) return 159;         // NumStableSlots
     if (bit <= 107) return bit;
@@ -5826,18 +5848,43 @@ static uint32 ClassicActivePlayerDataBit(uint32 bit)
     return bit + 42;                    // arrays after InvSlots (TC InvSlots has 108 of the client's 145)
 }
 
+// Client 70425 (update reader rva 0x79C6B0 vs 70291 0xA98E40), the group bits 134 and 166 stay where they are:
+// - a float after bit 120 (bit 121): 70291 bits 121..132 are one higher, 133 skips group 134 (135), 135..164 are one higher
+// - group 166 now holds ViewedOutfit (70291 165 -> 167), TransmogMetadata (167 -> 168) and a new optional (169, client +0x20E8, its
+//   has-value bit is read after the group 134 optional bits when group 166 is set); InvSlots group 168 -> 170, everything after +2
+static uint32 ClassicActivePlayerDataBit(uint32 bit)
+{
+    uint32 classicBit = ClassicActivePlayerDataBit70291(bit);
+    if (classicBit == ~0u || !ClassicOpcodes::IsBuild70425OrLater() || classicBit <= 120 || classicBit == 134 || classicBit == 166)
+        return classicBit;
+    if (classicBit == 133)
+        return 135;
+    if (classicBit == 165)
+        return 167;
+    if (classicBit == 167)
+        return 168;
+    return classicBit >= 168 ? classicBit + 2 : classicBit + 1;
+}
+
 // Classic group bit -> last child bit
 static constexpr std::array<std::pair<uint32, uint32>, 16> ClassicActivePlayerDataGroups =
 { {
     { 0, 31 }, { 32, 69 }, { 70, 101 }, { 102, 133 }, { 134, 165 }, { 166, 167 }, { 168, 313 }, { 314, 316 }, { 317, 345 },
     { 346, 352 }, { 353, 377 }, { 378, 410 }, { 411, 415 }, { 416, 418 }, { 419, 424 }, { 425, 442 }
 } };
+static constexpr std::array<std::pair<uint32, uint32>, 16> ClassicActivePlayerDataGroups70425 =
+{ {
+    { 0, 31 }, { 32, 69 }, { 70, 101 }, { 102, 133 }, { 134, 165 }, { 166, 169 }, { 170, 315 }, { 316, 318 }, { 319, 347 },
+    { 348, 354 }, { 355, 379 }, { 380, 412 }, { 413, 417 }, { 418, 420 }, { 421, 426 }, { 427, 444 }
+} };
 
 void ActivePlayerData::WriteUpdate(Mask const& changesMask, ByteBuffer& data, Player const* receiver, Player const* owner, bool ignoreNestedChangesMask) const
 {
 
-    std::array<uint32, 14> classicBlocks = WriteClassicChangesMaskHeader<14>(data, changesMask, &ClassicActivePlayerDataBit, ClassicActivePlayerDataGroups);
+    std::array<uint32, 14> classicBlocks = WriteClassicChangesMaskHeader<14>(data, changesMask, &ClassicActivePlayerDataBit,
+        ClassicOpcodes::IsBuild70425OrLater() ? ClassicActivePlayerDataGroups70425 : ClassicActivePlayerDataGroups);
     bool classicGroup134 = (classicBlocks[4] & (1u << (134 % 32))) != 0;
+    bool classicGroup166 = ClassicOpcodes::IsBuild70425OrLater() && (classicBlocks[5] & (1u << (166 % 32))) != 0;
 
     if (changesMask[0])
     {
@@ -7111,7 +7158,13 @@ void ActivePlayerData::WriteUpdate(Mask const& changesMask, ByteBuffer& data, Pl
         data.WriteBit(PetStable.has_value());
         data.WriteBit(WalkInData.has_value());
         data.WriteBit(ChallengeModeData.has_value());
+    }
+    if (classicGroup166)    // client 70425: has-value bit of the new optional (bit 169), read right after the group 134 bits
+        data.WriteBit(false);
+    if (classicGroup134 || classicGroup166)
         data.FlushBits();
+    if (classicGroup134)
+    {
         if (changesMask[139])
         {
             if (QuestSession.has_value())

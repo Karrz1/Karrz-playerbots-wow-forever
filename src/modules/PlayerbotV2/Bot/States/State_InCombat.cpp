@@ -518,7 +518,7 @@ bool MaybeUseManaPotion(BotSnapshotView const& s, GroupSnapshotView const& g, Bo
 } // anonymous
 
 // ---- Group threat discipline ----
-// Port of Karrz's ike3-based bots group threat rules (MoltenCoreDungeonActions.cpp
+// Port of Karrz's wow-1.12 group threat rules (MoltenCoreDungeonActions.cpp
 // MCRaidHoldDamage / MCRaidWaitForTank, MoltenCoreDungeonStrategies.cpp
 // GroupPveRestraint), generalised from Molten Core to any group with a tank.
 // The pure verdict lives in BotSnapshotView::threat_hold(); this layer adds
@@ -646,6 +646,8 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
     if (!cfg.threat_hold_enabled() || s.in_battleground()) return ThreatHold::None;
     if (!s.is_in_instance() && !cfg.threat_hold_open_world()) return ThreatHold::None;
     if (ai.effective_role(s) == Role::Tank) return ThreatHold::None;
+    // A boss fight script owns this bot's start and target (RaidFightScript.h): its start wait is the only hold.
+    if (s.raw().raid_order.active && s.raw().raid_order.script_owns) return ThreatHold::None;
     NearbyUnit const* u = s.hostile_unit(target);
     if (!u) return ThreatHold::None;
 
@@ -783,8 +785,11 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
     // A party's DPS wait for the owner's Attack after a Pull / Pull back and open by themselves this long after the tank's first hit
     // (playtest 2026-10-15: six seconds, in case the owner forgets).
     constexpr uint32 kPartyOpenWaitMs    = 6000;
+    // A raid's boss: eight seconds from the tank's first hit, because the tank takes a while to run in (playtest 2026-10-16); the config wait
+    // is honoured when longer. A party's boss keeps the six-second bound.
     uint32 wait_ms = !u->unit_in_combat ? kMaxUnpulledOwnerWaitMs
-                   : boss ? std::min<uint32>(kMaxOpenWaitBossMs, cfg.threat_opening_wait_boss_ms())
+                   : boss ? (s.is_in_raid() ? std::max<uint32>(kRaidBossOpenWaitMs, cfg.threat_opening_wait_boss_ms())
+                                            : std::min<uint32>(kMaxOpenWaitBossMs, cfg.threat_opening_wait_boss_ms()))
                           : (s.is_in_raid() ? std::max<uint32>(kMaxOpenWaitTrashMs, cfg.threat_opening_wait_trash_ms()) : kPartyOpenWaitMs);
     // A raid trash mob a tank already holds (it is the mob's victim) needs no long lead wait: its
     // threat only has to start building, so DPS opens ~2 s after the tank has it (MC 2026-10-06:
@@ -2611,8 +2616,11 @@ void DispatchInCombat(BotAI& ai,
             if (alive) { skull = mark; break; }
         }
         Role const sk_role = ai.effective_role(snapshot);
+        // A boss fight script picks the target (it already honours the skull): this rule would be a second voice.
+        bool const script_target = snapshot.raw().raid_order.active && snapshot.raw().raid_order.script_owns &&
+            !snapshot.raw().raid_order.script_focus.IsEmpty();
         if (!skull.IsEmpty() && snapshot.victim() != skull && sk_role != Role::Tank && sk_role != Role::Healer &&
-            !HeldByOwner(ai, snapshot))
+            !HeldByOwner(ai, snapshot) && !script_target)
             for (auto const& u : snapshot.nearby_enemies())
             {
                 if (u.guid != skull) continue;
@@ -2644,7 +2652,9 @@ void DispatchInCombat(BotAI& ai,
         auto const& kf_po = snapshot.raw().pve_order;
         if (kf_po.active && !kf_po.kill_focus.IsEmpty() &&
             snapshot.is_alive() && !snapshot.is_casting() && !on_owner_attack &&
-            snapshot.victim() != kf_po.kill_focus)
+            snapshot.victim() != kf_po.kill_focus &&
+            !(snapshot.raw().raid_order.active && snapshot.raw().raid_order.script_owns &&
+              !snapshot.raw().raid_order.script_focus.IsEmpty()))   // a boss fight script picks the target
         {
             for (auto const& u : snapshot.nearby_enemies())
             {

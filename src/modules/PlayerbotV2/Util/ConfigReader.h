@@ -288,7 +288,7 @@ public:
     //   (PlayerbotV2.Combat.SkipUnfightable)
     bool combat_skip_unfightable() const { return combat_skip_unfightable_; }
 
-    // Group threat discipline (port of Karrz's ike3-based bots GroupPveRestraint /
+    // Group threat discipline (port of Karrz's wow-1.12 GroupPveRestraint /
     // MCRaidHoldDamage). Non-tank bots in a group with a tank hold damage
     // until the tank has an opening threat lead and stay under max_ratio of
     // the tank's threat. Leads are level-60 values, scaled by bot level.
@@ -497,7 +497,7 @@ private:
     bool   raid_provide_consumables_     = false;
     bool   consumables_pve_              = true;
     bool   consumables_pvp_              = false;
-    uint32 raid_dps_wait_timeout_ms_     = 10000;
+    uint32 raid_dps_wait_timeout_ms_     = 8000;
     bool   threat_hold_open_world_       = false;
     float  threat_max_ratio_             = 0.9f;
     float  threat_opening_lead_boss_     = 900.0f;

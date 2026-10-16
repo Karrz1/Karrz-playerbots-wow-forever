@@ -21,7 +21,7 @@ namespace Playerbot::V2::TownLife
 // strikes (a bot stood still too long), split by capital and elsewhere, which is how a frozen bot shows up in the log.
 struct Stats
 {
-    std::atomic<std::uint32_t> inn_ticks{0}, mailbox_ticks{0}, duels{0}, campfires{0}, lfg_calls{0}, idle_town{0}, idle_field{0};
+    std::atomic<std::uint32_t> inn_ticks{0}, inn_walk{0}, inn_none{0}, inn_stuck{0}, mailbox_ticks{0}, duels{0}, campfires{0}, lfg_calls{0}, idle_town{0}, idle_field{0};
 };
 inline Stats& Counters()
 {

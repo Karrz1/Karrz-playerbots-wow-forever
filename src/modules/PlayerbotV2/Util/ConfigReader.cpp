@@ -1,4 +1,5 @@
 #include "ConfigReader.h"
+#include "../Bot/ThreatLimits.h"
 #include "Config.h"
 #include "Log.h"
 #include <algorithm>
@@ -150,7 +151,7 @@ void ConfigReader::apply_from_loaded_config()
     raid_provide_consumables_ = c.GetBoolDefault("Playerbot.Raid.ProvideConsumables", true, true);
     consumables_pve_          = c.GetBoolDefault("Playerbot.Consumables.PvE", true, true);
     consumables_pvp_          = c.GetBoolDefault("Playerbot.Consumables.PvP", false, true);
-    raid_dps_wait_timeout_ms_ = uint32(std::clamp<int64>(int64(c.GetIntDefault("Playerbot.Raid.DpsWaitTimeoutMs", 6000, true)), 1000, 6000));
+    raid_dps_wait_timeout_ms_ = uint32(std::clamp<int64>(int64(c.GetIntDefault("Playerbot.Raid.DpsWaitTimeoutMs", int(kRaidDpsWaitTimeoutMaxMs), true)), 1000, int64(kRaidDpsWaitTimeoutMaxMs)));
     threat_hold_open_world_ = c.GetBoolDefault("PlayerbotV2.Threat.HoldInOpenWorld", false, true);
     threat_max_ratio_ = std::clamp(float(c.GetFloatDefault("PlayerbotV2.Threat.MaxRatio", 0.9f, true)), 0.3f, 1.2f);
     threat_opening_lead_boss_  = std::max(0.0f, float(c.GetFloatDefault("PlayerbotV2.Threat.OpeningLeadBoss", 900.0f, true)));

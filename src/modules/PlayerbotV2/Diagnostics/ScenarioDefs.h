@@ -300,6 +300,21 @@ inline ScenarioDef MakeOnyScenario()
     return MakeRaidScenario(kOny, kOnyEntrance, RaidSquad(kOnyRaid, sizeof(kOnyRaid) / sizeof(kOnyRaid[0])));
 }
 
+// The same fight judged on the dodge. onyxia_full passes on the kill however many die, which let a live fight lose 38 of 40 (25 to Deep Breath, 11 to
+// Heated Ground, three waves, 2026-10-16) with the boss alive and say nothing. Here the fourth death fails the run and the sixth ends it: the raid
+// stands off the line of the waypoint she hovers at before the cast, and out of the Heated Ground the pass leaves. Read the run's [raid_breath]
+// lines (the corridor opens on the cast), [raid_death] (spell, position) and [raid_hazard] (Heated Ground exits).
+inline ScenarioDef MakeOnyDodgeScenario()
+{
+    ScenarioDef d = MakeOnyScenario();
+    d.name = "onyxia_dodge";
+    d.summary = "Onyxia's Lair: the whole fight with three deaths allowed, so a Deep Breath or Heated Ground that kills the raid fails the run";
+    d.limits.kill_is_pass = false;
+    d.limits.tolerated_deaths = 3;
+    d.limits.max_deaths = 6;
+    return d;
+}
+
 // ---- Blackwing Lair, Razorgore the Untamed: the orb fight, 40 level 60 raiders ----
 // Phase 1: nobody attacks Razorgore while a Black Dragon Egg stands (he dying early kills the raid). A DPS bot walks to the Orb of Domination
 // (GO 177808) and uses it, which engages and possesses Razorgore; the controller sends him egg to egg (Destroy Egg), Mind Exhaustion hands the
@@ -399,6 +414,7 @@ inline std::vector<ScenarioDef> const& ScenarioCatalogue()
         for (RaidBossRow const& r : kMcBosses)
             v.push_back(MakeMcScenario(r));
         v.push_back(MakeOnyScenario());
+        v.push_back(MakeOnyDodgeScenario());
         v.push_back(MakeBwlRazorgoreScenario());
         // The names are built once and kept: ScenarioDef carries char const*.
         static std::deque<std::string> s_parity_names;

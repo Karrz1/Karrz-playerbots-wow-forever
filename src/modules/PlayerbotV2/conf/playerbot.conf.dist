@@ -1035,7 +1035,7 @@ PlayerbotV2.Move.RouteAwareCombatAdvance = 1
 # combat frame; WC corridor freeze 2026-07-03 (z-disconnected ledge pack).
 PlayerbotV2.Combat.SkipUnfightable       = 1
 
-# Group threat discipline (port of Karrz's ike3-based bots GroupPveRestraint /
+# Group threat discipline (port of Karrz's wow-1.12 GroupPveRestraint /
 # MCRaidHoldDamage). Applies only to non-tank bots in a group that has a tank
 # (main-tank flag, LFG tank role or tank spec) - never to solo bots, BGs or
 # a mob already hitting a non-tank member (self-defence). Holding = the bot
@@ -1070,9 +1070,10 @@ Playerbot.Raid.ProvideConsumables     = 1
 Playerbot.Consumables.PvE             = 1
 Playerbot.Consumables.PvP             = 0
 # Playerbot.Raid.DpsWaitTimeoutMs  with DpsWaitForAttack: after the tanks have fought this long without the owner's
-#   Attack, the DPS go anyway (a forgotten Attack no longer wipes the raid). Same six seconds as a party's Pull; the
-#   value is limited to 1000-6000 (there is no "never"). Default 6000.
-Playerbot.Raid.DpsWaitTimeoutMs       = 6000
+#   Attack, the DPS go anyway (a forgotten Attack no longer wipes the raid). Eight seconds for a raid, because the tank
+#   takes a while to run in (a party's Pull keeps six); the value is limited to 1000-8000 (there is no "never").
+#   Default 8000.
+Playerbot.Raid.DpsWaitTimeoutMs       = 8000
 PlayerbotV2.Threat.HoldInOpenWorld    = 0
 PlayerbotV2.Threat.MaxRatio           = 0.9
 PlayerbotV2.Threat.OpeningLeadBoss    = 900

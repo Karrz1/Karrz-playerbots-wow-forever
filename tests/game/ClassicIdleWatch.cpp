@@ -73,3 +73,14 @@ TEST_CASE("IdleWatch: strikes and bot ids spread a stuck crowd over different hu
     CHECK(IdlePickHub(0, 3, 7) == 0);
     CHECK(IdlePickHub(2, 5, 9) < 2);
 }
+
+TEST_CASE("IdleWatch: only the rules that walk toward a quest objective are objective rules", "[idlewatch]")
+{
+    using Playerbot::V2::IsObjectiveRule;
+    CHECK(IsObjectiveRule("idle:pursue_quest_goal"));
+    CHECK(IsObjectiveRule("idle:far_same_map_travel"));
+    CHECK_FALSE(IsObjectiveRule("idle:watch_walk"));
+    CHECK_FALSE(IsObjectiveRule("idle:travel_to_hub"));
+    CHECK_FALSE(IsObjectiveRule("idle:pursue_quest"));
+    CHECK_FALSE(IsObjectiveRule(nullptr));
+}

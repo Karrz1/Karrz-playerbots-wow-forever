@@ -199,4 +199,11 @@ constexpr bool IsLiquidImpassableForWalk(LiquidVerdict v)
 // Null = LiquidPolicy::None.
 extern LiquidPolicy (*g_LiquidPathPolicy)(Player* p);
 
+// How often the path calls from a bot's spot have failed with no route (NoPath, or a destination off the mesh), per window of three
+// minutes (Fleet/CityLayer.h). The stranded watch reads it: a bot in a pocket with void all round it fails once a second and never
+// moves far enough for the idle watch to see it stand still. World thread.
+void NoteNoPath(Player const* p);
+bool NoPathStorm(Player const* p);
+void ClearNoPath(Player const* p);
+
 } // namespace Playerbot::BotMovement

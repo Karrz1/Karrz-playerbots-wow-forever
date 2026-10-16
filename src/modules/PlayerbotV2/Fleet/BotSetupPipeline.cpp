@@ -625,6 +625,9 @@ bool BotSetupPipeline::DoLearnProfessions(Player* bot)
     // granted here even though bandages still exist as items. Apprentice
     // ranks: Cooking 2550, Fishing 7732.
     grant_skill(/*Cooking*/  185, 2550);
+    // Basic Campfire comes with Cooking; the campfire show (idle:campfire) needs it, and a bot that got the skill by SetSkill alone may not have it.
+    if (!bot->HasSpell(818) && sSpellMgr->GetSpellInfo(818, DIFFICULTY_NONE))
+        bot->LearnSpell(818, /*dependent=*/false);
     grant_skill(/*Fishing*/  356, 7732);
 
     // Classic 1.60: vanilla has First Aid (removed only in BfA) and no

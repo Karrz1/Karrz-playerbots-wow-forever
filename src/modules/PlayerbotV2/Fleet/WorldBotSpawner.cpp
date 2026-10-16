@@ -1,6 +1,7 @@
 // WorldBotSpawner - see the header for the model. World thread only.
 
 #include "Fleet/WorldLeash.h"
+#include "Fleet/CityLayer.h"
 #include "WorldBotSpawner.h"
 #include "Bot/TownLife.h"
 #include "WakeSelect.h"
@@ -299,8 +300,8 @@ std::string WorldBotSpawner::Report() const
         ambient_online_, cfg_.max_bots, tied_online_, owned_online_, soak_anchors_, n_evicted_, n_arrived_walking_, n_left_walking_, leaving_.size());
     {
         auto& tl = ::Playerbot::V2::TownLife::Counters();
-        line += Trinity::StringFormat(" | town_life inn_ticks={} mailbox_ticks={} duels={} campfires={} lfg_calls={} idle_strikes town={} field={}",
-            tl.inn_ticks.load(std::memory_order_relaxed), tl.mailbox_ticks.load(std::memory_order_relaxed), tl.duels.load(std::memory_order_relaxed),
+        line += Trinity::StringFormat(" | town_life inn_ticks={} inn_walk={} inn_none={} inn_stuck={} mailbox_ticks={} duels={} campfires={} lfg_calls={} idle_strikes town={} field={}",
+            tl.inn_ticks.load(std::memory_order_relaxed), tl.inn_walk.load(std::memory_order_relaxed), tl.inn_none.load(std::memory_order_relaxed), tl.inn_stuck.load(std::memory_order_relaxed), tl.mailbox_ticks.load(std::memory_order_relaxed), tl.duels.load(std::memory_order_relaxed),
             tl.campfires.load(std::memory_order_relaxed), tl.lfg_calls.load(std::memory_order_relaxed), tl.idle_town.load(std::memory_order_relaxed), tl.idle_field.load(std::memory_order_relaxed));
     }
     auto const tiers = Services::Scheduler().tier_counts();
@@ -434,6 +435,9 @@ static bool CompletePathTo(Player* from, float x, float y, float z)
 // stranded on that alone. So an incomplete path is followed: the next call starts where the last one ended, and the goal is reached when
 // some call completes. A real pocket (the Great Forge pit) ends at the same point every time, so the chain stops advancing and it is
 // refused. At most `hops` calls; `used` gets the number made (the caller's probe budget).
+// A path that goes down a cliff face is not one a bot can walk: Detour joins the layers of Stormwind over steep faces, so a bot on a
+// platform above the city "reaches" the city by a drop it cannot make (Dutchess, 36 minutes on the wall at z 101). The check is
+// Fleet::PathHasCliff (CityLayer.h); no function of the same name may be declared in this file, or the call below binds to it.
 static bool ReachableChain(Player* from, float x, float y, float z, uint32 hops, uint32& used)
 {
     float sx = from->GetPositionX(), sy = from->GetPositionY(), sz = from->GetPositionZ();
@@ -446,11 +450,11 @@ static bool ReachableChain(Player* from, float x, float y, float z, uint32 hops,
         if (t & (PATHFIND_NOT_USING_PATH | PATHFIND_SHORTCUT))
             return true;
         if ((t & PATHFIND_NORMAL) && !(t & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE | PATHFIND_FARFROMPOLY)))
-            return true;
+            return !PathHasCliff(pg.GetPath());
         if (!(t & PATHFIND_INCOMPLETE) || (t & PATHFIND_NOPATH))
             return false;
         Movement::PointsArray const& pts = pg.GetPath();
-        if (pts.size() < 2)
+        if (pts.size() < 2 || PathHasCliff(pts))
             return false;
         G3D::Vector3 const& end = pts.back();
         if (std::hypot(end.x - sx, end.y - sy) < 3.0f)
@@ -1088,6 +1092,8 @@ void WorldBotSpawner::DriveSpawn(uint32 now_ms, std::vector<Anchor> const& ancho
             }
         }
 
+        // Random order, not oldest-seen first: the oldest rows are the same ones every pass, and when they are all of the other faction
+        // (or never match the slots) the pass matched nothing and the anchor's zone stayed empty (pathing-9 soak: Duskwood 0/8 each pass).
         // Level range that suits the anchor's zone; capitals and the like have none, so spread around the player.
         uint8 lo = 0, hi = 0;
         WindowFor(a, lo, hi);
@@ -1106,7 +1112,7 @@ void WorldBotSpawner::DriveSpawn(uint32 now_ms, std::vector<Anchor> const& ancho
             "SELECT pv.character_guid_low, c.level, c.race, c.map, c.position_x, c.position_y, c.position_z FROM playerbot_v2_character pv "
             "JOIN characters c ON c.guid = pv.character_guid_low "
             "WHERE c.level BETWEEN {} AND {} AND c.online = 0 AND pv.distribution_level > 0 {}"
-            "ORDER BY pv.last_seen_at ASC LIMIT {}",
+            "ORDER BY RAND() LIMIT {}",
             uint32(lo), uint32(hi), SkyborneRaceClause(Skyborne::IsOnIsle(a.map)), std::max<uint32>(want * 20u, 100u)).c_str())
             .WithCallback([this, a, slots, slot_levels](QueryResult res)
         {
@@ -1184,7 +1190,7 @@ void WorldBotSpawner::DriveCrowd(uint32 now_ms, std::vector<Anchor> const& ancho
 void WorldBotSpawner::DriveStranded(uint32 now_ms, std::vector<Anchor> const& anchors)
 {
     constexpr uint32 kPassMs = 2000u;
-    constexpr uint32 kProbesPerPass = 3u;      // path probes (the costly ones) per pass; lava checks are cheap
+    constexpr uint32 kProbesPerPass = 12u;     // path probes (the costly ones) per pass; lava checks are cheap. Three a pass checked a bot once in two minutes or worse once 40 bots needed the full chain (soak 2026-10-16)
     constexpr float  kTownPathRange = 200.0f;  // a town's player this close gives the reference for "a way out"
     if (last_stranded_ms_ && getMSTimeDiff(last_stranded_ms_, now_ms) < kPassMs)
         return;
@@ -1233,6 +1239,37 @@ void WorldBotSpawner::DriveStranded(uint32 now_ms, std::vector<Anchor> const& an
             path_out = ReachableChain(p, near_a->x, near_a->y, near_a->z, 4u, used);
             probes += std::max<uint32>(1u, used);
         }
+        else if (!magma && in_town)
+        {
+            // Nobody close by: the town's own meeting places are the reference. A bot on a lower layer under the city (n124: Dyanne at z 75 and 59
+            // below the Trade District's z 97, same x/y) reaches none of them. It must reach at least one of the three nearest.
+            std::vector<::Playerbot::V2::Fleet::GatherSpot> spots =
+                ::Playerbot::V2::Fleet::TownGatherSpots(p->GetMapId(), px, py, 150.0f, p->GetTeam() == ALLIANCE);
+            if (spots.empty())   // a far corner of the city (Dutchess, the wall at the north-west): no meeting place within 150 y, so look wider
+                spots = ::Playerbot::V2::Fleet::TownGatherSpots(p->GetMapId(), px, py, 600.0f, p->GetTeam() == ALLIANCE);
+            std::sort(spots.begin(), spots.end(), [&](auto const& a, auto const& b)
+                { return Dist2D(a.x, a.y, px, py) < Dist2D(b.x, b.y, px, py); });
+            if (spots.size() > 3u)
+                spots.resize(3u);
+            if (!spots.empty())
+            {
+                if (probes >= kProbesPerPass)
+                    return;
+                path_out = false;
+                for (auto const& g : spots)
+                {
+                    uint32 used = 0;
+                    bool const ok = ReachableChain(p, g.x, g.y, g.z, 4u, used);
+                    probes += std::max<uint32>(1u, used);
+                    if (ok) { path_out = true; break; }
+                }
+            }
+        }
+        // Every path call from this spot has been failing for minutes (a pocket with void all round it: Hellice, 3720 NoPath in an hour,
+        // pacing a few yards so the idle watch never saw her stand still): as cut off as a bot whose probe finds no way out.
+        bool const storm = !magma && path_out && ::Playerbot::BotMovement::NoPathStorm(p);
+        if (storm)
+            path_out = false;
         if (!StrandedUpdate(st, magma, path_out, px, py, pz, now_ms))
             return;
 
@@ -1240,12 +1277,13 @@ void WorldBotSpawner::DriveStranded(uint32 now_ms, std::vector<Anchor> const& an
         if (!ap || !ap->IsInWorld() || !PlaceNear(p, ap))
             return;
         placed_[uint64(id)] = Placed{ now_ms };
+        ::Playerbot::BotMovement::ClearNoPath(p);
         ++n_stranded_moved_;
         // How it got there, so the cause can be read from the log: the rule that last moved it, and the spot the previous check found it
         // on (a bot that walked in shows a previous spot nearby; one that was put there or woke there shows none or a far one).
         char const* last_rule = entry.ai && entry.ai->last_rule_fired() ? entry.ai->last_rule_fired() : "-";
         TC_LOG_INFO("playerbot.v2", "[world] {} ({}) was {} at ({:.0f},{:.0f},{:.0f}) in zone {}, placed again next to {} | last_rule={} previous_check=({:.0f},{:.0f},{:.0f})",
-                    p->GetName(), uint64(id), magma ? "standing in lava" : "on ground with no way out", px, py, pz, p->GetZoneId(), ap->GetName(),
+                    p->GetName(), uint64(id), magma ? "standing in lava" : storm ? "on ground where every path call fails" : "on ground with no way out", px, py, pz, p->GetZoneId(), ap->GetName(),
                     last_rule, prev_x, prev_y, prev_z);
     });
     // Forget bots that are gone.
@@ -1300,13 +1338,13 @@ void WorldBotSpawner::DriveStuckLedger(uint32 now_ms)
         float const ground = p->GetMap()->GetHeight(p->GetPhaseShift(), px, py, pz + 3.0f, true, 20.0f);
         TC_LOG_INFO("playerbot.v2",
             "[stuck_ledger] {} ({}) zone {} at ({:.1f},{:.1f},{:.1f}) strikes={} on_mesh={} {} ground_z={:.1f} rooted={} stunned={} held_state={} "
-            "falling={} swimming={} move_gen={} run_speed={:.1f} target=({:.0f},{:.0f},{:.0f}) {} last_rule={}",
+            "falling={} swimming={} move_gen={} run_speed={:.1f} nopath_storm={} target=({:.0f},{:.0f},{:.0f}) {} last_rule={}",
             p->GetName(), uint64(id), p->GetZoneId(), px, py, pz, w.strikes, on_mesh ? "yes" : "NO",
             on_mesh ? "" : (wide ? std::format("(walkable ground {:.0f} y away)", std::hypot(wide_mesh.GetPositionX() - px, wide_mesh.GetPositionY() - py)) : std::string("(none within 40 y)")),
             ground > INVALID_HEIGHT ? ground : -999.f, p->HasUnitMovementFlag(MOVEMENTFLAG_ROOT) ? 1 : 0, p->HasUnitState(UNIT_STATE_STUNNED) ? 1 : 0,
             p->HasUnitState(UNIT_STATE_ROOT | UNIT_STATE_CONFUSED | UNIT_STATE_FLEEING | UNIT_STATE_CONTROLLED) ? 1 : 0,
             p->IsFalling() ? 1 : 0, p->IsInWater() ? 1 : 0, uint32(p->GetMotionMaster()->GetCurrentMovementGeneratorType()),
-            p->GetSpeed(MOVE_RUN), w.tx, w.ty, w.tz, reach,
+            p->GetSpeed(MOVE_RUN), ::Playerbot::BotMovement::NoPathStorm(p) ? 1 : 0, w.tx, w.ty, w.tz, reach,
             entry.ai->last_rule_fired() ? entry.ai->last_rule_fired() : "-");
         if (!on_mesh && wide)
         {
@@ -1511,7 +1549,7 @@ void WorldBotSpawner::DriveGlobalSpawn(uint32 now_ms, std::vector<Anchor> const&
         "SELECT pv.character_guid_low, c.level, c.race, c.map, c.position_x, c.position_y, c.position_z FROM playerbot_v2_character pv "
         "JOIN characters c ON c.guid = pv.character_guid_low "
         "WHERE c.level BETWEEN {} AND {} AND c.online = 0 AND pv.distribution_level > 0 {}"
-        "ORDER BY pv.last_seen_at ASC LIMIT {}",
+        "ORDER BY RAND() LIMIT {}",
         cfg_.min_level, cfg_.max_level, SkyborneRaceClause(false), std::max<uint32>(want * 40u, 200u)).c_str())
         .WithCallback([this, g, slots, slot_levels](QueryResult res)
     {

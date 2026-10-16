@@ -215,10 +215,23 @@ TEST_CASE("Onyxia's ranged and healers stand in the flank wedges in phases 1 and
             if (f.enemy == 10184 && f.who == who)
             {
                 ++phases;
-                CHECK(f.centerDeg - f.halfAngleDeg >= 50.0f);   // outside the 45 degree front cones
-                CHECK(f.centerDeg + f.halfAngleDeg <= 90.0f);   // in front of the tail sweep
+                // Outside the widened front cone and in front of the widened tail sweep (read from the rules, so a change of either moves the test).
+                float frontEdge = 0.0f, tailEdge = 180.0f;
+                for (AvoidFrontal const& c : r->avoidFrontal)
+                    if (c.enemy == 10184)
+                    {
+                        if (c.facingOffsetDeg == 0.0f)
+                            frontEdge = ConeEdgeDeg(c);
+                        else
+                            tailEdge = 180.0f - ConeEdgeDeg(c);
+                    }
+                CHECK(f.centerDeg - f.halfAngleDeg > frontEdge);
+                CHECK(f.centerDeg + f.halfAngleDeg < tailEdge);
                 if (who != Who::Melee)
+                {
                     CHECK(f.minDist >= 20.0f);                  // outside Wing Buffet
+                    CHECK(f.maxDist <= 29.0f);                  // inside the casters' 30 y reach: the range step must not pull them out again
+                }
             }
         CHECK(phases == 2);
     }
@@ -271,8 +284,32 @@ TEST_CASE("Onyxia's frontal cones do not make the tank turn her", "[ClassicRaidR
         {
             ++cones;
             CHECK(!f.tankTurns);
+            CHECK(f.marginDeg > 0.0f);   // a cast lands two seconds after she turns
         }
     CHECK(cones == 2);
+}
+
+// Third live pull 2026-10-16: 27 of 38 deaths were Flame Breath at raiders 55-77 degrees off her facing, one breath 117 degrees across.
+TEST_CASE("Onyxia's Flame Breath cone is modelled wider than 45 degrees with a margin, and the wedges sit between it and the tail", "[ClassicRaidRagnaros]")
+{
+    CHECK(kOnyFrontHalfDeg >= 60.0f);
+    CHECK(kOnyWedgeLoDeg == kOnyFrontHalfDeg + kOnyConeMarginDeg + kOnyWedgeGapDeg);
+    CHECK(kOnyWedgeHiDeg == 180.0f - kOnyTailHalfDeg - kOnyConeMarginDeg - kOnyWedgeGapDeg);
+    CHECK(kOnyWedgeHalfDeg >= 8.0f);   // room for a row of casters
+    CHECK(kOnyWedgeCentreDeg - kOnyWedgeHalfDeg == kOnyWedgeLoDeg);
+    CHECK(kOnyWedgeCentreDeg + kOnyWedgeHalfDeg == kOnyWedgeHiDeg);
+    RaidRules const* r = RulesForMap(249);
+    REQUIRE(r != nullptr);
+    bool front = false;
+    for (AvoidFrontal const& f : r->avoidFrontal)
+        if (f.enemy == 10184 && f.facingOffsetDeg == 0.0f)
+        {
+            front = true;
+            CHECK(f.halfAngleDeg == kOnyFrontHalfDeg);
+            CHECK(f.radius >= 45.0f);                          // Flame Breath's 45 y
+            CHECK(ConeEdgeDeg(f) == kOnyFrontHalfDeg + kOnyConeMarginDeg);
+        }
+    CHECK(front);
 }
 
 // chris 2026-10-15: the tank holds Onyxia with her back to the raid in the two ground phases (one locked step, not a turn at every cone).
@@ -304,5 +341,63 @@ TEST_CASE("Onyxia's eight breaths each list two safe points off their line", "[C
             if (s.enemy == path.enemy && s.castSpell == path.castSpell)
                 ++n;
         CHECK(n == 2);
+    }
+}
+
+// onyxia_full live 2026-10-16 (wipe at 267 s): the corridor opened with the 5 s cast, 16 raiders died in the second it ended, eight of them 45 y or more
+// from the nearest safe point. The line is known as soon as she hovers at a waypoint, so every corridor opens on her arrival.
+TEST_CASE("Onyxia's breath corridors open while she hovers at their first waypoint", "[ClassicRaidRagnaros]")
+{
+    RaidRules const* r = RulesForMap(249);
+    REQUIRE(r != nullptr);
+    int hover = 0;
+    for (AvoidBreath const& path : r->avoidBreath)
+    {
+        if (path.enemy != 10184)
+            continue;
+        CHECK(path.hover);
+        CHECK(path.who == Who::Anyone);   // tanks and healers leave the line too
+        ++hover;
+        // At its own waypoint, and a few yards off it, the hover breath is this one.
+        AvoidBreath const* at = HoverBreath(*r, 10184, path.ax, path.ay, 12.0f);
+        REQUIRE(at != nullptr);
+        CHECK(at->castSpell == path.castSpell);
+        CHECK(HoverBreath(*r, 10184, path.ax + 5.0f, path.ay - 5.0f, 12.0f) == at);
+        // The end point of the line is the opposite waypoint: her next hover breath there is another spell.
+        AvoidBreath const* far = HoverBreath(*r, 10184, path.bx, path.by, 12.0f);
+        REQUIRE(far != nullptr);
+        CHECK(far->castSpell != path.castSpell);
+        CHECK(far->ax == path.bx);
+    }
+    CHECK(hover == 8);
+    // The middle of the hall is no waypoint, and another enemy has no hover breath.
+    CHECK(HoverBreath(*r, 10184, -32.0f, -215.0f, 12.0f) == nullptr);
+    CHECK(HoverBreath(*r, 12118u, 22.8763f, -217.152f, 12.0f) == nullptr);
+}
+
+// The breath damage is one instant at the end of the cast and the flight after it hurts nobody: a corridor held much longer shut the raid in while
+// Heated Ground burned (rays in avoid circle on every exit).
+TEST_CASE("A cast breath's corridor closes soon after its damage", "[ClassicRaidRagnaros]")
+{
+    CHECK(kBreathCorridorOpenMs >= 6000u);    // the 5 s cast, the plan interval and the trigger chain
+    CHECK(kBreathCorridorOpenMs <= 10000u);
+}
+
+// Eleven raiders died in Heated Ground (22191..22202), standing on the safe points of the breaths, which lie in it.
+TEST_CASE("Onyxia's Heated Ground is a ground hazard for everybody", "[ClassicRaidRagnaros]")
+{
+    RaidRules const* r = RulesForMap(249);
+    REQUIRE(r != nullptr);
+    for (uint32_t spell = 22191u; spell <= 22202u; ++spell)
+    {
+        bool found = false;
+        for (AvoidGroundEffect const& g : r->avoidGroundEffect)
+            if (g.enemy == 10184 && g.spell == spell)
+            {
+                found = true;
+                CHECK(g.who == Who::Anyone);
+                CHECK(g.margin > 0.0f);
+            }
+        CHECK(found);
     }
 }

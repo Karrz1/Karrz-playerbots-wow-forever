@@ -30,3 +30,15 @@ TEST_CASE("Melee never releases above the tank's threat and casters keep a tenth
     CHECK(ThreatHardRatio(false) == 1.10f);
     CHECK(ThreatHardRatio(false) > ThreatHardRatio(true));
 }
+
+// Raid pulls: the tank takes a while to run in, so the DPS open eight seconds after its first hit on a boss (the owner's Attack still releases at once).
+// The generic hold, the raid brain's hold and every boss fight script read this one number.
+TEST_CASE("A raid's DPS wait eight seconds after the tank's first hit on a boss", "[ClassicThreatLimits]")
+{
+    CHECK(kRaidBossOpenWaitMs == 8000u);
+    // The "forgotten Attack" release (Playerbot.Raid.DpsWaitTimeoutMs) is the one that actually opened the live Lucifron fight at 6 s; it was
+    // limited to six seconds in the config reader. A raid may now be set up to eight, a party stays at six.
+    CHECK(kRaidDpsWaitTimeoutMaxMs == 8000u);
+    CHECK(kPartyDpsWaitTimeoutMs == 6000u);
+    CHECK(kRaidDpsWaitTimeoutMaxMs > kPartyDpsWaitTimeoutMs);
+}

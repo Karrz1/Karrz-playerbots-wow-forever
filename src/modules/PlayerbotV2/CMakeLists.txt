@@ -53,10 +53,15 @@ function(playerbot_v2_configure_sublib target_name)
       CXX_EXTENSIONS OFF
       FOLDER "src/modules/PlayerbotV2"
   )
+  # A function that calls itself on every path never returns and the compiler turns it into a bare jump to itself (a static wrapper
+  # named like the function it forwards to did this, and froze the world thread): that warning is an error here.
   if(MSVC)
-    target_compile_options(${target_name} PRIVATE /W4)
+    target_compile_options(${target_name} PRIVATE /W4 /we4717)
   else()
     target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      target_compile_options(${target_name} PRIVATE -Werror=infinite-recursion)
+    endif()
   endif()
   if(USE_COREPCH)
     target_precompile_headers(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/PCH.h)

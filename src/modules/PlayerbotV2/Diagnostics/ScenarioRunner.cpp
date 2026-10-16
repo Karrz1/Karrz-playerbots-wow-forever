@@ -23,6 +23,9 @@
 #include "GroupMgr.h"
 #include "Log.h"
 #include "InstanceLockMgr.h"
+#include "MMapManager.h"
+#include "PhasingHandler.h"
+#include "DetourNavMeshQuery.h"
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "DB2Stores.h"
@@ -1112,6 +1115,47 @@ void SamplePull(Run& run)
 
 // What the squad stands in at the pull: health and buffs per role, so a scenario that fails can be told from a raid that is under-prepared
 // (MC Ragnaros 2026-10-13: healers died to 2000 damage with ~2000 health at the hit). One line per role.
+// Every raider's footing at the order: how many stand on the navmesh, and the ones that do not (position, nearest-poly probe). A bot with no
+// polygon under it cannot path anywhere (Mcmageb on mc_lucifron 44609c95: srcpoly=0, void ahead, 55-70 y from its target for the whole fight),
+// which reads as a rule that never acts. 2 = a polygon within 5 y vertically, 1 = one only far above or below, 0 = no tile or no mesh, -1 = probe fault.
+void LogRaiderFooting(Run const& run)
+{
+    std::uint32_t total = 0, on_mesh = 0;
+    for (Member const& m : run.members)
+    {
+        Player* p = Find(m.id);
+        if (!p || !p->IsAlive())
+            continue;
+        ++total;
+        int probe = 0;
+        if (Map* map = p->GetMap())
+        {
+            uint32 const terrain_map = PhasingHandler::GetTerrainMapId(p->GetPhaseShift(), p->GetMapId(), map->GetTerrain(), p->GetPositionX(), p->GetPositionY());
+            if (dtNavMeshQuery const* q = MMAP::MMapManager::instance()->GetNavMeshQuery(terrain_map, p->GetMapId(), p->GetInstanceId()))
+            {
+                dtQueryFilter f;
+                f.setIncludeFlags(0xFFFF);
+                float ext[3] = { 3.0f, 5.0f, 3.0f };
+                float pt[3] = { p->GetPositionY(), p->GetPositionZ(), p->GetPositionX() };   // TC -> Detour (y, z, x)
+                int r = ::Playerbot::BotMovement::SehSafeNearestPolyProbe(q, pt, ext, &f);
+                if (r != 0)
+                    probe = r > 0 ? 2 : -1;
+                else
+                {
+                    float ext2[3] = { 3.0f, 200.0f, 3.0f };
+                    probe = ::Playerbot::BotMovement::SehSafeNearestPolyProbe(q, pt, ext2, &f);
+                }
+            }
+        }
+        if (probe == 2)
+            ++on_mesh;
+        else
+            TC_LOG_INFO("playerbot.v2", "[scenario] {} footing: {} stands at {:.1f},{:.1f},{:.1f} with no navmesh polygon under it (probe {})", run.def->name,
+                        p->GetName(), p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(), probe);
+    }
+    TC_LOG_INFO("playerbot.v2", "[scenario] {} footing: {} of {} raiders stand on the navmesh", run.def->name, on_mesh, total);
+}
+
 void LogPullState(Run const& run)
 {
     // Power Word: Fortitude / Prayer of Fortitude, Mark of the Wild / Gift of the Wild, Arcane Intellect / Brilliance, Blessings and Greater Blessings.
@@ -1175,6 +1219,7 @@ bool IssueAttack(Run& run)
         return false;
     }
     LogPullState(run);
+    LogRaiderFooting(run);
     // How many of the boss's entry stand within 400 y, and where: a leftover from an earlier run (Ragnaros summoned twice, a lair summon that
     // was never cleared) would explain tanks that read 16-20 y from "the boss" at the order and a fight that starts on the wrong one.
     {
@@ -1207,7 +1252,9 @@ bool IssueAttack(Run& run)
     TC_LOG_INFO("playerbot.v2", "[scenario] {} ordered {} onto {} ({}) at {} s, {:.0f} y away (start_attack result {})", run.def->name,
                 tank->GetName(), boss->GetName(), run.def->goal_entry, run.run_ms / 1000u, tank->GetDistance(boss), int(res));
     // A target the server refuses (immune to players, not interactible) is a fault in the setup, not a fight that happens to be quiet.
-    if (res == ::Playerbot::Result::InvalidTarget)
+    // Not when the boss is already fighting the raid: a boss script (Bot/Raid/RaidFightScript.h) owns the pull and had the DPS on it before
+    // this order, and Attack on a mob the bot already fights is refused as an invalid target.
+    if (res == ::Playerbot::Result::InvalidTarget && !boss->IsInCombat())
         run.monitor->NoteSetupFailure(run.run_ms, "", fmt::format("{} refused the attack order on {} ({}): the boss is not attackable (immune to players or not interactible)",
                                                                    tank->GetName(), boss->GetName(), run.def->goal_entry));
     return true;

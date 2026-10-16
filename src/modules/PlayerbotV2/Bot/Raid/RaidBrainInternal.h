@@ -97,6 +97,9 @@ bool NaxxMechanicsMove(Plan const& plan, Member const& self, uint32_t now, RaidO
 void NaxxMechanicsElect(Election& e, uint32_t now);
 void BwlMechanicsElect(Election& e, uint32_t now);
 void BwlPrePull(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, std::ostringstream& dump, uint32_t now);
+// A boss fight script (RaidFightScript.h): after the rule passes, overwrites the DPS bots' target and start wait for the scripted boss.
+void ApplyFightScript(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, uint32_t now, std::ostringstream& dump);
+
 bool Aq40MechanicsMove(Plan const& plan, Member const& self, uint32_t now, RaidOrder& out);
 void Aq40MechanicsElect(Election& e, uint32_t now);
 
