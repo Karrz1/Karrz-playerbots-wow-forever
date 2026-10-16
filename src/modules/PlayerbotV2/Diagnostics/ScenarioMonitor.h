@@ -579,7 +579,8 @@ private:
 
     static bool IsThreatHold(std::string const& rule)
     {
-        return rule == "combat:threat_hold" || rule == "combat:threat_wait_tank" || rule == "raid:threat_hold";
+        return rule == "combat:threat_hold" || rule == "combat:threat_wait_tank" || rule == "raid:threat_hold" ||
+               rule == "combat:shield_hold";
     }
 
     static float Dist2d(float ax, float ay, float bx, float by) { return std::hypot(ax - bx, ay - by); }

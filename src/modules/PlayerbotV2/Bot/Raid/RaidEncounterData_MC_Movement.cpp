@@ -61,6 +61,7 @@ namespace Playerbot::Raid {
         // everybody else (his frontal attacks, Lava Bomb victims and Panic runners then do not start at the raid), and the raid
         // stands in the 140-degree sector behind him. Melee at his heels, casters and healers further back but well inside heal range.
         r.faceAway.push_back({ 11982 });
+        r.faceAway.push_back({ 12018 });   // Majordomo: his tank stands on the far side from the raid, away from the adds
         r.standBehind.push_back({ 11982, Who::Melee, 3.0f, 7.0f, 80.0f });
         r.standBehind.push_back({ 11982, Who::Ranged, 18.0f, 26.0f, 70.0f });
         r.standBehind.push_back({ 11982, Who::Healer, 18.0f, 26.0f, 70.0f });

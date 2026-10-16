@@ -147,6 +147,10 @@ struct AvoidEnemy { uint32_t enemy; float radius; Who who; float hpMax = 100.0f;
 // (or carries it): the spell's chained triggers land on fixed points, whatever the caster's position and facing. Onyxia's script starts
 // the breath wherever her movement timer runs out, mid-flight, so a corridor taken from her position and facing pointed the wrong way
 // (onyxia_full n31 runs 5 and 6: she stood at -8.7,-216.5 facing east, the breath ran west, 16 raiders died in each).
+// Fixed standing points out of one breath spell's corridor (the AzerothCore bots' per-breath safe zones): a member inside the
+// corridor of <castSpell> walks to the nearest of these instead of searching for a way out.
+struct BreathSafe { uint32_t enemy; uint32_t castSpell; float x, y; };
+
 struct AvoidBreath { uint32_t enemy; uint32_t castSpell; float halfWidth; float length; Who who; bool windup = false;
                      bool fixedPath = false; float ax = 0.0f, ay = 0.0f, bx = 0.0f, by = 0.0f; };
 
@@ -184,7 +188,11 @@ struct StayNear { uint32_t enemy; float radius; Who who; float hpMax = 100.0f; f
 // While <enemy> is alive and a tank holds it, that tank stands on the far side of the enemy from the raid (the line from the
 // raid's centre through the enemy, at melee range), so the enemy turns its back on everybody else (Magmadar). The raid's centre
 // is the mean position of the non-tank members within 60 yards. A tank that already opposes the raid within 30 degrees stays.
-struct FaceAway { uint32_t enemy; float hpMax = 100.0f; float hpMin = 0.0f; };
+// bearingDeg (when not kNoBearing): the world bearing from the enemy to the tank's spot, instead of the line from the raid's centre. Onyxia: east,
+// the back of the lair, wherever the raid stands (the raid enters from the west and spreads; a bearing taken from where it stood at the pull
+// put the tank on the wrong side once the raid moved).
+constexpr float kNoBearing = 1000.0f;
+struct FaceAway { uint32_t enemy; float hpMax = 100.0f; float hpMin = 0.0f; float bearingDeg = kNoBearing; };
 
 // While <enemy> is alive and fighting, matching bots stand in the sector behind it: <halfAngleDeg> either side of the line
 // straight behind where it faces, between <minDist> and <maxDist> yards. A bot outside walks to the nearest such spot on its
@@ -235,6 +243,7 @@ struct RaidRules
     std::vector<TankSwap> tankSwap;
     std::vector<AvoidEnemy> avoidEnemy;
     std::vector<AvoidBreath> avoidBreath;
+    std::vector<BreathSafe> breathSafe;
     std::vector<MeleeSoak> meleeSoak;
     std::vector<ControlledMember> controlledMember;
     std::vector<OnlyAttackers> onlyAttackers;

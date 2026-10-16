@@ -139,6 +139,7 @@ private:
     void DriveGraduation(uint32 now_ms);
     // Residents standing in lava or on ground with no way out are placed again (Fleet/StrandedWatch.h).
     void DriveStranded(uint32 now_ms, std::vector<Anchor> const& anchors);
+    void DriveStuckLedger(uint32 now_ms);   // bots the idle watch keeps finding standing: why they cannot move, and back onto the mesh if off it
     // A bot the spawner no longer wants: out of every player's sight it logs out at once; in sight it first walks to the nearest inn
     // (or away from the player) and logs out once it is out of view or after a minute. True when the bot was dealt with (logged out
     // or sent walking).
@@ -196,6 +197,8 @@ private:
     std::unordered_map<uint64, Seeding> seeding_;
     uint32 last_grad_ms_ = 0;
     uint32 last_stranded_ms_ = 0;
+    uint32 last_ledger_ms_ = 0;
+    std::unordered_map<uint64, uint32> ledger_ms_;   // per bot: when its last ledger line was written
     uint32 last_crowd_ms_ = 0;
     std::unordered_map<uint64, uint32> leaving_;   // bot guid low -> module ms when it was sent walking away
     uint64 n_arrived_walking_ = 0;

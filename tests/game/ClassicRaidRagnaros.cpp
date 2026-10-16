@@ -157,11 +157,11 @@ TEST_CASE("Baron Geddon's raid drinks Greater Fire Protection against the Living
 }
 
 // n24 onyxia run 2: every DPS was ranked onto the whelps while Onyxia flew and she never left 57-61 percent.
-TEST_CASE("Onyxia's whelps outrank her only for melee and the AoE share in phase 2", "[ClassicRaidRagnaros]")
+TEST_CASE("Onyxia's whelps outrank her only for melee in phase 2", "[ClassicRaidRagnaros]")
 {
     RaidRules const* r = RulesForMap(249);
     REQUIRE(r != nullptr);
-    int phase2Ranged = 1, phase2Melee = 0, phase2Share = 0;
+    int phase2Ranged = 1, phase2Melee = 0, phase2Share = 0;   // share must stay 0: ranged stay on her
     bool gatedOnly = true;
     for (Priority const& p : r->priority)
     {
@@ -178,7 +178,7 @@ TEST_CASE("Onyxia's whelps outrank her only for melee and the AoE share in phase
     }
     CHECK(phase2Ranged < 1);      // below Onyxia's default 1
     CHECK(phase2Melee >= 2);
-    CHECK(phase2Share >= 2);
+    CHECK(phase2Share == 0);
     CHECK(gatedOnly);
     CHECK(std::find(KillOrder(249).begin(), KillOrder(249).end(), 11262u) == KillOrder(249).end());   // no unconditional group focus on whelps
 }
@@ -273,4 +273,36 @@ TEST_CASE("Onyxia's frontal cones do not make the tank turn her", "[ClassicRaidR
             CHECK(!f.tankTurns);
         }
     CHECK(cones == 2);
+}
+
+// chris 2026-10-15: the tank holds Onyxia with her back to the raid in the two ground phases (one locked step, not a turn at every cone).
+TEST_CASE("Onyxia's tank faces her away from the raid in the ground phases", "[ClassicRaidRagnaros]")
+{
+    RaidRules const* r = RulesForMap(249);
+    REQUIRE(r != nullptr);
+    int phases = 0;
+    for (FaceAway const& f : r->faceAway)
+        if (f.enemy == 10184)
+        {
+            ++phases;
+            CHECK(f.hpMax <= 100.0f);
+            CHECK(f.hpMin < f.hpMax);
+            CHECK(!(f.hpMax > 65.0f && f.hpMin < 65.0f));   // no window runs into the flying phase
+            CHECK((!(f.hpMax > 40.0f && f.hpMin < 40.0f) || f.hpMax <= 65.0f));
+        }
+    CHECK(phases == 2);
+}
+
+TEST_CASE("Onyxia's eight breaths each list two safe points off their line", "[ClassicRaidRagnaros]")
+{
+    RaidRules const* r = RulesForMap(249);
+    REQUIRE(r != nullptr);
+    for (AvoidBreath const& path : r->avoidBreath)
+    {
+        int n = 0;
+        for (BreathSafe const& s : r->breathSafe)
+            if (s.enemy == path.enemy && s.castSpell == path.castSpell)
+                ++n;
+        CHECK(n == 2);
+    }
 }

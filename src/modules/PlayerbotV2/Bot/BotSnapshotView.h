@@ -392,7 +392,7 @@ public:
     // this bot or another non-tank member (self-defence) or someone outside
     // the group. Role, map-type and config gating are the CALLER's job, as
     // is the opening-wait timeout.
-    enum class ThreatHold : uint8 { None, TankOpening, OverThreat };
+    enum class ThreatHold : uint8 { None, TankOpening, OverThreat, ShieldUp };
     ThreatHold threat_hold(ObjectGuid target, float opening_lead, float max_ratio) const;
     // Tank helper (LooseAttackersTrigger): nearest live enemy within `range`
     // whose victim is a NON-TANK group member - the mobs a tank must taunt

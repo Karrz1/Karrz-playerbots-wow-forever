@@ -30,7 +30,7 @@ namespace Playerbot::Raid {
         // to the whelps and she sat at 57-61 percent from 121 s to 333 s while the waves stacked. Ranged DPS stay on her; the melee and an
         // AoE share of the casters (every second one by guid) take the whelps. Tanks and everyone outside phase 2 rank the whelps above
         // her (a landed Onyxia in phase 1 and 3 is the tank's, the whelps are the adds). First matching entry wins.
-        r.priority.push_back({ 11262, 2, Who::AoeShare, 10184, 65.0f, 40.0f });
+        r.priority.push_back({ 11262, 2, Who::Tank,     10184, 65.0f, 40.0f });   // tanks pick up the whelps while she flies
         r.priority.push_back({ 11262, 2, Who::Melee,    10184, 65.0f, 40.0f });
         r.priority.push_back({ 11262, 0, Who::NonTank,  10184, 65.0f, 40.0f });   // below Onyxia (1): the rest stay on her
         r.priority.push_back({ 11262, 2, Who::Anyone,   10184, 100.0f, 65.0f });
@@ -75,20 +75,49 @@ namespace Playerbot::Raid {
         r.avoidFrontal.push_back({ 10184, 45.0f, 45.0f, Who::NonTank, 0.0f, 100.0f, 0.0f, false });
         r.avoidFrontal.push_back({ 10184, 30.0f, 80.0f, Who::NonTank, 180.0f, 100.0f, 0.0f, false });
 
+        // Where to stand for each breath, the AzerothCore bots' safe zones (mod-playerbots Ai/Raid/Ony/OnyActions.h): two points per breath,
+        // 32-53 y off its line, at the hall's ends. A member inside a corridor walks to the nearer one.
+        struct SafeSpot { uint32_t spell; float x1, y1, x2, y2; };
+        static constexpr SafeSpot kSafe[] =
+        {
+            { 17086u, -10.0f, -180.0f, -20.0f, -250.0f }, { 18351u, -10.0f, -180.0f, -20.0f, -250.0f },
+            { 18576u,  20.0f, -210.0f, -75.0f, -210.0f }, { 18609u,  20.0f, -210.0f, -75.0f, -210.0f },
+            { 18564u, -60.0f, -195.0f,  10.0f, -240.0f }, { 18584u, -60.0f, -195.0f,  10.0f, -240.0f },
+            { 18596u,   7.0f, -185.0f, -60.0f, -240.0f }, { 18617u,   7.0f, -185.0f, -60.0f, -240.0f },
+        };
+        for (SafeSpot const& s : kSafe)
+        {
+            r.breathSafe.push_back({ 10184, s.spell, s.x1, s.y1 });
+            r.breathSafe.push_back({ 10184, s.spell, s.x2, s.y2 });
+        }
+
+        // Greater Fire Protection Potion for everyone: Deep Breath (1500 fire a tick) cannot be left on its north-south and south-north lines, where the
+        // corridor covers the width of the hall (n71 live 2026-10-15: two such breaths killed 35 of 40, the raid found no way out in the west half).
+        r.resistPotion.push_back({ 10184, 13457, Who::Anyone });
+
+        // The tank holds her on the far side from the raid, so her front (Flame Breath, Wing Buffet, Cleave) points at the wall and not at the
+        // raiders. One step to the far side, then it stays: the tank's spot lies due east of her (bearing 0, the back of the lair; the raid enters from the west), so
+        // there is no repeated turning. The cone-triggered turn of AvoidFrontal is off for her (tankTurns false: n57 run 1, the tank turned her
+        // every 9 s and the ranged re-positioned each time). Phases 1 and 3; in phase 2 she flies.
+        r.faceAway.push_back({ 10184, 100.0f, 65.0f, 0.0f });
+        r.faceAway.push_back({ 10184, 40.0f, 0.0f, 0.0f });
+
         // Melee DPS stand on her flank, in the wedge between the front cones (45 degrees) and the tail sweep (everything behind, from 90):
         // 55..85 degrees off her facing, 3-8 yards out. Phases 1 and 3 only; she flies in phase 2 (the rule skips a flying enemy too).
         // Onyxia n7 2026-10-14: six melee DPS died to one tail sweep at 19 s while alternating "leave cone" and attack.
-        r.standFlank.push_back({ 10184, Who::Melee, 3.0f, 8.0f, 70.0f, 15.0f, 100.0f, 65.0f });
-        r.standFlank.push_back({ 10184, Who::Melee, 3.0f, 8.0f, 70.0f, 15.0f, 40.0f, 0.0f });
+        r.standFlank.push_back({ 10184, Who::Melee, 2.0f, 9.0f, 70.0f, 20.0f, 100.0f, 65.0f });
+        r.standFlank.push_back({ 10184, Who::Melee, 2.0f, 9.0f, 70.0f, 20.0f, 40.0f, 0.0f });
 
+        // Each bot has its own slot in the wedge (RaidBrain 3d: the matching members on its side share a grid of rows and columns) and that is
+        // the only position rule for it in phases 1 and 3; healers take the inner band (20-26 y), ranged the outer one (26-34 y), melee 2-9 y.
         // Ranged DPS and healers take the same side wedges, out of Wing Buffet (20 y) and the tail sweep, 22-30 y from her. Her facing follows
         // whoever she is hitting; with the ranged massed on one bearing a single Flame Breath (45 y) took ten of them at once, in the first
         // minute of n38 run 5 (all ten stood 48-68 degrees off her facing, 8-30 y out) and in a dozen breaths of run 6's phase 3, where the
         // whole raid stood round her. In the wedges only the side she turns to is exposed, and the other side is clear. Phases 1 and 3.
-        r.standFlank.push_back({ 10184, Who::Ranged, 22.0f, 30.0f, 67.0f, 12.0f, 100.0f, 65.0f });
-        r.standFlank.push_back({ 10184, Who::Ranged, 22.0f, 30.0f, 67.0f, 12.0f, 40.0f, 0.0f });
-        r.standFlank.push_back({ 10184, Who::Healer, 22.0f, 30.0f, 67.0f, 12.0f, 100.0f, 65.0f });
-        r.standFlank.push_back({ 10184, Who::Healer, 22.0f, 30.0f, 67.0f, 12.0f, 40.0f, 0.0f });
+        r.standFlank.push_back({ 10184, Who::Ranged, 26.0f, 34.0f, 70.0f, 20.0f, 100.0f, 65.0f });
+        r.standFlank.push_back({ 10184, Who::Ranged, 26.0f, 34.0f, 70.0f, 20.0f, 40.0f, 0.0f });
+        r.standFlank.push_back({ 10184, Who::Healer, 20.0f, 26.0f, 70.0f, 20.0f, 100.0f, 65.0f });
+        r.standFlank.push_back({ 10184, Who::Healer, 20.0f, 26.0f, 70.0f, 20.0f, 40.0f, 0.0f });
 
         // The two cave alcoves (-30.1,-254.5 and -30.8,-177.1, ony/boss_onyxia.cpp whelp spawn points) are out of bounds: static whelps lie in
         // them, and raiders sent there (the off-tanks stood 6 y inside each mouth, the casters' AoE share behind them) and raiders pushed there by
@@ -102,6 +131,12 @@ namespace Playerbot::Raid {
         // whelps at the far cave. She flies a ring and moves every 15-25 s, so the ranged that work on her follow her to within 20 y on the
         // ground (about 30 y with her 20 y altitude, the casters' range).
         r.stayNear.push_back({ 10184, 20.0f, Who::Ranged, 65.0f, 40.0f });
+
+        // The floor cracks of phase 3: the lair's two lava trap game objects, 177984 (16.8,-225.1) and 177985 (-28.1,-190.7), both spawned in
+        // our world data on map 249 and declared (GO_LAVATRAP_1/2) in the VMaNGOS boss_onyxia.cpp; nobody stands within 8 y of one. The radius is
+        // UNVERIFIED (the template's trap radius was not in the data we could read).
+        r.avoidGameObject.push_back({ 177984, 8.0f, Who::Anyone });
+        r.avoidGameObject.push_back({ 177985, 8.0f, Who::Anyone });
 
         // Left out on purpose (needs engine support or coordinates the scripts do not give):
         //  - Bellowing Roar fear (18431): no dispel (fear), tremor totem / fear ward is a buff decision.

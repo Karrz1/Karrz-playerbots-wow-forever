@@ -141,6 +141,13 @@ bool DispatchRaidOrder(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em
         std::find(o.forbidden_targets.begin(), o.forbidden_targets.end(), victim) != o.forbidden_targets.end();
     // An idle DPS bot picks up the fallback too, unless its owner told it to stay.
     bool const idleDps = victim.IsEmpty() && !o.fallback_target.IsEmpty() && !ai.holding_position(s.published_at_ms());
+    // An idle tank (its enemy is airborne or dead) takes the brain's ground target.
+    bool const idleTank = victim.IsEmpty() && o.fallback_target.IsEmpty() && !o.tank_fallback_target.IsEmpty() && !ai.holding_position(s.published_at_ms());
+    if (idleTank && emit.start_attack(o.tank_fallback_target))
+    {
+        ai.set_last_rule_fired("raid:switch_target");
+        return true;
+    }
     if (forbidden || idleDps)
     {
         if (!o.fallback_target.IsEmpty() && o.fallback_target != victim)

@@ -1232,6 +1232,11 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
         if (e.alive && e.src->max_hp > 0 && Pct(e.src->hp, e.src->max_hp) < 40) { emergency = true; break; }
 
     std::vector<ObjectGuid> cc_taken;
+    bool moon_is_tank_mark = false;
+    for (auto const& [tank_low, marker] : Services::Owners().TankMarks(group_low))
+        if (marker == 4) moon_is_tank_mark = true;
+    if (auto h = by_low.find(held_by[4]); held_by[4] && h != by_low.end() && h->second->tank)
+        moon_is_tank_mark = true;   // the moon on a tank bot itself
     // Pass 1: crowd control. Bots in member order, one bot per mob, never the skull, never a boss.
     if (cc_on)
         for (auto const& e : mem)
@@ -1247,7 +1252,9 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
                 if (c < 7 && std::find(order.begin(), order.end(), c) == order.end()) order.push_back(c);
             // No icon or rti cc of its own: the caster holds the owner's moon (ike3's default rti cc). Marked mobs left the auto crowd
             // control, so without this a moon nobody was assigned to stayed free.
-            if (order.empty()) order.push_back(4);
+            // Not when the owner gave the moon to a tank ("assign moon" on a tank bot): that tank holds the mob, and a sheep on
+            // it breaks on the tank's first hit (n71 Majordomo: Deleria sheeped the Healer Yuna was tanking).
+            if (order.empty() && !moon_is_tank_mark) order.push_back(4);
             BotSnapshotView const view(*sn->second);
             // Sticky: a bot keeps its mob while the icon stays on it and the mob lives; a view that loses the mob for a few
             // seconds (a banished mob drops out of a lock's list) is no release (Garr 2026-10-08: Gustinor was assigned and
@@ -1349,7 +1356,10 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
                                 if (rule.enemy == u.entry) return false;
                     if (u.max_hp > 0 && u.hp * 2 < u.max_hp) return false;
                     if (std::find(cc_taken.begin(), cc_taken.end(), u.guid) != cc_taken.end()) return false;
-                    return MarkCc::PickOption(view, e.cls, MarkCc::TypeOf(u), !e.src->in_combat && !u.unit_in_combat) != nullptr;
+                    MarkCc::Option const* opt = MarkCc::PickOption(view, e.cls, MarkCc::TypeOf(u), !e.src->in_combat && !u.unit_in_combat);
+                    // A root is not a hold on a caster: a rooted Flamewaker Elite stands and fireballs the healers (n71 Majordomo: four
+                    // raid members died to Fireball). Only the owner's own mark roots one.
+                    return opt && !(opt->root && u.is_ranged_caster);
                 };
                 ObjectGuid pick;
                 {
@@ -1810,6 +1820,25 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
         auto& cc_held = cc_held_[bkey];
         for (auto it = cc_held.begin(); it != cc_held.end();)
             it = now_ms >= it->second.until_ms ? cc_held.erase(it) : std::next(it);
+        // A mob carrying an icon the owner gave a crowd-control caster is that caster's (Majordomo n78: the circle on an Elite was
+        // Scott's, and Hannorto took the same Elite as "nearest", so his hits broke the sheep over and over). Tanks leave it alone
+        // until it is loose on a member.
+        auto cc_owned = [&](Mob const& m) -> bool
+        {
+            if (!mk_grp || m.loose) return false;
+            for (uint8 sym = 0; sym < 7; ++sym)
+            {
+                if (mk_grp->GetTargetIcon(sym) != m.u->guid) continue;
+                for (Member const& e : mem)
+                {
+                    if (!e.is_bot || e.tank || !MarkCc::IsMarkCcClass(e.cls)) continue;
+                    if (held_by[sym] == e.guid_low) return true;
+                    for (uint8 c : Services::Owners().RtiOrderOf(e.guid_low).cc)
+                        if (c == sym) return true;
+                }
+            }
+            return false;
+        };
         auto nearest_free = [&](Member const* t) -> Mob const*
         {
             auto rank = [&](Mob const& m) -> int
@@ -1827,7 +1856,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             float best_d2 = kTankAssignRange * kTankAssignRange;
             for (auto const& m : mobs)
             {
-                if (is_taken(m.u->guid)) continue;
+                if (is_taken(m.u->guid) || cc_owned(m)) continue;
                 const float dx = m.u->x - t->src->x, dy = m.u->y - t->src->y;
                 const float d2 = dx * dx + dy * dy;
                 if (d2 > kTankAssignRange * kTankAssignRange) continue;
@@ -1903,6 +1932,46 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                 assign(t, *best, best->loose ? "loose_nearest" : "nearest");
             }
         }
+        // -- The owner's skull and cross are held by a tank -----------------------
+        // They are the owner's kill calls, and a mob nobody tanks is on a healer or a mage while the raid burns it (n78 Majordomo: the
+        // skull moved onto a sheeped Healer, the sheep broke, and no tank took it; then the cross Healer ran loose for 20 s and killed
+        // the owner, while every tank sat on its own Elite or dropped target). A tank with no symbol of the owner's drops its mob for
+        // it: the main tank first, else the one with the fewest mobs on it. Skull first, then cross, each on a different tank.
+        if (mk_grp)
+            for (uint8 const kill_icon : { uint8(7), uint8(6) })
+            {
+                ObjectGuid const sk = mk_grp->GetTargetIcon(kill_icon);
+                if (sk.IsEmpty()) continue;
+                Mob const* sm = find_mob(sk);
+                if (!sm || is_taken(sk) || Raid::NoTank(map_id, sm->u->entry) || sm->u->is_dungeon_boss || sm->u->is_boss_rank)
+                    continue;
+                Member const* best = nullptr;
+                size_t best_load = SIZE_MAX;
+                for (Member const* t : tanks)
+                {
+                    if (!t->is_bot || !t->alive || user_sym.count(t->guid_low)) continue;
+                    // A tank already on the other kill mark keeps it.
+                    if (auto sit = sticky.find(t->guid_low); sit != sticky.end() &&
+                        (sit->second == mk_grp->GetTargetIcon(7) || sit->second == mk_grp->GetTargetIcon(6)))
+                        continue;
+                    size_t load = 0;
+                    for (Mob const& o : mobs)
+                        if (o.u->victim == t->src->guid) ++load;
+                    if (!best || (t->guid_low == main_tank && best->guid_low != main_tank) ||
+                        (best->guid_low != main_tank && load < best_load))
+                    {
+                        best = t;
+                        best_load = load;
+                    }
+                }
+                if (!best) continue;
+                if (auto sit = sticky.find(best->guid_low); sit != sticky.end())
+                {
+                    taken.erase(std::remove(taken.begin(), taken.end(), sit->second), taken.end());
+                    sticky.erase(sit);
+                }
+                assign(best, *sm, kill_icon == 7 ? "owner_skull" : "owner_cross");
+            }
         // -- The boss is never left without a tank ----------------------------
         // An engaged boss nobody holds (its tank died, or every tank is busy with adds) is the threat that wipes the raid;
         // the strongest bot tank drops its add for it, the add becoming a free mob for the next pass (Garr 2026-10-08: the
@@ -2232,8 +2301,10 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                             // (Garr 2026-10-09: the skull Firesworn read all-school immune and 3 DPS held for minutes). The next mark or the
                             // generic pick takes over; the skull returns to it once the immunity ends.
                             !Raid::GetBrain().AllSchoolsAvoided(group_low, map_id, u.guid) &&
-                            // A skull the owner puts on a crowd-controlled mob is the call to kill it: the CC is released.
-                            !(u.is_cc_locked && member_of(u.cc_caster) && !(explicit_call && idle_call)) &&
+                            // A skull the owner puts on a crowd-controlled mob is the call to kill it, in a fight too: the caster stops
+                            // holding it (TryCast refuses the kill target) and the raid switches (n71 Majordomo: the owner rotates the
+                            // skull onto each sheeped Healer in turn). Any other mark on a held mob is no kill call.
+                            !(u.is_cc_locked && member_of(u.cc_caster) && !explicit_call) &&
                             (u.unit_in_combat || (explicit_call && idle_call)))
                             marked = &u;
                         break;
