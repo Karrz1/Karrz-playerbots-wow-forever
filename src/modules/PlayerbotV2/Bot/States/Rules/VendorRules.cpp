@@ -883,10 +883,49 @@ bool CapitalBagRunFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView co
     return true;
 }
 
+// ---------- idle:bag_hearth ----------
+// Full bags in the field, no vendor in sight and the vendor walk given up (or no town near enough for the capital run): what a player
+// does is hearth to the town they are bound in, sell, and come back. Once per full-bag episode; the hearthstone's own cooldown bounds it.
+constexpr float kBagHearthMinYards = 1200.0f;   // nearer than this the walk to the bound town is the better way
+
+bool BagHearthGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32 now_ms)
+{
+    constexpr uint8 kVvBagFull = 1u << 1;
+    if ((s.vendor_visit_phases_pending() & kVvBagFull) == 0) return false;
+    if (s.in_combat() || s.is_casting() || s.raw().movement.is_mounted || s.has_owner_character()) return false;
+    if (s.in_group() || s.is_in_dungeon() || s.in_battleground() || s.is_in_instance() || s.on_transport()) return false;
+    if (ai.bag_hearth_used() || ai.bag_recovery_backoff_until() == 0) return false;   // only once local recovery has proved futile
+    if (!s.can_hearth() || s.homebind_map_id() != s.map_id()) return false;
+    if (s.nearest_npc_with_flag(UNIT_NPC_FLAG_VENDOR) != nullptr) return false;
+    float bx, by, bz; s.position(bx, by, bz);
+    if (std::hypot(s.homebind_x() - bx, s.homebind_y() - by) < kBagHearthMinYards) return false;
+    // A capital near enough for the bank-and-sell run is that rule's.
+    using ::Playerbot::V2::World::NearestCapital;
+    auto const* cap = NearestCapital(s.map_id(), bx, by, s.raw().identity.race);
+    return !cap || std::hypot(cap->x - bx, cap->y - by) > 800.0f;
+}
+
+bool BagHearthFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    emit.hearth();
+    ai.set_bag_hearth_used();
+    ai.set_last_rule_fired("idle:bag_hearth");
+    return true;
+}
+
 } // anonymous namespace
 
 void RegisterVendorRules(IdleRuleRegistry& r)
 {
+    {
+        IdleRule rule;
+        rule.name     = "idle:bag_hearth";
+        rule.priority = 709;   // above the capital run (705) and the quest funnel, below the vendor recovery it follows (710)
+        rule.gate     = &BagHearthGate;
+        rule.fire     = &BagHearthFire;
+        rule.min_interval_ms = 5000;
+        r.register_rule(std::move(rule));
+    }
     {
         IdleRule rule;
         rule.name     = "idle:critical_repair";

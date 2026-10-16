@@ -38,7 +38,7 @@ namespace
 bool IsWorldErrand(std::string_view name)
 {
     static constexpr std::string_view kPrefixes[] = {
-        "idle:ah_", "idle:autoact_dispatch", "idle:bags_full_recover", "idle:bank_deposit",
+        "idle:ah_", "idle:autoact_dispatch", "idle:bag_hearth", "idle:bags_full_recover", "idle:bank_deposit",
         "idle:calendar_", "idle:capital_bag_run", "idle:craft_order_", "idle:critical_repair", "idle:dual_spec_switch",
         "idle:dungeon_loop_requeue", "idle:dungeon_quest_approach", "idle:far_same_map_travel", "idle:gather",
         "idle:guild_", "idle:homebind", "idle:invite_nearby_player", "idle:legacy_vendor_dispatch",

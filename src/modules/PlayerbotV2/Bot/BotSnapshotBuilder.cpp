@@ -3807,7 +3807,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         snap->cast.last_cast_spell_id = lc_ai->last_cast_spell_id();
 
     // ---- Threat discipline context ----
-    // Port of the owner's group threat rules (ike3-based bots MCRaidHoldDamage /
+    // Port of the owner's group threat rules (wow-1.12 MCRaidHoldDamage /
     // LooseAttackersTrigger). Resolve the group's live same-map members and
     // tanks once, then stamp every attacker / nearby enemy below with the
     // bot's threat, the best tank threat and who the mob is hitting, read
@@ -5920,12 +5920,15 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             bool has_complete = false;
             for (auto const& dq : snap->quest_log.quests)
                 if (dq.state == 1) { has_complete = true; break; }
-            // At most one dump per bot per minute (per build thread): a bot parked on a complete quest wrote it on every build, which
+            // At most one dump per bot per minute: a bot parked on a complete quest wrote it on every build, which
             // made [picker_none] 79% of the log at 85-150 bots and pushed every other diagnostic out of the rotation.
             if (has_complete)
             {
-                thread_local std::unordered_map<uint64, uint32> s_picker_none_ms;
+                // One table for all build threads (a table per thread let each thread log the same bot once a minute).
+                static std::mutex s_picker_none_mx;
+                static std::unordered_map<uint64, uint32> s_picker_none_ms;
                 uint32 const pn_now = snap->published_at_ms ? snap->published_at_ms : 1u;
+                std::lock_guard<std::mutex> pn_lock(s_picker_none_mx);
                 uint32& pn_last = s_picker_none_ms[snap->guid.GetCounter()];
                 if (pn_last && pn_now - pn_last < 60000u)
                     has_complete = false;
@@ -5941,10 +5944,25 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                     best_breadcrumb_sm_set ? 1 : 0, best_breadcrumb_set ? 1 : 0,
                     bot_map);
                 for (auto const& dq : snap->quest_log.quests)
+                {
+                    // Which of the picker's skip gates (in loop order) drops this quest.
+                    char const* skip = "none";
+                    Quest const* dqt = sObjectMgr->GetQuestTemplate(dq.quest_id);
+                    if (dqt && dqt->GetRequiredSkill() && const_cast<Player*>(p)->GetSkillValue(dqt->GetRequiredSkill()) == 0)
+                        skip = "skill";
+                    else if (bot_ai && bot_ai->quest_blacklisted(dq.quest_id, now_ms))
+                        skip = "quest_blacklist";
+                    else if (dqt && !const_cast<Player*>(p)->SatisfyQuestMinLevel(dqt, false))
+                        skip = "min_level";
+                    else if (bot_ai && bot_ai->objective_blacklisted(dq.quest_id, 0u, now_ms))
+                        skip = "turnin_blacklist";
+                    else if (!QuestHasAnyEnder(dq.quest_id))
+                        skip = "no_ender";
                     TC_LOG_INFO("playerbot.v2",
-                        "[picker_none]   q{} state={} objs={} ender_resolved={} ender_map={}",
+                        "[picker_none]   q{} state={} objs={} ender_resolved={} ender_map={} skip={}",
                         dq.quest_id, uint32(dq.state), uint32(dq.objectives.size()),
-                        dq.ender_resolved ? 1 : 0, dq.ender_map_id);
+                        dq.ender_resolved ? 1 : 0, dq.ender_map_id, skip);
+                }
             }
         }
     }

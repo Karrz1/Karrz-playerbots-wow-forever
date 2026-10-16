@@ -12,6 +12,7 @@
 //                                Added in pass 12 after IdleRule signature was
 //                                extended to thread GroupSnapshotView.
 
+#include <mutex>
 #include "Bot/IdleRule.h"
 #include "Group/GroupSnapshot.h"
 #include "Bot/BotAI.h"
@@ -30,6 +31,7 @@
 #include "Bot/BotRegistry.h"
 #include "Fleet/OwnerRegistry.h"
 #include "Util.h"
+#include "Log.h"
 #include "Config.h"
 #include "Bot/World/ZonePicker.h"
 #include "GameTime.h"
@@ -739,6 +741,24 @@ bool LeaveWaterFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const
 constexpr float kInnSearchYards = 150.0f;
 constexpr float kInnStandYards = 5.0f;
 
+// One line per bot and outcome every five minutes, so a soak shows which bots reached the inn and which found no innkeeper (the counters
+// above are bot-ticks and a few bots dominate them).
+static void InnLog(BotSnapshotView const& s, char const* what, float x, float y)
+{
+    static std::mutex mx;
+    static std::unordered_map<uint64, uint32> last;
+    uint32 const now = s.published_at_ms() ? s.published_at_ms() : 1u;
+    uint64 const key = (uint64(s.bot_id()) << 1) | (what[0] == 'r' ? 1u : 0u);
+    {
+        std::lock_guard<std::mutex> lock(mx);
+        uint32& at = last[key];
+        if (at && now - at < 300000u)
+            return;
+        at = now;
+    }
+    TC_LOG_INFO("playerbot.v2", "[inn] {} {} (zone {}, {:.0f},{:.0f})", s.raw().identity.name, what, s.zone_id(), x, y);
+}
+
 bool InnRestGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
 {
     if (!TownLifeEnabled()) return false;
@@ -756,16 +776,31 @@ bool InnRestFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, 
     s.position(bx, by, bz);
     auto const* inn = ::Playerbot::V2::Travel::TownNpcIndex::Instance().Nearest(
         s.map_id(), bx, by, bz, UNIT_NPC_FLAG_INNKEEPER, s.is_alliance(), kInnSearchYards);
-    if (!inn) return false;
+    if (!inn)
+    {
+        V2::TownLife::Counters().inn_none.fetch_add(1, std::memory_order_relaxed);
+        InnLog(s, "no innkeeper within reach", bx, by);
+        return false;
+    }
     // Stand a few yards from the innkeeper, on the side the bot comes from, so a crowd does not stack on one point.
     float const dx = bx - inn->x, dy = by - inn->y, len = std::hypot(dx, dy);
     float const ux = len > 0.5f ? dx / len : 1.0f, uy = len > 0.5f ? dy / len : 0.0f;
     float const stand = kInnStandYards + float(s.bot_id() % 5u);
     float const tx = inn->x + ux * stand, ty = inn->y + uy * stand;
-    if (std::hypot(bx - tx, by - ty) > 4.0f)
-        return States::ChunkedWalkToward(s, ai, emit, tx, ty, inn->z, "idle:inn_rest", now_ms);
+    // The stand point is a straight line from the innkeeper and can sit behind a wall; the inn is the goal, so a bot that is within a
+    // few yards of the innkeeper, or that cannot get closer than a room's width, rests where it is.
+    float const to_inn = std::hypot(bx - inn->x, by - inn->y);
+    if (to_inn > kInnStandYards + 6.0f && std::hypot(bx - tx, by - ty) > 4.0f)
+    {
+        V2::TownLife::Counters().inn_walk.fetch_add(1, std::memory_order_relaxed);
+        if (States::ChunkedWalkToward(s, ai, emit, tx, ty, inn->z, "idle:inn_rest", now_ms))
+            return true;
+        V2::TownLife::Counters().inn_stuck.fetch_add(1, std::memory_order_relaxed);
+        if (to_inn > 20.0f) return false;
+    }
     V2::TownLife::Counters().inn_ticks.fetch_add(1, std::memory_order_relaxed);
     if (s.is_moving()) return false;
+    InnLog(s, "rests at the inn", bx, by);
     emit.sit();
     ai.set_last_rule_fired("idle:inn_rest");
     return true;

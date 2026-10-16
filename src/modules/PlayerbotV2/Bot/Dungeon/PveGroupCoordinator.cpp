@@ -14,6 +14,7 @@
 #include "../Raid/RaidHealSlots.h"
 #include "../Raid/RaidHealGroups.h"
 #include "../ClassicUpkeep.h"
+#include "../ThreatLimits.h"
 #include "MarkCc.h"
 #include "PrePullCc.h"
 #include "Combat/Apl/ApInterrupt.h"
@@ -241,7 +242,9 @@ void PveGroupCoordinator::Update(uint32 now_ms)
             uint32& started = fight_start_[bkey];
             if (!started)
                 started = now_ms;
-            uint32 const wait_ms = Services::Config().raid_dps_wait_timeout_ms();
+            // A raid waits as long as configured (up to eight seconds: the tank takes a while to run in); a party keeps its six.
+            uint32 const wait_ms = gs->is_raid ? Services::Config().raid_dps_wait_timeout_ms()
+                                               : std::min<uint32>(Services::Config().raid_dps_wait_timeout_ms(), kPartyDpsWaitTimeoutMs);
             if (wait_ms && now_ms - started >= wait_ms && !(mark_release_until_.count(bkey) && now_ms < mark_release_until_[bkey]))
             {
                 mark_release_until_[bkey] = now_ms + 10000u;

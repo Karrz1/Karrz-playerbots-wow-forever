@@ -2905,6 +2905,7 @@ public:
         bag_recovery_free_seen_ = 255;
         bag_recovery_backoff_until_ms_ = 0;   // futile episode over (bags cleared)
         capital_run_futile_until_ms_ = 0;     // and any capital-run suppression
+        bag_hearth_used_ = false;             // and the one hearth this episode may take
     }
     // Capital-bag-run futility. When the in-city walk to the banker/AH/vendor
     // cluster proves UNREACHABLE (ChunkedWalkToward gives up after its strike
@@ -2913,6 +2914,9 @@ public:
     // bags) instead of looping the unreachable walk above the quest funnel forever
     // (live 2026-06-22: Durnan/Velruun pinned in Stormwind, 200+ path_fail on the
     // same 55y path ending 6.5y short). Retries after the cooldown.
+    // One hearthstone ride to the bound town per full-bag episode (idle:bag_hearth): a bot far from any vendor goes where the vendors are.
+    bool   bag_hearth_used() const { return bag_hearth_used_; }
+    void   set_bag_hearth_used() { bag_hearth_used_ = true; }
     bool   capital_run_in_futility(uint32 now_ms) const
     { return capital_run_futile_until_ms_ != 0 && now_ms < capital_run_futile_until_ms_; }
     void   capital_run_note_futile(uint32 now_ms)
@@ -4806,6 +4810,7 @@ private:
     uint32 crit_repair_backoff_until_ms_  = 0;  // suppress critical_repair until this time (too poor)
     // bag-recovery futility backoff — see bag_recovery_note_and_check_futile() above.
     uint32 bag_recovery_backoff_until_ms_ = 0;  // suppress bags_full_recover until this time
+    bool   bag_hearth_used_               = false;
     uint32 capital_run_futile_until_ms_   = 0;  // suppress capital_bag_run after an unreachable-city give-up
     RpgState rpg_;                              // RpgRules: town NPC visits + city / AH trips
     uint32 bag_recovery_first_ms_         = 0;  // first tick of the current no-progress window (0 = none)

@@ -24,6 +24,7 @@
 #include "UnitDefines.h"
 
 #include <algorithm>
+#include <map>
 #include <cmath>
 #include <limits>
 #include <queue>
@@ -77,6 +78,7 @@ constexpr float kMaxWalkEdgeYds = 600.0f;
 // but never to the ground / bottom stop (dz 90+); comfortably above any real
 // ramp's rise across a 600y edge.
 constexpr float kMaxWalkEdgeDz = 18.0f;
+constexpr float kLinkCandidateYds = 1100.0f;   // the farthest two pieces are tried for a link by the offline check (tools/walk_link_check)
 
 inline float Dist2D(float ax, float ay, float bx, float by)
 {
@@ -919,6 +921,122 @@ void UnifiedTravelGraph::BuildWalkEdges()
     }
     TC_LOG_INFO("playerbot.v2", "[UnifiedTravelGraph] BuildWalkEdges: {} edges (cap={}y)",
                 added, uint32(kMaxWalkEdgeYds));
+    LogWalkGaps();
+}
+
+// Names the places where the walk edges of one landmass break into separate pieces, so a "no route" between two hubs on the same map can
+// be traced to a missing link: per map, each piece with its node count and box, and the closest pair of nodes between two pieces of the
+// same landmass (distance and height gap). Diagnostic only; it changes no edge.
+void UnifiedTravelGraph::LogWalkGaps() const
+{
+    for (auto const& [map_id, ids] : _nodes_by_map)
+    {
+        if (ids.size() < 2)
+            continue;
+        std::unordered_map<NodeId, size_t> index;
+        for (size_t i = 0; i < ids.size(); ++i)
+            index[ids[i]] = i;
+        std::vector<size_t> parent(ids.size());
+        for (size_t i = 0; i < parent.size(); ++i)
+            parent[i] = i;
+        auto const find = [&](size_t v)
+        {
+            while (parent[v] != v)
+                v = parent[v] = parent[parent[v]];
+            return v;
+        };
+        for (size_t i = 0; i < ids.size(); ++i)
+            if (ids[i] < _adj.size())
+                for (GraphEdge const& e : _adj[ids[i]])
+                    if (e.kind == EdgeKind::Walk)
+                        if (auto it = index.find(e.to); it != index.end())
+                            parent[find(i)] = find(it->second);
+
+        struct Piece { size_t n = 0; float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f; uint32 region = 0; std::string sample; };
+        std::unordered_map<size_t, Piece> pieces;
+        for (size_t i = 0; i < ids.size(); ++i)
+        {
+            GraphNode const& n = _nodes[ids[i]];
+            Piece& pc = pieces[find(i)];
+            if (pc.n++ == 0)
+            {
+                pc.region = RegionForPosition(map_id, n.x, n.y);
+                pc.sample = n.name;
+            }
+            pc.x0 = std::min(pc.x0, n.x); pc.x1 = std::max(pc.x1, n.x);
+            pc.y0 = std::min(pc.y0, n.y); pc.y1 = std::max(pc.y1, n.y);
+        }
+        if (pieces.size() < 2)
+            continue;
+        TC_LOG_INFO("playerbot.v2", "[walk_gaps] map {}: {} nodes in {} separate walk pieces", map_id, ids.size(), pieces.size());
+
+        // Candidate links for the offline navmesh check (src/tools/walk_link_check): per pair of pieces the closest pair of real places
+        // (flight master, quest hub, capital) on the same landmass, up to kLinkCandidateYds apart. One line each, with the heights.
+        {
+            auto const isPlace = [](GraphNode const& n)
+            { return n.kind == NodeKind::FlightMaster || n.kind == NodeKind::QuestHub || n.kind == NodeKind::Capital; };
+            struct Cand { size_t i, j; float d; };
+            std::map<std::pair<size_t, size_t>, Cand> best_pair;
+            for (size_t i = 0; i < ids.size(); ++i)
+            {
+                GraphNode const& a = _nodes[ids[i]];
+                if (!isPlace(a)) continue;
+                for (size_t j = i + 1; j < ids.size(); ++j)
+                {
+                    GraphNode const& b = _nodes[ids[j]];
+                    size_t const ri = find(i), rj = find(j);
+                    if (ri == rj || !isPlace(b)) continue;
+                    if (RegionForPosition(map_id, a.x, a.y) != RegionForPosition(map_id, b.x, b.y)) continue;
+                    float const d = Dist2D(a.x, a.y, b.x, b.y);
+                    if (d > kLinkCandidateYds) continue;
+                    auto key = std::minmax(ri, rj);
+                    auto it = best_pair.find(key);
+                    if (it == best_pair.end() || d < it->second.d)
+                        best_pair[key] = Cand{ i, j, d };
+                }
+            }
+            std::vector<Cand> list;
+            for (auto const& [k, c] : best_pair)
+                list.push_back(c);
+            std::sort(list.begin(), list.end(), [](Cand const& l, Cand const& r) { return l.d < r.d; });
+            if (list.size() > 300)
+                list.resize(300);
+            for (Cand const& c : list)
+            {
+                GraphNode const& a = _nodes[ids[c.i]];
+                GraphNode const& b = _nodes[ids[c.j]];
+                TC_LOG_INFO("playerbot.v2", "[walk_gap_pair] map={} a={} ax={:.1f} ay={:.1f} az={:.1f} b={} bx={:.1f} by={:.1f} bz={:.1f} d={:.0f}",
+                            map_id, uint32(a.kind), a.x, a.y, a.z, uint32(b.kind), b.x, b.y, b.z, c.d);
+            }
+        }
+        size_t lines = 0;
+        for (auto const& [root, pc] : pieces)
+        {
+            if (++lines > 40)   // a map in pieces everywhere (a battleground, a staging zone) would drown the log
+                break;
+            // Closest node of another piece on the same landmass, from any node of this one.
+            float best = 1e18f, best_dz = 0.f;
+            GraphNode const* from = nullptr; GraphNode const* to = nullptr;
+            for (size_t i = 0; i < ids.size(); ++i)
+            {
+                if (find(i) != root) continue;
+                GraphNode const& a = _nodes[ids[i]];
+                for (size_t j = 0; j < ids.size(); ++j)
+                {
+                    if (find(j) == root) continue;
+                    GraphNode const& b = _nodes[ids[j]];
+                    if (RegionForPosition(map_id, b.x, b.y) != pc.region) continue;
+                    float const d = Dist2D(a.x, a.y, b.x, b.y);
+                    if (d < best) { best = d; best_dz = b.z - a.z; from = &a; to = &b; }
+                }
+            }
+            TC_LOG_INFO("playerbot.v2",
+                "[walk_gaps]   piece of {} node(s) x[{:.0f}..{:.0f}] y[{:.0f}..{:.0f}] e.g. '{}'; nearest other piece: {} ({:.0f},{:.0f}) -> '{}' ({:.0f},{:.0f}) {:.0f} y, dz {:.0f}",
+                pc.n, pc.x0, pc.x1, pc.y0, pc.y1, pc.sample,
+                from ? from->name : std::string("-"), from ? from->x : 0.f, from ? from->y : 0.f,
+                to ? to->name : std::string("-"), to ? to->x : 0.f, to ? to->y : 0.f, from ? best : 0.f, best_dz);
+        }
+    }
 }
 
 void UnifiedTravelGraph::ConnectIslands()

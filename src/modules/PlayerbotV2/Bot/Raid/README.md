@@ -1,6 +1,6 @@
 # Raid layer (branch playerbot-v2-raid)
 
-Port of Karrz's raid10-revamp ike3 raid logic (the ike3-based playerbot code, src/game/PlayerBots) onto PlayerbotV2.
+Port of Karrz's raid10-revamp ike3 raid logic (Karrz1/wow-1.12, src/game/PlayerBots) onto PlayerbotV2.
 
 - `RaidEncounters.h/.cpp`: rule vocabulary and per-map registry (409 MC, 469 BWL, 249 Onyxia, 531 AQ40, 533 Naxx).
 - `RaidEncounterData_*.cpp`: data only. MC/BWL/Onyxia ported as-is (ids match Forever's Classic VMaNGOS ports);
@@ -76,3 +76,15 @@ whether a possessed creature follows MoveChase for a bot controller and whether 
   Panic - fear! Tremor Totem / Fear Ward in about 5 sec"). Instant abilities are predicted from the script timers (earliest time
   minus lead) and re-anchored when the aura lands on the boss or the raid. Config: `Playerbot.Raid.BossWarnings` (default 1).
   Add a boss by adding rows to the table; tests in tests/game/ClassicBossWarnings.cpp.
+
+## Boss fight scripts (RaidFightScript.h / .cpp)
+
+A fight script owns the DPS side of one boss and nothing else. Today: Lucifron (map 409). Tank assignment, healing, dispels and the hazard
+rules are the generic ones and are not touched.
+- Target: the kill order is data (`Script::kFights`: Protectors, then Lucifron). Every DPS bot gets the same enemy, one at a time (the most
+  hurt of the current rank, kept until it dies). The owner's skull, else cross, wins. Written to `RaidOrder::script_focus`.
+- Start: DPS attack `startWaitMs` (8 s, `kRaidBossOpenWaitMs`, the same wait as the generic boss opening) after the first engaged enemy of the fight, then there are no threat holds at all. The combat
+  state's `EvaluateThreatHold`, `combat:follow_skull` and `combat:pve_kill_focus` stand down for a bot with `script_owns`.
+- Crowd control: the brain's CC election is dropped for the fight's own enemies.
+- Log: `[fight_script]` on a focus change and at the start; bot rule names `raid:script_focus` / `raid:script_wait` in /history.
+- Adding a boss: one row in `kFights`. Run the `mc_lucifron` scenario (Diagnostics/ScenarioDefs.h) first.

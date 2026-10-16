@@ -135,6 +135,24 @@ bool DispatchRaidOrder(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em
         return true;
     }
 
+    // 3b. A boss fight script owns this DPS bot's target (RaidFightScript.h): during its start wait nothing is attacked, afterwards the one
+    //     enemy the script names, whatever the bot was on. The skull / kill-focus pickers in the combat state stand down for it.
+    if (o.script_owns && !o.script_focus.IsEmpty())
+    {
+        if (!held.IsEmpty())
+        {
+            if (!s.victim().IsEmpty())
+                emit.stop_attack();
+            ai.set_last_rule_fired("raid:script_wait");
+            return true;
+        }
+        if (s.victim() != o.script_focus && emit.start_attack(o.script_focus))
+        {
+            ai.set_last_rule_fired("raid:script_focus");
+            return true;
+        }
+    }
+
     // 4. Never-target / crowd-controlled / reflecting enemies, and the swap enemy for a debuffed tank.
     ObjectGuid const victim = s.victim();
     bool const forbidden = !victim.IsEmpty() &&

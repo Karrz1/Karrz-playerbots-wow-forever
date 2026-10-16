@@ -42,6 +42,7 @@
 #include "Map.h"
 #include "MapManager.h"
 #include "MotionMaster.h"
+#include "MoveSpline.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "PathGenerator.h"
@@ -786,6 +787,10 @@ std::unordered_map<uint64_t, BreathLatch> g_breath;
 // The breath spell a fixed-path rule saw cast (AvoidBreath::fixedPath) and until when its corridor stays open.
 struct BreathSpellLatch { uint32_t spell = 0, until = 0; };
 std::unordered_map<uint64_t, BreathSpellLatch> g_breathSpell;
+// An airborne enemy hovers "at" a path's first point when it, or the end of its spline, is within this many yards of it. (A cast breath's
+// corridor stays open kBreathCorridorOpenMs from the first sighting of the cast; it used to be 11 s after the last sighting, 16 s from the
+// start, which kept the bots from walking out of the Heated Ground the pass leaves behind.)
+constexpr float kBreathHoverReach = 12.0f;
 
 bool IsCasting(Unit* enemy, uint32_t spell)
 {
@@ -872,6 +877,7 @@ std::unordered_map<uint64_t, uint32_t> g_auraCircleLeaveLogged;  // bot -> g_aur
 std::unordered_map<uint64_t, AuraCircleOrigin> g_auraCircleOrigin;
 
 uint32_t g_breathEnemy = 0, g_breathCast = 0;   // the fixed-path breath whose corridor HazardsFor just opened for this member (0 for none)
+size_t g_breathCircleFrom = 0;                  // where that corridor's circles start in the member's circle list; the ones before it are other hazards (Heated Ground)
 
 // Every avoid-circle that applies to this member right now.
 std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t now)
@@ -880,6 +886,7 @@ std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t no
     Player* bot = self.p;
     std::vector<Circle> circles;
     g_breathCast = 0;
+    g_breathCircleFrom = 0;
     for (AvoidEnemyAura const& rule : rules.avoidEnemyAura)
         if (Matches(rule.who, self, plan.mainTank))
             for (Unit* enemy : plan.enemies)
@@ -1031,20 +1038,37 @@ std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t no
                     continue;
                 BreathSpellLatch& latch = g_breathSpell[boss->GetGUID().GetCounter()];
                 if (uint32_t const cast = CastingBreath(boss, spells))
-                {
                     if (latch.spell != cast || now > latch.until)
+                    {
                         TC_LOG_INFO("playerbot.v2.raid", "[raid_breath] {} breath spell {} corridor opened", boss->GetName(), cast);
-                    latch.spell = cast;
-                    latch.until = now + 11000;
+                        latch.spell = cast;
+                        latch.until = now + kBreathCorridorOpenMs;
+                    }
+                uint32_t active = (latch.spell && now <= latch.until) ? latch.spell : 0u;
+                // Not casting yet: the corridor of the waypoint she hovers at or flies to (AvoidBreath::hover). A breath can start any time
+                // she is there, and the cast is all the warning there is.
+                if (!active && boss->IsFlying())
+                {
+                    float hx = boss->GetPositionX(), hy = boss->GetPositionY();
+                    if (!boss->movespline->Finalized())
+                    {
+                        G3D::Vector3 const& end = boss->movespline->FinalDestination();
+                        hx = end.x;
+                        hy = end.y;
+                    }
+                    if (AvoidBreath const* hover = HoverBreath(rules, rule.enemy, hx, hy, kBreathHoverReach))
+                        if (Matches(hover->who, self, plan.mainTank))
+                            active = hover->castSpell;
                 }
-                if (!latch.spell || now > latch.until)
+                if (!active)
                     continue;
                 for (AvoidBreath const& path : rules.avoidBreath)
-                    if (path.enemy == rule.enemy && path.fixedPath && path.castSpell == latch.spell && Matches(path.who, self, plan.mainTank))
+                    if (path.enemy == rule.enemy && path.fixedPath && path.castSpell == active && Matches(path.who, self, plan.mainTank))
                     {
                         breathAdded.push_back(rule.enemy);
                         g_breathEnemy = rule.enemy;
                         g_breathCast = path.castSpell;
+                        g_breathCircleFrom = circles.size();
                         float const dx = path.bx - path.ax, dy = path.by - path.ay;
                         float const len = std::sqrt(dx * dx + dy * dy);
                         float const step = std::max(path.halfWidth * 0.8f, 2.0f);
@@ -1118,7 +1142,7 @@ Brain::MoveContext BuildMoveContext(Plan const& plan, Member const& self, std::v
     {
         if (!Matches(rule.who, self, plan.mainTank))
             continue;
-        float const s = std::sin(std::min(rule.halfAngleDeg, 89.0f) * (float(M_PI) / 180.0f));
+        float const s = std::sin(std::min(ConeEdgeDeg(rule), 89.0f) * (float(M_PI) / 180.0f));
         for (Unit* enemy : plan.enemies)
         {
             // A flying enemy has no ground cone (Onyxia's phase 2: she circles the cave and turns every waypoint).
@@ -1226,6 +1250,24 @@ bool FaceAxisFor(Plan const& plan, Unit* enemy, uint32_t now, float& axis, float
     TC_LOG_INFO("playerbot.v2.raid", "[raid_face] axis for {} locked: raid centre {:.0f} yd out, {} raiders, bearing {:.0f} deg", enemy->GetName(),
         Dist2D(sx / float(n), sy / float(n), ex, ey), n, axis * 180.0f / float(M_PI));
     return true;
+}
+
+// Whether (x,y) lies inside a frontal cone of <enemy> as it faces now, widened by the rule's margin, for a bot like <self>. The same sector test
+// the cone step (2b) uses, so a stand point this rejects is one that step would walk the bot out of again.
+bool InAnyLiveCone(RaidRules const& rules, Plan const& plan, Member const& self, Unit const* enemy, float x, float y)
+{
+    for (AvoidFrontal const& rule : rules.avoidFrontal)
+    {
+        if (rule.enemy != enemy->GetEntry() || !Matches(rule.who, self, plan.mainTank) || !InPhase(enemy, rule.hpMax, rule.hpMin))
+            continue;
+        if (Dist2D(x, y, enemy->GetPositionX(), enemy->GetPositionY()) > rule.radius)
+            continue;
+        float const facing = enemy->GetOrientation() + rule.facingOffsetDeg * (float(M_PI) / 180.0f);
+        float const toPoint = geo::NormalizeAngle(geo::Bearing(enemy->GetPositionX(), enemy->GetPositionY(), x, y) - facing);
+        if (std::fabs(toPoint) < ConeEdgeDeg(rule) * (float(M_PI) / 180.0f))
+            return true;
+    }
+    return false;
 }
 
 // A bot standing in lava or slime leaves it for the nearest dry navmesh point. The Ragnaros fight (live 2026-10-12) had bots standing in
@@ -1429,6 +1471,17 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             for (BreathSafe const* s : spots)
             {
                 float pz = 0.0f;
+                // Not into other hazards (the fire the breath leaves round the pits: the listed points lie in it): the corridor's own circles
+                // start at g_breathCircleFrom, the ones before are the others.
+                bool burning = false;
+                for (size_t i = 0; i < g_breathCircleFrom && i < circles.size(); ++i)
+                    if (Dist2D(s->x, s->y, circles[i].x, circles[i].y) < circles[i].r)
+                    {
+                        burning = true;
+                        break;
+                    }
+                if (burning)
+                    continue;
                 if (!Usable(bot, s->x, s->y, bot->GetPositionZ(), pz, /*urgent*/ true, /*hazard*/ true))
                     continue;
                 SetMove(out, s->x, s->y, pz, "leave hazard");
@@ -1487,7 +1540,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             float const distance = Dist2D(bot->GetPositionX(), bot->GetPositionY(), enemy->GetPositionX(), enemy->GetPositionY());
             if (distance > rule.radius)
                 continue;
-            float const half = rule.halfAngleDeg * (float(M_PI) / 180.0f);
+            float const half = ConeEdgeDeg(rule) * (float(M_PI) / 180.0f);
             float const facing = enemy->GetOrientation() + rule.facingOffsetDeg * (float(M_PI) / 180.0f);
             float toBot = std::atan2(bot->GetPositionY() - enemy->GetPositionY(), bot->GetPositionX() - enemy->GetPositionX()) - facing;
             while (toBot > float(M_PI)) toBot -= 2.0f * float(M_PI);
@@ -1693,7 +1746,18 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             if (enemy->GetEntry() != rule.enemy || !enemy->IsAlive() || enemy->IsFlying() || !InPhase(enemy, rule.hpMax, rule.hpMin))
                 continue;
             float const ex = enemy->GetPositionX(), ey = enemy->GetPositionY();
-            float const eo = enemy->GetOrientation();
+            // The wedge is measured from the line the tank holds her on (the locked FaceAway axis), not from her live facing: that swings with
+            // every step the tank takes, flipped the flank a bot counted itself on and sent it across the cone to the other wedge. The cones
+            // themselves (2b) still read the live facing, which is where the breath goes.
+            float eo = enemy->GetOrientation();
+            for (FaceAway const& fa : rules.faceAway)
+                if (fa.enemy == rule.enemy && InPhase(enemy, fa.hpMax, fa.hpMin))
+                {
+                    float axis;
+                    if (FaceAxisFor(plan, enemy, now, axis, fa.bearingDeg))
+                        eo = axis;
+                    break;
+                }
             float const half = rule.halfAngleDeg * (float(M_PI) / 180.0f), centre = rule.centerDeg * (float(M_PI) / 180.0f);
             // Which flank: the side of its facing the bot is on. The rear-sector helpers measure from the line straight behind a facing, so the
             // flank is handed to them as the "rear" of a facing turned a quarter round the other way.
@@ -1726,6 +1790,10 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             if (now - at < 4000)
                 break;
             if (!circles.empty() && InsideAny(circles, px, py, 1.0f))
+                break;
+            // No slot inside a cone as she faces right now: the cone step (2b) would walk the bot straight out again, the two rules passing it
+            // back and forth (180 flank and 140 cone steps in 70 s, live 2026-10-16). It waits where it is until she turns back.
+            if (InAnyLiveCone(rules, plan, self, enemy, px, py))
                 break;
             float pz = 0.0f;
             if (!Usable(bot, px, py, enemy->GetPositionZ(), pz))
@@ -2619,8 +2687,9 @@ void PublishThreatHolds(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& ord
             fight.last = now;
             // A boss gets the tank's time to arrive and build its lead: mc_geddon 09a8ff07 had Geddon on a mage 6 s in (the tank, 40 y off at the
             // pull, still short of the 900 lead when the 6 s opening wait ran out), loose in the middle of the raid when Inferno came.
-            // Never longer than six seconds from the tank's first hit (playtest 2026-10-15), the same cap as the combat state's wait.
-            uint32_t const capMs = boss ? 6000u : (tankThreat <= 0.0f ? 1000u : 2000u);
+            // Never longer than eight seconds from the tank's first hit in a raid (playtest 2026-10-16: the tank takes a while to run in), the
+            // same wait as the combat state's (kRaidBossOpenWaitMs).
+            uint32_t const capMs = boss ? uint32_t(kRaidBossOpenWaitMs) : (tankThreat <= 0.0f ? 1000u : 2000u);
             hold = now - std::min(since, fight.first) < capMs;
         }
         else
@@ -3715,6 +3784,7 @@ void Brain::Update(uint32_t now_ms)
             dump << "  rule kill focus: " << plan.ruleFocus.GetCounter() << "\n";
         }
         PublishThreatHolds(plan, next, now_ms);
+        ApplyFightScript(plan, next, now_ms, dump);
         PublishMeleeSoak(plan, next);
         PublishAuraReactions(plan, next);
     }

@@ -42,6 +42,8 @@
 #include "DetourNavMeshQuery.h"
 #include "PlayerbotV2.h"     // path-outcome telemetry, bot-leader battleground queue
 #include "PlayerbotMovement.h"  // unified bot-movement helpers
+#include "Fleet/CityLayer.h"      // same-level moves across a drop, NoPath storm
+#include "Bot/World/ZonePicker.h" // IsVanillaCapitalZone
 #include "Fleet/InstanceEntry.h"  // PrepareInstanceEntry: a stale raid lock must not keep a companion out of its owner's instance
 #include "PartialRouteStall.h"
 #include "NoMotionGuard.h"
@@ -1167,7 +1169,39 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // Ground height first, searched from above the hint: a slot built from the
     // owner's / mob's / anchor's Z next to a rock or ledge higher than the hint
     // would resolve to the terrain under the collision mesh (bot embedded).
+    float const z_ask = z;
     z = BotMovement::GroundZ(p_, x, y, z, "move_to");
+    // A world bot in a capital asking for its own level (the chunked walks and the wanderers pass the bot's z) whose destination has its
+    // ground 20+ y lower: the capital stands on layers (Stormwind: the city floor at z 94 to 100, others at z 75 and z 59 under it,
+    // joined only by steep faces). The ground probe would put the goal on the lower layer and the path would take the bot down the
+    // face, where the town's hubs cannot be reached (soak 2026-10-16: 3281 of 4102 big drops in Stormwind were such asks). The ask is
+    // refused like a blocked path, so the rule picks another bearing.
+    if (!p_->GetGroup() && !p_->IsInFlight() && !p_->GetTransport() && p_->GetMap() && !p_->GetMap()->IsDungeon()
+        && !p_->GetMap()->IsBattlegroundOrArena() && ::Playerbot::V2::World::IsVanillaCapitalZone(p_->GetZoneId())
+        && ::Playerbot::V2::Fleet::AcrossDrop(p_->GetPositionZ(), z_ask, z)
+        && !([&]
+        {
+            // The ground probe sees terrain and static models, the mover walks the navmesh. Where the mesh has a walkable surface at the
+            // asked level the ask is a request for that surface (a balcony or a roof with open air under it, not a drop): keep the level.
+            Position np;
+            if (!::Playerbot::BotMovement::NearestNavPoint(p_, x, y, z_ask, 3.0f, 6.0f, np))
+                return false;
+            z = np.GetPositionZ();
+            return true;
+        }()))
+    {
+        static std::unordered_map<uint64, uint32> s_guardAt;
+        uint32 const gnow = GameTime::GetGameTimeMS();
+        uint32& gat = s_guardAt[p_->GetGUID().GetCounter()];
+        if (gat == 0 || gnow - gat >= 10000u)
+        {
+            gat = gnow ? gnow : 1u;
+            TC_LOG_INFO("playerbot.v2", "[level_guard] {} refused a same-level move across a drop: z={:.1f} dst=({:.1f},{:.1f}) ground={:.1f}",
+                        p_->GetName(), z_ask, x, y, z);
+        }
+        NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS());
+        return Result::Locked;
+    }
     BotMovement::SnapToGround(p_, x, y, z);
 
     // Battleground start room (STATUS_WAIT_JOIN): the gates are shut and the bots only mill about their start area, so a
@@ -1650,9 +1684,44 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                 p_->GetPositionY(), x, y, z);
         Playerbot::V2::Module::instance().OnPathOutcome(1 /*NoPath*/);
         log_path_fail("NoPath");
+        BotMovement::NoteNoPath(p_);
         NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS(),
                      kPathFailTtlLongMs);
         return Result::Locked;
+    }
+    // Retry at the polygon found, for a destination that lies just off the mesh. A chunk step is aimed at a point on the bot's own level a
+    // stride ahead, so it often lands a few yards off a road, on a slope above or below it, or on another level of the same x,y. Detour then
+    // builds the corridor to the nearest polygon and flags the end as far from its polygon (6298 of these in the soak of 2026-10-16; 1271
+    // ended on the asked x,y at another height, 1250 within 3 to 30 y of it at much the same height). Where that polygon is within a
+    // stride's slack of the ask, walk to it: ask again at its x,y,z. A corridor that crosses a cliff face is still refused, and so are
+    // destinations whose nearest polygon is farther off (void, a wall, the far side of a gorge).
+    if (path_ok && (pt & PATHFIND_FARFROMPOLY_END) && !(pt & PATHFIND_NOPATH) && p_->GetMap() && !p_->GetMap()->IsDungeon()
+        && !p_->GetMap()->IsBattlegroundOrArena())
+    {
+        G3D::Vector3 const ae = path.GetActualEndPosition();
+        float const off_end = std::hypot(ae.x - x, ae.y - y);
+        float const dz_end = ae.z - z;
+        // In a capital the layers lie 20 to 40 y apart (Stormwind): a polygon that far from the asked height is another level, not a
+        // slope (Hellice, on a roof at z 148.6, was snapped to a polygon 20 to 35 y below it).
+        float const max_dz = ::Playerbot::V2::World::IsVanillaCapitalZone(p_->GetZoneId()) ? ::Playerbot::V2::Fleet::kCityDropYards : 60.0f;
+        if (off_end <= 12.0f && std::fabs(dz_end) < max_dz && !::Playerbot::V2::Fleet::PathHasCliff(path.GetPath()))
+        {
+            if (SehSafeCalculatePath(path, ae.x, ae.y, ae.z) && !(path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_FARFROMPOLY_END)))
+            {
+                float const ox = x, oy = y, oz = z;
+                pt = path.GetPathType();
+                x = ae.x; y = ae.y; z = ae.z;
+                static std::unordered_map<uint64, uint32> s_snapAt;
+                uint32 const snow = GameTime::GetGameTimeMS();
+                uint32& sat = s_snapAt[p_->GetGUID().GetCounter()];
+                if (sat == 0 || snow - sat >= 10000u)
+                {
+                    sat = snow ? snow : 1u;
+                    TC_LOG_INFO("playerbot.v2", "[far_end_snap] {} asked ({:.1f},{:.1f},{:.1f}), mesh at ({:.1f},{:.1f},{:.1f}), {:.1f} y off",
+                                p_->GetName(), ox, oy, oz, x, y, z, off_end);
+                }
+            }
+        }
     }
     if (pt & PATHFIND_FARFROMPOLY_END)
     {
@@ -1666,6 +1735,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             return Result::Ok;
         Playerbot::V2::Module::instance().OnPathOutcome(3 /*FarFromPolyEnd*/);
         log_path_fail("FarFromPolyEnd");
+        BotMovement::NoteNoPath(p_);
         // Off-mesh destination (above terrain / inside geometry / a phantom POI
         // Z). Permanently unreachable until the data changes â suppress long so
         // the bot stops oscillating toward it and goal-selection moves on.
@@ -1806,10 +1876,15 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                                         x, y, z);
         float const forward_progress = cur_to_dst - end_to_dst;
 
-        log_path_fail("Incomplete");
-        TC_LOG_INFO("playerbot.v2",
-            "[path_fail] {} Incomplete forward_progress={:.1f}y (cur_to_dst={:.1f} end_to_dst={:.1f})",
-            p_->GetName(), forward_progress, cur_to_dst, end_to_dst);
+        // A partial path that gets 5 y or more closer is the normal way a long or winding route is walked (74 polygons a call): 79000 such
+        // lines an hour in the 2026-10-16 soak, 7300 of them real stalls. Only the stalls are written at INFO.
+        if (forward_progress < kMinForwardProgressYards)
+        {
+            log_path_fail("Incomplete");
+            TC_LOG_INFO("playerbot.v2",
+                "[path_fail] {} Incomplete forward_progress={:.1f}y (cur_to_dst={:.1f} end_to_dst={:.1f})",
+                p_->GetName(), forward_progress, cur_to_dst, end_to_dst);
+        }
 
         if (forward_progress < kMinForwardProgressYards)
         {
@@ -2025,8 +2100,10 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                     "[path_loop] {} {} partial routes toward ({:.0f},{:.0f},{:.0f}) without closing in "
                     "(cur_to_dst={:.0f}); goal suppressed", p_->GetName(),
                     Playerbot::BotMovement::kStallMaxPartials, x, y, z, cur_to_dst);
+                // The long window: a loop is geometry (Francoise, a goal in the Keep, 632 y and not one yard closer for an hour), and three
+                // seconds had the rule ask for the same goal again every ten.
                 NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
-                             GameTime::GetGameTimeMS(), kPathFailTtlMs);
+                             GameTime::GetGameTimeMS(), kPathFailTtlLongMs);
                 return Result::Locked;
             }
             if (pts.size() >= 2)

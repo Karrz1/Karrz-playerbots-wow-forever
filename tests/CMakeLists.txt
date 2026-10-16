@@ -32,6 +32,7 @@ if(NOT BUILD_PLAYERBOT_V2)
     ClassicGroupOrderText.cpp
     ClassicRaidConsumables.cpp
     ClassicRaidDispel.cpp
+    ClassicRaidFightScript.cpp
     ClassicRaidGeometry.cpp
     ClassicRaidRagnaros.cpp)
   foreach(_test_source ${TESTS_MODULE_ONLY_SOURCES})
