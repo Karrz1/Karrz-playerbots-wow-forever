@@ -8,7 +8,7 @@ Matches the main realm build and moves to the newest game client. **You need the
 - Includes advocaite's latest Forever changes (client 70425 and 70450 data).
 
 **Raids and dungeons**
-- Molten Core: Majordomo sheep plan (mages sheep three Healers, tanks take a Healer last), Geddon, Garr, Shazzrah, Golemagg and Sulfuron fight scripts; Flamewaker Priests heal.
+- Molten Core: fight scripts for Geddon, Garr, Shazzrah, Golemagg and Sulfuron; Flamewaker Priests heal.
 - Blackwing Lair: Nefarian's phase 3 raises Bone Constructs, trash at vanilla density.
 - Zul'Gurub: Arlokk appears after the gong; Thekal, Lor'Khan and Zath feign death and Thekal rises as a tiger. Ruins of Ahn'Qiraj: General Rajaxx's waves and Andorov. Raid rules for ZG, AQ20, BWL, AQ40 and Naxxramas.
 - Scholomance and Lower Blackrock Spire event fixes, Naxxramas Thaddius, AQ40 Obsidian Eradicator, Horde Onyxia attunement.
