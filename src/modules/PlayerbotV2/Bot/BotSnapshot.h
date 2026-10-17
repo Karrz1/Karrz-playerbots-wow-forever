@@ -432,6 +432,8 @@ struct NearbyUnit
     // CC'd by their own teammates so the CC duration isn't wasted.
     bool       is_cc_locked = false;
     ObjectGuid cc_caster;
+    // Milliseconds left on the aura that set cc_caster (0 = unknown or permanent): lets a mage renew a sheep before it runs out.
+    uint32_t   cc_ms_left = 0;
     // Caster of a root aura on the unit (empty = none). Roots are not CC-locks (mobs stay targets), but the MarkCc
     // druid must see its own Entangling Roots to not recast them every tick.
     ObjectGuid root_caster;

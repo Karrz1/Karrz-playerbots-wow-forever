@@ -632,6 +632,13 @@ local function RaidReady()
         end
     end
 
+    -- Already in a group: it is the group that gets the orders and the ready check. The saved-roster call replaces the group with the
+    -- saved raid (a 10-man in UBRS was dismissed, 2026-10-17), so it only runs when you are alone.
+    if MemberCount() > 1 then
+        Print("raid ready: using your current group (" .. MemberCount() .. ").")
+        Finish(MemberCount())
+        return
+    end
     Print("raid ready: calling your saved bots...")
     ServerCommand(".bot summon saved")
     local lastN, stable, waited = -1, 0, 0
@@ -751,7 +758,7 @@ local function BuildFrame()
     y = y - 34
     local raidReadyBtn = MakeButton(frame, "Raid ready", 298, RaidReady, 24)
     raidReadyBtn:SetPoint("TOPLEFT", 16, y)
-    Tip(raidReadyBtn, "Raid ready", "Calls your saved bots, makes the group a raid if it needs one, sets the formation and spacing, and starts a ready check once the bots have buffed. Target your main tank first to set the Main Tank flag too. Not in combat.")
+    Tip(raidReadyBtn, "Raid ready", "Alone: calls your saved bots. Already in a group: uses that group and never changes it. Makes the group a raid if it needs one, sets the formation and spacing, and starts a ready check once the bots have buffed. Target your main tank first to set the Main Tank flag too. Not in combat.")
     y = y - 32
 
     ---------------------------------------------------------------------------------------------- order rows

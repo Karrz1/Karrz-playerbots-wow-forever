@@ -27,6 +27,7 @@
 #include "GameObject.h"
 #include "GameEventSender.h"
 #include "GameObjectAI.h"
+#include "GameTime.h"
 #include "InstanceScript.h"
 #include "Map.h"
 #include "MapReference.h"
@@ -35,6 +36,8 @@
 #include "MovementDefines.h"
 #include "Player.h"
 #include "Random.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "SpellScript.h"
 #include "TemporarySummon.h"
 #include "classic_blackrock_spire.h"
@@ -917,12 +920,23 @@ public:
 
             // The door also opens by proximity: a player carrying the Seal of Ascension within 12 yards of it. The area trigger
             // (2046) stays as it was, but it fires only when the client reports the trigger volume, and it skipped GM players.
-            if (GetData(TYPE_EVENT_DOOR_UBRS) != DONE)
+            if (GetData(TYPE_EVENT_DOOR_UBRS) != DONE || GetData(TYPE_ROOM_EVENT) == NOT_STARTED)
             {
                 if (_ubrsDoorCheckTimer <= diff)
                 {
                     _ubrsDoorCheckTimer = 1000;
-                    if (GameObject* door = instance->GetGameObject(_ubrsDoorGUID))
+                    // The rune-room event starts with the same area trigger (2046 sorts the room mobs): start it as soon as a
+                    // player is alive in the instance, otherwise the rooms never count and the door behind them stays shut.
+                    if (GetData(TYPE_ROOM_EVENT) == NOT_STARTED)
+                        for (MapReference const& ref : instance->GetPlayers())
+                            if (Player* player = ref.GetSource())
+                                if (player->IsAlive())
+                                {
+                                    DoSortRoomEventMobs();
+                                    break;
+                                }
+                    if (GetData(TYPE_EVENT_DOOR_UBRS) != DONE)
+                        if (GameObject* door = instance->GetGameObject(_ubrsDoorGUID))
                         for (MapReference const& ref : instance->GetPlayers())
                         {
                             Player* player = ref.GetSource();
@@ -1530,13 +1544,15 @@ struct classic_go_blackrock_altar : public GameObjectAI
         ALTAR_RANGE             = 8,
         ALTAR_HOLD_MS           = 3000,
         ALTAR_WAIT_MS           = 120000,
-        ALTAR_TICK_MS           = 500
+        ALTAR_TICK_MS           = 500,
+        ALTAR_CHANNEL_MS        = 5000
     };
 
     struct AltarUser
     {
         ObjectGuid guid;
         uint32 waitedMs = 0;
+        uint32 channelMs = 0;
     };
 
     classic_go_blackrock_altar(GameObject* go) : GameObjectAI(go), _tickMs(ALTAR_TICK_MS), _holdMs(0) { }
@@ -1563,6 +1579,7 @@ struct classic_go_blackrock_altar : public GameObjectAI
         user.guid = player->GetGUID();
         _users.push_back(user);
         player->CastSpell(player, SPELL_ALTAR_CHANNEL, CastSpellExtraArgs(TRIGGERED_FULL_MASK));
+        ShowChannel(player, _users.back());
         return true;
     }
 
@@ -1581,6 +1598,15 @@ struct classic_go_blackrock_altar : public GameObjectAI
         for (AltarUser& user : _users)
         {
             user.waitedMs += ALTAR_TICK_MS;
+            // The altar spell is an aura, so the channel (cast bar and beam to the altar) is drawn by hand and renewed
+            // every few seconds for as long as the user stays in the ritual.
+            if (user.channelMs <= ALTAR_TICK_MS)
+            {
+                if (Player* player = ObjectAccessor::GetPlayer(*me, user.guid))
+                    ShowChannel(player, user);
+            }
+            else
+                user.channelMs -= ALTAR_TICK_MS;
         }
 
         size_t const before = _users.size();
@@ -1601,7 +1627,10 @@ struct classic_go_blackrock_altar : public GameObjectAI
         Player* starter = ObjectAccessor::GetPlayer(*me, _users.front().guid);
         for (AltarUser const& user : _users)
             if (Player* player = ObjectAccessor::GetPlayer(*me, user.guid))
+            {
                 player->RemoveAurasDueToSpell(SPELL_ALTAR_CHANNEL);
+                HideChannel(player);
+            }
         _users.clear();
         _holdMs = 0;
         if (starter)
@@ -1609,6 +1638,27 @@ struct classic_go_blackrock_altar : public GameObjectAI
     }
 
 private:
+    void ShowChannel(Player* player, AltarUser& user)
+    {
+        SpellCastVisual visual;
+        if (SpellInfo const* info = sSpellMgr->GetSpellInfo(SPELL_ALTAR_CHANNEL, me->GetMap()->GetDifficultyID()))
+            visual.SpellXSpellVisualID = player->GetCastSpellXSpellVisualId(info);
+        player->ClearChannelObjects();
+        player->AddChannelObject(me->GetGUID());
+        player->SetChannelSpellId(SPELL_ALTAR_CHANNEL);
+        player->SetChannelVisual(visual);
+        player->SetChannelSpellData(GameTime::GetGameTimeMS(), ALTAR_CHANNEL_MS);
+        user.channelMs = ALTAR_CHANNEL_MS - 1000;
+    }
+
+    static void HideChannel(Player* player)
+    {
+        player->ClearChannelObjects();
+        player->SetChannelSpellId(0);
+        player->SetChannelVisual({});
+        player->SetChannelSpellData(0, 0);
+    }
+
     void Prune()
     {
         _users.erase(std::remove_if(_users.begin(), _users.end(), [this](AltarUser const& user)
@@ -1617,7 +1667,10 @@ private:
             bool const leaves = !player || !player->IsAlive() || !player->IsWithinDist(me, float(ALTAR_RANGE))
                 || !player->HasAura(SPELL_ALTAR_CHANNEL) || (_users.size() < ALTAR_CASTERS && user.waitedMs > ALTAR_WAIT_MS);
             if (leaves && player)
+            {
                 player->RemoveAurasDueToSpell(SPELL_ALTAR_CHANNEL);
+                HideChannel(player);
+            }
             return leaves;
         }), _users.end());
     }

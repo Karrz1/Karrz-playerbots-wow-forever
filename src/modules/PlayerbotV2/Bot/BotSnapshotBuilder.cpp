@@ -1887,7 +1887,8 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         // has feet wet, but it's burning, not drowning.
         snap->environment.is_underwater = (liquid & LIQUID_MAP_UNDER_WATER) != 0
                             && !is_magma && !is_slime;
-        snap->environment.is_in_damaging_liquid = in_liquid && (is_magma || is_slime);
+        // The core burns on any contact, floor within a tenth of the surface included (WATER_WALK): the Majordomo dais.
+        snap->environment.is_in_damaging_liquid = (liquid & MAP_LIQUID_STATUS_IN_CONTACT) != 0 && (is_magma || is_slime);
         if (snap->environment.is_underwater && lqmap)
             snap->environment.water_surface_z = lqmap->GetWaterLevel(
                 p->GetPhaseShift(), p->GetPositionX(), p->GetPositionY());
@@ -4039,6 +4040,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                     best_cc_pri = pri;
                     u.is_cc_locked = true;
                     u.cc_caster = abase->GetCasterGUID();
+                    u.cc_ms_left = abase->GetDuration() > 0 ? uint32(abase->GetDuration()) : 0u;
                 }
             }
         }
@@ -4717,7 +4719,9 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                         // Healers seven times and never the shield).
                         bool const shield = asi->Id == 20619 || asi->Id == 21075;
                         bool const shield_held = u.magic_buff_spell == 20619 || u.magic_buff_spell == 21075;
-                        if (shield || (!shield_held && (u.magic_buff_age_ms < 0 || age < u.magic_buff_age_ms)))
+                        // Both shields can stand at once; Magic Reflection (which sends a sheep back at the mage) is the one that must stay
+                        // visible, whichever aura the walk meets last.
+                        if ((shield && u.magic_buff_spell != 20619) || (!shield_held && (u.magic_buff_age_ms < 0 || age < u.magic_buff_age_ms)))
                         {
                             u.magic_buff_age_ms = age;
                             u.magic_buff_spell  = asi->Id;
@@ -4763,6 +4767,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                     best_cc_pri = pri;
                     u.is_cc_locked = true;
                     u.cc_caster = abase->GetCasterGUID();
+                    u.cc_ms_left = abase->GetDuration() > 0 ? uint32(abase->GetDuration()) : 0u;
                 }
             }
             fill_threat(u, t);
@@ -4967,6 +4972,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                         best_cc_pri = pri;
                         u.is_cc_locked = true;
                         u.cc_caster = abase->GetCasterGUID();
+                    u.cc_ms_left = abase->GetDuration() > 0 ? uint32(abase->GetDuration()) : 0u;
                     }
                 }
             }

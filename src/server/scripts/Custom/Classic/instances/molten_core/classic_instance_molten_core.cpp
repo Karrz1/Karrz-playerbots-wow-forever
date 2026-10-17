@@ -321,7 +321,16 @@ public:
                     RespawnBossPack(uiType);
 
                 if (uiType == CLASSIC_MC_TYPE_MAJORDOMO && uiData == DONE)
+                {
                     DoRespawnGameObject(m_uiFirelordCacheGUID, Seconds(HOUR));
+                    // The Cache could not be opened on 2026-10-17 and nothing on the server said why: record what the core holds for it.
+                    if (GameObject const* cache = instance->GetGameObject(m_uiFirelordCacheGUID))
+                        TC_LOG_INFO("scripts", "[MoltenCore] Cache of the Firelord: spawned {}, loot state {}, go state {}, not-selectable {}, in-use {}, locked {}, lock {}, loot {}, at ({:.1f},{:.1f},{:.1f})",
+                            cache->isSpawned(), uint32(cache->getLootState()), uint32(cache->GetGoState()), cache->HasFlag(GO_FLAG_NOT_SELECTABLE), cache->HasFlag(GO_FLAG_IN_USE), cache->HasFlag(GO_FLAG_LOCKED),
+                            cache->GetGOInfo()->GetLockId(), cache->GetGOInfo()->GetLootId(), cache->GetPositionX(), cache->GetPositionY(), cache->GetPositionZ());
+                    else
+                        TC_LOG_ERROR("scripts", "[MoltenCore] Majordomo is done but the Cache of the Firelord is not in instance {} (guid {})", instance->GetInstanceId(), m_uiFirelordCacheGUID.ToString());
+                }
                 return;
             }
 

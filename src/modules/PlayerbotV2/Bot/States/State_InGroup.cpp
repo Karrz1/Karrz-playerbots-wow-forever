@@ -22,6 +22,7 @@
 #include "Bot/ThreatDiscipline.h"   // ThreatOpeningLead (passive, tank first)
 #include "Bot/ClassicUpkeep.h"      // IsEating / IsDrinking (stand to defend)
 #include "Log.h"
+#include "GameTime.h"
 #include <cmath>
 #include <limits>
 
@@ -1184,22 +1185,6 @@ void DispatchInGroup(BotAI& ai,
          (ai.is_manual_mode(snapshot.published_at_ms()) && ai.owner_command() == BotAI::OwnerCommand::Engage)) &&
         dist < kDetourMaxRange;
     bool const refollow = ai.take_formation_refollow();
-    // The anchor stands 4+ y lower, near: he dropped or jumped down (UBRS stadium 2026-10-17: he went 11 y down into the arena and his bots,
-    // which only follow the walking route, went round through the Blackhand packs and died). Go toward him with follow_drop: when his floor is
-    // only reached by a ledge, API::move_to walks to the nearest one and drops (or leaps a gap); when the walking route is fine it is the
-    // ordinary pathed move. Gated like the follow below, so an order, a hold, a fight or a detour still wins.
-    if (!in_active_bg && !dungeon_run_owns_movement && !detour_leased && !holding_position && !order_owns_movement &&
-        !snapshot.is_rooted() && !snapshot.in_combat() && !snapshot.raw().movement.is_mounted &&
-        dist > 6.0f && dist <= 40.0f && bz - anchor->z >= 4.0f)
-    {
-        bool const pushed = emit.move_to(anchor->x, anchor->y, anchor->z, /*run=*/true, false, false, /*follow_drop=*/true);
-        // A refused move (the owner's spot is off the mesh) leaves the plain follow below to work; a deduped one is a walk to the ledge under way.
-        if (pushed || !ai.move_refused_recently(anchor->x, anchor->y, anchor->z, formation_now_ms))
-        {
-            ai.set_last_rule_fired("ingroup:follow_drop");
-            return;
-        }
-    }
     // Owner formation: the bot's goal is its SLOT, recomputed every tick from the owner's live position and facing,
     // not "within the recall slack of the owner" (a slot ring wider than the slack, or any spot inside the ring,
     // used to count as arrived, so most of a big group stood still while the owner ran). The destination is only
@@ -1366,7 +1351,11 @@ void DispatchInGroup(BotAI& ai,
     {
         // Within slack (or following suppressed) — not separated, clear the
         // stale-progress counter so a future real separation starts fresh.
-        ai.reset_follow_progress();
+        // Not while an owner formation has the bot outside its slack: the slot walk and the plain-follow fallback alternate (3 s / 8 s),
+        // and clearing the counter at every switch kept the stale count under the repath threshold forever, so a bot that could not
+        // reach its slot never got the validated repath or the escape node (Stormwind Trade District ramp, 2026-10-17).
+        if (!(formation_slot_active && dist > kRecallSlack))
+            ai.reset_follow_progress();
     }
 
     // Auto-mount when the leader is far ahead and we're outdoors — closes
@@ -1479,5 +1468,55 @@ void DispatchInGroup(BotAI& ai,
         }
     }
 }
+
+// Follow an owner who dropped or jumped to a floor 4+ y below (UBRS stadium 2026-10-17: he went 11 y down into the arena; his bots, which
+// only followed the walking route, went round through the Blackhand packs and died. A warlock then started the ledge walk, a buff cast
+// stopped it, and a combat escape took it along the rim the long way). Runs at the top of every tick, whatever the state. The follow
+// itself is API::move_to follow_drop: when the walking route to him is missing or a long detour it walks to the nearest ledge and
+// drops or leaps; when the route is fine it is the ordinary pathed move and the intent executor marks it fine (no attempt for 3 s).
+// While the walk or the flight is on, the tick is consumed: no buff, no stand-up, no combat step can re-aim the bot.
+bool HonorFollowDrop(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit)
+{
+    uint32 const now = GameTime::GetGameTimeMS();
+    if (!s.is_alive() || s.in_battleground() || ai.dungeon_active() || s.is_rooted() || s.raw().movement.is_mounted || !g.exists())
+    { ai.clear_follow_drop(); return false; }
+    uint32 const pub = s.published_at_ms();
+    if (ai.holding_position(pub) || ai.pull_back_active() ||
+        (ai.is_manual_mode(pub) && ai.owner_command() == BotAI::OwnerCommand::Engage))
+    { ai.clear_follow_drop(); return false; }
+    ObjectGuid const leader_guid = g.leader();
+    auto const* members = g.members();
+    if (leader_guid.IsEmpty() || leader_guid == s.guid() || !members)
+    { ai.clear_follow_drop(); return false; }
+    GroupMemberSummary const* leader = nullptr;
+    for (auto const& m : *members)
+        if (m.guid == leader_guid) { leader = &m; break; }
+    // Only a human owner is followed off a ledge; a bot leader is not.
+    if (!leader || !leader->online || !leader->is_alive || leader->is_bot || leader->map_id != s.map_id())
+    { ai.clear_follow_drop(); return false; }
+    float bx, by, bz; s.position(bx, by, bz);
+    float const dist = DistanceXY(bx, by, leader->x, leader->y);
+    if (dist < 6.0f || dist > 40.0f || bz - leader->z < 4.0f)
+    { ai.clear_follow_drop(); return false; }
+
+    bool const committed = ai.follow_drop_committed(now);
+    if (!committed && (ai.follow_drop_fine(now) || ai.follow_drop_blocked(now)))
+        return false;
+    if (committed && now - ai.follow_drop_since_ms() > BotAI::kFollowDropMaxMs)
+    {
+        TC_LOG_INFO("playerbot.v2", "[follow_drop] {} gives up the walk to the ledge after {} s", s.name(), BotAI::kFollowDropMaxMs / 1000u);
+        ai.block_follow_drop(now);
+        return false;
+    }
+    bool const pushed = emit.move_to(leader->x, leader->y, leader->z, /*run=*/true, false, false, /*follow_drop=*/true);
+    // A refused move (casting, no path) ends the attempt; the rules and the plain follow carry on.
+    if (!pushed && ai.move_refused_recently(leader->x, leader->y, leader->z, pub))
+    { ai.clear_follow_drop(); return false; }
+    ai.set_last_rule_fired(committed ? "follow_drop:commit" : "follow_drop:try");
+    // A first attempt consumes its tick so the plain follow cannot override the ledge walk it starts; a deduped re-attempt of one in
+    // progress consumes it too (the walk is running); a deduped attempt with nothing in progress lets the rules run.
+    return committed || pushed;
+}
+
 
 } // namespace Playerbot::States

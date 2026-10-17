@@ -220,7 +220,19 @@ struct IntentVisitor
         return r;
     }
     Result operator()(GroundTargetSpellIntent const& i) { return api.cast_spell_at_position(i.spell_id, i.x, i.y, i.z); }
-    Result operator()(MoveToIntent const& i)           { return api.move_to(i.x, i.y, i.z, i.run, i.direct, i.drop, i.follow_drop); }
+    Result operator()(MoveToIntent const& i)
+    {
+        Result const r = api.move_to(i.x, i.y, i.z, i.run, i.direct, i.drop, i.follow_drop);
+        if (i.follow_drop && bot_ai && r != Result::Locked)
+        {
+            // A ledge walk or flight commits the follow; an ordinary pathed move means the walking route is fine (State_InGroup HonorFollowDrop).
+            if (api.follow_drop_acted())
+                bot_ai->commit_follow_drop(GameTime::GetGameTimeMS());
+            else
+                bot_ai->note_follow_drop_fine(GameTime::GetGameTimeMS());
+        }
+        return r;
+    }
     Result operator()(TeleportToIntent const& i)       { return api.teleport_to(i.map_id, i.x, i.y, i.z, i.o); }
     Result operator()(StopMovementIntent const& i)     { return api.stop_movement(i.clear_generators); }
     Result operator()(JumpIntent const& i)             { return api.jump(i.forward); }

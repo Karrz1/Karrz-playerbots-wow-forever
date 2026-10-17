@@ -7,6 +7,7 @@
 #include "BotActivityTier.h"
 #include "Group/GroupSnapshot.h"
 #include "States/StateBase.h"
+#include "States/MaintainHelpers.h"
 #include "fmt/format.h"
 #include "GameTime.h"
 #include "SharedDefines.h"  // SPELL_FAILED_NO_AMMO
@@ -628,6 +629,10 @@ void BotAI::tick(BotSnapshotView snapshot,
     // Owner-led / small-party-in-a-raid-map autopilot suspension, settled before any
     // state reads dungeon_active() this tick.
     update_dungeon_autopilot_hold(snapshot, group);
+
+    // Follow-drop: the owner dropped or jumped to a floor 4+ y below; the walk to the ledge and the flight are not interruptible.
+    if (States::HonorFollowDrop(snapshot, *this, group, emit))
+        return;
 
     // 2. Primary state dispatch.
     dispatch_primary(snapshot, group, emit);

@@ -448,7 +448,12 @@ bool SafeNearTeleport(Player* p, float x, float y, float z, float o, bool navmes
         LiquidData ld;
         ZLiquidStatus const st = p->GetMap()->GetLiquidStatus(
             p->GetPhaseShift(), px, py, pz,
-            map_liquidHeaderTypeFlags::Magma | map_liquidHeaderTypeFlags::Slime, &ld);
+            map_liquidHeaderTypeFlags::AllLiquids, &ld);
+        // The vmap filters on the model's raw liquid type, before the area table's override (the Majordomo dais is lava only after it),
+        // so ask for all liquids and test the flags that come back.
+        if (st != LIQUID_MAP_NO_WATER && !ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) &&
+            !ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Slime))
+            return false;
         // A point ON the surface reads WATER_WALK (delta > -0.1) and one just above it ABOVE_WATER, and the bot falls in at
         // once: the Molten Core entrance snap lands exactly on the lava surface (z 168.5, ground 165.2), so only IN / UNDER
         // let Cornelia and Cassanny die there on arrival (2026-10-11, killer=self). Anything within a yard of the surface

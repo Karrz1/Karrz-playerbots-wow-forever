@@ -6,7 +6,7 @@ does not depend on the addon-message protocol PlayerbotControl uses.
 Install: copy this folder to `<client>\_classic_beta_\Interface\AddOns\ForeverBots` (the folder name must stay
 `ForeverBots`). If the character screen's AddOns list marks it out of date, tick "Load out of date AddOns".
 
-In game: `/fb` opens the window. The Raid ready button (or `/fb raidready`) calls your saved bots (`.bot summon saved`), makes the group a raid if needed, sets formation and spacing, and starts a ready check once the bots have buffed.
+In game: `/fb` opens the window. The Raid ready button (or `/fb raidready`) calls your saved bots (`.bot summon saved`) when you are alone (already in a group, it uses that group and never changes it), makes the group a raid if needed, sets formation and spacing, and starts a ready check once the bots have buffed.
 
 On login the add-on greets the server once (a self-whisper under the `FBOTS` prefix). A player whose client does not greet within 30 seconds gets one chat line with the download link (`Playerbot.AddonHint.*` in the module config).
 

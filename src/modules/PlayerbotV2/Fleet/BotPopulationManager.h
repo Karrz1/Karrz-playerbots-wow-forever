@@ -18,6 +18,7 @@
 #include "AsyncCallbackProcessor.h"   // QueryCallbackProcessor member (async DB reads)
 #include "DatabaseEnvFwd.h"           // QueryCallbackProcessor / QueryResult aliases
 #include "WorldLoadFacts.h"
+#include "ObjectGuid.h"
 #include "BotQueueFiller.h"
 #include <unordered_map>
 #include <mutex>
@@ -188,6 +189,16 @@ public:
     };
     std::unordered_map<uint64, PendingCompanion> pending_companions_;
     void DrainCompanionSetups();
+    // A bot BringToOwner sent is only "brought" once it stands beside the owner in the owner's instance: checked 2 s after the teleport,
+    // and for up to 6 s, with both positions and instance ids in the log when it does not.
+    struct PendingBring
+    {
+        uint64 bot_low = 0;
+        ObjectGuid owner;
+        uint32 queued_ms = 0;
+    };
+    std::vector<PendingBring> pending_brings_;
+    void DrainBringChecks();
     void FinishCompanionSetup(Player* bot, Player* owner, uint8 role);
     std::unordered_map<uint64, uint32> pending_deletes_;   // bot -> queued at (getMSTime)
     void DrainCompanionDeletes();

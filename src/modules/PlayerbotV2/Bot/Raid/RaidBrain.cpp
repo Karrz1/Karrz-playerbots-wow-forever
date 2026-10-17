@@ -1385,8 +1385,13 @@ std::unordered_map<uint64_t, uint32_t> g_lastLavaLog;
 bool MagmaAt(Map* map, PhaseShift const& phase, float x, float y, float z, float& surfaceZ)
 {
     LiquidData ld;
-    ZLiquidStatus const st = map->GetLiquidStatus(phase, x, y, z, map_liquidHeaderTypeFlags::Magma | map_liquidHeaderTypeFlags::Slime, &ld);
+    // All liquids, then the flags of what came back: the vmap filters on the model's raw liquid type, before the area table swaps it for
+    // its own (the Majordomo hall's dais is a water-typed model liquid the area turns into lava). A Magma|Slime filter never saw it and the
+    // core, which asks for all liquids, burned bots there for 10% a second (nl100: six deaths at z -119.2, no [raid_lava] line).
+    ZLiquidStatus const st = map->GetLiquidStatus(phase, x, y, z, map_liquidHeaderTypeFlags::AllLiquids, &ld);
     if (!(st & MAP_LIQUID_STATUS_IN_CONTACT))
+        return false;
+    if (!ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) && !ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Slime))
         return false;
     surfaceZ = ld.level;
     return true;

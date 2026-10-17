@@ -33,6 +33,7 @@ constexpr uint32 kAnyType = (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u 
                             (1u << 8) | (1u << 9) | (1u << 10);
 
 constexpr uint32 kStealth = 1784;
+constexpr uint32 kRenewMs = 5000;   // a hold of ours with less than this left is cast again
 constexpr uint32 kFreezingTrap = 1499, kEnslaveDemon = 1098, kEntanglingRoots = 339;
 
 struct Option
@@ -157,7 +158,10 @@ bool TryCast(View const& s, Emit& emit, ObjectGuid target)
         return LogRefusal(low, now, s.name().c_str(), "mob not in view", target.GetEntry(), -1, 0.f), false;
     if (u->hp <= 0 || u->untargetable)
         return false;
-    if (u->is_cc_locked)
+    // Our own hold about to run out: a Polymorph lasts 50 s and the four Healers of Majordomo woke together (nl100 22:02:42), then stood loose
+    // for the 10 s the mages needed to start again. A renewal cast on the held mob resets it (vanilla mages did exactly this).
+    bool const renew = s.cls() == CLASS_MAGE && u->is_cc_locked && u->cc_caster == s.guid() && u->cc_ms_left > 0 && u->cc_ms_left < kRenewMs;
+    if (u->is_cc_locked && !renew)
         return false;   // held (by us or another): the goal
     if (CasterHoldsAnother(s, target))
         return LogRefusal(low, now, s.name().c_str(), "this caster's crowd control already holds another mob", u->entry, TypeOf(*u), 0.f), false;

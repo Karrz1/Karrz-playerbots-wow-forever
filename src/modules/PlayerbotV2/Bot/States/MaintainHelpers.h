@@ -78,6 +78,12 @@ bool DungeonRouteStepTowardPos(BotSnapshotView const& s,
 bool DungeonHonorCross(BotSnapshotView const& s, BotAI& ai,
                        BotIntentEmitter& emit, uint32 now_ms);
 
+// Following an owner who dropped or jumped to a floor 4+ y below (API::move_to follow_drop). Run at the top of every tick, whatever the
+// bot's state: starts the follow when the owner is that far below and near, and while the bot is walking to a ledge or in the air it
+// returns true so nothing else (a buff cast, a combat escape, the follow generator) can stop it. Clears itself on landing. Definition in
+// State_InGroup.cpp.
+bool HonorFollowDrop(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit);
+
 // Stranded-follower recovery (shared idle / InGroup / InCombat). Relocates a
 // non-tank follower that cannot rejoin the group on foot — a navmesh-disconnected
 // perch, a void pocket, or a death that respawns it at the far in-instance entrance

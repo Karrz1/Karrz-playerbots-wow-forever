@@ -792,8 +792,9 @@ void LogEngagements(Run& run, Player* viewer)
 bool InMagmaContact(Map* map, PhaseShift const& ps, float x, float y, float z)
 {
     LiquidData ld;
-    ZLiquidStatus const st = map->GetLiquidStatus(ps, x, y, z, map_liquidHeaderTypeFlags::Magma | map_liquidHeaderTypeFlags::Slime, &ld);
-    return (st & MAP_LIQUID_STATUS_IN_CONTACT) != 0;
+    ZLiquidStatus const st = map->GetLiquidStatus(ps, x, y, z, map_liquidHeaderTypeFlags::AllLiquids, &ld);
+    return (st & MAP_LIQUID_STATUS_IN_CONTACT) != 0 &&
+        (ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) || ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Slime));
 }
 
 bool PickArrival(Run& run, Player* leader)

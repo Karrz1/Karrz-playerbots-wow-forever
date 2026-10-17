@@ -195,6 +195,9 @@ public:
     // follow_drop=true: (x,y,z) is the owner. When he stands lower (or across a gap) and the walking route to him is missing or a long detour,
     // the bot walks to the nearest ledge and drops or leaps to his floor ([follow_drop] logs); otherwise this is the ordinary pathed move.
     Result move_to(float x, float y, float z, bool run = true, bool direct = false, bool drop = false, bool follow_drop = false);
+    // After a follow_drop move_to: the bot is walking to a ledge, or in the air after leaving one (the follow is committed), as against
+    // the ordinary pathed move it fell back to.
+    bool follow_drop_acted() const;
     // Ground height at (x,y) searched from above `z_hint` (Playerbot.Behavior.GroundSnap); returns z_hint when none found.
     float  ground_z(float x, float y, float z_hint, char const* where = "api");
     // clear_generators=true pops all MotionMaster generators (Clear + MoveIdle)

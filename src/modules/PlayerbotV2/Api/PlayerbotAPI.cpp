@@ -123,6 +123,10 @@ using BotMovement::SehSafeCalculatePath;
 // Follow-drop planning (move_to follow_drop): the walking-route verdict, then the ledge plan (Api/FollowDrop.h). World thread.
 namespace
 {
+    // Per bot: until when the follow is a ledge walk or a flight (API::follow_drop_acted), and until when a leap or drop is in the air.
+    std::unordered_map<uint64, uint32> s_followDropActive;
+    std::unordered_map<uint64, uint32> s_followDropAir;
+
     struct FollowDropPlan
     {
         FollowDrop::Mode mode = FollowDrop::Mode::None;
@@ -133,7 +137,7 @@ namespace
     {
         FollowDropPlan out;
         if (!p->IsAlive() || p->IsFlying() || p->IsInFlight() || p->GetVehicle() || p->GetTransport() || p->IsInWater() || p->IsFalling() ||
-            p->IsMounted() || p->IsInCombat())
+            p->IsMounted())
             return out;
         float const bx = p->GetPositionX(), by = p->GetPositionY(), bz = p->GetPositionZ();
         // Cheap gate: the owner is lower by a real drop, or about level (a gap). A bot already close to him just follows.
@@ -1091,6 +1095,14 @@ float API::ground_z(float x, float y, float z_hint, char const* where)
     return BotMovement::GroundZ(p_, x, y, z_hint, where);
 }
 
+bool API::follow_drop_acted() const
+{
+    if (!p_)
+        return false;
+    auto const it = s_followDropActive.find(p_->GetGUID().GetCounter());
+    return it != s_followDropActive.end() && GameTime::GetGameTimeMS() < it->second;
+}
+
 Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop, bool follow_drop)
 {
     if (!p_) return Result::Other;
@@ -1199,9 +1211,19 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
     // route to him is missing or a long detour, walk to the nearest ledge and leave it; otherwise fall through to the ordinary pathed move.
     if (follow_drop && !direct && !drop)
     {
+        uint64 const fdg = p_->GetGUID().GetCounter();
+        uint32 const fdnow = GameTime::GetGameTimeMS();
+        // In the air after leaving a ledge: nothing may re-aim the bot until it lands.
+        if (auto it = s_followDropAir.find(fdg); it != s_followDropAir.end() && fdnow < it->second)
+        {
+            s_followDropActive[fdg] = fdnow + 500u;
+            return Result::Ok;
+        }
         FollowDropPlan const fd = PlanFollowDropFor(p_, x, y, z);
+        s_followDropActive[fdg] = 0;
         if (fd.mode == FollowDrop::Mode::Walk)
         {
+            s_followDropActive[fdg] = fdnow + 2500u;
             p_->GetMotionMaster()->MovePoint(0, fd.ledge.x, fd.ledge.y, fd.ledge.z, /*generatePath*/ false);
             return Result::Ok;
         }
@@ -1209,7 +1231,13 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
         {
             TC_LOG_INFO("playerbot.v2", "[follow_drop] {} drops to the owner's floor: ledge=({:.1f},{:.1f},{:.1f}) landing=({:.1f},{:.1f},{:.1f}) owner=({:.1f},{:.1f},{:.1f})",
                         p_->GetName(), fd.ledge.x, fd.ledge.y, fd.ledge.z, fd.land.x, fd.land.y, fd.land.z, x, y, z);
-            return move_to(fd.land.x, fd.land.y, fd.land.z, true, false, /*drop*/ true);
+            Result const dr = move_to(fd.land.x, fd.land.y, fd.land.z, true, false, /*drop*/ true);
+            if (dr == Result::Ok)
+            {
+                s_followDropActive[fdg] = fdnow + 2500u;
+                s_followDropAir[fdg] = fdnow + 3500u;
+            }
+            return dr;
         }
         if (fd.mode == FollowDrop::Mode::Leap)
         {
@@ -1219,6 +1247,8 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
             if (auto it = s_leapUntil.find(lg); it != s_leapUntil.end() && lnow < it->second)
                 return Result::Locked;                               // already in the air
             s_leapUntil[lg] = lnow + 2500u;
+            s_followDropActive[lg] = lnow + 2500u;
+            s_followDropAir[lg] = lnow + 2500u;
             Position dest = p_->GetPosition();
             dest.Relocate(fd.land.x, fd.land.y, fd.land.z);
             p_->SetFacingTo(std::atan2(fd.land.y - p_->GetPositionY(), fd.land.x - p_->GetPositionX()));

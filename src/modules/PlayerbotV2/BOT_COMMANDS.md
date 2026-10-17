@@ -77,7 +77,7 @@ Install the `ForeverBots` folder into `Interface\AddOns` (the folder name must s
 out of date AddOns"). The addon only sends ordinary chat, so it needs nothing else on the client.
 
 - `/fb` opens or closes the window (it stays open across relog). The window has:
-  - **Raid ready** (also `/fb raidready`): calls your saved bots (`.bot summon saved`), waits until the group stops growing,
+  - **Raid ready** (also `/fb raidready`): calls your saved bots (`.bot summon saved`) when you are alone (already in a group it uses that group and never changes it), waits until the group stops growing,
     makes it a raid when it holds more than five, sets formation circle and spacing close, sends `resume` and the
     crowd-control switch, sets the Main Tank flag when you target a group member, and starts a ready check about twenty
     seconds later while the bots buff themselves. Not in combat; a new click or combat cancels it.

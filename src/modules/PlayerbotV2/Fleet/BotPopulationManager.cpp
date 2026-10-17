@@ -512,6 +512,7 @@ void BotPopulationManager::OnWorldTick(uint32 now_ms)
     // `.bot add` companions waiting for their first in-world tick.
     const uint32 slow_pipelines_ms = getMSTimeDiff(t_pipelines_start, getMSTime());
     { SLOW_CALL("DrainCompanionSetups"); DrainCompanionSetups(); }
+    DrainBringChecks();
     WarnOversizedInstanceGroups(now_ms);
     // `.bot delete` companions waiting to leave the world.
     DrainCompanionDeletes();
@@ -1664,7 +1665,15 @@ std::string BotPopulationManager::BringToOwner(Player* owner, Player* bot, char 
         bot->SpawnCorpseBones();
     }
     if (bot->IsInCombat())
-        return refuse("in combat");
+    {
+        // Fighting in the owner's own fight it stays; fighting somewhere the owner is not (the pack behind a closed door, another room)
+        // it leaves the fight and comes, so the owner is never left alone while the bots fight without him. The mobs lose it as a target.
+        if (bot->GetMapId() == owner->GetMapId() && owner->IsInCombat())
+            return refuse("in combat with you");
+        TC_LOG_INFO("playerbot.v2", "[summon] {} leaves its fight (map {}) to come to {}", bot->GetName(), bot->GetMapId(), owner->GetName());
+        bot->AttackStop();
+        bot->CombatStopWithPets(true);
+    }
     if (bot->IsBeingTeleported())
         return refuse("already on its way");
     Map const* ownerMap = owner->GetMap();
@@ -1687,10 +1696,58 @@ std::string BotPopulationManager::BringToOwner(Player* owner, Player* bot, char 
     TransferAbortReason const door = Fleet::PrepareInstanceEntry(bot, owner->GetMapId());
     if (door != TRANSFER_ABORT_NONE)
         return refuse(Fleet::TransferAbortName(door));
+    // The door puts a bot in the instance its group names for the map. A group formed while the owner already stood inside (a new raid,
+    // a re-formed one) names none, so the first bot in would open a second copy of the instance and arrive where the owner is not.
+    if (Group* group = owner->GetGroup(); group && ownerMap && ownerMap->IsDungeon() && bot->GetMapId() != owner->GetMapId())
+    {
+        uint32 const named = group->GetRecentInstanceId(owner->GetMapId());
+        if (named != ownerMap->GetInstanceId())
+        {
+            TC_LOG_INFO("playerbot.v2", "[summon] group instance of map {} was {}, set to {}'s instance {}", owner->GetMapId(), named,
+                        owner->GetName(), ownerMap->GetInstanceId());
+            group->SetRecentInstance(owner->GetMapId(), group->GetRecentInstanceOwner(owner->GetMapId()), ownerMap->GetInstanceId());
+        }
+    }
     if (!::Playerbot::BotMovement::SafeTeleport(bot, owner->GetMapId(), x, y, z, owner->GetOrientation(), 0))
         return refuse("the teleport was refused");
-    TC_LOG_INFO("playerbot.v2", "[summon] {} brought to {} on map {} ({})", bot->GetName(), owner->GetName(), owner->GetMapId(), why);
+    pending_brings_.push_back(PendingBring{ bot->GetGUID().GetCounter(), owner->GetGUID(), getMSTime() });
     return {};
+}
+
+void BotPopulationManager::DrainBringChecks()
+{
+    if (pending_brings_.empty())
+        return;
+    constexpr uint32 kSettleMs = 2000u, kGiveUpMs = 6000u;
+    constexpr float kBesideYards = 25.0f;
+    for (auto it = pending_brings_.begin(); it != pending_brings_.end();)
+    {
+        uint32 const age = getMSTimeDiff(it->queued_ms, getMSTime());
+        if (age < kSettleMs) { ++it; continue; }
+        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(it->bot_low));
+        Player* owner = ObjectAccessor::FindConnectedPlayer(it->owner);
+        if (!bot || !owner || !bot->IsInWorld() || !owner->IsInWorld())
+        {
+            TC_LOG_INFO("playerbot.v2", "[summon] bot {} not verified beside its owner: one of them left the world", it->bot_low);
+            it = pending_brings_.erase(it);
+            continue;
+        }
+        bool const sameMap = bot->GetMapId() == owner->GetMapId() && bot->GetInstanceId() == owner->GetInstanceId();
+        float const dist = sameMap ? bot->GetDistance(owner) : -1.0f;
+        if (sameMap && dist <= kBesideYards)
+        {
+            TC_LOG_INFO("playerbot.v2", "[summon] {} is beside {}: {:.0f}y on map {} instance {}", bot->GetName(), owner->GetName(), dist,
+                        owner->GetMapId(), owner->GetInstanceId());
+            it = pending_brings_.erase(it);
+            continue;
+        }
+        if (age < kGiveUpMs) { ++it; continue; }
+        TC_LOG_INFO("playerbot.v2", "[summon] {} did NOT arrive beside {}: bot on map {} instance {} at ({:.0f},{:.0f},{:.0f}), owner on map {} instance {} at ({:.0f},{:.0f},{:.0f}), {}",
+                    bot->GetName(), owner->GetName(), bot->GetMapId(), bot->GetInstanceId(), bot->GetPositionX(), bot->GetPositionY(),
+                    bot->GetPositionZ(), owner->GetMapId(), owner->GetInstanceId(), owner->GetPositionX(), owner->GetPositionY(),
+                    owner->GetPositionZ(), sameMap ? fmt::format("{:.0f}y apart", dist) : std::string("not the same map or instance"));
+        it = pending_brings_.erase(it);
+    }
 }
 
 bool BotPopulationManager::RegearNow(Player* p)

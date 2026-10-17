@@ -2695,7 +2695,7 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
         // door check, ring spot). A refusal is logged as [summon] and told to the sender, so no bot goes missing without a reason.
         if (std::string const why = Services::Population().BringToOwner(sender, bot, "come"); !why.empty())
         {
-            if (why != "in combat")   // a bot in the fight answers when it is over; no line per fighter
+            if (why != "in combat with you")   // a bot in your own fight answers when it is over; no line per fighter
                 ChatHandler(sender->GetSession()).PSendSysMessage("%s cannot come: %s.", bot->GetName().c_str(), why.c_str());
             return true;
         }

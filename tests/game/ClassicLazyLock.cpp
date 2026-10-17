@@ -19,6 +19,8 @@
 
 #include "../../src/modules/PlayerbotV2/Combat/LazyLock.h"
 
+#include <string>
+
 using namespace Playerbot::Lazy;
 
 namespace
@@ -116,14 +118,14 @@ TEST_CASE("A mob about to die gets no dots, an ordinary one a finisher, a boss s
     CHECK(Pick(in) == CurseOfAgony);
 }
 
-TEST_CASE("Shadowburn needs three shards and the last 20 percent", "[ClassicLazyLock]")
+TEST_CASE("Shadowburn needs two shards and the last 20 percent", "[ClassicLazyLock]")
 {
     Input in = Fresh();
     in.target_hp_pct = 15;
-    in.soul_shards = 2;
+    in.soul_shards = 1;
     in.ready &= ~Bit(DrainSoul);
     CHECK(Pick(in) == ShadowBolt);
-    in.soul_shards = 3;
+    in.soul_shards = 2;
     CHECK(Pick(in) == Shadowburn);
 }
 
@@ -199,21 +201,64 @@ TEST_CASE("A target out of range gets nothing", "[ClassicLazyLock]")
     CHECK(Pick(in) == None);
 }
 
-TEST_CASE("With a wand: Shadow Bolt down to 35 percent mana, then the wand once", "[ClassicLazyLock]")
+TEST_CASE("The wand only when Shadow Bolt cannot be cast", "[ClassicLazyLock]")
 {
     Input in = Fresh();
     in.wand_equipped = true;
     in.on_target = Bit(CurseOfAgony) | Bit(Corruption) | Bit(Immolate) | Bit(SiphonLife);
     in.ready &= ~Bit(Conflagrate);
-    in.mana_pct = 40;
-    CHECK(Pick(in) == ShadowBolt);
+    in.hp_pct = 45;   // too hurt to Life Tap
     in.mana_pct = 30;
+    CHECK(Pick(in) == ShadowBolt);   // low mana alone does not send a warlock to the wand
+    in.blocked = Bit(ShadowBolt);    // the server refused it: no mana
     CHECK(Pick(in) == Wand);
     in.wand_shooting = true;
     CHECK(Pick(in) == None);
 }
 
-TEST_CASE("Without a wand, or on a boss, Shadow Bolt goes on to 8 percent mana", "[ClassicLazyLock]")
+TEST_CASE("The global cooldown never turns into a wand shot", "[ClassicLazyLock]")
+{
+    Input in = Fresh();
+    in.wand_equipped = true;
+    in.gcd = true;
+    in.ready &= ~Bit(ShadowBolt);
+    CHECK(Pick(in) == None);
+}
+
+TEST_CASE("A pet that cannot be summoned does not hold the rotation back", "[ClassicLazyLock]")
+{
+    Input in = Fresh();
+    in.has_pet = false;
+    in.in_combat = false;
+    in.soul_shards = 0;
+    CHECK(Pick(in) == SummonPet);
+    in.blocked = Bit(SummonPet);   // refused for want of a shard
+    CHECK(Pick(in) == AmplifyCurse);
+    in.known &= ~Bit(SummonPet);   // or never known
+    in.blocked = 0;
+    CHECK(Pick(in) == AmplifyCurse);
+}
+
+TEST_CASE("A refused dot is skipped and the list moves on", "[ClassicLazyLock]")
+{
+    Input in = Fresh();
+    in.on_target = Bit(CurseOfAgony);
+    in.blocked = Bit(Corruption);
+    CHECK(Pick(in) == Immolate);
+}
+
+TEST_CASE("The reason of the choice is reported", "[ClassicLazyLock]")
+{
+    Input in = Fresh();
+    char const* why = nullptr;
+    CHECK(Pick(in, &why) == AmplifyCurse);
+    CHECK(std::string(why) == "before Curse of Agony");
+    in.has_target = false;
+    CHECK(Pick(in, &why) == None);
+    CHECK(std::string(why) == "no target");
+}
+
+TEST_CASE("Without a wand Shadow Bolt goes on to 5 percent mana", "[ClassicLazyLock]")
 {
     Input in = Fresh();
     in.on_target = Bit(CurseOfAgony) | Bit(Corruption) | Bit(Immolate) | Bit(SiphonLife);
@@ -221,6 +266,6 @@ TEST_CASE("Without a wand, or on a boss, Shadow Bolt goes on to 8 percent mana",
     in.hp_pct = 45;   // too hurt to Life Tap
     in.mana_pct = 12;
     CHECK(Pick(in) == ShadowBolt);
-    in.mana_pct = 5;
+    in.mana_pct = 3;
     CHECK(Pick(in) == None);
 }

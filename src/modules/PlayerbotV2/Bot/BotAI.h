@@ -607,6 +607,42 @@ public:
                (owner_command_ == OwnerCommand::Stay || owner_command_ == OwnerCommand::Hold);
     }
 
+    // Follow-drop commitment (HonorFollowDrop, run at the top of every tick). The owner dropped or jumped to a floor 4+ y below and the
+    // bot is walking to a ledge, or is in the air after leaving it: nothing else may run until it lands (UBRS stadium 2026-10-17: a
+    // warlock's buff cast stopped the walk, then a combat escape took it round the rim the long way). Set by the intent executor when
+    // API::move_to follow_drop took a ledge, cleared on landing or when the way is no longer wanted. The values are written on the
+    // world thread (executor) and read by the bot worker, hence atomics.
+    static constexpr uint32 kFollowDropHoldMs  = 2500;    // a commit lasts this long past the last ledge move
+    static constexpr uint32 kFollowDropMaxMs   = 15000;   // a walk to a ledge that takes longer is given up
+    static constexpr uint32 kFollowDropFineMs  = 3000;    // after the walking route was judged fine, no new attempt for this long
+    static constexpr uint32 kFollowDropBlockMs = 8000;
+    bool follow_drop_committed(uint32 now_ms) const { return now_ms < follow_drop_until_ms_.load(std::memory_order_relaxed); }
+    uint32 follow_drop_since_ms() const { return follow_drop_since_ms_.load(std::memory_order_relaxed); }
+    void commit_follow_drop(uint32 now_ms)
+    {
+        if (!follow_drop_committed(now_ms))
+            follow_drop_since_ms_.store(now_ms ? now_ms : 1u, std::memory_order_relaxed);
+        follow_drop_until_ms_.store(now_ms + kFollowDropHoldMs, std::memory_order_relaxed);
+    }
+    void clear_follow_drop()
+    {
+        follow_drop_until_ms_.store(0, std::memory_order_relaxed);
+        follow_drop_since_ms_.store(0, std::memory_order_relaxed);
+    }
+    // The walking route to the owner is fine: no ledge attempt for a while.
+    void note_follow_drop_fine(uint32 now_ms)
+    {
+        follow_drop_fine_until_ms_.store(now_ms + kFollowDropFineMs, std::memory_order_relaxed);
+        clear_follow_drop();
+    }
+    bool follow_drop_fine(uint32 now_ms) const { return now_ms < follow_drop_fine_until_ms_.load(std::memory_order_relaxed); }
+    void block_follow_drop(uint32 now_ms)
+    {
+        follow_drop_block_until_ms_.store(now_ms + kFollowDropBlockMs, std::memory_order_relaxed);
+        clear_follow_drop();
+    }
+    bool follow_drop_blocked(uint32 now_ms) const { return now_ms < follow_drop_block_until_ms_.load(std::memory_order_relaxed); }
+
     // Owner said flee: run to them without fighting back until the window ends (DispatchInCombat).
     static constexpr uint32 kFleeMs = 8000;
     void       start_flee(ObjectGuid to, uint32 now_ms) { flee_to_ = to; flee_until_ms_ = now_ms + kFleeMs; }
@@ -3384,6 +3420,10 @@ private:
     std::atomic<bool>  loot_all_{false};
     DungeonRunMode dungeon_run_mode_      = DungeonRunMode::Off;
     std::atomic<bool> owner_follow_order_{false};
+    std::atomic<uint32_t> follow_drop_until_ms_{0};
+    std::atomic<uint32_t> follow_drop_since_ms_{0};
+    std::atomic<uint32_t> follow_drop_fine_until_ms_{0};
+    std::atomic<uint32_t> follow_drop_block_until_ms_{0};
     std::atomic<uint8_t> owner_stance_{0};   // OwnerStance
     bool           raid_map_party_hold_   = false;
     bool           owner_hold_            = false;   // an owner Stay / Hold is on: the autopilot walks nobody (update_dungeon_autopilot_hold)

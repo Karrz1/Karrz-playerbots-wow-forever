@@ -1,19 +1,27 @@
 // One-button warlock: gathers the facts for Lazy::Pick (Combat/LazyLock.h) from the live Player and casts the answer through the
 // bot API (highest known rank, range / facing / stun / silence gates). World thread only (the command and add-on handlers run there).
+//
+// A spell the server refuses for want of a resource (no soul shard for the Voidwalker, no mana, a missing reagent) is taken out of the
+// choice for a few seconds and the press picks again, so a missing pet or shard never holds the rotation back.
 
 #include "LazyLock.h"
 
-#include "PlayerbotAPI.h"
 #include "Combat/LazyLock.h"
 #include "Creature.h"
+#include "GameTime.h"
 #include "Item.h"
+#include "Log.h"
 #include "Pet.h"
+#include "PlayerbotAPI.h"
 #include "Player.h"
 #include "SharedDefines.h"
 #include "Spell.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "World.h"
+
+#include <array>
+#include <unordered_map>
 
 namespace Playerbot {
 
@@ -28,7 +36,22 @@ constexpr float  kCastRange      = 30.0f;
 constexpr uint32 kDemonSkin = 687, kDemonArmor = 706, kImp = 688, kVoidwalker = 697, kBloodFury = 20572, kBerserking = 20554;
 constexpr uint32 kTongues = 1714;
 
+// How long a refused spell stays out of the choice (ms): a pet that failed to summon is not retried every press.
+constexpr uint32 kBlockMs     = 6000;
+constexpr uint32 kBlockPetMs  = 60000;
+constexpr int    kMaxPicks    = 4;
+
 int32 Pct(int64 value, int64 max) { return max > 0 ? int32(value * 100 / max) : 100; }
+
+using BlockTimes = std::array<uint32, Lazy::Count>;
+std::unordered_map<uint64, BlockTimes> s_blocked;   // per warlock: game time (ms) until which a spell is left out
+
+char const* SpellText(uint32 id)
+{
+    SpellInfo const* info = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE);
+    char const* name = info && info->SpellName ? (*info->SpellName)[sWorld->GetDefaultDbcLocale()] : nullptr;
+    return name && *name ? name : "spell";
+}
 
 } // namespace
 
@@ -69,6 +92,9 @@ std::string LazyLockPress(Player* p)
     ids[ShadowBolt]       = 686;
     ids[Wand]             = kShoot;
 
+    uint32 const now = GameTime::GetGameTimeMS();
+    BlockTimes& blocked_until = s_blocked[p->GetGUID().GetCounter()];
+
     Input in;
     for (uint32 s = DemonArmor; s < Count; ++s)
     {
@@ -81,6 +107,7 @@ std::string LazyLockPress(Player* p)
     }
 
     in.casting        = p->IsNonMeleeSpellCast(false, false, true);
+    in.gcd            = !(in.ready & Bit(ShadowBolt)) && (in.known & Bit(ShadowBolt));   // Shadow Bolt has no cooldown of its own
     in.in_combat      = p->IsInCombat();
     in.has_target     = valid_target;
     in.has_pet        = p->GetPet() && p->GetPet()->IsAlive();
@@ -107,28 +134,45 @@ std::string LazyLockPress(Player* p)
             api.pet_attack(target->GetGUID());
     }
 
-    Cast const pick = Pick(in);
-    if (pick == None)
-        return {};
-
-    ObjectGuid const cast_at = (pick == DemonArmor || pick == SummonPet || pick == LifeTap || pick == Racial || pick == AmplifyCurse) ? ObjectGuid::Empty
-                                                                                                                                     : target->GetGUID();
-    Result const r = api.cast_spell(ids[pick], cast_at);
-    switch (r)
+    std::string refused;
+    for (int attempt = 0; attempt < kMaxPicks; ++attempt)
     {
-        case Result::Ok:
-        case Result::NotReady:
-        case Result::Locked:
-        case Result::OutOfRange:
-            return {};
-        case Result::NotEnoughResource:
-            return "Lazy lock: out of mana or reagents.";
-        default:
-            break;
+        in.blocked = 0;
+        for (uint32 s = DemonArmor; s < Count; ++s)
+            if (blocked_until[s] > now)
+                in.blocked |= Bit(Cast(s));
+
+        char const* why = "";
+        Cast const pick = Pick(in, &why);
+        if (pick == None)
+        {
+            TC_LOG_DEBUG("playerbot.v2", "[lazy] {}: nothing ({}) hp={} mana={} target_hp={} shards={} blocked={:#x}", p->GetName(), why, in.hp_pct, in.mana_pct,
+                         in.target_hp_pct, in.soul_shards, in.blocked);
+            return refused;
+        }
+
+        ObjectGuid const cast_at = (pick == DemonArmor || pick == SummonPet || pick == LifeTap || pick == Racial || pick == AmplifyCurse) ? ObjectGuid::Empty
+                                                                                                                                         : target->GetGUID();
+        Result const r = api.cast_spell(ids[pick], cast_at);
+        TC_LOG_INFO("playerbot.v2", "[lazy] {}: {} ({}) -> {} hp={} mana={} target_hp={} shards={} pet={}", p->GetName(), SpellText(api.highest_known_rank(ids[pick])), why,
+                    uint32(r), in.hp_pct, in.mana_pct, in.target_hp_pct, in.soul_shards, in.has_pet);
+        switch (r)
+        {
+            case Result::Ok:
+            case Result::NotReady:
+            case Result::Locked:
+            case Result::OutOfRange:
+                return refused;
+            default:
+                // Refused (no shard, no mana, wrong target...): leave it out for a few seconds and pick the next step.
+                blocked_until[pick] = now + (pick == SummonPet ? kBlockPetMs : kBlockMs);
+                in.blocked |= Bit(pick);
+                if (r == Result::NotEnoughResource)
+                    refused = "Lazy lock: out of mana or reagents for " + std::string(SpellText(api.highest_known_rank(ids[pick]))) + ", skipping it.";
+                break;
+        }
     }
-    SpellInfo const* info = sSpellMgr->GetSpellInfo(api.highest_known_rank(ids[pick]), DIFFICULTY_NONE);
-    char const* name = info && info->SpellName ? (*info->SpellName)[sWorld->GetDefaultDbcLocale()] : nullptr;
-    return std::string("Lazy lock: ") + (name && *name ? name : "spell") + " refused.";
+    return refused;
 }
 
 } // namespace Playerbot
