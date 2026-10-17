@@ -54,8 +54,9 @@ Status: compile-checked on Linux (GCC 13, Ninja, Release, static scripts): `-DBU
    mysql -u<user> -p playerbot < sql/playerbot_shared/playerbot_shared_data.sql
    ```
 3. Rename the module config the build copies into `worldserver.conf.d` from
-   `playerbot.conf.dist` to `playerbot.conf`. Optionally copy `examples/zz-forever-bots.conf`
-   there too (optional extras and recommended values; it is read after `playerbot.conf`).
+   `playerbot.conf.dist` to `playerbot.conf`. The auction house bot is already on through `zz-0-playerbot-defaults.conf`, which the build copies there
+   too. Optionally copy `examples/zz-forever-bots.conf`
+   there as well (optional extras and recommended values; it is read after `playerbot.conf`).
 4. Start worldserver. `sql/playerbot_v2/*.sql` migrations are applied on boot to the characters
    and `playerbot` databases (back up `characters` first). If the binary runs on a machine
    without the source tree, set `SourceDirectory` in `worldserver.conf`.

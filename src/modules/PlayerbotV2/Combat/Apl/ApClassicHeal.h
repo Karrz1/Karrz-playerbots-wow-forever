@@ -63,6 +63,7 @@
 #include "Bot/RezClaims.h"      // IsRezSpell, rez cast refusals
 #include "Bot/RezRule.h"        // RezRank, RezFightLive
 #include "Bot/ThreatDiscipline.h"
+#include "Bot/ThreatLimits.h"          // StalledTankClock: the near-tank hold's bound
 #include "Bot/Raid/RaidEncounters.h"   // Raid::ThreatShareAfterDrop
 #include "Bot/Raid/RaidHealStats.h"
 #include "Bot/Raid/RaidManaLedger.h"
@@ -512,6 +513,11 @@ inline bool TankOpeningOnBoss(BotSnapshotView const& s)
 // Away cut the tank by a quarter and she turned on it). Healing threat is the effective health done, so the healer leaves members above
 // kHealOpeningHoldPct alone until the tank is clear of it again. Emergencies are never held, and a tank is never held off.
 constexpr float kHealerThreatHoldRatio = 0.85f;
+// The hold waits for the tank to build threat again; a tank that is stunned, feared, dead or out of reach never does, so it is bounded by
+// the tank standing still for kStalledTankHoldMs (Bot/ThreatLimits.h), one clock per healer and boss. The healer heals as usual after that.
+constexpr uint32 kHealerThreatHoldGapMs = 4000;
+inline std::mutex g_healer_threat_hold_mu;
+inline std::unordered_map<uint64, StalledTankClock> g_healer_threat_hold;
 inline bool HealerNearTankThreat(BotSnapshotView const& s)
 {
     if (!ThreatDisciplineApplies(s))
@@ -520,7 +526,15 @@ inline bool HealerNearTankThreat(BotSnapshotView const& s)
         if ((u.is_dungeon_boss || u.is_boss_rank) && !u.is_player && u.hp > 0 && u.has_threat_list && u.unit_in_combat &&
             ThreatVictim(u.victim_kind) == ThreatVictim::Tank && u.tank_threat > 0.0f &&
             u.my_threat >= u.tank_threat * kHealerThreatHoldRatio * Raid::ThreatShareAfterDrop(s.map_id(), u.entry))
-            return true;
+        {
+            uint32 const now = s.published_at_ms();
+            uint64 const key = (uint64(s.guid().GetCounter()) << 32) | uint64(uint32(u.guid.GetCounter()));
+            std::lock_guard<std::mutex> lock(g_healer_threat_hold_mu);
+            if (g_healer_threat_hold.size() > 1024)
+                for (auto it = g_healer_threat_hold.begin(); it != g_healer_threat_hold.end();)
+                    it = (now - it->second.last_ms > 60'000u) ? g_healer_threat_hold.erase(it) : std::next(it);
+            return !StalledTankHoldExpired(g_healer_threat_hold[key], now, u.tank_threat, kHealerThreatHoldGapMs);
+        }
     return false;
 }
 

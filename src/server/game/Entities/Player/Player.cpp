@@ -28200,6 +28200,8 @@ void Player::StoreLootItem(ObjectGuid lootWorldObjectGuid, uint8 lootSlot, Loot*
                 return;
             }
 
+            loot->LogGiven(GetMap(), GetName().c_str(), *item,
+                !item->rollWinnerGUID.IsEmpty() ? "roll winner takes it" : loot->GetLootMethod() == MASTER_LOOT ? "master loot, taken" : "looted");
             Item* newitem = StoreNewItem(dest, item->itemid, true, item->randomBonusListId, item->GetAllowedLooters(), item->context);
             if (newitem)
                 sScriptMgr->OnPlayerLootItem(this, newitem);

@@ -157,6 +157,10 @@ public:
         CastRejectBeyondRange,
     };
     uint32 last_cast_fail() const { return last_cast_fail_; }
+    // The instance map the last teleport_to / enter_area_trigger was refused for because it holds its most players (0: none). The
+    // rejoin rule waits for a slot instead of walking a full instance's entrance.
+    uint32 last_instance_full_map() const { return last_instance_full_map_; }
+    void   clear_instance_full_map() { last_instance_full_map_ = 0; }
     static char const* CastFailName(uint32 code);
 
     // Why a mount spell would draw nothing on the client, nullptr when its model resolves: the display the aura picks (Mount
@@ -171,6 +175,8 @@ public:
     // the spell's own cooldown and the global cooldown, read from the spell history. 0 when
     // nothing is running. Feeds the per-spell back-off after SPELL_FAILED_NOT_READY.
     uint32 cast_ready_in_ms(uint32 spell_id, bool exact_rank = false) const;
+    // The rank of `spell_id` cast_spell() would use: the highest one the player knows (spell_id itself when it knows none).
+    uint32 highest_known_rank(uint32 spell_id) const;
     // Cast a ground-target spell (Death and Decay, Blizzard, Ring of Frost,
     // Healing Rain, Ursol's Vortex). Bot's facing/position constraints still
     // apply server-side; OutOfRange / InvalidTarget will return through Result.
@@ -1124,6 +1130,7 @@ private:
 
     Player* p_;
     uint32  last_cast_fail_ = 0;   // see last_cast_fail()
+    uint32  last_instance_full_map_ = 0;   // see last_instance_full_map()
 };
 
 } // namespace Playerbot

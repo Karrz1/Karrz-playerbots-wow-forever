@@ -9,6 +9,9 @@
 #include "DayRhythm.h"
 #include "SoakAnchors.h"
 #include "../Travel/TownNpcIndex.h"
+#include "../Travel/ReachMemory.h"
+#include "../Travel/SoakBoard.h"
+#include "../Travel/UnifiedTravelGraph.h"
 #include "UnitDefines.h"
 #include "TownGatherSource.h"
 #include "WorldFactionMix.h"
@@ -264,7 +267,11 @@ void WorldBotSpawner::LoadConfig()
     c.area_cap_town    = uint32(std::clamp<int64>(sConfigMgr->GetIntDefault("Playerbot.World.AreaCapTown", 40, true), 0, 500));
     c.area_radius      = std::clamp(sConfigMgr->GetFloatDefault("Playerbot.World.AreaRadius", 45.0f, true), 15.0f, 200.0f);
     c.pool_horde_pct   = std::clamp<uint32>(uint32(sConfigMgr->GetIntDefault("Playerbot.World.PoolHordePct", 50, true)), 5, 95);
-    c.skyborne_seed_pct = std::min<uint32>(100, uint32(sConfigMgr->GetIntDefault("Playerbot.World.SkyborneSeedPct", 5, true)));
+    c.variable_max     = uint32(std::clamp<int64>(sConfigMgr->GetIntDefault("Playerbot.World.VariableMax", 2000, true), 0, 20000));
+    c.travel_soak      = sConfigMgr->GetBoolDefault("Playerbot.World.TravelSoak", false, true);
+    c.travel_soak_bots = uint32(std::clamp<int64>(sConfigMgr->GetIntDefault("Playerbot.World.TravelSoakBots", 8, true), 1, 64));
+    c.travel_soak_leg_s = uint32(std::clamp<int64>(sConfigMgr->GetIntDefault("Playerbot.World.TravelSoakLegSeconds", 1200, true), 60, 7200));
+    c.variable_ttl_h   = uint32(std::clamp<int64>(sConfigMgr->GetIntDefault("Playerbot.World.VariableTtlHours", 24, true), 1, 24 * 90));
     cfg_ = c;
 }
 
@@ -272,7 +279,7 @@ WorldLoadFacts WorldBotSpawner::Load() const
 {
     WorldLoadFacts f;
     f.awake = ambient_online_;
-    int64 const pool = pool_count_ < 0 ? 0 : pool_count_;
+    int64 const pool = pool_count_ < 0 ? 0 : pool_count_ + variable_count_;   // temporary residents are rows too
     f.sleeping = pool > int64(all_online_) ? uint32(pool - int64(all_online_)) : 0u;
     f.rss_mb = uint32(ProcessRssKb() / 1024u);
     f.cpu_pct = cpu_pct_;
@@ -306,11 +313,16 @@ std::string WorldBotSpawner::Report() const
     }
     auto const tiers = Services::Scheduler().tier_counts();
     // Persistent residents: the pool is the roster, a bot logged out stays where it stood. sleeping = pool bots offline.
-    int64 const pool = pool_count_ < 0 ? 0 : pool_count_;
+    int64 const pool = pool_count_ < 0 ? 0 : pool_count_ + variable_count_;   // temporary residents are rows too
     int64 const sleeping = pool > int64(all_online_) ? pool - int64(all_online_) : 0;
     double const awake_ram_mb = all_online_ ? double(rss) / 1024.0 / double(all_online_) : 0.0;
     line += Trinity::StringFormat(" | roster pool={} awake={} sleeping={} seeding={} seeded_total={} woken_total={} wake_dry={} wake_radius={:.0f} | cost proc_cpu_pct={:.1f} cpu_pct_per_awake_bot={:.3f} ram_mb_per_awake_bot_incl_base={:.2f} ram_mb_per_sleeping_bot=0 (offline: a row in the characters table)",
         pool, all_online_, sleeping, seeding_.size(), n_seeded_, n_woken_, n_wake_dry_, cfg_.wake_radius, cpu_pct_, all_online_ ? cpu_pct_ / double(all_online_) : 0.0, awake_ram_mb);
+    {
+        auto& rm = ::Playerbot::V2::Travel::ReachMemory::Instance();
+        line += Trinity::StringFormat(" | reach_memory cells={} noted={} skipped={}", rm.size(), rm.noted(), rm.skips());
+    }
+    line += Trinity::StringFormat(" | variable pool={}/{} created={} retired={}", variable_count_, cfg_.variable_max, n_created_variable_, n_retired_);
     line += Trinity::StringFormat(" | tiers combat={} active={} cruise={} idle={} parked={}", tiers[0], tiers[1], tiers[2], tiers[3], tiers[4]);
     return line;
 }
@@ -835,6 +847,7 @@ void WorldBotSpawner::DriveDespawn(uint32 now_ms, std::vector<Anchor> const& anc
         }
         ++ambient;
         if (pending_.contains(uint64(id)) || seeding_.contains(uint64(id)) || leaving_.contains(uint64(id))) return;
+        if (::Playerbot::V2::Travel::SoakBoard::Instance().Has(uint64(id))) return;   // a soak runner is far from every anchor on purpose
 
         // Distance to the nearest anchor on the bot's own map.
         float nearest = 1e9f;
@@ -1146,6 +1159,7 @@ void WorldBotSpawner::DriveCrowd(uint32 now_ms, std::vector<Anchor> const& ancho
         if (!p || !p->IsInWorld() || !p->GetMap() || !owner_.IsAmbientBot(id, p)) return;
         if (p->InBattleground() || p->InBattlegroundQueue() || p->GetGroup() || p->GetMap()->IsDungeon() || p->GetMap()->IsBattlegroundOrArena())
             return;
+        if (::Playerbot::V2::Travel::SoakBoard::Instance().Has(uint64(id))) return;   // a soak runner is not re-placed next to a player
         bool const town = ::Playerbot::V2::World::IsVanillaCapitalZone(p->GetZoneId());
         by_map[p->GetMapId()].push_back({ uint64(id), p->GetPositionX(), p->GetPositionY(), town ? cfg_.area_cap_town : cfg_.area_cap_outdoors });
         if (p->IsAlive() && !p->IsInCombat() && !p->IsBeingTeleported() && !p->IsInFlight() && !p->GetTransport()
@@ -1358,6 +1372,151 @@ void WorldBotSpawner::DriveStuckLedger(uint32 now_ms)
             it = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(it->first)) ? std::next(it) : ledger_ms_.erase(it);
 }
 
+// The variable pool (PoolBudget.h): temporary residents were created around a player; once one has been offline for VariableTtlHours,
+// with no owner, group or queue tag and not flagged anything but temporary, the server's own character delete removes it. The core
+// roster, a player's companions, saved or grouped bots and anything online are never selected, in the query and again live.
+// One small batch per pass (the query runs off the world thread; only the few deletes run on it), logged with its cost.
+void WorldBotSpawner::DriveRetire(uint32 now_ms)
+{
+    constexpr uint32 kRetirePassMs = 10u * 60u * 1000u;
+    constexpr uint32 kRetirePerPass = 25u;
+    if (variable_sweep_inflight_ || pool_count_ < 0 || query_inflight_)
+        return;
+    if (variable_sweep_ms_ && getMSTimeDiff(variable_sweep_ms_, now_ms) < kRetirePassMs)
+        return;
+    variable_sweep_ms_ = now_ms ? now_ms : 1u;
+    variable_sweep_inflight_ = true;
+    uint32 const ttl_h = cfg_.variable_ttl_h;
+    queries_.AddCallback(CharacterDatabase.AsyncQuery(Trinity::StringFormat(
+        "SELECT pv.character_guid_low, c.account, c.name, c.online, "
+        "(pv.owner_account_id <> 0 OR pv.owner_player_guid <> 0), "
+        "EXISTS (SELECT 1 FROM `group_member` gm WHERE gm.memberGuid = c.guid), "
+        "(pv.jit_for_queue IS NOT NULL AND pv.jit_for_queue <> ''), "
+        "GREATEST(UNIX_TIMESTAMP() - c.logout_time, UNIX_TIMESTAMP() - UNIX_TIMESTAMP(pv.spawned_at)) "
+        "FROM playerbot_v2_character pv JOIN characters c ON c.guid = pv.character_guid_low "
+        "WHERE pv.variable_pool = 1 AND c.online = 0 AND pv.spawned_at < (NOW() - INTERVAL {} HOUR) "
+        "AND c.logout_time < (UNIX_TIMESTAMP() - {}) ORDER BY c.logout_time LIMIT {}",
+        ttl_h, uint64(ttl_h) * 3600u, kRetirePerPass).c_str())
+        .WithCallback([this, ttl_h](QueryResult res)
+    {
+        variable_sweep_inflight_ = false;
+        if (!res)
+            return;
+        uint32 const t0 = getMSTime();
+        uint32 retired = 0;
+        do
+        {
+            Field* f = res->Fetch();
+            uint64 const guid = f[0].GetUInt64();
+            RetireFacts facts;
+            facts.variable = true;   // the query selects flagged rows only
+            facts.online = f[3].GetUInt8() != 0 || pending_.contains(guid) || seeding_.contains(guid) || placed_.contains(guid);
+            facts.owned = f[4].GetInt64() != 0;
+            facts.grouped = f[5].GetInt64() != 0;
+            facts.queue_tagged = f[6].GetInt64() != 0;
+            facts.offline_seconds = f[7].GetInt64();
+            if (!CanRetire(facts, int64(ttl_h) * 3600))
+                continue;
+            if (owner_.RetireVariableBot(guid, f[1].GetUInt32(), f[2].GetString()))
+            {
+                ++retired;
+                --variable_count_;
+            }
+        } while (res->NextRow());
+        if (retired)
+        {
+            n_retired_ += retired;
+            TC_LOG_INFO("playerbot.v2", "[world] variable pool: {} temporary resident(s) deleted after {} h unused in {} ms (now {}/{}, {} deleted, {} created since start)",
+                        retired, ttl_h, getMSTimeDiff(t0, getMSTime()), variable_count_, cfg_.variable_max, n_retired_, n_created_variable_);
+        }
+    }));
+}
+
+// The travel soak (Playerbot.World.TravelSoak = 1, off by default): a few ambient bots at a time are each sent to a random town, flight master,
+// quest hub or dock of the travel graph, on their own map or another, with the quest travel executor (idle:soak_travel). Every leg is logged
+// when it ends - arrived, timed out where it stood, or no route - and a summary groups the legs that never arrived by the 50 y cell they
+// stopped in, so an overnight run answers "which legs never arrive, and where" (roadmap Track 4). Soak runners are not despawned.
+void WorldBotSpawner::DriveTravelSoak(uint32 now_ms)
+{
+    using namespace ::Playerbot::V2::Travel;
+    SoakBoard& board = SoakBoard::Instance();
+    for (SoakOutcome const& o : board.Drain())
+    {
+        TC_LOG_INFO("playerbot.v2",
+            "[travel_soak] leg {} {} bot={} from map {} ({:.0f},{:.0f},{:.0f}) to '{}' kind {} map {} ({:.0f},{:.0f},{:.0f}) after {} s; ended map {} ({:.0f},{:.0f},{:.0f}) cell {}; plan leg {}/{}",
+            o.goal.id, SoakResultName(o.result), o.guid, o.goal.start_map, o.goal.sx, o.goal.sy, o.goal.sz, o.goal.name, uint32(o.goal.node_kind), o.goal.map,
+            o.goal.x, o.goal.y, o.goal.z, o.duration_ms / 1000u, o.end_map, o.ex, o.ey, o.ez, SoakCell(o.end_map, o.ex, o.ey), o.leg_index, o.plan_legs);
+    }
+    if (!cfg_.travel_soak && !board.Active())
+        return;
+    for (uint64 const guid : board.ActiveGuids())
+    {
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
+        if (!p || !p->IsInWorld())
+            board.Cancel(guid);
+    }
+    if (getMSTimeDiff(soak_summary_ms_, now_ms) >= 10u * 60u * 1000u)
+    {
+        soak_summary_ms_ = now_ms ? now_ms : 1u;
+        uint32 const arrived = board.Total(SoakResult::Arrived), timeout = board.Total(SoakResult::TimedOut), none = board.Total(SoakResult::NoRoute);
+        if (arrived + timeout + none)
+        {
+            std::string cells;
+            for (auto const& [cell, n] : board.TopStops(10))
+                cells += Trinity::StringFormat(" {}x{}", cell, n);
+            TC_LOG_INFO("playerbot.v2", "[travel_soak_summary] legs {}: arrived {}, timeout {}, no_route {}; stopped most in cells (map/x/y of 50 y):{}",
+                        arrived + timeout + none, arrived, timeout, none, cells.empty() ? std::string(" -") : cells);
+        }
+    }
+    if (!cfg_.travel_soak || board.Active() >= cfg_.travel_soak_bots)
+        return;
+    if (soak_ms_ && getMSTimeDiff(soak_ms_, now_ms) < 5000u)
+        return;
+    soak_ms_ = now_ms ? now_ms : 1u;
+
+    // One bot per pass: an ambient world bot that is free to travel (no group, battleground, instance, combat or pending login).
+    std::vector<Player*> free_bots;
+    Services::Registry().for_each([&](BotId id, BotRegistryEntry const&)
+    {
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
+        if (!p || !p->IsInWorld() || !p->IsAlive() || !owner_.IsAmbientBot(id, p)) return;
+        if (p->GetGroup() || p->InBattleground() || p->InBattlegroundQueue() || p->IsInCombat() || p->IsBeingTeleported()) return;
+        if (Map* m = p->GetMap(); !m || m->IsDungeon() || m->IsBattlegroundOrArena()) return;
+        if (pending_.contains(uint64(id)) || seeding_.contains(uint64(id)) || leaving_.contains(uint64(id)) || board.Has(uint64(id))) return;
+        if (!owner_.SetupDone(uint64(id))) return;
+        free_bots.push_back(p);
+    });
+    if (free_bots.empty())
+        return;
+    Player* bot = free_bots[urand(0, uint32(free_bots.size() - 1))];
+
+    UnifiedTravelGraph& graph = Services::TravelGraph();
+    size_t const nodes = graph.GetNodeCount();
+    if (!nodes)
+        return;
+    GraphNode const* dest = nullptr;
+    for (int tries = 0; tries < 60 && !dest; ++tries)
+    {
+        GraphNode const* n = graph.GetNode(NodeId(urand(0, uint32(nodes - 1))));
+        if (!n) continue;
+        if (n->kind != NodeKind::FlightMaster && n->kind != NodeKind::Capital && n->kind != NodeKind::QuestHub && n->kind != NodeKind::Dock) continue;
+        if (n->faction != 0 && n->faction != bot->GetTeam()) continue;
+        if (n->map_id == bot->GetMapId() && Dist2D(n->x, n->y, bot->GetPositionX(), bot->GetPositionY()) < 300.0f) continue;
+        dest = n;
+    }
+    if (!dest)
+        return;
+    SoakGoal g;
+    g.id = soak_next_id_++;
+    g.map = dest->map_id; g.x = dest->x; g.y = dest->y; g.z = dest->z;
+    g.name = dest->name.empty() ? std::string("-") : dest->name;
+    g.node_kind = uint8(dest->kind);
+    g.start_map = bot->GetMapId(); g.sx = bot->GetPositionX(); g.sy = bot->GetPositionY(); g.sz = bot->GetPositionZ();
+    g.started_ms = now_ms ? now_ms : 1u;
+    g.timeout_ms = cfg_.travel_soak_leg_s * 1000u;
+    board.Assign(bot->GetGUID().GetCounter(), g);
+}
+
 void WorldBotSpawner::DriveGraduation(uint32 now_ms)
 {
     // Every few seconds, at most two bots per pass: a bot reaching level 10 on the isle is moved the way a new level-10 bot is
@@ -1421,7 +1580,10 @@ void WorldBotSpawner::DriveSeed(uint32 now_ms)
         ++it;
     }
 
-    if (!cfg_.seed_roster || pool_count_ < 0 || rss_capped_ || pool_count_ >= int64(cfg_.pool_max))
+    if (!cfg_.seed_roster || pool_count_ < 0 || rss_capped_)
+        return;
+    // The seeder only builds the standing roster (core). Temporary residents are created on demand around a player (FinishSpawn).
+    if (pool_count_ >= int64(cfg_.pool_max))
         return;
     if (seeding_.size() >= cfg_.seed_in_flight || ambient_online_ + pending_.size() + seeding_.size() >= cfg_.max_bots)
         return;
@@ -1431,22 +1593,16 @@ void WorldBotSpawner::DriveSeed(uint32 now_ms)
         return;
     SeedChoice const want = PickSeed(pool_counts_, cfg_.pool_horde_pct, double(urand(0, 999999)) / 1000000.0);
     bool const alliance = want.deficit > 0 ? want.alliance : urand(0, 99) >= cfg_.pool_horde_pct;
-    // A small share of the seeds are Skyborne residents of Zephras Isle: level 1-9, asleep on the island (their pipeline leaves
-    // them at the start), so a player who arrives there finds the island lived in. The rest are the usual leveling-town bots.
-    bool const isle = urand(0, 99) < cfg_.skyborne_seed_pct;
     uint8 level;
-    if (isle)
-        level = uint8(urand(Skyborne::kIsleLevelLo, Skyborne::kIsleLevelHi));
-    else if (want.deficit > 0)
+    if (want.deficit > 0)
         level = uint8(urand(std::max(cfg_.min_level, PoolBracketLo(want.bracket)), std::max(cfg_.min_level, std::min(cfg_.max_level, PoolBracketHi(want.bracket)))));
     else
         level = uint8(urand(cfg_.min_level, cfg_.max_level));
-    if (uint64 const guid = owner_.SpawnAmbientBot(level, alliance, isle ? Skyborne::RaceForTeam(alliance) : uint8(0)))
+    if (uint64 const guid = owner_.SpawnAmbientBot(level, alliance, uint8(0)))
     {
         seeding_[guid] = Seeding{ now_ms ? now_ms : 1u, 0 };
         ++pool_count_;
-        if (!isle)
-            PoolAdd(pool_counts_, alliance, level);
+        PoolAdd(pool_counts_, alliance, level);
     }
     else
         ++n_spawn_failed_;
@@ -1563,17 +1719,18 @@ void WorldBotSpawner::FinishSpawn(Anchor const& a, std::vector<bool> const& slot
 {
     struct Row { uint64 guid; bool alliance; bool used; bool in_hub; };
     std::vector<Row> rows;
+    uint32 skipped_pending = 0, skipped_owned = 0, skipped_online = 0;   // rows the fetch brought but this pass cannot use
     if (res)
     {
         do
         {
             Field* f = res->Fetch();
             uint64 const guid = f[0].GetUInt64();
-            if (pending_.contains(guid)) continue;
+            if (pending_.contains(guid)) { ++skipped_pending; continue; }
             // A player's companion (owner-bound, e.g. dismissed with `.bot dismiss`) is never an ambient pool bot: logging it
             // back in would bring it back following its owner.
-            if (Services::Owners().GetOwner(guid).account_id != 0) continue;
-            if (ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid))) continue;
+            if (Services::Owners().GetOwner(guid).account_id != 0) { ++skipped_owned; continue; }
+            if (ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid))) { ++skipped_online; continue; }
             // World-wide filler: only pool bots that were saved inside a quest hub / town. Memory grows with the number of
             // distinct places that have a Player in them (grids, mmap tiles), so the filler is kept on shared hubs.
             // Hub rows are preferred; rows saved elsewhere are the fallback (stage B, 2026-10-07: a hub-only filter left
@@ -1616,19 +1773,31 @@ void WorldBotSpawner::FinishSpawn(Anchor const& a, std::vector<bool> const& slot
 
         // No pool bot of that faction at that level: create one (bounded by PoolMax).
         ++n_no_match_;
-        if (pool_count_ >= int64(cfg_.pool_max))
+        // Around a Zephras anchor every new resident is Skyborne (the other races cannot leave their start for the isle's quests).
+        // The island's residents are always temporary; anyone else goes to the core roster while it has room and, when it is full,
+        // to the variable pool - so a new character meets bots of its own level whatever the core is made of (PoolBudget.h).
+        uint8 const race = !global && Skyborne::IsOnIsle(a.map) ? Skyborne::RaceForTeam(alliance) : uint8(0);
+        PoolBudget budget{ pool_count_, int64(cfg_.pool_max), variable_count_, int64(cfg_.variable_max) };
+        PoolSlot const slot = ChoosePoolSlot(budget, race != 0);
+        if (slot == PoolSlot::None)
         {
             ++n_pool_full_;
             continue;
         }
-        // Around a Zephras anchor every new resident is Skyborne (the other races cannot leave their start for the isle's quests).
-        uint8 const race = !global && Skyborne::IsOnIsle(a.map) ? Skyborne::RaceForTeam(alliance) : uint8(0);
         if (uint64 const guid = owner_.SpawnAmbientBot(slot_levels[i], alliance, race))
         {
             pending_[guid] = Pending{ a.guid, now, global };
-            ++pool_count_;
             ++n_created_;
-            PoolAdd(pool_counts_, alliance, slot_levels[i]);
+            PoolCountCreated(budget, slot);
+            pool_count_ = budget.core;
+            variable_count_ = budget.variable;
+            if (slot == PoolSlot::Variable)
+            {
+                CharacterDatabase.PExecute("UPDATE playerbot_v2_character SET variable_pool = 1 WHERE character_guid_low = {}", guid);
+                ++n_created_variable_;
+            }
+            else
+                PoolAdd(pool_counts_, alliance, slot_levels[i]);
         }
         else
             ++n_spawn_failed_;
@@ -1639,10 +1808,13 @@ void WorldBotSpawner::FinishSpawn(Anchor const& a, std::vector<bool> const& slot
     {
         last_why_ms_ = now;
         TC_LOG_INFO("playerbot.v2",
-            "[world] spawn pass around anchor (zone {}, L{}): wanted {} slot(s), {} offline pool row(s) fetched; "
-            "totals no_match={} pool_full={} (pool {}/{}) spawn_failed={} login_failed={}",
-            a.zone, uint32(a.level), slots.size(), rows.size(), n_no_match_, n_pool_full_, pool_count_,
-            cfg_.pool_max, n_spawn_failed_, n_login_failed_);
+            "[world] spawn pass around anchor (zone {}, L{}): wanted {} slot(s) ({} Alliance), {} offline pool row(s) usable ({} Alliance) "
+            "of those fetched (skipped: {} pending, {} companions, {} already online); "
+            "totals no_match={} pool_full={} (core {}/{}, variable {}/{}) spawn_failed={} login_failed={}",
+            a.zone, uint32(a.level), slots.size(), uint32(std::count(slots.begin(), slots.end(), true)), rows.size(),
+            uint32(std::count_if(rows.begin(), rows.end(), [](Row const& r) { return r.alliance; })),
+            skipped_pending, skipped_owned, skipped_online, n_no_match_, n_pool_full_, pool_count_,
+            cfg_.pool_max, variable_count_, cfg_.variable_max, n_spawn_failed_, n_login_failed_);
     }
 }
 
@@ -1707,11 +1879,22 @@ void WorldBotSpawner::OnWorldTick(uint32 now_ms)
     {
         pool_count_inflight_ = true;
         queries_.AddCallback(CharacterDatabase.AsyncQuery(
-            "SELECT COUNT(*) FROM playerbot_v2_character WHERE distribution_level > 0 "
-            "AND (jit_for_queue IS NULL OR jit_for_queue = '')")
+            Trinity::StringFormat(
+            "SELECT COUNT(*), CAST(COALESCE(SUM(pv.variable_pool = 1), 0) AS UNSIGNED), "
+            "CAST(COALESCE(SUM(pv.variable_pool = 0 AND c.race IN ({}, {}) AND c.level < {}), 0) AS UNSIGNED) "
+            "FROM playerbot_v2_character pv JOIN characters c ON c.guid = pv.character_guid_low "
+            "WHERE pv.distribution_level > 0 AND (pv.jit_for_queue IS NULL OR pv.jit_for_queue = '')",
+            uint32(Skyborne::kRaceAlliance), uint32(Skyborne::kRaceHorde), uint32(Skyborne::kGraduationLevel)).c_str())
             .WithCallback([this](QueryResult res)
         {
-            pool_count_ = res ? int64((*res)[0].GetUInt64()) : 0;
+            // The core roster (PoolMax) is the standing level 10+ residents. Temporary residents (flagged) and the island
+            // residents created before the flag existed are counted against VariableMax, so a core full of level 60 bots can
+            // never keep a new character's surroundings empty (2026-10-16: pool 5506/3000, 12 bots on the island).
+            int64 const total = res ? int64((*res)[0].GetUInt64()) : 0;
+            int64 const flagged = res ? int64((*res)[1].GetUInt64()) : 0;
+            int64 const legacy_isle = res ? int64((*res)[2].GetUInt64()) : 0;
+            variable_count_ = flagged + legacy_isle;
+            pool_count_ = std::max<int64>(0, total - variable_count_);
             pool_count_inflight_ = false;
         }));
     }
@@ -1802,6 +1985,8 @@ void WorldBotSpawner::OnWorldTick(uint32 now_ms)
     DriveDespawn(now_ms, keep_anchors);
     DriveSpawn(now_ms, anchors);
     DriveSeed(now_ms);
+    DriveRetire(now_ms);
+    DriveTravelSoak(now_ms);
     DriveGraduation(now_ms);
     DriveStranded(now_ms, anchors);
     DriveStuckLedger(now_ms);

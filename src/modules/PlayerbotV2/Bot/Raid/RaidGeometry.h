@@ -87,4 +87,25 @@ inline bool TankOpposesRaid(float bossX, float bossY, float tankX, float tankY, 
     return std::fabs(NormalizeAngle(toTank - toRaid)) >= kPi - tolerance;
 }
 
+// The point lies inside the sector in front of the boss: within <radius> yards and <halfAngle> radians either side of its facing.
+inline bool InFrontSector(float bossX, float bossY, float bossFacing, float px, float py, float halfAngle, float radius)
+{
+    return std::hypot(px - bossX, py - bossY) <= radius && std::fabs(NormalizeAngle(Bearing(bossX, bossY, px, py) - bossFacing)) < halfAngle;
+}
+
+// The straight walk from (fx,fy) to (tx,ty) passes through the front sector. Samples every 2 yards, both ends excluded: a bot that stands
+// inside the sector is the cone step's business, and a target inside it is refused before this is asked.
+inline bool PathCrossesFrontSector(float bossX, float bossY, float bossFacing, float halfAngle, float radius, float fx, float fy, float tx, float ty)
+{
+    float const length = std::hypot(tx - fx, ty - fy);
+    int const steps = std::max(1, int(std::ceil(length / 2.0f)));
+    for (int i = 1; i < steps; ++i)
+    {
+        float const t = float(i) / float(steps);
+        if (InFrontSector(bossX, bossY, bossFacing, fx + (tx - fx) * t, fy + (ty - fy) * t, halfAngle, radius))
+            return true;
+    }
+    return false;
+}
+
 } // namespace Playerbot::Raid::geo

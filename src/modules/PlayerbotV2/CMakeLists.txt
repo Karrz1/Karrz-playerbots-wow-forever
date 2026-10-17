@@ -231,6 +231,7 @@ endif()
 
 trinity_add_module(playerbot-v2 AddSC_playerbot_v2
   CONFIGS
-    ${CMAKE_CURRENT_SOURCE_DIR}/conf/playerbot.conf.dist)
+    ${CMAKE_CURRENT_SOURCE_DIR}/conf/playerbot.conf.dist
+    ${CMAKE_CURRENT_SOURCE_DIR}/conf/zz-0-playerbot-defaults.conf)
 
 message(STATUS "Playerbot V2 module enabled (multi-library: 13 sub-libs)")

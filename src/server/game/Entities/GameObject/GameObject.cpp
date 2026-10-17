@@ -1518,7 +1518,10 @@ void GameObject::Update(uint32 diff)
 
                     // Type 0 despawns after being triggered, type 1 does not.
                     /// @todo This is activation radius. Casting radius must be selected from spell data.
-                    float radius = goInfo->trap.radius / 2.f; // this division seems to date back to when the field was called diameter, don't think it is still relevant.
+                    // Vanilla object data (VMaNGOS) reads the field as a radius: the Rookery Egg (175124) hatches a whelp
+                    // at 3 yards, not 1.5. Keep the halving for owned (player-summoned) traps, whose templates come from
+                    // the client data.
+                    float radius = GetOwner() ? goInfo->trap.radius / 2.f : goInfo->trap.radius;
                     if (!radius)
                         break;
 

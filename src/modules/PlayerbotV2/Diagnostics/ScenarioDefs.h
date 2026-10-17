@@ -67,6 +67,8 @@ struct ScenarioDef
     // A fight with no boss death to wait for (Majordomo Executus yields when his eight adds are dead): the goal is reached when this many
     // creatures of these two entries have died on the map. 0 = the goal boss's death.
     std::uint32_t goal_adds_a = 0, goal_adds_b = 0, goal_adds_needed = 0;
+    // An add that must not die before the goal boss (Garr's Firesworn): each one that does is reported when the boss is dead. 0 = not checked.
+    std::uint32_t spare_entry = 0;
     bool order_attack = false;
     std::uint32_t order_delay_ms = 0;
     // A whole-dungeon clear to the last boss: long, so `runall` with no filter leaves it out (`runall full` or `run <name>` starts it).
@@ -182,6 +184,24 @@ inline constexpr RaidRow kMcRaid[] = {
     { "Mcshad",   ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Dps,    2 },
 };
 
+// Majordomo's court is nine mobs (him, four Elites, four Healers) and the plan gives each a tank (RaidEncounterData_MC.cpp): five tanks and
+// eleven healers, the other 24 as above. With four tanks four or five mobs stood loose on the healers from the first seconds and no add
+// died in 52 s (mc_majordomo local-next-89, 2026-10-17).
+inline constexpr RaidRow kMcRaidFiveTanks[] = {
+    { "Mctankw",  ScnRace::Human,    ScnClass::Warrior, ScenarioRoleKind::Tank,   4 },
+    { "Mctankd",  ScnRace::NightElf, ScnClass::Druid,   ScenarioRoleKind::Tank,   1 },
+    { "Mcheals",  ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Healer, 4 },
+    { "Mchealp",  ScnRace::Human,    ScnClass::Paladin, ScenarioRoleKind::Healer, 4 },
+    { "Mchealdr", ScnRace::NightElf, ScnClass::Druid,   ScenarioRoleKind::Healer, 3 },
+    { "Mcmage",   ScnRace::Human,    ScnClass::Mage,    ScenarioRoleKind::Dps,    5 },
+    { "Mclock",   ScnRace::Human,    ScnClass::Warlock, ScenarioRoleKind::Dps,    5 },
+    { "Mcrogue",  ScnRace::Human,    ScnClass::Rogue,   ScenarioRoleKind::Dps,    4 },
+    { "Mchunt",   ScnRace::Dwarf,    ScnClass::Hunter,  ScenarioRoleKind::Dps,    4 },
+    { "Mcwarr",   ScnRace::Dwarf,    ScnClass::Warrior, ScenarioRoleKind::Dps,    3 },
+    { "Mcret",    ScnRace::Human,    ScnClass::Paladin, ScenarioRoleKind::Dps,    1 },
+    { "Mcshad",   ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Dps,    2 },
+};
+
 inline std::vector<ScenarioMember> RaidSquad(RaidRow const* rows, std::size_t n)
 {
     std::vector<ScenarioMember> squad;
@@ -204,13 +224,16 @@ struct RaidBossRow
     float lair_x = 0.f, lair_y = 0.f, lair_z = 0.f, lair_o = 0.f;   // a boss a script summons (no creature row): where; see ScenarioDef::lair_x
     float arrive_min_yards = 0.f;       // see ScenarioDef::arrive_min_yards
     std::uint32_t goal_adds_a = 0, goal_adds_b = 0, goal_adds_needed = 0;   // see ScenarioDef::goal_adds_needed
+    std::uint32_t spare_entry = 0;      // see ScenarioDef::spare_entry
 };
 
 // In the order of the raid. Each starts at the boss's room with the encounter pre-spawned (the earlier bosses alive too).
 inline constexpr RaidBossRow kMcBosses[] = {
-    { "mc_garr",      "Molten Core: 40 level 60 raiders to Garr",      12057, "Garr",      15, 12099 },   // 12099 Firesworn
+    { "mc_garr",      "Molten Core: 40 level 60 raiders to Garr",      12057, "Garr",      15, 12099, 0, 0,
+      0.f, 0.f, 0.f, 0.f, 0.f, 0, 0, 0, 12099 },   // 12099 Firesworn: kept alive at staging, and none may die before Garr
     { "mc_lucifron",  "Molten Core: 40 level 60 raiders to Lucifron",  12118, "Lucifron",  15, 12119, 0, 1 },   // Flamewaker Protector; Lucifron's Curse must be removed
     { "mc_magmadar",  "Molten Core: 40 level 60 raiders to Magmadar",  11982, "Magmadar",  15, 0, 1 },          // Frenzy must be tranquilized
+    { "mc_shazzrah",  "Molten Core: 40 level 60 raiders to Shazzrah",  12264, "Shazzrah",  15, 0, 0, 1 },       // Shazzrah's Curse must be removed; the Gate drops him on a random raider
     { "mc_gehennas",  "Molten Core: 40 level 60 raiders to Gehennas",  12259, "Gehennas",  15, 11661, 0, 1 },   // Flamewaker; Gehennas' Curse must be removed
     { "mc_sulfuron",  "Molten Core: 40 level 60 raiders to Sulfuron Harbinger", 12098, "Sulfuron Harbinger", 15, 11662 },   // Flamewaker Priests: Dark Mending is interrupted, Inspire purged, Shadow Word: Pain kept off
     { "mc_golemagg",  "Molten Core: 40 level 60 raiders to Golemagg the Incinerator", 11988, "Golemagg the Incinerator", 15, 11672 },   // Core Ragers: the off tank holds them away from Golemagg; Magma Splash stacks on the main tank
@@ -257,6 +280,7 @@ inline ScenarioDef MakeRaidScenario(RaidBossRow const& r, RaidEntrance const& e,
     d.arrive_near_entry = r.boss_entry;
     d.keep_entry = r.keep_entry;
     d.goal_adds_a = r.goal_adds_a; d.goal_adds_b = r.goal_adds_b; d.goal_adds_needed = r.goal_adds_needed;
+    d.spare_entry = r.spare_entry;
     d.lair_x = r.lair_x; d.lair_y = r.lair_y; d.lair_z = r.lair_z; d.lair_o = r.lair_o;
     d.arrive_min_yards = r.arrive_min_yards;
     d.order_attack = true;
@@ -266,6 +290,8 @@ inline ScenarioDef MakeRaidScenario(RaidBossRow const& r, RaidEntrance const& e,
 
 inline ScenarioDef MakeMcScenario(RaidBossRow const& r)
 {
+    if (r.boss_entry == 12018)   // Majordomo Executus
+        return MakeRaidScenario(r, kMcEntrance, RaidSquad(kMcRaidFiveTanks, sizeof(kMcRaidFiveTanks) / sizeof(kMcRaidFiveTanks[0])));
     return MakeRaidScenario(r, kMcEntrance, RaidSquad(kMcRaid, sizeof(kMcRaid) / sizeof(kMcRaid[0])));
 }
 

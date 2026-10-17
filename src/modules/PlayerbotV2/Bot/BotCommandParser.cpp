@@ -5901,7 +5901,7 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
     {
         // "use <object name or entry>": the nearest matching game object within 30 y of the bot (an altar, brazier, lever, orb).
         // The bot walks over, uses it once and stays there (idle:owner_use); "follow" releases it. A ritual such as the UBRS
-        // Blackrock Altar (3 users) completes once enough different players have used it: the owner plus ";Name:use altar" to two bots.
+        // Blackrock Altar (3 users) completes once enough different players have used it: the owner plus "Name use altar" in party chat to two bots.
         // A selected game object still works for clients that can select one.
         ObjectGuid selection = sender->GetTarget();
         std::string want = parsed.tail;   // lower case (Normalize)

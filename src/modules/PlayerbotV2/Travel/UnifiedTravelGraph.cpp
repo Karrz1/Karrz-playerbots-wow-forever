@@ -22,8 +22,10 @@
 #include "PathGenerator.h"
 #include "Player.h"
 #include "UnitDefines.h"
+#include "Travel/WalkLinkTable.h"
 
 #include <algorithm>
+#include <iterator>
 #include <map>
 #include <cmath>
 #include <limits>
@@ -78,7 +80,12 @@ constexpr float kMaxWalkEdgeYds = 600.0f;
 // but never to the ground / bottom stop (dz 90+); comfortably above any real
 // ramp's rise across a 600y edge.
 constexpr float kMaxWalkEdgeDz = 18.0f;
-constexpr float kLinkCandidateYds = 1100.0f;   // the farthest two pieces are tried for a link by the offline check (tools/walk_link_check)
+// The Classic 1.60 maps (ids from 2000) are mountain islands with tiers up to 350 y apart in height; a distance-and-height rule cannot say
+// whether two places on them are joined by ground. Their walk edges come only from the checked link table (WalkLinkTable.h), never from the
+// 600 y / 18 y rule or from a Bridge node: an unchecked edge sent bots to a hub they could not reach (Zephras Isle, 2026-10-16: "partial
+// routes toward (3289,1758,824)" and a 91 s wedge at the starter hub), where no edge sends them to the places they can.
+constexpr uint32 kForeverMapFrom = 2000;
+constexpr float kLinkCandidateYds = 1600.0f;   // the farthest two pieces are tried for a link by the offline check (tools/walk_link_check)
 
 inline float Dist2D(float ax, float ay, float bx, float by)
 {
@@ -155,6 +162,27 @@ void UnifiedTravelGraph::Initialize()
         counts.dungeon_entries, counts.capitals, counts.quest_hubs,
         counts.bridges, counts.elevator_stops,
         total_edges, _nodes_by_map.size());
+    LogForeverMaps();
+}
+
+// What the bots know of the Classic 1.60 maps (ids from 2000): the quest hubs on them (zone, level band, team, quests) and every dock or
+// portal that starts or ends on one, so a missing exit or a hub with the wrong level band shows in the log (tools: Fleet/SkyborneIsle.h).
+void UnifiedTravelGraph::LogForeverMaps() const
+{
+    Services::Hubs().ForEach([&](QuestHub const& h)
+    {
+        if (h.mapId < kForeverMapFrom) return;
+        TC_LOG_INFO("playerbot.v2", "[forever_maps] hub {} map {} zone {} at ({:.0f},{:.0f},{:.0f}) r {:.0f} L{}-{} team mask {} {} quest(s) '{}'",
+                    h.hubId, h.mapId, h.zoneId, h.location.GetPositionX(), h.location.GetPositionY(), h.location.GetPositionZ(), h.radius,
+                    h.minLevel, h.maxLevel, h.factionMask, uint32(h.questIds.size()), h.name);
+    });
+    for (auto const& a : Services::Portals().Anchors())
+        if (a.source_map >= kForeverMapFrom || a.dest_map >= kForeverMapFrom)
+            TC_LOG_INFO("playerbot.v2", "[forever_maps] {} {} map {} ({:.0f},{:.0f},{:.0f}) -> map {} ({:.0f},{:.0f})",
+                        a.kind == PortalAnchor::Kind::Portal ? "portal" : "dock", a.go_entry, a.source_map, a.x, a.y, a.z, a.dest_map, a.dest_x, a.dest_y);
+    for (auto const& [map_id, ids] : _nodes_by_map)
+        if (map_id >= kForeverMapFrom)
+            TC_LOG_INFO("playerbot.v2", "[forever_maps] map {}: {} graph node(s)", map_id, uint32(ids.size()));
 }
 
 NodeId UnifiedTravelGraph::AppendNode(GraphNode node)
@@ -884,6 +912,8 @@ void UnifiedTravelGraph::BuildWalkEdges()
     uint32 added = 0;
     for (auto const& [map_id, ids] : _nodes_by_map)
     {
+        if (map_id >= kForeverMapFrom)
+            continue;   // checked links only (see kForeverMapFrom)
         for (size_t i = 0; i < ids.size(); ++i)
         {
             for (size_t j = i + 1; j < ids.size(); ++j)
@@ -921,7 +951,52 @@ void UnifiedTravelGraph::BuildWalkEdges()
     }
     TC_LOG_INFO("playerbot.v2", "[UnifiedTravelGraph] BuildWalkEdges: {} edges (cap={}y)",
                 added, uint32(kMaxWalkEdgeYds));
+    AddCheckedWalkLinks();
     LogWalkGaps();
+}
+
+// The fixed links of Travel/WalkLinkTable.h: walk edges between pieces that the 600 y / 18 y rule leaves apart, each one checked offline
+// against the real mmaps. An end that names no node (the node data changed since the check) is skipped and counted.
+void UnifiedTravelGraph::AddCheckedWalkLinks()
+{
+    struct P { float x, y, z; };
+    uint32 added = 0, unmatched = 0;
+    for (WalkLink const& l : kWalkLinks)
+    {
+        auto const map_it = _nodes_by_map.find(l.map);
+        if (map_it == _nodes_by_map.end())
+        {
+            ++unmatched;
+            continue;
+        }
+        std::vector<P> pts;
+        pts.reserve(map_it->second.size());
+        for (NodeId id : map_it->second)
+            pts.push_back(P{ _nodes[id].x, _nodes[id].y, _nodes[id].z });
+        long const ia = MatchWalkLinkEnd(pts, l.ax, l.ay, l.az);
+        long const ib = MatchWalkLinkEnd(pts, l.bx, l.by, l.bz);
+        if (ia < 0 || ib < 0 || ia == ib)
+        {
+            ++unmatched;
+            continue;
+        }
+        NodeId const a = map_it->second[size_t(ia)], b = map_it->second[size_t(ib)];
+        bool have = false;
+        for (GraphEdge const& e : _adj[a])
+            if (e.kind == EdgeKind::Walk && e.to == b) { have = true; break; }
+        if (have)
+            continue;
+        float const cost = l.length / kWalkSpeedYds;
+        GraphEdge eab{};
+        eab.to = b; eab.kind = EdgeKind::Walk; eab.cost = cost;
+        AddEdge(a, eab);
+        GraphEdge eba{};
+        eba.to = a; eba.kind = EdgeKind::Walk; eba.cost = cost;
+        AddEdge(b, eba);
+        added += 2;
+    }
+    TC_LOG_INFO("playerbot.v2", "[UnifiedTravelGraph] WalkLinks: {} edges from {} checked links, {} with an end that names no node",
+                added, uint32(std::size(kWalkLinks)), unmatched);
 }
 
 // Names the places where the walk edges of one landmass break into separate pieces, so a "no route" between two hubs on the same map can
@@ -973,8 +1048,10 @@ void UnifiedTravelGraph::LogWalkGaps() const
         // Candidate links for the offline navmesh check (src/tools/walk_link_check): per pair of pieces the closest pair of real places
         // (flight master, quest hub, capital) on the same landmass, up to kLinkCandidateYds apart. One line each, with the heights.
         {
-            auto const isPlace = [](GraphNode const& n)
-            { return n.kind == NodeKind::FlightMaster || n.kind == NodeKind::QuestHub || n.kind == NodeKind::Capital; };
+            // On the Classic 1.60 maps every node is tried (their docks and hubs are all there is); elsewhere only the real places.
+            bool const forever = map_id >= kForeverMapFrom;
+            auto const isPlace = [forever](GraphNode const& n)
+            { return forever || n.kind == NodeKind::FlightMaster || n.kind == NodeKind::QuestHub || n.kind == NodeKind::Capital; };
             struct Cand { size_t i, j; float d; };
             std::map<std::pair<size_t, size_t>, Cand> best_pair;
             for (size_t i = 0; i < ids.size(); ++i)
@@ -999,8 +1076,8 @@ void UnifiedTravelGraph::LogWalkGaps() const
             for (auto const& [k, c] : best_pair)
                 list.push_back(c);
             std::sort(list.begin(), list.end(), [](Cand const& l, Cand const& r) { return l.d < r.d; });
-            if (list.size() > 300)
-                list.resize(300);
+            if (list.size() > 500)
+                list.resize(500);
             for (Cand const& c : list)
             {
                 GraphNode const& a = _nodes[ids[c.i]];
@@ -1069,6 +1146,7 @@ void UnifiedTravelGraph::ConnectIslands()
         if (has_walk[i]) continue;
         // Find the closest other node on the same map.
         GraphNode const& src = _nodes[i];
+        if (src.map_id >= kForeverMapFrom) continue;   // no unchecked bridge on the Classic 1.60 maps (see kForeverMapFrom)
         auto it = _nodes_by_map.find(src.map_id);
         if (it == _nodes_by_map.end()) continue;
         NodeId best = INVALID_NODE_ID;

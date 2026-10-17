@@ -249,11 +249,21 @@ Playerbot.World.JumpGraceSec = 20
 Playerbot.World.AreaCapOutdoors = 14
 Playerbot.World.AreaCapTown = 40
 Playerbot.World.AreaRadius = 45
-# Classic 1.60 (Skyborne): share of the seeded residents (SeedRoster = 1) that are level 1-9 Skyborne who sleep on Zephras Isle, the
-# Skyborne start, so a player who arrives there finds quests being done. Around a player on Zephras the spawner always keeps
-# Skyborne bots of level 1-9 (MinLevel does not apply there); a Skyborne bot that reaches level 10 on the island is moved to a
-# leveling town of the vanilla world, because the island has no exit. 0 = no seeded islanders.
-Playerbot.World.SkyborneSeedPct = 5
+# Temporary residents. PoolMax is the standing (core) roster; VariableMax more characters may exist next to it, created around a real
+# player where the core has nobody fitting (a new character on Zephras Isle, a new low-level player) and deleted again, with the
+# server's own character delete, once they have been offline VariableTtlHours with no owner, group or queue tag. The island's
+# Skyborne residents (level 1-9, MinLevel does not apply there) are always temporary. A Skyborne bot that reaches level 10 on the
+# island is moved to a leveling town of the vanilla world. VariableMax = 0: no temporary residents.
+Playerbot.World.VariableMax = 2000
+Playerbot.World.VariableTtlHours = 24
+
+# Travel soak (for testing, off by default): a few world bots at a time are sent between towns, flight masters, quest hubs and docks of the
+# travel graph, across maps by flight path, boat or zeppelin too, and each leg is logged when it ends ("[travel_soak] leg ... arrived /
+# timeout / no_route"); a summary every ten minutes lists the 50 y cells where legs stopped most. Run it overnight with no player online.
+# TravelSoakBots legs run at once; a leg that takes longer than TravelSoakLegSeconds counts as stuck.
+Playerbot.World.TravelSoak = 0
+Playerbot.World.TravelSoakBots = 8
+Playerbot.World.TravelSoakLegSeconds = 1200
 
 #-----------------------------------------------------------------------------
 # Player interaction
@@ -542,19 +552,20 @@ Playerbot.Behavior.DungeonTactics = 1
 #                     question or their name: within 25 yd, 60 s per bot, 8 s global, 1-4 s delay, '[say_reply]' log.
 Playerbot.Behavior.BotWhisperable = 1
 Playerbot.Behavior.WorldBotSayReply = 1
-#   InstanceGroupCap  OFF by default (an owner may have as many companions out as they like, up to the 40-man raid
-#                     group limit; playtest 2026-10-08). Set 1 to cap: inside an instance `.bot add`, `.bot call` and the addon buttons stop once the owner has
+#   InstanceGroupCap  ON by default (UBRS 2026-10-16: a 15-bot raid in a 10-player dungeon left the extra bots refused at the door).
+#                     Inside an instance `.bot add`, `.bot call` and the addon buttons stop once the owner has
 #                     as many companions out as the map holds, or the group (human included) is full (5 dungeon,
 #                     10/20/40 raid, from the map data; fallback 5 / 40). The owner is warned once when a larger
-#                     group enters a smaller instance. Outside an instance the OpenWorldGroupCap below applies.
-Playerbot.Behavior.InstanceGroupCap = 0
+#                     group enters a smaller instance. Outside an instance the OpenWorldGroupCap below applies. Set 0 to turn the cap off.
+Playerbot.Behavior.InstanceGroupCap = 1
 #   OpenWorldGroupCap outside an instance (open world) an owner has at most this many of their own companions out
 #                     (`.bot add`, `.bot call`, saved roster, addon buttons, relog). Default 5. More bots only by
-#                     inviting world bots, which are not counted; the group becomes a raid when it needs to. A
+#                     inviting world bots, which are not counted; the group becomes a raid when it needs to. Default 40: no limit
+#                     beyond the raid (a raid is built in the open world); set 5 for a normal party. A
 #                     companion above the cap (called inside an instance) is dismissed 10 s after the owner stands
 #                     outside: grouped ones are kept first. Needs InstanceGroupCap = 1. Battleground and arena maps
 #                     are not capped by this. Range 1-40.
-Playerbot.Behavior.OpenWorldGroupCap = 5
+Playerbot.Behavior.OpenWorldGroupCap = 40
 #   BgHumanPriority   a human queueing for a battleground never opens a second instance while a running one can
 #                     make room: a bot leaves it for the human, and a bots-only battleground keeps playing to its
 #                     normal end after the last human leaves ([bg_queue] log lines).

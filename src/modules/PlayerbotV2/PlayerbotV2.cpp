@@ -48,6 +48,7 @@
 #include "Bot/BotCommandParser.h"
 #include "Bot/BotChatReactor.h"
 #include "Bot/GroupOrderText.h"
+#include "Util.h"
 #include "Bot/AddonHint.h"
 #include "Bot/BotTextMgr.h"
 #include "Chat.h"
@@ -3461,13 +3462,35 @@ void Module::OnPartyChat(Player* sender, Group* group, std::string const& msg)
     if (msg.front() != ';')
     {
         // A bare group order ("follow", "stay", ...) in party or raid chat goes to every bot of the sender's in the
-        // group. Other chatter stays ignored.
+        // group. A line that starts with the name of a bot in the group, or with "all", is that bot's (every bot's)
+        // order without the ';' ("Lentha use altar", "all use altar"). Other chatter stays ignored.
         if (auto const order = ClassifyGroupOrder(msg, Services::Config().behavior_owner_commands()))
             RouteGroupOrder(sender, group, *order);
+        else if (auto const addressed = AddressedGroupOrder(msg, [group](std::string_view name) { return GroupHasBotNamed(group, name); }))
+            DispatchSquadLine(sender, group, *addressed, false);
         return;
     }
     const std::string body = msg.substr(1);
     if (body.empty()) return;
+    DispatchSquadLine(sender, group, body, true);
+}
+
+bool Module::GroupHasBotNamed(Group const* group, std::string_view name)
+{
+    if (!group || name.empty()) return false;
+    for (GroupReference const& itr : group->GetMembers())
+    {
+        Player const* member = itr.GetSource();
+        if (!member) continue;
+        if (!Services::Registry().has(member->GetGUID().GetCounter())) continue;
+        if (StringEqualI(member->GetName(), name)) return true;
+    }
+    return false;
+}
+
+void Module::DispatchSquadLine(Player* sender, Group* group, std::string const& body, bool answer_unknown)
+{
+    if (!sender || !group || body.empty()) return;
     // Walk the group for the sender's first owned bot. We need a
     // primary bot to attach the reply whisper to; if the owner has
     // none in the group, route to the first owned-on-realm fallback.
@@ -3511,7 +3534,7 @@ void Module::OnPartyChat(Player* sender, Group* group, std::string const& msg)
     if (!primary)
         primary = any_group_bot;
     if (!primary) return;
-    if (!BotCommandParser::Dispatch(sender, primary, body, "party;"))
+    if (!BotCommandParser::Dispatch(sender, primary, body, "party;") && answer_unknown)
     {
         // A ";" line is meant as an order: an unknown or refused one answers instead of vanishing. (A plain whisper falls
         // through to the social reactor and a bare party word is chatter, so only this explicit route replies.)

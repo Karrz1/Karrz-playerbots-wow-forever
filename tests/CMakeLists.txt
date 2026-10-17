@@ -30,8 +30,10 @@ if(NOT BUILD_PLAYERBOT_V2)
     ClassicAddonHint.cpp
     ClassicBotConversation.cpp
     ClassicGroupOrderText.cpp
+    ClassicInstanceFullHold.cpp
     ClassicRaidConsumables.cpp
     ClassicRaidDispel.cpp
+    ClassicRaidRetaunt.cpp
     ClassicRaidFightScript.cpp
     ClassicRaidGeometry.cpp
     ClassicRaidRagnaros.cpp)

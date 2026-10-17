@@ -19,6 +19,7 @@
 #include <algorithm>
 
 #include "../../src/modules/PlayerbotV2/Bot/Raid/RaidEncounters.h"
+#include "../../src/modules/PlayerbotV2/Bot/Raid/DispelWorth.h"
 
 using namespace Playerbot::Raid;
 
@@ -40,4 +41,109 @@ TEST_CASE("Lucifron's curse and Impending Doom are still dispelled", "[ClassicRa
     auto has = [&](uint32_t aura) { return std::any_of(mc->dispel.begin(), mc->dispel.end(), [&](Dispel const& d) { return d.aura == aura; }); };
     CHECK(has(19703));
     CHECK(has(19702));
+}
+
+// MC Lucifron kill: Impending Doom drew up to 11 dispel orders a round for 27 rounds, and every healer paid a heal's mana for it.
+TEST_CASE("Impending Doom hands out three dispel orders per plan", "[ClassicRaidDispel]")
+{
+    RaidRules const* mc = RulesForMap(409);
+    REQUIRE(mc != nullptr);
+    auto it = std::find_if(mc->dispel.begin(), mc->dispel.end(), [](Dispel const& d) { return d.aura == 19702; });
+    REQUIRE(it != mc->dispel.end());
+    CHECK(it->urgent);                      // still healers and tanks first, still cast in an emergency
+    CHECK(it->maxOrders >= 2);
+    CHECK(it->maxOrders <= 3);
+    unsigned given = 0;
+    while (Playerbot::Raid::DispelOrderAllowed(it->urgent, it->maxOrders, given))
+        ++given;
+    CHECK(given == it->maxOrders);
+}
+
+TEST_CASE("Dispel order caps: an own cap wins, urgent without one is uncapped, non-urgent keeps its default", "[ClassicRaidDispel]")
+{
+    using Playerbot::Raid::DispelOrderAllowed;
+    using Playerbot::Raid::kNonUrgentDispelOrdersPerPlan;
+    CHECK(DispelOrderAllowed(true, 0, 50));                                    // Lucifron's Curse: every carrier
+    CHECK(DispelOrderAllowed(false, 0, kNonUrgentDispelOrdersPerPlan - 1));
+    CHECK_FALSE(DispelOrderAllowed(false, 0, kNonUrgentDispelOrdersPerPlan));
+    CHECK(DispelOrderAllowed(true, 3, 2));
+    CHECK_FALSE(DispelOrderAllowed(true, 3, 3));
+    CHECK_FALSE(DispelOrderAllowed(false, 1, 1));
+}
+
+TEST_CASE("Lucifron's Flamewaker Protectors are never crowd-controlled by the group", "[ClassicRaidDispel]")
+{
+    RaidRules const* mc = RulesForMap(409);
+    REQUIRE(mc != nullptr);
+    auto never = [&](uint32_t entry) { return std::any_of(mc->noControl.begin(), mc->noControl.end(), [&](NoControl const& n) { return n.enemy == entry; }); };
+    CHECK(never(12119));
+    CHECK_FALSE(never(12118));   // Lucifron himself is a boss, not a sheep target either way, and has no rule
+    // the raid brain's own election must not hold them either
+    for (CrowdControl const& c : mc->crowdControl)
+        CHECK(c.enemy != 12119);
+}
+
+// ---- Garr: no Firesworn dies before him ----
+
+TEST_CASE("Garr spares his Firesworn near death while he lives, and the 17 y run-away rule is gone", "[ClassicRaidDispel]")
+{
+    RaidRules const* mc = RulesForMap(409);
+    REQUIRE(mc != nullptr);
+    auto it = std::find_if(mc->spare.begin(), mc->spare.end(), [](Spare const& s) { return s.enemy == 12099; });
+    REQUIRE(it != mc->spare.end());
+    CHECK(it->gateEnemy == 12057);
+    CHECK(it->belowPct >= 15.f);          // above the healers' 15 percent step-away: no add is already dying when it is spared
+    CHECK(it->belowPct <= 40.f);          // a rule that spares half-health adds would leave the tanks nothing to do
+    CHECK(SpareNow(*it, 25.f, true));     // at the line
+    CHECK(SpareNow(*it, 3.f, true));
+    CHECK_FALSE(SpareNow(*it, 26.f, true));
+    CHECK_FALSE(SpareNow(*it, 3.f, false));   // Garr dead: the generic rules kill the adds
+    // The old rule made every ranged and healer bot run from every live add (MC Garr 2026-10-10: a healer died doing it).
+    for (AvoidEnemy const& a : mc->avoidEnemy)
+        if (a.enemy == 12099)
+        {
+            CHECK(a.who == Who::Healer);  // the Movement table's one rule, for a dying add
+            CHECK(a.hpMax <= 15.f);
+        }
+}
+
+// ---- Majordomo: three Healers sheeped, the Elites tanked ----
+
+TEST_CASE("Majordomo: three Healers are sheeped one at a time, the Elites never", "[ClassicRaidDispel]")
+{
+    RaidRules const* mc = RulesForMap(409);
+    REQUIRE(mc != nullptr);
+    auto never = [&](uint32_t entry) { return std::any_of(mc->noControl.begin(), mc->noControl.end(), [&](NoControl const& n) { return n.enemy == entry; }); };
+    CHECK_FALSE(never(11663));
+    CHECK(never(11664));                                // Elites cannot be sheeped: the tanks hold them
+    CHECK_FALSE(never(12018));
+    int healerRules = 0;
+    for (CrowdControl const& c : mc->crowdControl)
+    {
+        CHECK(c.enemy != 11664);
+        if (c.enemy != 11663)
+            continue;
+        ++healerRules;
+        CHECK(c.kind == CcKind::Polymorph);
+        CHECK(c.maxActive == 3);                        // the fourth Healer is the raid's first kill
+        CHECK(c.oneAtATime);                            // then one sheep is broken at a time
+    }
+    CHECK(healerRules == 1);
+}
+
+TEST_CASE("Majordomo's Healers: casters and healers keep out of the 20 yard Shadow Shock", "[ClassicRaidDispel]")
+{
+    RaidRules const* mc = RulesForMap(409);
+    REQUIRE(mc != nullptr);
+    bool ranged = false, healer = false;
+    for (AvoidEnemy const& a : mc->avoidEnemy)
+        if (a.enemy == 11663)
+        {
+            CHECK(a.radius > 20.f);                     // Shadow Shock 20603 reaches 20 y around the Healer
+            ranged = ranged || a.who == Who::Ranged;
+            healer = healer || a.who == Who::Healer;
+            CHECK(a.who != Who::Melee);                 // melee must stand at a Healer to kill it
+        }
+    CHECK(ranged);
+    CHECK(healer);
 }

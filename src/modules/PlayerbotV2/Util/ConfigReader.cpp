@@ -186,8 +186,8 @@ void ConfigReader::apply_from_loaded_config()
     bhv_bot_whisperable_      = c.GetBoolDefault("Playerbot.Behavior.BotWhisperable", true, true);
     chatter_conversation_     = c.GetBoolDefault("Playerbot.Chatter.Conversation", true, true);
     bhv_world_bot_say_reply_  = c.GetBoolDefault("Playerbot.Behavior.WorldBotSayReply", true, true);
-    bhv_instance_group_cap_   = c.GetBoolDefault("Playerbot.Behavior.InstanceGroupCap", false, true);
-    bhv_open_world_group_cap_ = std::clamp<int32>(c.GetIntDefault("Playerbot.Behavior.OpenWorldGroupCap", 5, true), 1, 40);
+    bhv_instance_group_cap_   = c.GetBoolDefault("Playerbot.Behavior.InstanceGroupCap", true, true);
+    bhv_open_world_group_cap_ = std::clamp<int32>(c.GetIntDefault("Playerbot.Behavior.OpenWorldGroupCap", 40, true), 1, 40);
     bhv_bg_human_priority_    = c.GetBoolDefault("Playerbot.Behavior.BgHumanPriority", true, true);
     bhv_tank_markers_         = c.GetBoolDefault("Playerbot.Behavior.TankMarkers", true, true);
     bhv_mark_cc_              = c.GetBoolDefault("Playerbot.Behavior.MarkCc", true, true);

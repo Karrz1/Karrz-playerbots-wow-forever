@@ -43,11 +43,14 @@ Optional first: the vanilla (1.12) numbers. They are not in the repository; you 
    Your database user needs rights on the new `playerbot` database
    (`GRANT ALL ON playerbot.* TO '<your db user>'@'%';`). The server reads and writes it with the
    same login as your other databases. The files do not drop anything.
-4. **Settings.** In `worldserver.conf.d`, rename `playerbot.conf.dist` to `playerbot.conf`, and copy
+4. **Settings.** In `worldserver.conf.d`, rename `playerbot.conf.dist` to `playerbot.conf`. The build has already put
+   `zz-0-playerbot-defaults.conf` there: it turns the auction house bot **on** (one neutral house, vanilla items), with nothing to copy.
+   Do not edit it (a build replaces it); put your own changes in a later file such as `zz-9-local.conf`, and
+   set `AuctionHouseBot.Seller.Enabled = 0` and `AuctionHouseBot.Buyer.Enabled = 0` there to turn it off. Optionally also copy
    `examples\zz-forever-bots.conf` into the same folder. That file is optional and turns on
    extras that are **not** Blizzlike: solo raid entry and saving on entry (`Instance.IgnoreRaid`, `Instance.BindOnEntry`), killed raid trash staying dead (`Instance.PersistRaidTrash`),
    no Molten Core runes, no attunements, open Ahn'Qiraj gates (see `doc/OptionalServerOptions.md`), the
-   auction house bot, faster raid casting, and world bots (stage A, 300 bots, `Playerbot.World.*`).
+   auction house bot (all three houses buying), faster raid casting, and world bots (stage A, 300 bots, `Playerbot.World.*`).
    Change a value and restart to tune; set `Playerbot.World.Enable = 0` for no roaming bots,
    `AuctionHouseBot.Seller.Enabled = 0` for no auction bot. Weak PC: set `Playerbot.World.MaxBots = 100`
    and `Playerbot.World.GlobalFill = 0`. Expect 4-6 GB of extra RAM at 300 bots.

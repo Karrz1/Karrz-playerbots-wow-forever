@@ -57,4 +57,26 @@ constexpr unsigned kRaidBossOpenWaitMs = 8000;
 constexpr unsigned kRaidDpsWaitTimeoutMaxMs = kRaidBossOpenWaitMs;
 constexpr unsigned kPartyDpsWaitTimeoutMs   = 6000;
 
+// Past the hard limit the over-threat hold waits for the tank's threat to rise. A tank that is stunned, feared, dead, in an Inferno
+// or out of reach never raises it, and every DPS and healer at the limit stood idle for as long as that lasted (audit 2026-10-16).
+// After kStalledTankHoldMs on a tank whose threat has not moved the hold releases: the class threat drop (Fade, Feign Death, Feint,
+// Cower) has had its chance during the hold, and plain fighting takes over. The same clock bounds the healer's near-tank hold.
+constexpr unsigned kStalledTankHoldMs = 6000;
+
+struct StalledTankClock { unsigned since_ms = 0; unsigned last_ms = 0; float tank_threat = 0.0f; };
+
+// One poll of a hold past the hard limit: true once the hold has lasted kStalledTankHoldMs with the tank's threat at a standstill.
+// The clock restarts when the tank's threat rises (the tank is building, the hold is doing its job) and after gap_ms without a
+// poll (a new hold).
+constexpr bool StalledTankHoldExpired(StalledTankClock& c, unsigned now, float tank_threat, unsigned gap_ms)
+{
+    if (!c.since_ms || now - c.last_ms > gap_ms || tank_threat > c.tank_threat)
+    {
+        c.since_ms = now;
+        c.tank_threat = tank_threat;
+    }
+    c.last_ms = now;
+    return now - c.since_ms >= kStalledTankHoldMs;
+}
+
 }  // namespace Playerbot

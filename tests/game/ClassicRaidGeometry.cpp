@@ -195,3 +195,27 @@ TEST_CASE("Magmadar: a tank spot a little off the straight line still turns the 
     FaceAwaySpot(0, 0, -22, 0, 3.5f, 35.f * kDeg, tx, ty);
     CHECK_FALSE(TankOpposesRaid(0, 0, tx, ty, -22, 0, 30.f * kDeg));
 }
+
+// Onyxia, live 2026-10-16 kill: all eight deaths came 3-27 s after a roar, feared bots walking back through her front arc. A raid move whose straight line
+// crosses the widened arc is dropped (RaidBrain ApplyFrontArcGuard); the bot waits on its flank.
+TEST_CASE("Onyxia: a walk from one flank to the other through her front arc is detected", "[ClassicRaidGeometry]")
+{
+    constexpr float half = 72.0f * kDeg;   // 60 degrees and the margin
+    // She faces east at the origin. A bot south of her (feared there) sent to a slot on the north flank walks through the front.
+    CHECK(PathCrossesFrontSector(0, 0, 0.0f, half, 45.0f, 10.0f, -20.0f, 4.0f, 24.0f));
+    // The same walk on the far side of her reach is not through the arc.
+    CHECK_FALSE(PathCrossesFrontSector(0, 0, 0.0f, half, 45.0f, 60.0f, -30.0f, 60.0f, 30.0f));
+    // The ends are not tested: a bot already inside the arc is the cone step's business.
+    CHECK_FALSE(PathCrossesFrontSector(0, 0, 0.0f, half, 45.0f, 20.0f, 0.0f, 20.0f, 0.0f));
+}
+
+TEST_CASE("Onyxia: a walk along one flank or behind her is left alone", "[ClassicRaidGeometry]")
+{
+    constexpr float half = 72.0f * kDeg;
+    CHECK_FALSE(PathCrossesFrontSector(0, 0, 0.0f, half, 45.0f, -2.0f, 25.0f, 3.0f, 22.0f));      // along the north flank
+    CHECK_FALSE(PathCrossesFrontSector(0, 0, 0.0f, half, 45.0f, -15.0f, -20.0f, -2.0f, -24.0f));  // south flank, a little behind
+    CHECK_FALSE(PathCrossesFrontSector(0, 0, 0.0f, half, 45.0f, -20.0f, 20.0f, -20.0f, -20.0f));  // from flank to flank behind her
+    CHECK(InFrontSector(0, 0, 0.0f, 20.0f, 10.0f, half, 45.0f));
+    CHECK_FALSE(InFrontSector(0, 0, 0.0f, 5.0f, 24.0f, half, 45.0f));   // 78 degrees off her facing: in the wedge, outside the widened arc
+    CHECK_FALSE(InFrontSector(0, 0, 0.0f, 50.0f, 0.0f, half, 45.0f));   // beyond the arc's reach
+}

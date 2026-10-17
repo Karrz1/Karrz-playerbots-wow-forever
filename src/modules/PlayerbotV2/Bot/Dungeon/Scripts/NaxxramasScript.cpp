@@ -25,17 +25,17 @@ public:
     DungeonAdvice get_advice(BotSnapshotView const& /*s*/) const override
     {
         DungeonAdvice a;
+        // The raid rules (Raid/RaidEncounterData_NAXX.cpp) replace this list below (ApplyRaidAdvice); it stays in step with them:
+        // Faerlina's Worshippers (16506) are mind-controlled and sacrificed, Razuvious' Understudies (16803) are the tanks, Kel'Thuzad's
+        // Guardians (16441) are shackled, and Thaddius himself (15928) is the boss, not an add. None of them is a kill target.
         a.high_priority_kill_entries = {
             16573,  // Crypt Guard (Anub'Rekhan)
             17055,  // Spiderling
             16486,  // Web Wrap (Maexxna — frees trapped player)
-            16506,  // Naxxramas Worshipper (Faerlina)
             16505,  // Naxxramas Follower (Faerlina)
-            16803,  // Death Knight Understudy (Razuvious — MC target)
             16360,  // Zombie Chow (Gluth)
-            15928,  // Feugen (Thaddius)
+            15930,  // Feugen (Thaddius)
             15929,  // Stalagg (Thaddius)
-            16441,  // Guardian of Icecrown (Kel'Thuzad)
         };
         a.mandatory_interrupt_spells = {
             // Patchwerk

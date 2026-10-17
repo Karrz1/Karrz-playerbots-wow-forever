@@ -8,6 +8,7 @@
 
 #include "IdleWatch.h"
 #include "WalkOrder.h"
+#include "Travel/ReachMemory.h"
 #include "BotTypes.h"
 #include "BotSnapshot.h"  // CurrencyEntry — cached_currencies_ member needs full type
 #include "Battleground/BgTactics.h"          // BgTactics::StallWatch (bg_stall_ member)
@@ -271,6 +272,13 @@ public:
         uint32 direct_tries = 0;
         static constexpr uint32 kDirectTries = 3;
     };
+    // The instance map a companion was last refused for being full, and when: the rejoin rule holds still for kInstanceFullHoldMs
+    // and asks again (idle:rejoin_instance_full), instead of walking to an entrance it cannot use.
+    void     note_instance_full(uint32 map_id, uint32 now_ms) { instance_full_map_ = map_id; instance_full_ms_ = now_ms ? now_ms : 1u; }
+    uint32   instance_full_map() const { return instance_full_map_; }
+    uint32   instance_full_ms()  const { return instance_full_ms_; }
+    void     clear_instance_full() { instance_full_map_ = 0; instance_full_ms_ = 0; }
+    static constexpr uint32 kInstanceFullHoldMs = 30000u;
     RejoinRun&       rejoin_run()       { return rejoin_run_; }
     RejoinRun const& rejoin_run() const { return rejoin_run_; }
     // The release order is not among these (see release_order_ms above).
@@ -1969,7 +1977,9 @@ public:
         if (quest_id == 0) return false;
         std::lock_guard<std::mutex> lk(quest_mem_mtx_);
         auto const it = quest_blacklist_until_ms_.find(quest_id);
-        if (it == quest_blacklist_until_ms_.end()) return false;
+        if (it == quest_blacklist_until_ms_.end())
+            // Not this bot's own drop: other bots may have given up on the walk to its goal (Travel/ReachMemory.h).
+            return ::Playerbot::V2::Travel::QuestGoalMemory::Instance().KnownUnreachable(quest_id, now_ms);
         return now_ms < it->second;
     }
     // Drop expired entries. Called periodically from State_Idle (every ~5min)
@@ -5377,6 +5387,8 @@ private:
     std::atomic<uint32> release_order_ms_{0};
     std::atomic<uint32> died_at_ms_{0};
     RejoinRun      rejoin_run_;
+    uint32         instance_full_map_ = 0;
+    uint32         instance_full_ms_ = 0;
     uint32         death_log_ms_ = 0;
     bool           wipe_logged_ = false;
     uint32         owner_wait_since_ms_ = 0;

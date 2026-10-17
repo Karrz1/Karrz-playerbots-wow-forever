@@ -6971,13 +6971,12 @@ static ClassicSpellValue::Value const* ClassicCoefficientRow(SpellInfo const* sp
     return sSpellMgr->GetClassicSpellValue(spellInfo->Id, uint32(effectInfo.EffectIndex));
 }
 
-// Classic 1.60 (vanilla, VMaNGOS SpellCaster::CalculateLevelPenalty): spells learned below level 20 get less from spell power,
-// 1 - (20 - spell level) * 3.75% (Fireball rank 1: 0.429 x 0.2875 = 0.123). The 1.60 client coefficients are the unpenalized ones.
-static float ClassicSpellLevelPenalty(SpellInfo const* spellInfo)
+// Classic 1.60: the spell power / healing power factor of an effect with the vanilla level penalty in. A vanilla table row is
+// already penalised and is taken as it is; the client's coefficient is the unpenalized one and gets 1 - (20 - spell level) * 3.75%
+// below level 20 (Fireball rank 1: 0.429 x 0.2875 = 0.123). See ClassicSpellValue::BonusCoefficientWithLevelPenalty.
+static float ClassicBonusCoefficient(SpellInfo const* spellProto, SpellEffectInfo const& spellEffectInfo)
 {
-    if (!spellInfo || spellInfo->SpellLevel <= 0 || spellInfo->SpellLevel >= 20)
-        return 1.0f;
-    return 1.0f - (20.0f - float(spellInfo->SpellLevel)) * 0.0375f;
+    return ClassicSpellValue::BonusCoefficientWithLevelPenalty(ClassicCoefficientRow(spellProto, spellEffectInfo), spellEffectInfo.BonusCoefficient, int32(spellProto->SpellLevel));
 }
 
 int32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, int32 pdamage, DamageEffectType damagetype, SpellEffectInfo const& spellEffectInfo, uint32 stack /*= 1*/, Spell* spell /*= nullptr*/, AuraEffect const* aurEff /*= nullptr*/) const
@@ -7052,7 +7051,7 @@ int32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, int3
     // Default calculation
     if (DoneAdvertisedBenefit)
     {
-        float coeff = ClassicSpellValue::BonusCoefficientOr(ClassicCoefficientRow(spellProto, spellEffectInfo), spellEffectInfo.BonusCoefficient) * ClassicSpellLevelPenalty(spellProto);
+        float coeff = ClassicBonusCoefficient(spellProto, spellEffectInfo);
         if (Player* modOwner = GetSpellModOwner())
         {
             coeff *= 100.0f;
@@ -7575,7 +7574,7 @@ int32 Unit::SpellHealingBonusDone(Unit* victim, SpellInfo const* spellProto, int
     // Default calculation
     if (DoneAdvertisedBenefit)
     {
-        float coeff = spellEffectInfo.BonusCoefficient * ClassicSpellLevelPenalty(spellProto);
+        float coeff = ClassicBonusCoefficient(spellProto, spellEffectInfo);
         if (Player* modOwner = GetSpellModOwner())
         {
             coeff *= 100.0f;
@@ -7797,7 +7796,11 @@ int32 Unit::SpellBaseHealingBonusDone(SpellSchoolMask schoolMask) const
 
 int32 Unit::SpellBaseAbsorbBonusDone(SpellSchoolMask schoolMask) const
 {
-    return SpellBaseHealingBonusDone(schoolMask);
+    // Classic 1.60 (vanilla, VMaNGOS Aura::HandleSchoolAbsorb): a holy shield (Power Word: Shield) grows with healing power, the mage and
+    // warlock wards (Fire Ward, Frost Ward, Shadow Ward) with spell damage of their school.
+    if (schoolMask & SPELL_SCHOOL_MASK_HOLY)
+        return SpellBaseHealingBonusDone(schoolMask);
+    return SpellBaseDamageBonusDone(schoolMask);
 }
 
 int32 Unit::SpellAbsorbBonusDone(Unit* victim, SpellInfo const* spellProto, int32 absorbamount, SpellEffectInfo const& spellEffectInfo, uint32 stack /*= 1*/, AuraEffect const* aurEff /*= nullptr*/) const
@@ -7846,7 +7849,7 @@ int32 Unit::SpellAbsorbBonusDone(Unit* victim, SpellInfo const* spellProto, int3
 
     if (doneAdvertisedBenefit)
     {
-        float coeff = spellEffectInfo.BonusCoefficient * ClassicSpellLevelPenalty(spellProto);
+        float coeff = ClassicBonusCoefficient(spellProto, spellEffectInfo);
 
         if (Player* modOwner = GetSpellModOwner())
         {

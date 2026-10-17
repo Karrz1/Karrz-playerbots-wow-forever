@@ -97,7 +97,9 @@ where the client offers `Menu.ModifyMenu` (untested here); the legacy UnitPopupM
 The window stays where you put it and stays open (it is not closed by Escape, clicks, combat or target changes; its open state survives /reload and relog). `/fb` toggles it, or use the X button.
 
 `/fb fallback`, `/fb pullback`, `/fb rally`, `/fb formation circle|arrow|line|none`, `/fb spacing tight|close|spread`, `/fb distance <1-20>` and `/fb maintank [name]` and `/fb tank <name> <marker>|clear` work without the window.
-The `.bot` commands need a GM account (gm level 3 on the realm).
+The `.bot` commands for your own bots (add, call, dismiss, save, list, regear and the rest) work for every account; no GM account is needed. Only `.bot world`, `.bot bgstress`, `.bot bgsoak` and `.bot itemstats` are GM.
 
 Key bindings (0.2.2): Esc > Options > Key Bindings > AddOns > "WoW Forever Bots". Unbound by default; one entry each for Attack, Pull, Pull back, Follow, Stay, Resume, Stop attacking, Flee, Come, Fall back, Toggle stance and Show / hide the bot window. The order keys send the same line as the window buttons and work in combat.
+
+Lazy lock key (0.2.4, warlocks): one key that does the right next thing on your target. Each press casts one spell: Demon Armor and your pet when you have none, the curse (Curse of Tongues on mana users, Curse of Agony on the rest), Corruption, Immolate and Siphon Life kept up, Conflagrate, Shadow Bolt as the filler (the free instant bolt on a Shadow Trance proc), Life Tap when mana runs low, Death Coil / Drain Life when your health is low, and your racial on a long fight. The wand takes over when mana is dry. It also sends your pet at the target. Bind it under "Lazy lock" and tap or mash it; it runs the server command `.playerbot lazy`, which you can also type.
 Attack (mouseover) key: hover a mob and press it; the mob becomes your target and the bots attack it. Group pings (the ping wheel, if your client has one): an Attack ping on an enemy sends the bots in, an On my way ping on the ground sends them there. Needs a server with the ping hooks.

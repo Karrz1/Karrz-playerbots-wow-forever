@@ -13,6 +13,7 @@
 // top-of-tick dispatch in `State_Idle::DispatchIdle`.
 
 #include "Bot/IdleRule.h"
+#include "Bot/InstanceFullHold.h"
 #include "Group/GroupSnapshot.h"
 #include "Bot/BotAI.h"
 #include "Bot/BotSnapshotView.h"
@@ -27,6 +28,7 @@
 #include "Travel/QuestHubDatabase.h"
 #include "Travel/PortalIndex.h"
 #include "Travel/UnifiedTravelGraph.h"
+#include "Travel/SoakBoard.h"
 #include "Bot/States/MaintainHelpers.h"
 #include "GameTime.h"
 #include "DB2Stores.h"
@@ -40,6 +42,68 @@
 namespace Playerbot {
 
 namespace {
+
+// ---------- idle:soak_travel ----------
+// The travel soak (Playerbot.World.TravelSoak, Fleet/WorldBotSpawner.cpp DriveTravelSoak): the world thread gives a few bots a place of the
+// travel graph (Travel/SoakBoard.h); this rule walks, flies and rides them there with the quest travel executor and reports how the leg
+// ended: arrived, timed out where it stood, or no route. Ordinary bots never have an assignment, so the gate costs one locked lookup.
+bool SoakTravelGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    return !s.in_group() && ::Playerbot::V2::Travel::SoakBoard::Instance().Has(s.raw().guid.GetCounter());
+}
+
+bool SoakTravelFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    using namespace ::Playerbot::V2::Travel;
+    SoakBoard& board = SoakBoard::Instance();
+    uint64 const id = s.raw().guid.GetCounter();
+    SoakGoal g;
+    if (!board.Get(id, g))
+        return false;
+    float bx, by, bz; s.position(bx, by, bz);
+    uint32 const now_ms = GameTime::GetGameTimeMS();
+    uint32 const legs = uint32(ai.travel_plan().size()), leg_index = uint32(ai.travel_plan_leg_index());
+    if (SoakArrived(g, s.map_id(), bx, by))
+    {
+        board.Finish(id, SoakResult::Arrived, now_ms, s.map_id(), bx, by, bz, legs, leg_index);
+        ai.clear_travel_plan();
+        return false;
+    }
+    if (SoakTimedOut(g, now_ms))
+    {
+        board.Finish(id, SoakResult::TimedOut, now_ms, s.map_id(), bx, by, bz, legs, leg_index);
+        ai.clear_travel_plan();
+        return false;
+    }
+    // Aboard a ship or zeppelin the ride rules step the bot off at the far dock; a flight runs out by itself.
+    if (s.on_transport())
+        return false;
+    if (s.is_moving())
+    {
+        ai.set_last_rule_fired("idle:soak_travel");
+        return true;
+    }
+    ::Playerbot::States::EnsureTravelPlan(s, ai, bx, by, bz, g.map, g.x, g.y, g.z, /*quest_goal=*/false);
+    if (!ai.has_travel_plan())
+    {
+        // No plan on the goal's own map is the plain walk; no plan for another map is no route.
+        if (g.map != s.map_id())
+        {
+            board.Finish(id, SoakResult::NoRoute, now_ms, s.map_id(), bx, by, bz, legs, leg_index);
+            ai.clear_travel_plan();
+            return false;
+        }
+        if (::Playerbot::States::ChunkedWalkToward(s, ai, emit, g.x, g.y, g.z, "idle:soak_walk", now_ms))
+            return true;
+        return false;
+    }
+    if (::Playerbot::States::DriveTravelPlanTo(s, ai, emit, bx, by, bz, g.map, g.x, g.y, g.z, /*quest_goal=*/false))
+    {
+        ai.set_last_rule_fired("idle:soak_travel");
+        return true;
+    }
+    return false;
+}
 
 // ---------- idle:swim_stuck ----------
 bool SwimStuckGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32)
@@ -808,6 +872,27 @@ bool RejoinInstanceFire(BotSnapshotView const& s, BotAI& ai,
         return false;
     }
 
+    // The door refused the bot because the instance holds its most players (a 15-bot raid in a 10-player dungeon, UBRS 2026-10-16): it
+    // stays where it is, safe, instead of walking the open world to an entrance it cannot use (Justor died to the Scarshield Sentries on
+    // that walk, outside the instance where Raul could not raise him), and asks again every kInstanceFullHoldMs for a free slot.
+    if (ai.instance_full_map() == anchor->map_id)
+    {
+        if (V2::InstanceFullHolds(ai.instance_full_map(), ai.instance_full_ms(), anchor->map_id, now_ms, BotAI::kInstanceFullHoldMs))
+        {
+            if (rr.log_ms == 0 || now_ms - rr.log_ms >= 60000u)
+            {
+                rr.log_ms = now_ms ? now_ms : 1u;
+                TC_LOG_INFO("playerbot.v2", "[rejoin] {} waits on map {}: {} in map {} is full, it asks again in {}s",
+                            s.name(), s.map_id(), anchor->name, anchor->map_id,
+                            (BotAI::kInstanceFullHoldMs - (now_ms - ai.instance_full_ms())) / 1000u);
+            }
+            ai.set_last_rule_fired("idle:rejoin_instance_full");
+            return true;
+        }
+        ai.clear_instance_full();
+        rr.direct_tries = 0;
+    }
+
     float bx, by, bz;
     s.position(bx, by, bz);
     // Walking range with hysteresis: switching mode resets the rejoin (the far
@@ -1033,6 +1118,14 @@ bool InviteNearbyPlayerFire(BotSnapshotView const& s, BotAI& ai,
 
 void RegisterCoreFlowRules(IdleRuleRegistry& r)
 {
+    {
+        IdleRule rule;
+        rule.name     = "idle:soak_travel";
+        rule.priority = 863;   // under swim_stuck (870) and water_escape (865): a soak bot in the water still gets out first
+        rule.gate     = &SoakTravelGate;
+        rule.fire     = &SoakTravelFire;
+        r.register_rule(std::move(rule));
+    }
     {
         IdleRule rule;
         rule.name     = "idle:swim_stuck";

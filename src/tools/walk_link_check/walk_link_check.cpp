@@ -7,6 +7,8 @@
  * more ground than the drop). The checked links are printed as a table, one line each with the path length.
  *
  * Usage: walk_link_check <mmaps_dir> <Playerbot.log> [links_out.txt]
+ *        walk_link_check --road-census <mmaps_dir> <map_id> [road_polys_out.txt]
+ *        walk_link_check --road-trace <mmaps_dir> <map_id> <x1> <y1> <x2> <y2> [road_rows_out.sql]
  *
  * Pure Detour API, like mmap_probe: no TC core, no worldserver needed. The mmaps must be the ones the server runs on.
  */
@@ -69,6 +71,7 @@ static constexpr uint16_t NAV_GROUND_STEEP = 1u << (11 - 10); // 0x02
 static constexpr uint16_t NAV_WATER        = 1u << (11 - 9);  // 0x04
 // NAV_MAGMA_SLIME = 0x08
 static constexpr uint16_t NAV_ROAD         = 1u << (11 - 7);  // 0x10
+static constexpr int      NAV_AREA_ROAD    = 7;               // area id of a road polygon (MMapDefines.h)
 
 namespace
 {
@@ -204,6 +207,7 @@ int LoadAllTiles(dtNavMesh* navMesh, std::string const& dir, uint32_t mapId, std
 namespace
 {
 constexpr int kMaxPolys = 4096;            // a 1,100 y walk can cross some hundreds of polygons
+constexpr float kMaxPathYards = 4000.0f;   // a complete path longer than this is not a link (its real length is the edge cost, so a long way round is fair below it)
 constexpr float kCliffDropYards = 15.0f;   // mirrors Fleet::kCliffDropYards (CityLayer.h)
 
 struct Pair
@@ -224,6 +228,29 @@ bool Parse(std::string const& line, Pair& p)
     p.ax = std::stof(m[2]); p.ay = std::stof(m[3]); p.az = std::stof(m[4]);
     p.bx = std::stof(m[5]); p.by = std::stof(m[6]); p.bz = std::stof(m[7]);
     p.d = std::stof(m[8]);
+    return true;
+}
+
+// A stuck bot from a "[wedge]" line: where it stood and the (x, y) goal it was walking to (the goal's height is not logged).
+struct Wedge
+{
+    uint32_t map = 0;
+    float x = 0, y = 0, z = 0;
+    float gx = 0, gy = 0;
+    std::string bot;
+    std::string cat;
+};
+
+bool ParseWedge(std::string const& line, Wedge& w)
+{
+    static std::regex const re(R"(\[wedge\] bot=(\S+) cat=(\S+) map=(\d+) zone=\d+ pos=\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\) dur=\d+s obj=(?:\S+ )*?(?:move_goal|quest_goal)@\((-?[\d.]+),(-?[\d.]+)\))");
+    std::smatch m;
+    if (!std::regex_search(line, m, re))
+        return false;
+    w.bot = m[1]; w.cat = m[2];
+    w.map = uint32_t(std::stoul(m[3]));
+    w.x = std::stof(m[4]); w.y = std::stof(m[5]); w.z = std::stof(m[6]);
+    w.gx = std::stof(m[7]); w.gy = std::stof(m[8]);
     return true;
 }
 
@@ -272,18 +299,213 @@ Verdict Check(dtNavMeshQuery* query, Pair const& p)
     }
     v.length = len;
     if (cliff) { v.status = "CLIFF"; return v; }
-    if (len > 3.0f * p.d + 300.0f) { v.status = "LONG"; return v; }
+    if (len > kMaxPathYards) { v.status = "LONG"; return v; }
     v.status = "OK";
     v.ok = true;
     return v;
 }
+// Path from where a bot got stuck to its goal on the real mesh. A partial path says where the walkable ground ends (the barrier).
+// The goal's height is unknown, so the polygon nearest the goal in x, y (within 300 y of the bot's height) is used.
+void CheckWedge(dtNavMeshQuery* query, Wedge const& w)
+{
+    dtQueryFilter filter;
+    filter.setIncludeFlags(NAV_GROUND | NAV_GROUND_STEEP | NAV_ROAD);
+    filter.setExcludeFlags(0);
+    float const ext_start[3] = { 6.0f, 20.0f, 6.0f }, ext_goal[3] = { 6.0f, 300.0f, 6.0f };
+    float a[3] = { w.y, w.z, w.x }, b[3] = { w.gy, w.z, w.gx };
+    dtPolyRef ra = 0, rb = 0;
+    float ca[3] = {}, cb[3] = {};
+    query->findNearestPoly(a, ext_start, &filter, &ra, ca);
+    query->findNearestPoly(b, ext_goal, &filter, &rb, cb);
+    char const* status = "OK";
+    float end_x = 0, end_y = 0, end_z = 0, gap = 0;
+    if (!ra) status = "START_OFF_MESH";
+    else if (!rb) status = "GOAL_OFF_MESH";
+    else
+    {
+        static dtPolyRef polys[kMaxPolys];
+        int n = 0;
+        dtStatus const s = query->findPath(ra, rb, ca, cb, &filter, polys, &n, kMaxPolys);
+        if (dtStatusFailed(s) || n == 0) status = "NOPATH";
+        else if ((s & DT_PARTIAL_RESULT) || polys[n - 1] != rb)
+        {
+            status = "PARTIAL";
+            float last[3] = {};
+            bool over = false;
+            if (dtStatusSucceed(query->closestPointOnPoly(polys[n - 1], cb, last, &over)))
+            {
+                end_x = last[2]; end_y = last[0]; end_z = last[1];
+                gap = std::hypot(end_x - w.gx, end_y - w.gy);
+            }
+        }
+    }
+    std::printf("  %-14s map %u %s [%s] (%.0f,%.0f,%.0f) -> (%.0f,%.0f) goal poly z %.0f", status, w.map, w.bot.c_str(), w.cat.c_str(), w.x, w.y, w.z, w.gx, w.gy, cb[1]);
+    if (std::strcmp(status, "PARTIAL") == 0)
+        std::printf("; walkable ground ends at (%.0f,%.0f,%.0f), %.0f y short of the goal", end_x, end_y, end_z, gap);
+    std::printf("\n");
+}
+// --road-census: how many polygons of each area a map's mmaps carry, and (with an output file) one line per road polygon (TC x y z of its
+// centre). Tells whether the mmaps hold road data at all before anything is built on it.
+int RoadCensus(std::string const& dir, uint32_t map_id, char const* out_path)
+{
+    dtNavMeshParams params{};
+    if (!LoadNavMeshParams(dir, map_id, params))
+        return 2;
+    dtNavMesh* mesh = dtAllocNavMesh();
+    if (!mesh || dtStatusFailed(mesh->init(&params)))
+        return 2;
+    std::vector<LoadedTile> loaded;
+    int const tiles = LoadAllTiles(mesh, dir, map_id, loaded);
+    std::map<int, size_t> by_area;
+    size_t road_tiles = 0;
+    std::ofstream out;
+    if (out_path)
+        out.open(out_path);
+    for (int i = 0; i < mesh->getMaxTiles(); ++i)
+    {
+        dtMeshTile const* t = static_cast<dtNavMesh const*>(mesh)->getTile(i);
+        if (!t || !t->header)
+            continue;
+        size_t roads = 0;
+        for (int k = 0; k < t->header->polyCount; ++k)
+        {
+            dtPoly const& poly = t->polys[k];
+            if (poly.getType() != DT_POLYTYPE_GROUND)
+                continue;
+            ++by_area[poly.getArea()];
+            if (poly.getArea() != NAV_AREA_ROAD)
+                continue;
+            ++roads;
+            if (out)
+            {
+                float c[3] = {};
+                for (int v = 0; v < poly.vertCount; ++v)
+                    for (int d = 0; d < 3; ++d)
+                        c[d] += t->verts[poly.verts[v] * 3 + d] / poly.vertCount;
+                out << c[2] << ' ' << c[0] << ' ' << c[1] << '\n';   // Detour (y, z, x) -> TC x y z
+            }
+        }
+        road_tiles += roads > 0;
+    }
+    std::printf("map %u: %d tile(s)\n", map_id, tiles);
+    for (auto& [area, n] : by_area)
+        std::printf("  area %d%s: %zu polygon(s)\n", area, area == NAV_AREA_ROAD ? " (ROAD)" : "", n);
+    std::printf("  tiles with road polygons: %zu\n", road_tiles);
+    dtFreeNavMesh(mesh);
+    return 0;
+}
+
+// --road-trace: the walk between two places on the real mesh, written as handcrafted_road rows (a centerline a bot can follow). Every
+// segment lies inside walkable polygons because it comes from the straight path; a long straight run is split so the road graph gets
+// nodes at least every 40 y, and each segment is raycast again and rejected (the whole trace fails) if it climbs a cliff face.
+int RoadTrace(std::string const& dir, uint32_t map_id, float ax, float ay, float bx, float by, char const* out_path)
+{
+    dtNavMeshParams params{};
+    if (!LoadNavMeshParams(dir, map_id, params))
+        return 2;
+    dtNavMesh* mesh = dtAllocNavMesh();
+    if (!mesh || dtStatusFailed(mesh->init(&params)))
+        return 2;
+    std::vector<LoadedTile> loaded;
+    LoadAllTiles(mesh, dir, map_id, loaded);
+    dtNavMeshQuery* query = dtAllocNavMeshQuery();
+    if (loaded.empty() || !query || dtStatusFailed(query->init(mesh, 65535)))
+        return 2;
+    dtQueryFilter filter;
+    filter.setIncludeFlags(NAV_GROUND | NAV_GROUND_STEEP | NAV_ROAD);
+    filter.setExcludeFlags(0);
+    float const ext[3] = { 6.0f, 500.0f, 6.0f };
+    float a[3] = { ay, 100.0f, ax }, b[3] = { by, 100.0f, bx };
+    dtPolyRef ra = 0, rb = 0;
+    float ca[3] = {}, cb[3] = {};
+    query->findNearestPoly(a, ext, &filter, &ra, ca);
+    query->findNearestPoly(b, ext, &filter, &rb, cb);
+    if (!ra || !rb)
+    {
+        std::printf("TRACE NO_POLY (start %s, goal %s)\n", ra ? "ok" : "off the mesh", rb ? "ok" : "off the mesh");
+        return 1;
+    }
+    static dtPolyRef polys[kMaxPolys];
+    int n = 0;
+    dtStatus s = query->findPath(ra, rb, ca, cb, &filter, polys, &n, kMaxPolys);
+    if (dtStatusFailed(s) || n == 0 || (s & DT_PARTIAL_RESULT) || polys[n - 1] != rb)
+    {
+        std::printf("TRACE %s\n", n == 0 || dtStatusFailed(s) ? "NOPATH" : "PARTIAL");
+        return 1;
+    }
+    static float pts[kMaxPolys * 3];
+    int np = 0;
+    s = query->findStraightPath(ca, cb, polys, n, pts, nullptr, nullptr, &np, kMaxPolys, 0);
+    if (dtStatusFailed(s) || np < 2)
+    {
+        std::printf("TRACE NOPATH\n");
+        return 1;
+    }
+    struct P { float x, y, z; };
+    std::vector<P> line;   // TC x y z
+    auto push = [&](float x, float y, float z) { line.push_back({ x, y, z }); };
+    for (int i = 0; i < np; ++i)
+    {
+        P cur{ pts[i * 3 + 2], pts[i * 3 + 0], pts[i * 3 + 1] };
+        if (i > 0)
+        {
+            P prev = line.back();
+            float const d = std::hypot(cur.x - prev.x, cur.y - prev.y);
+            int const parts = std::max(1, static_cast<int>(std::ceil(d / 40.0f)));
+            for (int k = 1; k < parts; ++k)
+            {
+                float const t = static_cast<float>(k) / parts;
+                push(prev.x + (cur.x - prev.x) * t, prev.y + (cur.y - prev.y) * t, prev.z + (cur.z - prev.z) * t);
+            }
+        }
+        push(cur.x, cur.y, cur.z);
+    }
+    // First and last node sit exactly on the asked places, so the new line joins the existing road nodes.
+    line.front().x = ax; line.front().y = ay;
+    line.back().x = bx;  line.back().y = by;
+    float length = 0.0f, worst_drop = 0.0f;
+    int cliffs = 0;
+    for (size_t i = 1; i < line.size(); ++i)
+    {
+        float const d = std::hypot(line[i].x - line[i - 1].x, line[i].y - line[i - 1].y);
+        float const dz = line[i].z - line[i - 1].z;
+        length += d;
+        worst_drop = std::max(worst_drop, std::fabs(dz));
+        if (std::fabs(dz) >= kCliffDropYards && d < std::fabs(dz) * 2.0f)
+            ++cliffs;
+    }
+    std::printf("TRACE %s: %zu node(s), %.0f y long, start z %.1f goal z %.1f, steepest segment dz %.1f, %d cliff segment(s)\n",
+        cliffs ? "CLIFF" : "OK", line.size(), length, line.front().z, line.back().z, worst_drop, cliffs);
+    if (cliffs)
+        return 1;
+    if (out_path)
+    {
+        std::ofstream out(out_path);
+        out << "INSERT INTO `handcrafted_road` (`mapId`, `fromX`, `fromY`, `toX`, `toY`, `width`, `comment`, `verified`) VALUES\n";
+        for (size_t i = 1; i < line.size(); ++i)
+        {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "(%u,%.2f,%.2f,%.2f,%.2f,8,'Elwynn-Westfall traced',0)%s\n", map_id, line[i - 1].x, line[i - 1].y,
+                line[i].x, line[i].y, i + 1 == line.size() ? ";" : ",");
+            out << buf;
+        }
+    }
+    dtFreeNavMesh(mesh);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
+    if (argc >= 8 && std::string(argv[1]) == "--road-trace")
+        return RoadTrace(argv[2], static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 10)), std::strtof(argv[4], nullptr), std::strtof(argv[5], nullptr),
+            std::strtof(argv[6], nullptr), std::strtof(argv[7], nullptr), argc > 8 ? argv[8] : nullptr);
+    if (argc >= 4 && std::string(argv[1]) == "--road-census")
+        return RoadCensus(argv[2], static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 10)), argc > 4 ? argv[4] : nullptr);
     if (argc < 3)
     {
-        std::fprintf(stderr, "Usage: %s <mmaps_dir> <Playerbot.log> [links_out.txt]\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s <mmaps_dir> <Playerbot.log> [links_out.txt]\n  reads [walk_gap_pair] lines (candidate links) and [wedge] lines (where bots stood stuck and the goal they walked to)\n", argv[0]);
         return 2;
     }
     std::string const dir = argv[1];
@@ -294,20 +516,34 @@ int main(int argc, char** argv)
         return 2;
     }
     std::map<uint32_t, std::vector<Pair>> by_map;
+    std::map<uint32_t, std::vector<Wedge>> wedges_by_map;
     std::string line;
-    size_t total = 0;
+    size_t total = 0, total_wedges = 0;
+    std::set<std::string> seen_wedges;   // one per bot and 50 y cell of the start and of the goal
     while (std::getline(in, line))
     {
         Pair p;
+        Wedge w;
         if (Parse(line, p))
         {
             by_map[p.map].push_back(p);
             ++total;
         }
+        else if (ParseWedge(line, w))
+        {
+            char key[160];
+            std::snprintf(key, sizeof(key), "%u/%d/%d/%d/%d", w.map, int(std::floor(w.x / 50)), int(std::floor(w.y / 50)), int(std::floor(w.gx / 50)), int(std::floor(w.gy / 50)));
+            if (seen_wedges.insert(key).second)
+            {
+                wedges_by_map[w.map].push_back(w);
+                by_map[w.map];   // the map is loaded even when it has no pair
+                ++total_wedges;
+            }
+        }
     }
-    if (!total)
+    if (!total && !total_wedges)
     {
-        std::fprintf(stderr, "ERROR: no [walk_gap_pair] lines in %s (start a worldserver build that writes them first)\n", argv[2]);
+        std::fprintf(stderr, "ERROR: no [walk_gap_pair] or [wedge] lines in %s (start a worldserver build that writes them first)\n", argv[2]);
         return 2;
     }
 
@@ -325,7 +561,7 @@ int main(int argc, char** argv)
         }
         std::vector<LoadedTile> loaded;
         int const tiles = LoadAllTiles(mesh, dir, map_id, loaded);
-        std::printf("map %u: %d tile(s), %zu candidate pair(s)\n", map_id, tiles, pairs.size());
+        std::printf("map %u: %d tile(s), %zu candidate pair(s), %zu wedge(s)\n", map_id, tiles, pairs.size(), wedges_by_map[map_id].size());
         dtNavMeshQuery* query = dtAllocNavMeshQuery();
         if (tiles == 0 || !query || dtStatusFailed(query->init(mesh, 65535)))
         {
@@ -344,6 +580,8 @@ int main(int argc, char** argv)
                 table.push_back(buf);
             }
         }
+        for (Wedge const& w : wedges_by_map[map_id])
+            CheckWedge(query, w);
         dtFreeNavMeshQuery(query);
         dtFreeNavMesh(mesh);
     }
