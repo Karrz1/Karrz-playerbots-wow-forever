@@ -344,7 +344,7 @@ TEST_CASE("Onyxia's Flame Breath cone is modelled wider than 45 degrees with a m
     CHECK(front);
 }
 
-// chris 2026-10-15: the tank holds Onyxia with her back to the raid in the two ground phases (one locked step, not a turn at every cone).
+// 2026-10-15: the tank holds Onyxia with her back to the raid in the two ground phases (one locked step, not a turn at every cone).
 TEST_CASE("Onyxia's tank faces her away from the raid in the ground phases", "[ClassicRaidRagnaros]")
 {
     RaidRules const* r = RulesForMap(249);
