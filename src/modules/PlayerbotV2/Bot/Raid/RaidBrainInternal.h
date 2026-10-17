@@ -33,7 +33,7 @@ struct Member
     bool mana = false;
 };
 
-struct Circle { float x, y, r; };
+struct Circle { float x, y, r; float pad = 0.0f; };   // pad: Escape leaves to r + pad + the probe ring (AvoidEnemy::pad)
 
 struct Plan
 {

@@ -17,7 +17,8 @@ namespace Playerbot::Raid {
         // on the healers it is the difference between a sustained kill and an out-of-mana wipe, so it is urgent (healers and tanks first,
         // even while the raid is in an emergency), like Gehennas' Curse.
         r.dispel.push_back({ 19703, DispelKind::Curse, true });      // Lucifron's Curse (mc/boss_lucifron.cpp:19)
-        r.dispel.push_back({ 19702, DispelKind::Magic, true });      // Impending Doom, 2000 shadow after 10s within 40 yd (mc/boss_lucifron.cpp:18); kind UNVERIFIED
+        r.dispel.push_back({ 19702, DispelKind::Magic, true, 0, kImpendingDoomDispelOrders }); // Impending Doom, 2000 shadow after 10s within 40 yd (mc/boss_lucifron.cpp:18); kind UNVERIFIED
+        r.noControl.push_back({ 12119 });                      // the Protectors are killed, not sheeped
         r.priority.push_back({ 12119, 4 });                    // Flamewaker Protector (MCRaidPolicy.h:100)
         r.controlledMember.push_back({ 20604 });               // Protector's Dominate Mind (vanilla_smartai, VMaNGOS spell list 121190)
 
@@ -45,10 +46,12 @@ namespace Playerbot::Raid {
         r.crowdControl.push_back({ 12099, CcKind::Banish, 0, 0, true }); // Firesworn is an elemental (type 4) (MoltenCoreDungeonActions.cpp:201)
         r.priority.push_back({ 12099, 0 });                    // see correction above
         // (removed) noAoe on Garr himself: nothing in the script justifies it.
-        // A Firesworn that dies explodes (Massive Eruption 19497, radius 15, mc/boss_garr.cpp:232-249): the tank beside it dies to it
-        // (MC Garr 2026-10-10: Kaido at 203 s) and casters standing 14-28 y out went with earlier wipes. Ranged and healers keep outside.
-        r.avoidEnemy.push_back({ 12099, 17.0f, Who::Ranged });
-        r.avoidEnemy.push_back({ 12099, 17.0f, Who::Healer });
+        // A Firesworn that dies explodes (Massive Eruption 19497, radius 15, mc/boss_garr.cpp:232-249) and hastens Garr. None dies before Garr:
+        // at 25 percent nobody attacks it, the tank that holds it included (n24 mc_garr 2026-10-14: the holding tanks killed five of eight
+        // before Garr fell). With no eruption in the fight there is no reason for ranged and healers to keep 17 y from every live add; the
+        // old Ranged / Healer rule made them run (MC Garr 2026-10-10: a healer died running), and the Movement table keeps the one rule
+        // for a dying add (healers, under 15 percent). Fight script: Bot/Raid/RaidFightScript.h.
+        r.spare.push_back({ 12099, kGarrFireswornSparePct, 12057 });
 
         // BARON GEDDON - boss 12056
         r.dispel.push_back({ 19659, DispelKind::Magic });      // Ignite Mana (mc/boss_baron_geddon.cpp:30); kind UNVERIFIED
@@ -58,13 +61,23 @@ namespace Playerbot::Raid {
         // (mc/boss_golemagg.cpp:275-284, 113): never a target.
         r.priority.push_back({ 11672, -1 });                   // Core Rager (mc/boss_golemagg.cpp:275-284)
         r.noAoe.push_back({ 11672 });                          // no AoE on the Ragers: they heal to full at 50% and only die with Golemagg (ike3)
+        // Earthquake (19798): below 10 percent he casts it every 3 s (mc/boss_golemagg.cpp:80), instant, 1500 physical to everything within 18 y
+        // (golemagg-spell-data 2026-10-16). Everyone but the tanks leaves his 22 y and the ranged finish him; the bot he is hitting is never moved.
+        r.avoidEnemy.push_back({ 11988, kGolemaggEarthquakeLeave, Who::NonTank, kGolemaggEarthquakePct });
+        // Magma Splash (13880): a melee hit on him procs it (25 percent), up to 50 stacks for 30 s, 50 fire a tick and -250 resistance per stack.
+        // A bot carrying 20 stacks stays 12 y off until it fades. No tank swap on it: the swap takes the nearest clean tank, which could be the
+        // off tank holding the Core Ragers at the far camp; that waits for a log of the fight.
+        r.avoidOnStacks.push_back({ 11988, 13880, kGolemaggSplashStacks, kGolemaggSplashBackoff, Who::NonTank });
 
         // SULFURON HARBINGER - boss 12098
         r.priority.push_back({ 11662, 5 });                    // Flamewaker Priest (MCRaidPolicy.h:99)
         // Inspire 19779: Sulfuron buffs himself and his priests (mc/classic_boss_sulfuron_harbinger.cpp:95-109), a magic buff the priests and shamans take off.
         r.purge.push_back({ 19779 });
+        // The list is in kick order (InterruptOrder): Dark Mending 19775, the heal, goes before everything else on the map. Sulfuron's
+        // Flamewaker Priests cast it (spell list 116620), and so do Majordomo's Flamewaker Healers since the world SQL
+        // 2026_10_16_00_world_classic_flamewaker_healer_dark_mending (every 5-10 s on an ally under 80%, 27750-32250 healed).
         r.interruptFirst.push_back(19775);
-        r.interruptFirst.push_back(20603);   // Flamewaker Healer: Shadow Shock (VMaNGOS creature_spells 116630; it has no heal)                     // Flamewaker Priest: Dark Mending, the heal on Sulfuron and his priests (spell list 116620)
+        r.interruptFirst.push_back(20603);   // Flamewaker Healer: Shadow Shock (VMaNGOS creature_spells 116630)
         r.dispel.push_back({ 19776, DispelKind::Magic });      // Flamewaker Priest: Shadow Word: Pain (vanilla_smartai, VMaNGOS spell list 116620)
         r.dispel.push_back({ 20294, DispelKind::Magic });      // Flamewaker Priest: Immolate (same list)
 
@@ -72,26 +85,40 @@ namespace Playerbot::Raid {
         // He surrenders when the adds are dead and cannot be killed (mc/boss_majordomo_executus.cpp:335,379): never a target.
         // Every 30s one of Magic Reflection / Damage Shield is cast on ALL living adds (:485-501): dispel them off before attacking.
         r.priority.push_back({ 12018, -1 });                   // Majordomo Executus (mc/boss_majordomo_executus.cpp:335)
-        // One plan (n71 wipe): one tank holds Majordomo, away from the raid, and the other tanks take the four Elites. Mages sheep up to
-        // three Healers; the raid kills Healers first, then Elites (the owner's marks first). Casters stop on Magic Reflection, melee on
-        // Damage Shield. He surrenders when all eight adds are dead.
+        // The retail plan (2026-10-17): one tank holds Majordomo, away from the raid, and the tanks take the Elites (they cannot be sheeped).
+        // Mages sheep three Healers; the raid kills the fourth, then one sheep is broken at a time and that Healer is killed (CrowdControl
+        // maxActive 3, oneAtATime), then the Elites. Casters stop on Magic Reflection, melee on Damage Shield. He surrenders when all eight
+        // adds are dead.
         // The adds' casts go first for the kickers: Shadow Bolt (Healer) and Fireball (Elite) were interrupted four times in 95 s (n38).
         r.interruptFirst.push_back(21077);
         r.interruptFirst.push_back(20420);
         // Flamewaker Elite: Blast Wave 20229 hits everyone within about 10 yards for 1100-1300 (n38: seven raiders dead in 3 s, hunters,
         // rogues, a healer and a warrior beside the tanks holding the Elites). Casters, hunters and healers keep 13 yards from them.
-        r.avoidEnemy.push_back({ 11664, 13.0f, Who::Ranged });
-        r.avoidEnemy.push_back({ 11664, 13.0f, Who::Healer });
+        r.avoidEnemy.push_back({ 11664, 13.0f, Who::Ranged, 100.0f, 0.0f, 3.0f });
+        r.avoidEnemy.push_back({ 11664, 13.0f, Who::Healer, 100.0f, 0.0f, 3.0f });
+        // Flamewaker Healer: Shadow Shock 20603 is instant (never seen as a cast to kick), 800 base, radius 20 around the Healer: about 1,100-1,250
+        // on everyone within 20 yards. With five tanks holding all nine mobs (mc_majordomo local-next-90) the first Healer died at 28 s, then
+        // eight raiders died in two seconds to Shocks, all 7-14 y from the casting Healer. Casters and healers stay 21 yards from every Healer;
+        // melee must stand at the Healers to kill them and are healed through it.
+        r.avoidEnemy.push_back({ 11663, 21.0f, Who::Ranged, 100.0f, 0.0f, 5.0f });
+        r.avoidEnemy.push_back({ 11663, 21.0f, Who::Healer, 100.0f, 0.0f, 5.0f });
         r.tankOrder.push_back(12018);
         r.tankOrder.push_back(11664);
         r.tankOrder.push_back(11663);
+        // The Healers are the mages' (sheep), not the tanks': a tank that grabs one at the pull keeps it, the crowd-control election skips every mob a
+        // tank holds, and the sheep never land (mc_majordomo nl96, 1023: one Polymorph in 116 s, two tanks on Healers at 9 s while Elites ran loose).
+        // The tanks take a Healer only when no Majordomo or Elite is left free: a released sheep, or the fourth Healer once the rest are held.
+        r.tankLast.push_back(11663);
         // The brain already refuses to hit an add under either shield (Raid::kMagicReflection / kDamageShield) but nothing took
         // them off, so the raid stood idle for up to 30 s per cast. Priests and shamans purge them (Election::Assign purge).
         r.purge.push_back({ 20619 });                          // Magic Reflection (classic_boss_majordomo_executus.cpp:50)
         r.purge.push_back({ 21075 });                          // Damage Shield (classic_boss_majordomo_executus.cpp:51)
         r.priority.push_back({ 11664, 4 });                    // Flamewaker Elite (MCRaidPolicy.h:100)
         r.priority.push_back({ 11663, 5 });                    // Flamewaker Healer (MCRaidPolicy.h:99)
-        // No raid-chosen sheep here: the owner marks the Healers and gives each to a mage; skull moves onto them in turn (n71).
+        // Three Healers are sheeped (humanoid); skip the ones that carry the crowd-control Immunity he puts on the rest after four adds have died
+        // (classic_boss_majordomo_executus.cpp). The fight script kills the unheld Healer first, then each released one, then the Elites.
+        r.crowdControl.push_back({ 11663, CcKind::Polymorph, 21087, 3, true });   // Flamewaker Healer
+        r.noControl.push_back({ 11664 });                      // Flamewaker Elite: the wiki lists the Healers only as sheepable
 
         // RAGNAROS - boss 11502
         // Submerged phase: it ends early when every Son of Flame is banished (mc/boss_ragnaros.cpp:347-363).

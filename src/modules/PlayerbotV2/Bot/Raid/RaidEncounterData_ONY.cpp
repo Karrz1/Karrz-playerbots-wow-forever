@@ -141,9 +141,13 @@ namespace Playerbot::Raid {
         // The two cave alcoves (-30.1,-254.5 and -30.8,-177.1, ony/boss_onyxia.cpp whelp spawn points) are out of bounds: static whelps lie in
         // them, and raiders sent there (the off-tanks stood 6 y inside each mouth, the casters' AoE share behind them) and raiders pushed there by
         // a flank, spacing or dodge move pulled out dozens of whelps, 38 loose at 3 min (n58 live 2026-10-15). No move target may end within
-        // 22 y of either centre; the whelps the script sends out come to the raid, which fights them where it stands.
-        r.keepOut.push_back({ 10184, -30.1f, -254.5f, 22.0f });
-        r.keepOut.push_back({ 10184, -30.8f, -177.1f, 22.0f });
+        // kOnyCaveKeepOutRadius of either centre; the whelps the script sends out come to the raid, which fights them where it stands.
+        // The circle is the whelps' own pull range, not a wide berth: the core's aggro radius is 15 y less the creature's combat reach plus the
+        // level difference (Creature::GetAggroRange), about 10-13 y for a level 56-59 whelp against a level 60 raider. The 22 y it had put both
+        // flank wedges inside the circles whenever she stands at her spawn spot (x -34.6: the wedge's slots are 7-19 y from the cave centres), the
+        // brain pushed every casters' move out to the rim in front of her and 945 cone steps followed (live 2026-10-16, kill at 405 s).
+        r.keepOut.push_back({ 10184, -30.1f, -254.5f, kOnyCaveKeepOutRadius });
+        r.keepOut.push_back({ 10184, -30.8f, -177.1f, kOnyCaveKeepOutRadius });
 
         // Phase 2 range. In n50 run 1 she went 56% -> 54% in 36 s with 20 DPS "hitting": the ranged stood 54-78 y from her (dps_idle_reason
         // "target out of range" with the flying Onyxia, moving=1 for whole minutes) and the casters on the whelp share ran 36-71 y after

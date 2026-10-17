@@ -16,6 +16,7 @@
 #include "RaidIncoming.h"
 #include "RaidManaLedger.h"
 #include "RaidRoster.h"
+#include "ShieldRules.h"
 #include "../../Fleet/BotPopulationManager.h"
 #include "../../Fleet/OwnerRegistry.h"
 #include "../BotRegistry.h"
@@ -112,9 +113,7 @@ Ranks const kHammerOfJustice = { 853, 5588, 5589, 10308 };  // Paladin stun
 Ranks const kGouge         = { 1776, 1777, 8629, 11285, 11286 }; // Rogue incapacitate
 Ranks const kBash          = { 5211, 6798, 8983 };          // Druid (bear) stun
 
-// Majordomo Executus' adds: Magic Reflection / Damage Shield (mc/boss_majordomo_executus.cpp). Hitting them hurts.
-constexpr uint32_t kMagicReflection = 20619;
-constexpr uint32_t kDamageShield    = 21075;
+// Majordomo Executus' adds' shields (Magic Reflection / Damage Shield) and who stays off them: ShieldRules.h.
 
 std::vector<Ranks const*> DispelSpellsFor(DispelKind kind)
 {
@@ -514,6 +513,47 @@ void ApplyKeepOut(Plan const& plan, Member const& self, std::vector<Circle> cons
     }
 }
 
+AvoidFrontal const* FrontRule(RaidRules const& rules, Plan const& plan, Member const& self, Unit const* enemy);
+
+// No raid move walks through the front arc of an enemy with a cone rule (Onyxia's Flame Breath, 120 degrees): a bot back from a fear stands
+// anywhere, and the straight walk to a slot, a post or a target may run through the breath (all eight deaths of the 405 s kill, 2026-10-16,
+// came 3-27 s after a roar). A move whose straight line crosses the widened arc is dropped, and the bot waits on its flank; the ways out of
+// the arc itself (leave cone, leave hazard) and a bot that already stands inside it are not touched. At most one log line a bot every 10 s.
+std::unordered_map<uint64_t, uint32_t> g_lastArcGuardLog;
+
+void ApplyFrontArcGuard(Plan const& plan, Member const& self, uint32_t now, RaidOrder& out)
+{
+    if (!out.move || !out.move_reason || plan.rules->avoidFrontal.empty())
+        return;
+    if (std::strcmp(out.move_reason, "leave hazard") == 0 || std::strcmp(out.move_reason, "leave cone") == 0 ||
+        std::strcmp(out.move_reason, "wipe retreat") == 0)
+        return;
+    float const bx = self.p->GetPositionX(), by = self.p->GetPositionY();
+    for (Unit* enemy : plan.enemies)
+    {
+        if (!enemy->IsAlive() || enemy->IsFlying())
+            continue;
+        AvoidFrontal const* front = FrontRule(*plan.rules, plan, self, enemy);
+        if (!front)
+            continue;
+        float const ex = enemy->GetPositionX(), ey = enemy->GetPositionY(), facing = enemy->GetOrientation();
+        float const half = ConeEdgeDeg(*front) * (float(M_PI) / 180.0f);
+        if (geo::InFrontSector(ex, ey, facing, bx, by, half, front->radius))
+            continue;
+        if (!geo::PathCrossesFrontSector(ex, ey, facing, half, front->radius, bx, by, out.move_x, out.move_y))
+            continue;
+        uint32_t& at = g_lastArcGuardLog[self.p->GetGUID().GetCounter()];
+        if (now - at > 10000)
+        {
+            at = now;
+            TC_LOG_INFO("playerbot.v2.raid", "[raid_arc] {}: move ({}) would cross {}'s front arc, dropped", self.p->GetName(), out.move_reason,
+                enemy->GetName());
+        }
+        out.move = false;
+        return;
+    }
+}
+
 bool SetMove(RaidOrder& out, float x, float y, float z, char const* reason)
 {
     out.move = true;
@@ -611,9 +651,10 @@ bool Escape(Player* bot, std::vector<Circle> const& circles, RaidOrder& out, std
     for (int pass = 0; pass < 2; ++pass)
     {
     pathChecks = 0;
-    for (float extra : { 2.0f, 5.0f, 9.0f, 14.0f, 20.0f })
+    for (float ring : { 2.0f, 5.0f, 9.0f, 14.0f, 20.0f })
         for (int k = 0; k < 24; ++k)
         {
+            float const extra = ring + c.pad;
             float const offset = k == 0 ? 0.0f : float((k + 1) / 2) * (float(M_PI) / 12.0f) * ((k % 2) ? 1.0f : -1.0f);
             float const px = c.x + (c.r + extra) * std::cos(base + offset);
             float const py = c.y + (c.r + extra) * std::sin(base + offset);
@@ -1006,7 +1047,13 @@ std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t no
                 // only drags it through the raid and into the next pack (MC 2026-10-06, loose Molten Giants chased their
                 // casters across the room). The bot stays for a tank's taunt instead.
                 if (enemy->GetEntry() == rule.enemy && enemy->GetVictim() != bot && InPhase(enemy, rule.hpMax, rule.hpMin))
-                    circles.push_back({ enemy->GetPositionX(), enemy->GetPositionY(), rule.radius });
+                    circles.push_back({ enemy->GetPositionX(), enemy->GetPositionY(), rule.radius, rule.pad });
+    for (AvoidOnStacks const& rule : rules.avoidOnStacks)
+        if (Matches(rule.who, self, plan.mainTank))
+            if (Aura const* carried = bot->GetAura(rule.aura); carried && carried->GetStackAmount() >= rule.stacks)
+                for (Unit* enemy : plan.enemies)
+                    if (enemy->GetEntry() == rule.enemy && enemy->GetVictim() != bot && circles.size() < 64)
+                        circles.push_back({ enemy->GetPositionX(), enemy->GetPositionY(), rule.radius });
     if (!rules.avoidBreath.empty())
     {
         std::vector<uint32_t> breathAdded; // one corridor per enemy, however many breath spells are listed for it
@@ -1268,6 +1315,16 @@ bool InAnyLiveCone(RaidRules const& rules, Plan const& plan, Member const& self,
             return true;
     }
     return false;
+}
+
+// The front-cone rule of <enemy> that applies to a bot like <self> in the enemy's current phase (the cone with no facing offset), or null.
+AvoidFrontal const* FrontRule(RaidRules const& rules, Plan const& plan, Member const& self, Unit const* enemy)
+{
+    for (AvoidFrontal const& rule : rules.avoidFrontal)
+        if (rule.enemy == enemy->GetEntry() && rule.facingOffsetDeg == 0.0f && Matches(rule.who, self, plan.mainTank) &&
+            InPhase(enemy, rule.hpMax, rule.hpMin))
+            return &rule;
+    return nullptr;
 }
 
 // A bot standing in lava or slime leaves it for the nearest dry navmesh point. The Ragnaros fight (live 2026-10-12) had bots standing in
@@ -1783,17 +1840,36 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             uint32_t const row = index % rows, col = index / rows;
             float const angle = centre - half + (float(col) + 0.5f) / float(cols) * 2.0f * half;
             float const dist = rule.minDist + (float(row) + 0.5f) / float(rows) * depth;
-            float const px = ex + dist * std::cos(eo + side * angle), py = ey + dist * std::sin(eo + side * angle);
+            float const slotAngle = eo + side * angle;
+            // A slot is only a slot where nothing would move the bot out again: no hazard circle, no whelp-cave circle (a move that ends in one is
+            // pushed out to its rim, which at her spawn spot put the casters in front of her, live 2026-10-16) and no cone as she faces right now
+            // (the cone step would walk the bot straight out: 180 flank and 140 cone steps in 70 s). The same bearing at another distance inside
+            // the band is tried before the bot gives up and stays where it is.
+            auto const validAt = [&](float d, float& vx, float& vy)
+            {
+                vx = ex + d * std::cos(slotAngle);
+                vy = ey + d * std::sin(slotAngle);
+                return !(!circles.empty() && InsideAny(circles, vx, vy, 1.0f)) && !InsideAny(g_keepOut, vx, vy, 0.0f) &&
+                    !InAnyLiveCone(rules, plan, self, enemy, vx, vy);
+            };
+            float px = 0.0f, py = 0.0f;
+            bool found = validAt(dist, px, py);
+            for (int k = 1; !found && k <= 4; ++k)
+                for (float sign : { -1.0f, 1.0f })
+                {
+                    float const d = dist + sign * 2.0f * float(k);
+                    if (d >= rule.minDist && d <= rule.maxDist && validAt(d, px, py))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+            if (!found)
+                break;
             if (Dist2D(bot->GetPositionX(), bot->GetPositionY(), px, py) <= 3.0f)
                 break;
             uint32_t& at = g_lastRearStep[bot->GetGUID().GetCounter()];
             if (now - at < 4000)
-                break;
-            if (!circles.empty() && InsideAny(circles, px, py, 1.0f))
-                break;
-            // No slot inside a cone as she faces right now: the cone step (2b) would walk the bot straight out again, the two rules passing it
-            // back and forth (180 flank and 140 cone steps in 70 s, live 2026-10-16). It waits where it is until she turns back.
-            if (InAnyLiveCone(rules, plan, self, enemy, px, py))
                 break;
             float pz = 0.0f;
             if (!Usable(bot, px, py, enemy->GetPositionZ(), pz))
@@ -2090,7 +2166,7 @@ void ElectRetaunt(Election& e)
                     o->cast_spell = id;
                     o->cast_target = enemy->GetGUID();
                     e.busy.insert(m.p->GetGUID().GetCounter());
-                    Services::PveCoordinator().ReassignTankTarget(plan.groupLow, plan.mapId, m.p->GetGUID().GetCounter(), enemy->GetGUID());
+                    Services::PveCoordinator().RetakeTankTarget(plan.groupLow, plan.mapId, m.p->GetGUID().GetCounter(), enemy->GetGUID());
                     e.dump << "  " << m.p->GetName() << ": re-taunts " << enemy->GetName() << " off " << holder->GetName() << "\n";
                     static std::unordered_map<uint64_t, uint32_t> lastLog;
                     uint32_t const now = GameTime::GetGameTimeMS();
@@ -2296,7 +2372,7 @@ void ElectDispels(Election& e)
         uint32_t given = 0;
         for (Member* m : carriers)
         {
-            if (!rule.urgent && given >= kNonUrgentDispelOrdersPerPlan)
+            if (!DispelOrderAllowed(rule.urgent, rule.maxOrders, given))
                 break;
             bool const ok = e.Assign(m->p, families, false, RaidOrder::CastKind::Dispel, "dispel", !rule.urgent,
                                      rule.urgent ? 0 : kNonUrgentDispelHealerManaPct);
@@ -2347,10 +2423,23 @@ void ElectDispels(Election& e)
     }
 }
 
-void ElectPurges(Election& e)
+void ElectPurges(Election& e, ObjectGuid killFocus)
 {
     Plan& plan = e.plan;
-    for (Unit* enemy : plan.enemies)
+    // The kill focus first, then the enemies a tank holds, then the rest: Majordomo shields all eight adds at once and the purgers take a few
+    // passes, so the add the raid is burning and the ones the tanks need their abilities on lose theirs first.
+    auto const rank = [&](Unit* enemy)
+    {
+        if (!killFocus.IsEmpty() && enemy->GetGUID() == killFocus)
+            return 0;
+        Unit* held = enemy->GetVictim();
+        Player* holder = held ? held->ToPlayer() : nullptr;
+        Member* hm = holder ? FindMember(plan, holder) : nullptr;
+        return hm && hm->tank ? 1 : 2;
+    };
+    std::vector<Unit*> order(plan.enemies.begin(), plan.enemies.end());
+    std::stable_sort(order.begin(), order.end(), [&](Unit* a, Unit* b) { return rank(a) < rank(b); });
+    for (Unit* enemy : order)
         for (PurgeEnemy const& rule : plan.rules->purge)
             if (enemy->HasAura(rule.aura))
                 e.Assign(enemy, { &kPurge, &kDispelMagic }, true, RaidOrder::CastKind::Purge, "purge", true);
@@ -2462,9 +2551,11 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
     RaidRules const& rules = *plan.rules;
     std::vector<ObjectGuid> forbiddenAll;      // nobody attacks these
     std::vector<ObjectGuid> forbiddenDps;      // non-tanks do not attack these
+    std::vector<ObjectGuid> forbiddenCasters;  // Magic Reflection: the spell casters do not attack these (ShieldRules.h)
+    std::vector<ObjectGuid> forbiddenMelee;    // Damage Shield: the melee DPS do not attack these
     // Packs that die together: downed members are left alone by everybody, members trailing the healthiest one by more than
     // the rule's spread are left alone by DPS, and only the healthiest one can become the DPS fallback or the group focus.
-    std::vector<Unit*> packHolders;            // per pack rule with a member up: the healthiest member
+    std::vector<std::pair<Unit*, KillTogether const*>> packHolders;   // per pack rule with a member up: the healthiest member
     for (KillTogether const& rule : rules.killTogether)
     {
         // Molten Core's hounds only feign and rise when Instance.MoltenCoreHoundsLinked is on (default off: they die one by one).
@@ -2473,7 +2564,7 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
         std::vector<Unit*> up;
         for (Unit* enemy : plan.enemies)
         {
-            if (enemy->GetEntry() != rule.enemy)
+            if (!InPack(rule, enemy->GetEntry()))
                 continue;
             if (enemy->GetHealth() <= 1 || (rule.downAura && enemy->HasAura(rule.downAura)))
                 forbiddenAll.push_back(enemy->GetGUID());
@@ -2487,15 +2578,26 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
         for (Unit* enemy : up)
             if (enemy->GetHealthPct() < healthiest->GetHealthPct() - rule.spreadPct)
                 forbiddenDps.push_back(enemy->GetGUID());
-        packHolders.push_back(healthiest);
+        packHolders.emplace_back(healthiest, &rule);
         // The group kill focus too: the coordinator's generic pick (lowest health first) would chase a downed or trailing one.
         if (plan.ruleFocus.IsEmpty())
             plan.ruleFocus = healthiest->GetGUID();
     }
+    // Spare rules: an add near death is left alone by everybody while its boss lives.
+    for (Spare const& rule : rules.spare)
+    {
+        bool gateAlive = false;
+        for (Unit* enemy : plan.enemies)
+            if (enemy->GetEntry() == rule.gateEnemy && enemy->IsAlive())
+                gateAlive = true;
+        for (Unit* enemy : plan.enemies)
+            if (enemy->GetEntry() == rule.enemy && SpareNow(rule, enemy->GetHealthPct(), gateAlive))
+                forbiddenAll.push_back(enemy->GetGUID());
+    }
     auto const trailsHolder = [&packHolders](Unit* enemy)
     {
-        for (Unit* holder : packHolders)
-            if (holder->GetEntry() == enemy->GetEntry() && holder != enemy)
+        for (auto const& [holder, rule] : packHolders)
+            if (holder != enemy && InPack(*rule, enemy->GetEntry()))
                 return true;
         return false;
     };
@@ -2509,14 +2611,20 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
             continue;   // a downed or trailing pack member
         if (trailsHolder(enemy))
             continue;   // within the spread but not the healthiest: no focus on it
-        bool const reflecting = enemy->HasAura(kMagicReflection) || enemy->HasAura(kDamageShield);
         // The owner's skull on a sheeped mob is the call to kill it (Majordomo: he rotates the skull onto each sheeped Healer).
         bool const skulled_hold = Controlled(enemy) && !coordFocus.IsEmpty() && enemy->GetGUID() == coordFocus;
-        if ((Controlled(enemy) && !skulled_hold) || reflecting)
+        if (Controlled(enemy) && !skulled_hold)
         {
             forbiddenAll.push_back(enemy->GetGUID());
             continue;
         }
+        // Majordomo's shields, 10 s on all eight adds every 30 s: Magic Reflection takes the casters off the add, Damage Shield the melee DPS.
+        // The other half keeps attacking, the tanks keep their swings, hunters are hit by neither (until 2026-10-16 either shield stopped
+        // everybody, a third of the fight idle for the whole raid: acmc, n040 and n124 Majordomo 2026-10-15, 3200-4500 raid damage a second).
+        if (enemy->HasAura(Shields::kMagicReflection))
+            forbiddenCasters.push_back(enemy->GetGUID());
+        if (enemy->HasAura(Shields::kDamageShield))
+            forbiddenMelee.push_back(enemy->GetGUID());
         if (PriorityFor(rules, enemy->GetEntry()) < 0)
         {
             forbiddenDps.push_back(enemy->GetGUID());
@@ -2546,12 +2654,24 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
         }
         return 1;
     };
+    // The shield that keeps this member off an enemy, by role (ShieldRules.h): a melee DPS off a Damage Shield, a caster off Magic Reflection.
+    auto const shieldForbids = [&](Member const& m, Unit* enemy)
+    {
+        bool const melee = Matches(Who::Melee, m, plan.mainTank);
+        bool const caster = Matches(Who::Caster, m, plan.mainTank);
+        if (!melee && !caster)
+            return false;
+        auto const in = [&](std::vector<ObjectGuid> const& v) { return std::find(v.begin(), v.end(), enemy->GetGUID()) != v.end(); };
+        return (melee && in(forbiddenMelee)) || (caster && in(forbiddenCasters));
+    };
     auto const bestFor = [&](Member const& m) -> Unit*
     {
         Unit* best = nullptr;
         int bestPriority = 0;
         for (Unit* enemy : candidates)
         {
+            if (shieldForbids(m, enemy))
+                continue;
             int const priority = priorityFor(m, enemy);
             if (priority < 0)
                 continue;
@@ -2574,6 +2694,10 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
         o.forbidden_targets.insert(o.forbidden_targets.end(), forbiddenAll.begin(), forbiddenAll.end());
         if (!m.tank)
             o.forbidden_targets.insert(o.forbidden_targets.end(), forbiddenDps.begin(), forbiddenDps.end());
+        if (Matches(Who::Melee, m, plan.mainTank))
+            o.forbidden_targets.insert(o.forbidden_targets.end(), forbiddenMelee.begin(), forbiddenMelee.end());
+        if (Matches(Who::Caster, m, plan.mainTank))
+            o.forbidden_targets.insert(o.forbidden_targets.end(), forbiddenCasters.begin(), forbiddenCasters.end());
         if (!m.tank)
             for (OnlyAttackers const& rule : rules.onlyAttackers)
                 if (!Matches(rule.who, m, plan.mainTank))
@@ -2588,7 +2712,7 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
             Unit* pick = nullptr;
             if (!focus.IsEmpty())
                 for (Unit* enemy : candidates)
-                    if (enemy->GetGUID() == focus)
+                    if (enemy->GetGUID() == focus && !shieldForbids(m, enemy))
                         pick = enemy;
             if (!pick)
                 pick = bestFor(m);
@@ -2621,6 +2745,9 @@ struct OverHold { uint32_t first = 0, last = 0; };
 std::unordered_map<uint64_t, OverHold> g_overHold;
 std::unordered_map<uint64_t, OverHold> g_holdFight;   // bot -> when its opening wait of this fight began (one wait per fight, not per enemy)
 constexpr uint32_t kOverHoldMaxMs = 3000, kOverHoldGapMs = 4000, kFightGapMs = 8000;
+// Past the hard limit the hold waits for the tank's threat to rise; a stunned, feared, dead or out-of-reach tank never raises it, so that
+// wait is bounded by the tank standing still for kStalledTankHoldMs (Bot/ThreatLimits.h), the same clock as the generic hold.
+std::unordered_map<uint64_t, StalledTankClock> g_stalledHold;
 
 void PublishThreatHolds(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, uint32_t now)
 {
@@ -2715,8 +2842,11 @@ void PublishThreatHolds(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& ord
                 if (!oh.first || now - oh.last > kOverHoldGapMs)
                     oh.first = now;
                 oh.last = now;
-                if (myThreat < tankThreat * hard && now - oh.first >= kOverHoldMaxMs)
+                bool const pastHard = myThreat >= tankThreat * hard;
+                if (!pastHard && now - oh.first >= kOverHoldMaxMs)
                     hold = false;
+                else if (pastHard && StalledTankHoldExpired(g_stalledHold[key], now, tankThreat, kOverHoldGapMs))
+                    hold = false;   // the tank has not built threat for kStalledTankHoldMs: nothing to wait for
             }
         }
         if (hold)
@@ -2729,6 +2859,9 @@ void PublishThreatHolds(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& ord
         if (map->size() > 1024)
             for (auto it = map->begin(); it != map->end();)
                 it = (now - it->second.last > 120000) ? map->erase(it) : std::next(it);
+    if (g_stalledHold.size() > 1024)
+        for (auto it = g_stalledHold.begin(); it != g_stalledHold.end();)
+            it = (now - it->second.last_ms > 120000) ? g_stalledHold.erase(it) : std::next(it);
 }
 
 // Which spell schools to prefer / avoid on each engaged enemy, from its live immunities, damage-taken auras and spell
@@ -2890,8 +3023,8 @@ constexpr BossNeed kBossNeeds[] = {
     { 12264, "purge (Deaden Magic)", kPurgers, 1 },
     { 12098, "interrupt (Dark Mending)", kKickers, 3 },
     { 12098, "purge (Inspire)", kPurgers, 1 },
-    { 12018, "polymorph (Flamewaker Healers)", kPolymorphers, 2 },
     { 12018, "purge (Magic Reflection / Damage Shield)", kPurgers, 2 },
+    { 12018, "polymorph (Flamewaker Healers)", kPolymorphers, 3 },
     { 12018, "interrupt (Flamewaker Healers)", kKickers, 3 },
     { 11502, "banish (Sons of Flame)", kBanishers, 2 },
     // Onyxia's Lair
@@ -3726,6 +3859,7 @@ void Brain::Update(uint32_t now_ms)
                 if (!m.p->HasUnitState(UNIT_STATE_ROOT | UNIT_STATE_STUNNED | UNIT_STATE_CONFUSED | UNIT_STATE_FLEEING))
                     DecideMove(plan, m, now_ms, circles, o);
                 ApplyKeepOut(plan, m, circles, o);
+                ApplyFrontArcGuard(plan, m, now_ms, o);
                 if (o.move)
                     dump << "  " << m.p->GetName() << ": move (" << o.move_reason << ")\n";
                 for (NoAoe const& rule : plan.rules->noAoe)
@@ -3773,7 +3907,7 @@ void Brain::Update(uint32_t now_ms)
         ElectRetaunt(e);
         ElectBerserkerDance(e);
         ElectDispels(e);
-        ElectPurges(e);
+        ElectPurges(e, CoordinatorFocus(plan.groupLow, plan.mapId));
         ElectCrowdControl(e, tankTargets, CoordinatorFocus(plan.groupLow, plan.mapId));
         PublishTargets(plan, next, CoordinatorFocus(plan.groupLow, plan.mapId));
         if (std::vector<EnemySchools> hints = SchoolHints(plan, dump); !hints.empty())

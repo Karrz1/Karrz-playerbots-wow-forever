@@ -62,6 +62,35 @@ std::optional<std::string> ClassifyGroupOrder(std::string_view msg, bool owner_w
     return order;
 }
 
+std::optional<std::string> AddressedGroupOrder(std::string_view msg, std::function<bool(std::string_view)> const& is_group_bot)
+{
+    if (msg.empty() || msg.front() == ';')
+        return std::nullopt;
+    auto const begin = msg.find_first_not_of(" \t");
+    if (begin == std::string_view::npos)
+        return std::nullopt;
+    msg.remove_prefix(begin);
+    auto const sep = msg.find_first_of(" \t");
+    if (sep == std::string_view::npos)
+        return std::nullopt;
+    std::string_view name = msg.substr(0, sep);
+    while (!name.empty() && (name.back() == ',' || name.back() == ':'))
+        name.remove_suffix(1);
+    std::string_view rest = msg.substr(sep + 1);
+    auto const rest_begin = rest.find_first_not_of(" \t");
+    if (name.empty() || rest_begin == std::string_view::npos)
+        return std::nullopt;
+    rest.remove_prefix(rest_begin);
+    rest = rest.substr(0, rest.find_last_not_of(" \t") + 1);
+    std::string lower(name);
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if (lower == "all" || lower == "everyone" || lower == "everybody")
+        return "squad:" + std::string(rest);
+    if (!is_group_bot(name))
+        return std::nullopt;
+    return std::string(name) + ":" + std::string(rest);
+}
+
 std::optional<std::string> ClassifyAddonOrder(std::string_view prefix, std::string_view text, bool owner_words)
 {
     if (prefix != kAddonOrderPrefix)

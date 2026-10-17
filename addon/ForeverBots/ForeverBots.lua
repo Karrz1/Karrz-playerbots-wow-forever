@@ -478,6 +478,17 @@ for _, k in ipairs(KEY_ORDERS) do
 end
 RefreshOrderMacros()
 
+-- Lazy lock (warlock): one key, the server picks the next spell (dots, curse, Shadow Bolt, cooldowns) and casts it on your target.
+-- The client will not let an add-on choose spells in a fight, so the key clicks a secure button that runs the server command
+-- ".playerbot lazy" as the player's own line, in combat too. Press it again for every cast.
+do
+    local b = CreateFrame("Button", "ForeverBotsKeyLazy", UIParent, "SecureActionButtonTemplate")
+    b:RegisterForClicks("AnyUp", "AnyDown")
+    b:SetAttribute("type", "macro")
+    b:SetAttribute("macrotext", ".playerbot lazy")
+    _G["BINDING_NAME_CLICK ForeverBotsKeyLazy:LeftButton"] = "Lazy lock (warlock: next spell on your target)"
+end
+
 local function ClassColor(token)
     local c = RAID_CLASS_COLORS and RAID_CLASS_COLORS[token]
     if c then

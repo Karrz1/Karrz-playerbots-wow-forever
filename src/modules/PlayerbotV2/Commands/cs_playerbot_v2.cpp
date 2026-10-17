@@ -75,6 +75,7 @@
 #include "Bot/BotSnapshot.h"
 #include "Bot/BotSnapshotView.h"
 #include "Session/AddonControl.h"
+#include "Session/LazyLock.h"
 #include "World/WorldMetadata.h"
 #include "ObjectMgr.h"
 #include "SpellInfo.h"
@@ -603,25 +604,28 @@ public:
             // caps total simultaneously-owned alts per account.
             { "summon",        HandleSummon,        rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "self",          HandleSelf,          rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "lazy",          HandleLazy,          rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
         };
         // One-step companions for the player at the keyboard: `.bot add warrior tank` creates the bot, binds it to the
         // caller's character, levels it to them, teaches its spells, sets role/talents/gear, brings it over and groups it.
+        // Every player: the commands for the caller's own bots (each one only ever touches bots owned by the caller's account).
+        // GM only: world, bgstress, bgsoak and itemstats, which look at other players or the whole server.
         static ChatCommandTable botTable =
         {
-            { "about",         HandleBotAbout,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "about",         HandleBotAbout,      rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::Yes },
             { "addon",         HandleBotAddonHello, rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No },
-            { "add",           HandleBotAdd,        rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "call",          HandleBotCall,       rbac::RBAC_PERM_COMMAND_GM, Console::No  },
+            { "add",           HandleBotAdd,        rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "call",          HandleBotCall,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             // Every player: brings the caller's own bots only (`.bot summon all|saved|<bot name>`).
             { "summon",        HandleBotSummon,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No },
-            { "dismiss",       HandleBotDismiss,    rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "regear",        HandleBotRegear,     rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "gear",          HandleBotGear,       rbac::RBAC_PERM_COMMAND_GM, Console::No  },
+            { "dismiss",       HandleBotDismiss,    rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "regear",        HandleBotRegear,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "gear",          HandleBotGear,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "itemstats",     HandleBotItemStats,  rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "save",          HandleBotSave,       rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "unsave",        HandleBotUnsave,     rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "delete",        HandleBotDelete,     rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "list",          HandleBotList,       rbac::RBAC_PERM_COMMAND_GM, Console::No  },
+            { "save",          HandleBotSave,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "unsave",        HandleBotUnsave,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "delete",        HandleBotDelete,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "list",          HandleBotList,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "world",         HandleBotWorld,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "bgstress",      HandleBotBgStress,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "bgsoak",        HandleBotBgSoak,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -870,12 +874,26 @@ public:
         std::vector<Playerbot::BotId> ids;
         if (roster && groupOnly)
         {
+            // The companions in the group (one logged out is logged in again: a raid member that is offline is a missing one) and the
+            // companions already online that are not in it yet: they are put in the group and brought, as `.bot call` does. Saved
+            // companions that are offline and not grouped stay where they are (the 2-person-party case above).
             Group const* grp = me->GetGroup();
+            uint32 grouped = 0, offlineGrouped = 0, outside = 0;
             for (Playerbot::BotId id : CompanionsMatching(sess, "all"))
-                if (grp && grp->IsMember(ObjectGuid::Create<HighGuid::Player>(id)) && ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id)))
-                    ids.push_back(id);
+            {
+                ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(id);
+                bool const online = ObjectAccessor::FindConnectedPlayer(guid) != nullptr;
+                bool const inGroup = grp && grp->IsMember(guid);
+                if (!inGroup && !online)
+                    continue;
+                ids.push_back(id);
+                if (inGroup) { ++grouped; offlineGrouped += online ? 0u : 1u; }
+                else ++outside;
+            }
+            TC_LOG_INFO("playerbot.v2", "[summon] {} .bot summon all on map {}: {} companions in the group ({} logged out), {} online outside the group",
+                        me->GetName(), me->GetMapId(), grouped, offlineGrouped, outside);
             if (ids.empty())
-            { handler->SendSysMessage("None of your bots are in your group. `.bot summon <name>` brings one, `.bot call all` brings back your saved raid."); return Refuse(handler); }
+            { handler->SendSysMessage("None of your bots are in your group or online. `.bot summon <name>` brings one, `.bot call all` brings back your saved raid."); return Refuse(handler); }
         }
         else
             ids = roster ? SavedCompanions(sess) : CompanionsMatching(sess, who);
@@ -958,7 +976,7 @@ public:
         while (!who.empty() && (who.front() == ' ' || who.front() == '\t')) who.erase(who.begin());
         bool const init = Playerbot::Services::Initialized();
         // `saved` = the saved roster (`.bot save`) plus the grouped bots, logged in if need be: the addon's "Call saved" button.
-        // `.bot call all` is the same but needs GM rights, which normal players do not have.
+        // `.bot call all` is the same.
         if (init && ToLowerAscii(who) == "saved")
         {
             CallCompanions(handler, "all", /*groupOnly*/ false);
@@ -4270,6 +4288,22 @@ public:
     //
     // Status sub-form prints whether bot logic is currently attached to self
     // without changing anything, useful for verifying the toggle.
+    // `.playerbot lazy`: one press casts the next spell of the warlock rotation on the target (the add-on's "Lazy lock" key runs this
+    // line as a secure macro, so it works in combat).
+    static bool HandleLazy(ChatHandler* handler, std::string const& /*arg*/)
+    {
+        WorldSession* sess = handler->GetSession();
+        if (!sess || !sess->GetPlayer())
+        {
+            handler->SendSysMessage("`.playerbot lazy` is in-game only (needs your character).");
+            return false;
+        }
+        std::string const msg = Playerbot::LazyLockPress(sess->GetPlayer());
+        if (!msg.empty())
+            handler->SendSysMessage(msg.c_str());
+        return true;
+    }
+
     static bool HandleSelf(ChatHandler* handler, std::string const& arg)
     {
         if (!Playerbot::Services::Initialized())

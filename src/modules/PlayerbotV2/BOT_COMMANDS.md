@@ -38,7 +38,10 @@ Rules worth knowing:
 
 - Only words on the group allow-list are picked up from party/raid chat. Ordinary chatter is ignored. Words that
   are not on the list (for example `inv`, `repair_all`) work by whisper only.
-- A `;` in front of a party line (`;tank: attack`) sends it through the full whisper parser, including address
+- A line that starts with the name of a bot in your group, or with `all`, is that bot's order (every bot's for `all`)
+  with no prefix needed: `Lentha use altar`, `Baxter, follow`, `all use altar`. Anything that is not an order after the
+  name is ignored, so talking about a bot in chat does nothing.
+- A `;` in front of a party line (`;tank: attack`) still sends it through the full whisper parser, including address
   prefixes.
 - **Address prefixes** (whisper or `;`): `all:`, `squad:`, `here:`, `tank:`, `healer:`, `dps:`, `<class>:` (for
   example `mage:`), `<spec>:`, `<BotName>:` before the order. ike3-style selectors also work with
@@ -50,7 +53,7 @@ Rules worth knowing:
 
 ## 2. Getting bots: add, call, save, dismiss
 
-`.bot` commands need a GM account (level 3 on the realm). The addon buttons run the same commands.
+The `.bot` commands for your own bots work for every account, no GM needed; each one only touches bots owned by your account. `.bot world`, `.bot bgstress`, `.bot bgsoak` and `.bot itemstats` need GM (level 3). The addon buttons run the same commands.
 
 | Command | What it does |
 |---|---|
@@ -211,7 +214,7 @@ A group chat order reaches every bot of yours; to address only some, whisper the
 
 ## 8. Instance rules
 
-- **Open world**: you have at most `Playerbot.Behavior.OpenWorldGroupCap` (default 5) of your own companions out at
+- **Open world**: you have at most `Playerbot.Behavior.OpenWorldGroupCap` (default 40: no limit beyond the raid; 5 = a normal party) of your own companions out at
   once (`.bot add`, `.bot call`, saved roster, buttons). For more, find world bots and invite them: invited world
   bots are not counted. Companions above the cap (called inside an instance) are dismissed 10 s after you walk out;
   the ones grouped with you stay. Needs `InstanceGroupCap = 1`.
@@ -298,8 +301,8 @@ Defaults are those of `conf/playerbot.conf.dist`. Behaviour switches are read wh
 
 | Key | Default |
 |---|---|
-| `Playerbot.Behavior.InstanceGroupCap` | 0 (off; 1 limits the companions to what the map holds) |
-| `Playerbot.Behavior.OpenWorldGroupCap` | 5 |
+| `Playerbot.Behavior.InstanceGroupCap` | 1 (on; 0 lifts the limit of companions to what the map holds) |
+| `Playerbot.Behavior.OpenWorldGroupCap` | 40 (no limit beyond the raid; 5 = a normal party) |
 | `Playerbot.Pve.Coordinator.Enable` | 1 |
 | `Playerbot.Raid.Enable` | 1 |
 | `Playerbot.Raid.BossWarnings` | 1 |

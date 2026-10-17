@@ -530,8 +530,8 @@ private:
     bool   bhv_bot_whisperable_      = true;
     bool   chatter_conversation_     = true;
     bool   bhv_world_bot_say_reply_  = true;
-    bool   bhv_instance_group_cap_   = false;
-    uint32 bhv_open_world_group_cap_ = 5;
+    bool   bhv_instance_group_cap_   = true;
+    uint32 bhv_open_world_group_cap_ = 40;
     bool   bhv_bg_human_priority_    = true;
     bool   bhv_tank_markers_         = true;
     bool   bhv_mark_cc_              = true;

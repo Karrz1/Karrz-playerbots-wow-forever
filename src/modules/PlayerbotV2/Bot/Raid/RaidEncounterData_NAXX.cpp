@@ -12,11 +12,13 @@ namespace Playerbot::Raid {
         r.name = "Naxxramas";
 
         // Kick-first casts (VMaNGOS creature_spells): Mad Scientist Mana Burn 28301, Living Monstrosity Chain Lightning 28293,
-        // Acolyte / Necropolis Acolyte Shadow Bolt Volley 28448, Unholy Staff Polymorph 29848.
+        // Acolyte / Necropolis Acolyte Shadow Bolt Volley 28448, Unholy Staff Polymorph 29848, Kel'Thuzad's Frostbolt 28478
+        // (classic_boss_kelthuzad.cpp:84).
         r.interruptFirst.push_back(28301);
         r.interruptFirst.push_back(28293);
         r.interruptFirst.push_back(28448);
         r.interruptFirst.push_back(29848);
+        r.interruptFirst.push_back(28478);
 
         // Encounter order (progression advice): Arachnid, Plague, Military, Construct quarter, then Sapphiron and Kel'Thuzad.
         r.bosses = { 15956, 15953, 15952,          // Anub'Rekhan, Faerlina, Maexxna
@@ -37,20 +39,26 @@ namespace Playerbot::Raid {
         r.dispel.push_back({ 28796, DispelKind::Poison });
         r.avoidGroundEffect.push_back({ 15953, 28794, 3.0f, Who::Anyone });
         r.priority.push_back({ 16505, 3 });     // Naxxramas Follower (classic_boss_faerlina.cpp:53): silence, charge
+        // The Follower's Silence 30225 reaches 10 yd around it (SAI 16505, vanilla data radius index 13): healers keep 13.
+        r.avoidEnemy.push_back({ 16505, 13.0f, Who::Healer });
         // Worshippers are the enrage counter: after each Enrage 28798 a priest mind-controls one and sacrifices it with Widow's
         // Embrace 28732 on her (RaidMechanics_Naxx.cpp). They have no bot logic; never a DPS target.
         r.priority.push_back({ 16506, -1 });
 
         // ---------------------------------------------------------------------------------------------------------------
         // MAEXXNA (15952): Web Wrap cocoons (16486) hold players until killed; Necrotic Poison 28776 on the tank (-90% healing,
-        // "Dispelllable" per the script comment); spiderlings 17055 (naxx/classic_boss_maexxna.cpp).
+        // "Dispelllable" per the script comment: a tank that cannot be healed is dispelled before anything else); Poison Shock 28741
+        // hits everything in front of her within 30 yd (vanilla data, radius index 10); spiderlings 17055 (naxx/classic_boss_maexxna.cpp).
         r.priority.push_back({ 16486, 7 });     // Web Wrap: free the wrapped player
         r.priority.push_back({ 17055, 4 });     // Maexxna Spiderling
-        r.dispel.push_back({ 28776, DispelKind::Poison });
+        r.dispel.push_back({ 28776, DispelKind::Poison, true });
+        r.avoidFrontal.push_back({ 15952, 30.0f, 60.0f, Who::NonTank });
 
         // ---------------------------------------------------------------------------------------------------------------
-        // NOTH THE PLAGUEBRINGER (15954): Curse of the Plaguebringer 29213; balcony phase adds (naxx/classic_boss_noth.cpp).
-        r.dispel.push_back({ 29213, DispelKind::Curse });
+        // NOTH THE PLAGUEBRINGER (15954): Curse of the Plaguebringer 29213 turns into Wrath of the Plaguebringer (4,000 shadow to
+        // everybody near the carrier) when it runs out, so it is dispelled before anything else; balcony phase adds
+        // (naxx/classic_boss_noth.cpp).
+        r.dispel.push_back({ 29213, DispelKind::Curse, true });
         r.priority.push_back({ 16983, 3 });     // Plagued Champion
         r.priority.push_back({ 16981, 3 });     // Plagued Guardian
         r.priority.push_back({ 16984, 2 });     // Plagued Warrior
@@ -75,7 +83,9 @@ namespace Playerbot::Raid {
         r.priority.push_back({ 16803, -1 });
 
         // ---------------------------------------------------------------------------------------------------------------
-        // GOTHIK THE HARVESTER (16060): waves on both sides (naxx/classic_naxxramas.h:114-120). Riders hit hardest.
+        // GOTHIK THE HARVESTER (16060): waves on both sides (naxx/classic_naxxramas.h:114-120). Riders hit hardest. He teleports
+        // between the sides once he comes down: a tank taunts him back each time.
+        r.retaunt.push_back(16060);
         r.priority.push_back({ 16126, 4 });     // Unrelenting Rider
         r.priority.push_back({ 16125, 3 });     // Unrelenting Deathknight
         r.priority.push_back({ 16124, 2 });     // Unrelenting Trainee
@@ -136,8 +146,8 @@ namespace Playerbot::Raid {
 
         // ---------------------------------------------------------------------------------------------------------------
         // SAPPHIRON (15989): Life Drain 28542, Blizzard creatures 16474 that drift around (naxx/classic_boss_sapphiron.cpp),
-        // Cleave / Tail Sweep front and back.
-        r.dispel.push_back({ 28542, DispelKind::Curse });
+        // Cleave / Tail Sweep front and back. Life Drain heals him for what it takes, so it goes before any other dispel.
+        r.dispel.push_back({ 28542, DispelKind::Curse, true });
         r.avoidCreature.push_back({ 16474, 8.0f, Who::Anyone });
         r.avoidFrontal.push_back({ 15989, 25.0f, 50.0f, Who::NonTank });
         r.avoidFrontal.push_back({ 15989, 20.0f, 45.0f, Who::NonTank, 180.0f });   // Tail Sweep 15847 behind him
@@ -157,8 +167,13 @@ namespace Playerbot::Raid {
         r.priority.push_back({ 16429, 4 });     // Soul Weaver
         r.priority.push_back({ 16427, 3 });     // Soldier of the Frozen Wastes
         r.priority.push_back({ 16428, 2 });     // Unstoppable Abomination
+        // Soul Weaver: Wail of Souls 28459, damage and a knockback in front of it within 30 yd (vanilla data, radius index 10).
+        r.avoidFrontal.push_back({ 16429, 30.0f, 60.0f, Who::NonTank });
         // Shackle at most 3 Guardians: a 4th frees them all (classic_boss_kelthuzad.cpp:1027-1100).
         r.crowdControl.push_back({ 16441, CcKind::Shackle, 0, 3 });
+        // A Guardian that is tanked stacks Blood Tap 28470 on its tank (+damage, +size per stack, classic_boss_kelthuzad.cpp:104):
+        // another tank takes it at 4.
+        r.tankSwap.push_back({ 16441, 28470, 4 });
         // Chains of Kel'Thuzad 28410 mind-controls a raider (:690-704): sheep or stun, never kill.
         r.controlledMember.push_back({ 28410 });
 
@@ -233,7 +248,7 @@ namespace Playerbot::Raid {
         //  * Thaddius: Forever's port gives every player Negative Charge (classic_boss_thaddius.cpp:851-858), so the charge
         //    sides above all resolve to one side; harmless. Magnetic Pull tank swap of Stalagg/Feugen relies on pvecoord.
         //  * Noth's balcony phase (immune 29230, adds) and blink: the generic tank pickup handles both.
-        //  * Kel'Thuzad: Frost Blast 27808 (heal through), Frostbolt 28478 interrupt (pvecoord's kicks if it owns it).
+        //  * Kel'Thuzad: Frost Blast 27808 (heal through).
         //  * Loatheb Inevitable Doom 29204 (heal through); Anub'Rekhan Impale (random line, nothing to dodge in time).
         //  * Trash: Plague Slime 16243 changes school immunity with its colour (needs the casters' rotations to pick a school);
         //    Plague Beast 16034 Mutated Spores (radius not in the spell data); Gargoyle Stoneskin needs an interrupt (pvecoord).

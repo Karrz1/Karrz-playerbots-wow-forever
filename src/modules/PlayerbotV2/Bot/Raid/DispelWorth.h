@@ -14,6 +14,15 @@ constexpr int kNonUrgentDispelHealerManaPct = 40;
 // A non-urgent dispel rule hands out at most this many orders per plan: an aura on forty members is not forty casts in a tick.
 constexpr unsigned kNonUrgentDispelOrdersPerPlan = 2;
 
+// How many orders a rule may hand out per plan. maxOrders (RaidEncounters.h Dispel) caps a rule that has its own limit, urgent or not;
+// 0 = the rule has none, so an urgent rule is uncapped and a non-urgent one gets kNonUrgentDispelOrdersPerPlan.
+inline bool DispelOrderAllowed(bool urgent, unsigned maxOrders, unsigned given)
+{
+    if (maxOrders > 0)
+        return given < maxOrders;
+    return urgent || given < kNonUrgentDispelOrdersPerPlan;
+}
+
 // A rule with hurtBelowPct > 0 (RaidEncounters.h Dispel) is only cast once the carrier is at or under that health: the debuff then
 // really costs the raid something. 0 = always (curses and other debuffs that do harm at full health). Urgent rules always.
 inline bool DispelWorthIt(bool urgent, int hurtBelowPct, int carrierHpPct)

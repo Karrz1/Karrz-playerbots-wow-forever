@@ -51,6 +51,23 @@ TEST_CASE("GroupOrder: owner words need the config switch", "[grouporder]")
     CHECK(ClassifyGroupOrder("drop quest Foo", true) == "drop quest foo");
     CHECK_FALSE(ClassifyGroupOrder("drop quest Foo", false));
 }
+TEST_CASE("GroupOrder: a line addressed to a group bot by name is its order without the ';'", "[grouporder]")
+{
+    auto const is_bot = [](std::string_view name) { return name == "Lentha" || name == "baxter" || name == "Baxter"; };
+    CHECK(AddressedGroupOrder("Lentha use altar", is_bot) == "Lentha:use altar");
+    CHECK(AddressedGroupOrder("  Lentha   use altar  ", is_bot) == "Lentha:use altar");
+    CHECK(AddressedGroupOrder("Baxter, follow", is_bot) == "Baxter:follow");
+    CHECK(AddressedGroupOrder("Baxter: stay", is_bot) == "Baxter:stay");
+    CHECK(AddressedGroupOrder("all use altar", is_bot) == "squad:use altar");
+    CHECK(AddressedGroupOrder("Everyone follow", is_bot) == "squad:follow");
+    // Not a group bot, no order after the name, chatter, or the ';' form (which has its own path).
+    CHECK_FALSE(AddressedGroupOrder("Karrz use altar", is_bot));
+    CHECK_FALSE(AddressedGroupOrder("Lentha", is_bot));
+    CHECK_FALSE(AddressedGroupOrder("Lentha   ", is_bot));
+    CHECK_FALSE(AddressedGroupOrder("nice pull Lentha", is_bot));
+    CHECK_FALSE(AddressedGroupOrder(";Lentha:use altar", is_bot));
+    CHECK_FALSE(AddressedGroupOrder("", is_bot));
+}
 TEST_CASE("GroupOrder: addon messages count only under the ForeverBots prefix", "[grouporder]")
 {
     CHECK(kAddonOrderPrefix.size() <= 16);

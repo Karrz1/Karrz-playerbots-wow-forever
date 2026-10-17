@@ -6,10 +6,12 @@
 #include <unordered_map>
 #include "PlayerbotAPI.h"
 #include "ClassicBotSkills.h"
+#include "Travel/ReachMemory.h"
 #include "ClassicSpec.h"
 #include "ClassicTalentBuilds.h"
 #include "ClassicSupplies.h"
 #include "Bot/ClassicUpkeep.h"
+#include "Bot/Raid/ShieldRules.h"
 #include "BotItemScorer.h"
 #include "Player.h"
 #include "Corpse.h"
@@ -180,6 +182,23 @@ namespace {
         auto& ring = g_path_fail[p->GetGUID().GetCounter()];
         ring.entries[ring.head] = {dest_key, now_ms, ttl_ms};
         ring.head = (ring.head + 1) % kPathFailCap;
+    }
+
+    // The shared memory of walks that cannot be done (Travel/ReachMemory.h): only for an ungrouped bot walking the open world, where a
+    // failed path is geometry; a group, a battleground or an instance has its own holding logic and its own off-mesh bridges.
+    bool ReachMemoryApplies(Player const* p)
+    {
+        return p && !p->GetGroup() && !p->InBattleground() && p->GetMap() && !p->GetMap()->IsDungeon();
+    }
+    void NoteReachFail(Player const* p, float x, float y, uint32 now_ms)
+    {
+        if (ReachMemoryApplies(p))
+            ::Playerbot::V2::Travel::ReachMemory::Instance().NoteFail(p->GetMapId(), p->GetPositionX(), p->GetPositionY(), x, y, now_ms);
+    }
+    void NoteReachOk(Player const* p, float x, float y)
+    {
+        if (ReachMemoryApplies(p))
+            ::Playerbot::V2::Travel::ReachMemory::Instance().NoteOk(p->GetMapId(), p->GetPositionX(), p->GetPositionY(), x, y);
     }
 
     inline uint64 PathDestKey(uint32 map_id, float x, float y)
@@ -499,6 +518,11 @@ static bool FaceUnitForCast(Player* p, Unit* tu)
     return p->HasInArc(static_cast<float>(M_PI), tu);
 }
 
+uint32 API::highest_known_rank(uint32 spell_id) const
+{
+    return p_ && spell_id ? HighestKnownRank(p_, spell_id) : spell_id;
+}
+
 uint32 API::cast_ready_in_ms(uint32 spell_id, bool exact_rank) const
 {
     if (!p_ || !spell_id || !p_->GetMap())
@@ -680,9 +704,14 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
     // Mob versions (Reflective Shield variants) trigger the same
     // SPELL_AURA_REFLECT_SPELLS aura type, so the type check below
     // catches everything without needing an ID allowlist.
+    // Only a spell the aura can send back is refused (Spell::m_canReflect): an ability such as Sunder Armor, Revenge or Taunt is never
+    // reflected, and refusing it cost the tanks their threat on Majordomo's Magic Reflection adds (ShieldRules.h).
     if (tu != p_ && p_->IsValidAttackTarget(tu, info) &&
         !info->IsPositive() &&
-        tu->HasAuraType(SPELL_AURA_REFLECT_SPELLS))
+        tu->HasAuraType(SPELL_AURA_REFLECT_SPELLS) &&
+        Playerbot::Raid::Shields::ReflectRefuses(info->DmgClass == SPELL_DAMAGE_CLASS_MAGIC, info->HasAttribute(SPELL_ATTR0_IS_ABILITY),
+            info->HasAttribute(SPELL_ATTR7_ALLOW_SPELL_REFLECTION), info->HasAttribute(SPELL_ATTR1_NO_REFLECTION),
+            info->HasAttribute(SPELL_ATTR0_NO_IMMUNITIES), info->IsPassive()))
     {
         TC_LOG_DEBUG("playerbot.api",
             "[API::cast_spell] spell {} target {} rejected: target has Spell Reflect aura",
@@ -1381,6 +1410,13 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             }
             return Result::Locked;
         }
+        // The same walk failed for other bots from this part of the map: no Detour call for it (Travel/ReachMemory.h).
+        if (ReachMemoryApplies(p_) &&
+            ::Playerbot::V2::Travel::ReachMemory::Instance().KnownUnreachable(p_->GetMapId(), p_->GetPositionX(), p_->GetPositionY(), x, y, move_now_ms))
+        {
+            NotePathFail(p_, dest_key, move_now_ms, kPathFailTtlLongMs);   // this bot's own rules stop asking for it too
+            return Result::Locked;
+        }
     }
 
     // Per-world-tick pathfinding budget. Once this tick's bot-pathfinding window
@@ -1687,6 +1723,8 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         BotMovement::NoteNoPath(p_);
         NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS(),
                      kPathFailTtlLongMs);
+        NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
+        NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
         return Result::Locked;
     }
     // Retry at the polygon found, for a destination that lies just off the mesh. A chunk step is aimed at a point on the bot's own level a
@@ -1741,6 +1779,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         // the bot stops oscillating toward it and goal-selection moves on.
         NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS(),
                      kPathFailTtlLongMs);
+        NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
         return Result::Locked;
     }
     if (pt & PATHFIND_FARFROMPOLY_START)
@@ -2060,6 +2099,8 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                 (cur_to_dst > 100.0f) ? kPathFailTtlMs : kPathFailTtlLongMs;
             NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
                          GameTime::GetGameTimeMS(), nonadv_ttl);
+            if (nonadv_ttl == kPathFailTtlLongMs)
+                NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
             return Result::Locked;
         }
         // Advancing partial â drive to the REACHABLE endpoint Detour found, NOT
@@ -2104,6 +2145,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                 // seconds had the rule ask for the same goal again every ten.
                 NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
                              GameTime::GetGameTimeMS(), kPathFailTtlLongMs);
+                NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
                 return Result::Locked;
             }
             if (pts.size() >= 2)
@@ -2187,7 +2229,10 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         }
     }
     else
+    {
         Playerbot::V2::Module::instance().OnPathOutcome(0 /*Ok*/);
+        NoteReachOk(p_, x, y);
+    }
 
     // Liquid safety gate. Classifies the destination POINT (not the tile/chunk
     // â a chunk is routinely half-water / half-dry) through the shared
@@ -3836,8 +3881,13 @@ Result API::enter_area_trigger(uint32 area_trigger_id)
     WorldSession* sess = p_->GetSession();
     if (!sess) return Result::Other;
     AreaTriggerTeleport const* dest = sObjectMgr->GetAreaTrigger(area_trigger_id);
-    if (dest && dest->Loc.GetMapId() != p_->GetMapId())
-        V2::Fleet::PrepareInstanceEntry(p_, dest->Loc.GetMapId());
+    last_instance_full_map_ = 0;
+    if (dest && dest->Loc.GetMapId() != p_->GetMapId() &&
+        V2::Fleet::PrepareInstanceEntry(p_, dest->Loc.GetMapId()) == TRANSFER_ABORT_MAX_PLAYERS)
+    {
+        last_instance_full_map_ = dest->Loc.GetMapId();
+        return Result::ServerRefused;
+    }
     WorldPackets::AreaTrigger::AreaTrigger packet{ WorldPacket(CMSG_AREA_TRIGGER) };
     packet.AreaTriggerID = int32(area_trigger_id);
     packet.Entered = true;
@@ -3910,8 +3960,15 @@ Result API::teleport_to(uint32 map_id, float x, float y, float z, float orientat
     if (p_->IsNonMeleeSpellCast(false, false, true)) return Result::Locked;
     // Into an instance (the owner's raid): the door checks run first so a refusal is logged with its reason, and a lock on
     // another instance is dropped for a companion that follows its owner in.
-    if (map_id != p_->GetMapId() && V2::Fleet::PrepareInstanceEntry(p_, map_id) != TRANSFER_ABORT_NONE)
-        return Result::ServerRefused;
+    last_instance_full_map_ = 0;
+    if (map_id != p_->GetMapId())
+    {
+        TransferAbortReason const denied = V2::Fleet::PrepareInstanceEntry(p_, map_id);
+        if (denied == TRANSFER_ABORT_MAX_PLAYERS)
+            last_instance_full_map_ = map_id;
+        if (denied != TRANSFER_ABORT_NONE)
+            return Result::ServerRefused;
+    }
     // SafeTeleport probes the destination map (if loaded) for ground
     // height and snaps to ground+2 when the requested Z is >50y above
     // the queried floor (typical "stale POI / hand-curated coord" bug

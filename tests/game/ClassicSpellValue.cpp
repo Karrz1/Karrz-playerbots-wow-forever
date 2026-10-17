@@ -217,3 +217,28 @@ TEST_CASE("A creature with a vanilla melee row hits for the row per swing whatev
     CHECK(CreatureClassicHit(100.0f, 140.0f, 1.0f, 2000.0f, 0.0f, 1.0f, 0.0f, 1.0f) == Catch::Approx(120.0f));
     CHECK(CreatureClassicHit(100.0f, 140.0f, 1.0f, 1000.0f, 0.0f, 1.0f, 0.0f, 1.0f) == Catch::Approx(110.0f));
 }
+
+TEST_CASE("A vanilla table coefficient is already level adjusted and is not penalised again", "[ClassicSpellValue]")
+{
+    // Fireball rank 1 (133, spell level 1): VMaNGOS effectBonusCoefficient 0.123 = the client's 0.429 x 0.2875. Penalising the
+    // table value a second time gave 0.035.
+    Value const fireball1 = { SchoolDamage, 0, 13, 9, 0.6f, 0, 0.0f, 0.123f };
+    CHECK(BonusCoefficientWithLevelPenalty(&fireball1, 0.429f, 1) == Catch::Approx(0.123f));
+    // a row without a coefficient leaves the client's value, which takes the penalty once
+    Value const noCoefficient = { SchoolDamage, 0, 13, 9, 0.6f };
+    CHECK(BonusCoefficientWithLevelPenalty(&noCoefficient, 0.429f, 1) == Catch::Approx(0.429f * 0.2875f));
+    CHECK(BonusCoefficientWithLevelPenalty(nullptr, 0.429f, 1) == Catch::Approx(0.429f * 0.2875f));
+}
+
+TEST_CASE("The level penalty only touches spells learned below level 20", "[ClassicSpellValue]")
+{
+    CHECK(LevelPenalty(1) == Catch::Approx(0.2875f));
+    CHECK(LevelPenalty(10) == Catch::Approx(0.625f));
+    CHECK(LevelPenalty(19) == Catch::Approx(0.9625f));
+    CHECK(LevelPenalty(20) == 1.0f);
+    CHECK(LevelPenalty(60) == 1.0f);
+    // creature spells and spells without a level are not penalised
+    CHECK(LevelPenalty(0) == 1.0f);
+    // Flash of Light rank 1 (19750, level 20) keeps the client's 0.429 whole
+    CHECK(BonusCoefficientWithLevelPenalty(nullptr, 0.429f, 20) == Catch::Approx(0.429f));
+}

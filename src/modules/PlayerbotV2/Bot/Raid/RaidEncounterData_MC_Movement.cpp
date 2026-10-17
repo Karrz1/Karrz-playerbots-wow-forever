@@ -33,12 +33,23 @@ namespace Playerbot::Raid {
         // margin (RaidRangedApproachTank), so the circle and the stand slots are the same number. Heal range to the tank is 40 y.
         r.avoidEnemy.push_back({ 12056, 24.0f, Who::Ranged });
         r.avoidEnemy.push_back({ 12056, 24.0f, Who::Healer });
+        // Armageddon (20479, 8000 fire, radius 20 y) fires when his health crosses 2 percent (mc/boss_baron_geddon.cpp:70). The last of his health goes
+        // in seconds, so the melee are gone before it: below kGeddonMeleeLeavePct they stand outside the same 24 y as the casters and let the ranged
+        // finish him (MC Geddon n44 2026-10-15: a rogue, a warrior, a retribution paladin and the main tank, all 5 y from him and still on
+        // auto_attack, died to it at once). The tank stays: he follows it.
+        r.avoidEnemy.push_back({ 12056, 24.0f, Who::Melee, kGeddonMeleeLeavePct });
+        // Armageddon is an 8 s aura on Geddon (20478: periodic trigger of 20479, pacify, root; geddon-spell-data 2026-10-16): he cannot move while it runs,
+        // so everyone, the tank too, leaves the same circle as for Inferno until it ends. The tick period is not in the spell audit; whether the first
+        // tick lands before a bot is clear is what the next mc_geddon run shows.
+        r.avoidEnemyAura.push_back({ 12056, 20478, 24.0f, Who::Anyone });
         // Threat resets and teleports that leave the boss on a non-tank: Lucifron, Magmadar (Panic), Gehennas, Shazzrah (Gate), Ragnaros (Wrath
         // 20566 runs ResetThreatList, boss_ragnaros.cpp:198). A tank taunts the boss back at once; with no one in melee reach he casts Magma Blast
         // (6000 fire, range unlimited) on whoever holds threat: three casters died to it in the last fight. Geddon, Garr, Golemagg and Sulfuron are
         // on the list too: a boss that walks onto a mage takes the whole raid with it (mc_geddon 09a8ff07: Geddon on a mage 6 s in, loose in the
-        // casters' block when Inferno came, 8 dead).
-        for (uint32_t boss : { 12118u, 11982u, 12259u, 12264u, 11502u, 12056u, 12057u, 11988u, 12098u })
+        // casters' block when Inferno came, 8 dead). Majordomo: his Teleport resets his threat list every 20-30 s
+        // (classic_boss_majordomo_executus.cpp:553-571); nobody hits him (Priority -1), so after each one he stood on a healer (acmc 2026-10-15: on
+        // Lydie, then Zigor, for 30 s; he killed 10 raiders over three fights, all healers and casters).
+        for (uint32_t boss : { 12118u, 11982u, 12259u, 12264u, 11502u, 12056u, 12057u, 11988u, 12098u, 12018u })
             r.retaunt.push_back(boss);
         // Ragnaros: Elemental Fire (20564, 2400 fire a tick for 8 s) is reapplied by every swing on the current victim. The tank who carries it
         // hands over to a clean one (taunt 10 s), so each tank takes one application per turn; the holder with it stops attacking while a clean

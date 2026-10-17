@@ -247,7 +247,8 @@ TEST_CASE("Onyxia's cave alcoves are out of bounds and no post stands in them", 
         if (k.enemy == 10184)
         {
             ++caves;
-            CHECK(k.radius >= 20.0f);
+            CHECK(k.radius == kOnyCaveKeepOutRadius);
+            CHECK(k.radius <= 13.0f);   // the whelps' pull range (15 y less combat reach, plus the level difference), no wider
             CHECK(std::fabs(k.x + 30.5f) < 1.0f);
             CHECK((std::fabs(k.y + 254.5f) < 1.0f || std::fabs(k.y + 177.1f) < 1.0f));
         }
@@ -256,6 +257,37 @@ TEST_CASE("Onyxia's cave alcoves are out of bounds and no post stands in them", 
         if (s.enemy == 10184)
             for (KeepOut const& k : r->keepOut)
                 CHECK(std::hypot(s.x - k.x, s.y - k.y) >= k.radius);
+}
+
+// Live 2026-10-16 (kill, 405 s): she stood at her spawn spot (-34.6,-212.6) and the wedge's side slots lay inside the 22 y cave circles, so the casters
+// had no slot. At both of her spots every role must have a valid distance inside its band on every column of both wedges (the brain tries the band
+// in 2 y steps from the slot's own distance, RaidBrain 3d), outside both cave circles.
+TEST_CASE("Onyxia's flank wedges have a valid slot outside the cave circles at both of her spots", "[ClassicRaidRagnaros]")
+{
+    RaidRules const* r = RulesForMap(249);
+    REQUIRE(r != nullptr);
+    struct Spot { float x, y; };
+    for (Spot const& boss : { Spot{ -34.6f, -212.6f }, Spot{ -8.86f, -212.75f } })
+        for (StandFlank const& f : r->standFlank)
+        {
+            if (f.enemy != 10184)
+                continue;
+            for (float side : { -1.0f, 1.0f })
+                for (float deg = f.centerDeg - f.halfAngleDeg; deg <= f.centerDeg + f.halfAngleDeg + 0.01f; deg += 3.0f)
+                {
+                    float const angle = side * deg * (3.14159265f / 180.0f);   // her facing is east (bearing 0)
+                    bool valid = false;
+                    for (float d = f.minDist; d <= f.maxDist + 0.01f && !valid; d += 2.0f)
+                    {
+                        float const x = boss.x + d * std::cos(angle), y = boss.y + d * std::sin(angle);
+                        valid = true;
+                        for (KeepOut const& k : r->keepOut)
+                            if (k.enemy == 10184 && std::hypot(x - k.x, y - k.y) < k.radius)
+                                valid = false;
+                    }
+                    CHECK(valid);
+                }
+        }
 }
 
 // n50 onyxia_full run 1: the ranged stood 54-78 y from the flying Onyxia and she did not lose health in phase 2.
@@ -400,4 +432,82 @@ TEST_CASE("Onyxia's Heated Ground is a ground hazard for everybody", "[ClassicRa
             }
         CHECK(found);
     }
+}
+
+// MC Geddon n44 2026-10-15: a rogue, a warrior, a retribution paladin and the main tank died to Armageddon (20479, 8000 fire, radius 20 y) at
+// 5 y from him. It fires when his health crosses 2 percent (mc/boss_baron_geddon.cpp:70), and the raid takes the last percent in seconds.
+TEST_CASE("Geddon's melee leave his 24 y before Armageddon, the tank stays", "[ClassicRaidGeddon]")
+{
+    RaidRules const& r = Mc();
+    bool melee = false;
+    for (AvoidEnemy const& a : r.avoidEnemy)
+        if (a.enemy == 12056u && a.who == Who::Melee)
+        {
+            melee = true;
+            CHECK(a.radius > 21.5f);          // Armageddon's radius 20 plus the victim's combat reach
+            CHECK(a.hpMax > 2.0f);            // above the 2 percent line, with room for the leave
+            CHECK(a.hpMax <= 15.0f);          // the melee burn him for nearly all of the fight
+            CHECK(a.hpMin == 0.0f);
+        }
+        else if (a.enemy == 12056u)
+            CHECK(a.who != Who::Tank);        // he follows the tank: no avoid rule for it, a tank cannot outrun him
+    CHECK(melee);
+}
+
+// Armageddon 20478 is an 8 s aura on Geddon that roots him (geddon-spell-data 2026-10-16), so the tank can leave it too, like Inferno.
+TEST_CASE("Everybody, the tank included, leaves Geddon's 24 y while Armageddon runs", "[ClassicRaidGeddon]")
+{
+    RaidRules const& r = Mc();
+    float inferno = 0.f, armageddon = 0.f;
+    for (AvoidEnemyAura const& a : r.avoidEnemyAura)
+        if (a.enemy == 12056u)
+        {
+            if (a.aura == 19695u) inferno = a.radius;
+            if (a.aura == 20478u)
+            {
+                armageddon = a.radius;
+                CHECK(a.who == Who::Anyone);
+            }
+        }
+    CHECK(armageddon > 21.5f);
+    CHECK(armageddon == inferno);
+}
+
+// Golemagg (golemagg-spell-data 2026-10-16): Earthquake 19798 is instant, 1500 physical, 18 y, every 3 s from 10 percent health; Magma Splash 13880
+// stacks to 50 on whoever hits him, 50 fire a tick per stack for 30 s.
+TEST_CASE("Golemagg: everybody but the tanks leaves 18 y plus reach once Earthquake starts", "[ClassicRaidGolemagg]")
+{
+    RaidRules const& r = Mc();
+    bool found = false;
+    for (AvoidEnemy const& a : r.avoidEnemy)
+        if (a.enemy == 11988u)
+        {
+            found = true;
+            CHECK(a.radius > 18.0f + 1.5f);       // the 18 y radius plus the victim's combat reach
+            CHECK(a.who == Who::NonTank);         // tanks stay: he follows the main tank
+            CHECK(a.hpMax == 10.0f);              // the script starts it below 10 percent (boss_golemagg.cpp:80)
+            CHECK(a.hpMin == 0.0f);
+        }
+    CHECK(found);
+}
+
+TEST_CASE("Golemagg: a bot with 20 stacks of Magma Splash backs off his melee reach", "[ClassicRaidGolemagg]")
+{
+    RaidRules const& r = Mc();
+    bool found = false;
+    for (AvoidOnStacks const& a : r.avoidOnStacks)
+        if (a.enemy == 11988u)
+        {
+            found = true;
+            CHECK(a.aura == 13880u);
+            CHECK(a.stacks >= 10);                // a few stacks are harmless, the cap is 50
+            CHECK(a.stacks < 50);                 // and the rule must trigger before the cap
+            CHECK(a.radius > 5.0f);               // outside melee reach
+            CHECK(a.radius < 18.0f);              // and not a second Earthquake circle
+            CHECK(a.who == Who::NonTank);
+        }
+    CHECK(found);
+    // No tank swap on the splash: it could pull the Ragers' tank off them.
+    for (TankSwap const& t : r.tankSwap)
+        CHECK(t.enemy != 11988u);
 }

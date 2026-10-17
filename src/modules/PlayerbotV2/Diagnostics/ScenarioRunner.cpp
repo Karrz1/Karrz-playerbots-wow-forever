@@ -32,6 +32,7 @@
 #include "Map.h"
 #include "MapManager.h"
 #include "MotionMaster.h"
+#include "MoveSpline.h"
 #include "ObjectMgr.h"
 #include "ObjectAccessor.h"
 #include "PathGenerator.h"
@@ -112,6 +113,7 @@ struct Run
     std::uint32_t run_ms = 0;            // time since the run began (what the failure timestamps count)
     bool goal_reached = false;
     std::uint32_t adds_killed = 0;   // ScenarioDef::goal_adds_needed
+    std::uint32_t spared_killed = 0;   // ScenarioDef::spare_entry: dead before the goal boss
     std::string stage_status;
     // Raids: the goal boss's first spawn, the spot the squad is moved to, and whether the main tank has been ordered on it.
     bool boss_spawn_known = false;
@@ -724,9 +726,12 @@ void LogLanding(Run& run)
         if (!p || !p->IsInWorld())
             continue;
         BotAI* ai = ::Playerbot::Services::Registry().ai(m.id);
-        TC_LOG_INFO("playerbot.v2", "[scenario] {} landing round {} {}: {:.0f} y from the landing spot, moving {}, hold {}, rule {}", run.def->name,
+        // What drives the walk: the movement generator, and the spline's end point when one is running.
+        auto const& dest = p->movespline->FinalDestination();
+        TC_LOG_INFO("playerbot.v2", "[scenario] {} landing round {} {}: {:.0f} y from the landing spot, moving {}, hold {}, rule {}, generator {}, spline {} to {:.0f},{:.0f}", run.def->name,
                     run.landing_rounds, p->GetName(), std::hypot(p->GetPositionX() - run.arrive_x, p->GetPositionY() - run.arrive_y),
-                    p->isMoving() ? 1 : 0, ai && ai->holding_position(now) ? 1 : 0, ai && ai->last_rule_fired() ? ai->last_rule_fired() : "-");
+                    p->isMoving() ? 1 : 0, ai && ai->holding_position(now) ? 1 : 0, ai && ai->last_rule_fired() ? ai->last_rule_fired() : "-",
+                    uint32(p->GetMotionMaster()->GetCurrentMovementGeneratorType()), p->movespline->Finalized() ? "done" : "running", dest.x, dest.y);
     }
 }
 
@@ -1448,6 +1453,11 @@ void Finish(Run& run, bool timed_out, std::string const& note = {})
                 run.monitor->NoteSupportMissing(run.run_ms, fmt::format("{} curse(s) removed, at least {} expected: the boss's curse was never cleansed ([raid_dispel])",
                                                                        decurse, def.limits.min_decurses));
         }
+        if (def.spare_entry)
+            run.monitor->NoteInfo(fmt::format("spared adds: {} killed before {}", run.spared_killed, def.goal_name));
+        if (run.goal_reached && run.spared_killed)
+            run.monitor->NoteSupportMissing(run.run_ms, fmt::format("{} add(s) of entry {} died before {}: the raid was to leave them alive until he fell ([raid_fight])",
+                                                                   run.spared_killed, def.spare_entry, def.goal_name));
     }
 
     bool const pass = run.monitor->passed(run.goal_reached);
@@ -1951,7 +1961,14 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
                 }
                 for (Member const& m : run.members)
                     if (Player* p = Find(m.id))
+                    {
+                        // A walk or follow still running from the staging is cancelled with the landing, as a taxi flight is: mc_garr and mc_geddon
+                        // (local-next-88, 2026-10-17) had the healers walking 7 y/s from the landing spot under the Hold, rule idle:owner_holding,
+                        // and pulled the boss before the order.
+                        p->GetMotionMaster()->Clear();
+                        p->StopMoving();
                         ::Playerbot::BotMovement::SafeTeleport(p, run.def->map, run.arrive_x, run.arrive_y, run.arrive_z, run.arrive_o, 0);
+                    }
                 run.arrive_sent = true;
                 // Hold from the moment of the landing, not from "in place": the 40 raiders arrive over seconds, and until the Hold
                 // began they walked toward Garr and into his adds (MC Garr 2026-10-10: the first Firesworn engagements came with the
@@ -2206,6 +2223,8 @@ void NoteCreatureKilled(std::uint32_t map, std::uint32_t entry, bool tapped)
             }
         if (!any_alive)
             continue;
+        if (r->def->spare_entry && entry == r->def->spare_entry && !r->goal_reached)
+            ++r->spared_killed;
         if (entry == r->def->goal_entry)
             r->goal_reached = true;
         else if (r->def->goal_adds_needed && (entry == r->def->goal_adds_a || entry == r->def->goal_adds_b) && ++r->adds_killed >= r->def->goal_adds_needed)

@@ -77,6 +77,11 @@ public:
     // loses the mob and is given another one by the next plan. World thread only, same contract as Update().
     void ReassignTankTarget(uint64 group_low, uint32 map_id, uint64 tank_low, ObjectGuid mob);
 
+    // A tank that taunted <mob> back from a non-tank (Raid::ElectRetaunt): ReassignTankTarget, and the automatic tank markers of the retaker
+    // and of the tank who held <mob> before are swapped, so the marker pass keeps the assignment instead of undoing it (TankMarkSwap.h).
+    // Markers set by the owner (tank symbols, tank orders) are not touched. World thread only.
+    void RetakeTankTarget(uint64 group_low, uint32 map_id, uint64 tank_low, ObjectGuid mob);
+
 private:
     struct Member
     {
@@ -181,12 +186,15 @@ private:
     // raid icons on mobs nobody fights yet may start the fight (PveOrder::marks_released).
     std::unordered_map<uint64, uint32> mark_release_until_;
     std::unordered_map<uint64, uint32> fight_start_;   // first ms of the current fight (Playerbot.Raid.DpsWaitTimeoutMs)
+    // Per-(group, map): mob guid counter -> the last logged kick assignment on a listed cast (RaidRules::interruptFirst), spell and
+    // rank-0 kicker packed, so [raid_interrupt] plan lines come once per cast and not once per 500 ms plan.
+    std::unordered_map<uint64, std::unordered_map<uint64, uint64>> kick_plan_logged_;
     std::unordered_map<uint64, uint32> defend_since_;  // first ms a mob has stood on a non-tank member this fight (0 = none now)
     std::unordered_map<uint64, FightLog> fight_log_;
     // Interrupt rotation (Classic: live-ability ranks + per-casting-mob
     // assignment) and the hunter Tranquilizing Shot order. World thread,
     // inside Update(); write interrupt_* / tranq_rank into `plan`.
-    void PlanInterrupts(std::vector<Member> const& mem,
+    void PlanInterrupts(uint64 bkey, std::vector<Member> const& mem,
                         std::vector<std::shared_ptr<BotSnapshot const>> const& snaps,
                         std::unordered_map<uint64, PveOrder>& plan);
     void PlanTranq(uint64 bkey, std::vector<Member> const& mem,

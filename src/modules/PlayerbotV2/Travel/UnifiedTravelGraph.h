@@ -277,6 +277,8 @@ private:
     void BuildTaxiEdges();      // sTaxiPathStore → directed Taxi edges
     void BuildPortalEdges();    // Portal/Dock edges: cross-map, and same-map transport rides (dock -> dock)
     void MarkConnectorMaps();   // maps exempt from the transit penalty (same-map ride, nothing else there)
+    void AddCheckedWalkLinks(); // the fixed, offline-checked links of WalkLinkTable.h
+    void LogForeverMaps() const;  // [forever_maps] hubs and docks on the Classic 1.60 maps
     void LogWalkGaps() const;   // [walk_gaps] diagnostic after BuildWalkEdges
     void BuildWalkEdges();      // Same-map intra-cluster walk edges (bounded)
     void BuildElevatorEdges();  // Bidirectional Elevator edges between stops of the same platform

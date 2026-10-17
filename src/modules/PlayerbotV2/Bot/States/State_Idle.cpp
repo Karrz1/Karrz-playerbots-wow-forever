@@ -9,6 +9,7 @@
 #include "Bot/BotRegistry.h"
 #include "Bot/IdleRule.h"
 #include "Bot/QuestDoable.h"
+#include "Travel/ReachMemory.h"
 #include "Bot/ClassTables.h"
 #include "Bot/Gear/BotGearGenerator.h"   // RaidGearActive / RaidEquipUpgrade (raid-gear upgrade test)
 #include "Bot/RecipeDifficulty.h"
@@ -17745,6 +17746,15 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                 // to actually change maps. (Mirrors the swim_stuck same-map guard.)
                 if (h->mapId != s.map_id()) continue;
 
+                // Other bots already found this walk impossible from around here (a hub on another tier of a mountain island, across
+                // a gap): choose the next hub now instead of walking at the gap and wedging (Travel/ReachMemory.h).
+                if (::Playerbot::V2::Travel::ReachMemory::Instance().KnownUnreachable(
+                        s.map_id(), s.raw().position.x, s.raw().position.y, h->location.GetPositionX(), h->location.GetPositionY(), hub_now_ms))
+                {
+                    ai.note_hub_tried(h->hubId, hub_now_ms);
+                    continue;
+                }
+
                 // FIX 5a: skip any hub with no doable quest left for this bot —
                 // the SAME shared predicate the builder uses, so the rule and the
                 // builder agree about which hubs are exhausted (no oscillation).
@@ -19209,6 +19219,7 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                         if (t.goal_is_quest && s.current_quest_id() != 0)
                         {
                             ai.blacklist_quest(s.current_quest_id(), now_ms);
+                            ::Playerbot::V2::Travel::QuestGoalMemory::Instance().NoteDropped(s.current_quest_id(), now_ms);
                             tw.last_recovery_ms = now_ms;
                             tw.recovery_tier = 3;
                             ai.set_last_rule_fired("idle:unstick:drop_goal");

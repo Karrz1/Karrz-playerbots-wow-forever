@@ -26,7 +26,45 @@ CLIENT_HEAL_EFFECT = 10
 # (SpellEffects.cpp, "send main spell id as basepoints"), and the spell power factor is on 19993 (0.429 = 1.5 s / 3.5). The rank rows carry
 # coefficient 0. Taking that 0 across would make the heal ignore healing power, since here the rank heals directly.
 FLASH_OF_LIGHT_HEAL_CARRIER = 19993
+# VMaNGOS gives the absorb shields their spell power share in code, not in the table (SpellAuras.cpp HandleSchoolAbsorb): Power Word: Shield
+# takes 10% of healing power, Fire Ward, Frost Ward and Shadow Ward 10% of spell damage, each times the level penalty of the rank. The table
+# rows carry 0, which here would mean no scaling at all, so the rows get 0.1 times the penalty (the table value is the penalised one). The
+# spells are picked the way VMaNGOS picks them: family and class mask bit (SpellClassMask.h), or icon and category for Shadow Ward. The
+# extract has Shadow Ward with family 0, so that one gets nothing there and nothing here.
+SCHOOL_ABSORB_AURA = 69
+ABSORB_SHARE = 0.1
+ABSORB_SHIELDS = (
+    (6, 1 << 0, None, None),                            # priest, CF_PRIEST_POWER_WORD_SHIELD
+    (3, 1 << 3, None, None),                            # mage, CF_MAGE_FIRE_WARD
+    (3, 1 << 8, None, None),                            # mage, CF_MAGE_FROST_WARD
+    (5, None, 207, 56),                                 # warlock Shadow Ward: icon 207, category 56
+)
 FIRST_SCALED_SPELL_ID = 1000000                         # ids from this on are new to Forever (ClassicSpellValue.h)
+
+
+def level_penalty(spell_level):
+    # VMaNGOS SpellCaster::CalculateLevelPenalty: 1 - (20 - level) x 3.75% below level 20
+    if spell_level <= 0 or spell_level >= 20:
+        return 1.0
+    return 1.0 - (20.0 - spell_level) * 0.0375
+
+
+def absorb_coeff(ix, f, a, coeff):
+    if a != SCHOOL_ABSORB_AURA or coeff != 0.0 or 'spellFamilyName' not in ix:
+        return coeff
+    family = int(f[ix['spellFamilyName']])
+    flags = int(f[ix['spellFamilyFlags']])
+    icon = int(f[ix['spellIconId']])
+    category = int(f[ix['category']])
+    for fam, bit, want_icon, want_category in ABSORB_SHIELDS:
+        if family != fam:
+            continue
+        if bit is not None and not (flags & bit):
+            continue
+        if want_icon is not None and (icon != want_icon or category != want_category):
+            continue
+        return round(ABSORB_SHARE * level_penalty(int(f[ix['spellLevel']])), 4)
+    return coeff
 
 
 def esc(n):
@@ -56,6 +94,8 @@ def value_rows(ix, best):
                     coeff = carrier_coeff
                 rows.append((e, i - 1, CLIENT_HEAL_EFFECT, 0, bp, sides, ppl, 0, combo, coeff, esc(n)))
             elif ef in EFFECTS or (ef in AURA_EFFECTS and a in AURAS):
+                if ef in AURA_EFFECTS:
+                    coeff = absorb_coeff(ix, f, a, coeff)
                 rows.append((e, i - 1, ef, a if ef in AURA_EFFECTS else 0, bp, sides, ppl, misc if ef in AURA_EFFECTS else 0, combo, coeff, esc(n)))
     return rows
 

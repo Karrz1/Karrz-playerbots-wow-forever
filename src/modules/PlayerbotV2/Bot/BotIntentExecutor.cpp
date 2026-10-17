@@ -708,6 +708,10 @@ size_t V2::Module::DrainIntents()
             try
             {
                 Result r = std::visit(IntentVisitor{api, entry.ai.get()}, intent.body);
+                // A full instance is not a failed port to retry at once: the rejoin rule waits and asks again.
+                if (r == Result::ServerRefused && api.last_instance_full_map() != 0 && entry.ai)
+                    entry.ai->note_instance_full(api.last_instance_full_map(), GameTime::GetGameTimeMS());
+                api.clear_instance_full_map();
                 Services::Perf().record_intent_executed();
                 Services::Perf().record_intent_result(static_cast<size_t>(r));
                 if (r != Result::Ok)

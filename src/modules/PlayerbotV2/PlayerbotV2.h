@@ -73,6 +73,11 @@ public:
     // The ForeverBots add-on greeted the server (self-whisper or the silent `.bot addon` command): no download hint for this player.
     void NoteAddonHello(Player* p);
     void RouteGroupOrder(Player* sender, Group* group, std::string order);
+    // A squad line (";tank: attack", or the bare "Lentha use altar" / "all use altar") through the whisper parser, with the
+    // sender's first bot in the group as the messenger. answer_unknown: an unrecognised order whispers back instead of
+    // vanishing (the ';' form only; a bare line could be chatter).
+    void DispatchSquadLine(Player* sender, Group* group, std::string const& body, bool answer_unknown);
+    static bool GroupHasBotNamed(Group const* group, std::string_view name);
     // Phase C.3: route guild chat messages to BotChatReactor::ReactGuild.
     void OnGuildChat(Player* sender, uint64 guild_id, std::string const& msg);
 

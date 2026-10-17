@@ -29,6 +29,10 @@ namespace Playerbot::Raid {
         // Phase 2: Conflagration 23023 is cast on himself every 15-25s (classic_boss_razorgore.cpp:345-349) and disorients whoever stands
         // in melee, the tank included: a tank without it takes him over.
         r.tankSwap.push_back({ 12435, 23023, 1 });
+        // War Stomp 24375 (classic_boss_razorgore.cpp:49), the same stun as the Wyrmguard's below: casters and healers keep 18 yards
+        // (in phase 1 that also keeps them off the possessed Razorgore).
+        r.avoidEnemy.push_back({ 12435, 18.0f, Who::Ranged });
+        r.avoidEnemy.push_back({ 12435, 18.0f, Who::Healer });
         r.priority.push_back({ 14456, 2 });   // Blackwing Guardsman: Strike 15580 only (DB event 1445601)
 
         // ---------------------------------------------------------------------------------------------------------------
@@ -54,7 +58,9 @@ namespace Playerbot::Raid {
         // boss_broodlord_lashlayer.cpp:105-106). The trash around him is made unattackable while he lives (:109-143), so no add rules.
         // Blast Wave keep-away for ranged/healers: see RegisterBlackwingMovement (avoidEnemy, boss_broodlord_lashlayer.cpp:172).
         // No tank swap: Mortal Strike is cast only every 20-30s (:178-182) and the script gives no aura/stack condition, so a swap would
-        // only thrash against Knock Away's -50% threat (:105-106); the tanks keep the boss.
+        // only thrash against Knock Away's -50% threat (:105-106); the tanks keep the boss. Knock Away can still drop the tank
+        // below a DPS on his list: a tank taunts him back at once.
+        r.retaunt.push_back(12017);
 
         // ---------------------------------------------------------------------------------------------------------------
         // FIREMAW (11983) / EBONROC (14601) / FLAMEGOR (11981)
@@ -64,6 +70,10 @@ namespace Playerbot::Raid {
         // Flamegor has no tank debuff in his script (boss_flamegor.cpp:71-121): only Wing Buffet / Shadow Flame / Frenzy. Tank facing cannot be
         // a stand rule: no justified coordinates (the dragons are pulled to wherever the tank stands).
         r.tankSwap.push_back({ 14601, 23340, 1 });                                // Ebonroc: Shadow of Ebonroc (boss_ebonroc.cpp:24,106)
+        // Wing Buffet halves the victim's threat (boss_firemaw.cpp:71-77) on all three: the tank that lost the drake taunts it back.
+        r.retaunt.push_back(11983);
+        r.retaunt.push_back(14601);
+        r.retaunt.push_back(11981);
         // Frenzy 23342: Tranquilizing Shot is the PvE coordinator's (PlanTranq, any aura the shot removes). Flamegor Frenzy, periodically fire novas (boss_flamegor.cpp:26,105-113)
 
         // ---------------------------------------------------------------------------------------------------------------
@@ -72,7 +82,9 @@ namespace Playerbot::Raid {
         // A player holding all five becomes a "Chromatic Mutation" (:318-340). Red Affliction deaths heal him for 150k (:349-366).
         // DISPEL KIND of every entry below is UNVERIFIED (no spell_template in the extracts); Magic is the default requested by the lead.
         // The debuff ids ARE the cast ids: effect1 of each is 6 = APPLY_AURA (migration 20200515174239), so the player carries that id.
-        r.dispel.push_back({ 23170, DispelKind::Magic });                         // Brood Affliction: Bronze (boss_chromaggus.cpp:47), dispel type magic (ike3)
+        // Brood Affliction: Bronze 23170 (boss_chromaggus.cpp:47) has no dispel type in the vanilla data (only Hourglass Sand 19183
+        // removes it): no dispeller spends a cast on it.
+        r.noDispel.push_back(23170);
         r.dispel.push_back({ 23153, DispelKind::Magic });                         // Brood Affliction: Blue  (boss_chromaggus.cpp:44) UNVERIFIED kind
         r.dispel.push_back({ 23154, DispelKind::Curse });                         // Brood Affliction: Black (boss_chromaggus.cpp:45) UNVERIFIED kind
         r.dispel.push_back({ 23155, DispelKind::Disease });                         // Brood Affliction: Red   (boss_chromaggus.cpp:46) UNVERIFIED kind; dying with it heals the boss

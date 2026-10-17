@@ -41,6 +41,16 @@ std::map<uint32_t, std::unique_ptr<RaidRules>>& Registry()
         RegisterTempleOfAhnQiraj(*aq40);
         rules[531] = std::move(aq40);
 
+        auto aq20 = std::make_unique<RaidRules>();
+        aq20->name = "Ruins of Ahn'Qiraj";
+        RegisterRuinsOfAhnQiraj(*aq20);
+        rules[509] = std::move(aq20);
+
+        auto zg = std::make_unique<RaidRules>();
+        zg->name = "Zul'Gurub";
+        RegisterZulGurub(*zg);
+        rules[309] = std::move(zg);
+
         auto naxx = std::make_unique<RaidRules>();
         naxx->name = "Naxxramas";
         RegisterNaxxramas(*naxx);
@@ -74,8 +84,16 @@ bool OwnsAura(uint32_t mapId, uint32_t aura)
 
 bool InterruptFirst(uint32_t mapId, uint32_t spell)
 {
+    return InterruptOrder(mapId, spell) != kNotInterruptFirst;
+}
+
+size_t InterruptOrder(uint32_t mapId, uint32_t spell)
+{
     RaidRules const* rules = RulesForMap(mapId);
-    return rules && std::find(rules->interruptFirst.begin(), rules->interruptFirst.end(), spell) != rules->interruptFirst.end();
+    if (!rules)
+        return kNotInterruptFirst;
+    auto const it = std::find(rules->interruptFirst.begin(), rules->interruptFirst.end(), spell);
+    return it == rules->interruptFirst.end() ? kNotInterruptFirst : size_t(it - rules->interruptFirst.begin());
 }
 
 bool NoTank(uint32_t mapId, uint32_t entry)

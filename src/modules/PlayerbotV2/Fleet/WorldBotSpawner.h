@@ -31,6 +31,7 @@
 #include "WorldLoadFacts.h"
 #include "WorldFactionMix.h"
 #include "PoolBalance.h"
+#include "PoolBudget.h"
 
 class Player;
 
@@ -94,7 +95,11 @@ private:
         uint32 area_cap_town    = 40;      // the same in a capital
         float  area_radius      = 45.0f;
         uint32 pool_horde_pct   = 50;      // share of the roster that should be Horde, in every level bracket (PoolBalance.h)
-        uint32 skyborne_seed_pct = 5;      // share of the roster seeds that are level 1-9 Skyborne residents of Zephras Isle (Classic 1.60)
+        uint32 variable_max     = 2000;    // temporary residents allowed to exist next to the core roster (PoolBudget.h); 0 = none
+        uint32 variable_ttl_h   = 24;      // hours a temporary resident stays offline before it is deleted
+        bool   travel_soak      = false;   // send a few world bots between places of the travel graph and log how each leg ends (Travel/SoakBoard.h)
+        uint32 travel_soak_bots = 8;       // bots on a soak leg at the same time
+        uint32 travel_soak_leg_s = 1200;   // seconds a leg may take before it counts as stuck
     };
 
     struct Anchor
@@ -132,6 +137,8 @@ private:
     // Roster seeding: creates residents (level spread, both factions) one by one, lets the setup pipeline gear them and send them
     // to a zone hub for their level, then logs them out so they sleep there. No player needed; stops at PoolMax.
     void DriveSeed(uint32 now_ms);   // log in the pool bots that sleep around this anchor, no placement
+    void DriveRetire(uint32 now_ms);   // deletes temporary residents that nobody has needed for VariableTtlHours
+    void DriveTravelSoak(uint32 now_ms);   // gives soak legs to world bots and logs how they end
     void FinishSpawn(Anchor const& a, std::vector<bool> const& slots, std::vector<uint8> const& slot_levels,
                      QueryResult res, bool global = false);
     void DriveGlobalSpawn(uint32 now_ms, std::vector<Anchor> const& anchors);
@@ -179,7 +186,15 @@ private:
     QueryCallbackProcessor queries_;
     bool   query_inflight_ = false;
     uint32 query_started_ms_ = 0;
-    int64  pool_count_ = -1;                        // ambient characters in the DB (-1 = not loaded yet)
+    int64  pool_count_ = -1;                        // ambient characters in the DB, island residents not counted (-1 = not loaded yet)
+    int64  variable_count_ = 0;                     // temporary residents in the DB, plus the island residents created before the flag existed
+    uint32 variable_sweep_ms_ = 0;                  // when temporary residents were last retired
+    bool   variable_sweep_inflight_ = false;
+    uint32 n_created_variable_ = 0;                 // temporary residents created since start
+    uint32 soak_ms_ = 0;                            // when the travel soak last looked for a bot to send
+    uint32 soak_summary_ms_ = 0;
+    uint32 soak_next_id_ = 1;
+    uint32 n_retired_ = 0;                          // temporary residents deleted since start
     bool   pool_count_inflight_ = false;
     PoolCounts pool_counts_;                        // the roster by faction and level bracket (levels 10+)
     bool   pool_counts_inflight_ = false;

@@ -732,6 +732,8 @@ TEST_CASE("ScenarioDefs: the Molten Core scenarios are a 40-man raid with 4 tank
         CHECK(d->limits.max_deaths == 0);
         CHECK_FALSE(d->limits.tanks_dead_is_wipe);
         CHECK(d->limits.dps_hold_ms == 20000);
+        // Garr's Firesworn must not die before him; no other raid boss checks an add.
+        CHECK(d->spare_entry == (r.boss_entry == 12057 ? 12099u : 0u));
         CHECK(d->limits.bounds.enabled);
         CHECK(d->x >= d->limits.bounds.min_x);
         CHECK(d->x <= d->limits.bounds.max_x);
@@ -753,8 +755,9 @@ TEST_CASE("ScenarioDefs: the Molten Core scenarios are a 40-man raid with 4 tank
                 if (i) CHECK(((i > 1 && std::tolower(m.name[i]) == std::tolower(m.name[i - 1]) && std::tolower(m.name[i]) == std::tolower(m.name[i - 2])) == false));
             }
         }
-        CHECK(tanks == 4);
-        CHECK(healers == 12);
+        // Majordomo's court is nine mobs: his squad has five tanks and eleven healers.
+        CHECK(tanks == (r.boss_entry == 12018 ? 5u : 4u));
+        CHECK(healers == (r.boss_entry == 12018 ? 11u : 12u));
         CHECK(warlocks >= 3);                                   // Banish for Garr's Firesworn
         CHECK(names.size() == 40);
         // The raid is one faction: Alliance races only.
@@ -762,7 +765,7 @@ TEST_CASE("ScenarioDefs: the Molten Core scenarios are a 40-man raid with 4 tank
             CHECK((m.race == ScnRace::Human || m.race == ScnRace::Dwarf || m.race == ScnRace::NightElf || m.race == ScnRace::Gnome));
     }
     // The raid set, by name: a boss added to or dropped from it has to be said here (mc_geddon joined the first four, mc_ragnaros after it).
-    CHECK(found == std::set<std::string>{ "mc_garr", "mc_lucifron", "mc_magmadar", "mc_gehennas", "mc_sulfuron", "mc_golemagg", "mc_majordomo", "mc_geddon", "mc_ragnaros" });
+    CHECK(found == std::set<std::string>{ "mc_garr", "mc_lucifron", "mc_magmadar", "mc_shazzrah", "mc_gehennas", "mc_sulfuron", "mc_golemagg", "mc_majordomo", "mc_geddon", "mc_ragnaros" });
     // Both catalogues share one list, with no clash between a dungeon and a raid name.
     std::set<std::string> all;
     for (ScenarioDef const& d : ScenarioCatalogue())
@@ -889,6 +892,7 @@ TEST_CASE("ScenarioDefs: Magmadar needs a Tranquilizing Shot, Lucifron and Gehen
     CHECK(magmadar->limits.min_decurses == 0);
     CHECK(lucifron->limits.min_decurses == 1);
     CHECK(gehennas->limits.min_decurses == 1);
+    CHECK(FindScenario("mc_shazzrah")->limits.min_decurses == 1);   // Shazzrah's Curse
     CHECK(FindScenario("mc_garr")->limits.min_tranq_shots == 0);
     // The raid has the classes that do the job: hunters for the shot, mages and druids for the curse.
     bool hunter = false, mage = false;

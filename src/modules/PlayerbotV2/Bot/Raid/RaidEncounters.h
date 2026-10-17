@@ -6,7 +6,7 @@
 // so the creature entries and spell ids carry over unchanged.
 //
 // A rule set is registered per MAP ID (409 Molten Core, 469 Blackwing Lair,
-// 249 Onyxia's Lair, 533 Naxxramas). RaidBrain.cpp reads these tables on the
+// 249 Onyxia's Lair, 309 Zul'Gurub, 509 Ruins of Ahn'Qiraj, 531 Temple of Ahn'Qiraj, 533 Naxxramas). RaidBrain.cpp reads these tables on the
 // world thread and turns them into per-bot raid orders (move out of hazards,
 // spread, stand at role positions, taunt swaps, dispels, purges, crowd
 // control, forbidden targets). The data files (RaidEncounterData_*.cpp)
@@ -19,7 +19,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -74,7 +76,8 @@ constexpr float kOnyFrontHalfDeg  = 60.0f;   // Flame Breath, Wing Buffet: each 
 constexpr float kOnyTailHalfDeg   = 60.0f;   // Tail Sweep: each side of the line straight behind her
 constexpr float kOnyConeMarginDeg = 12.0f;   // a cast lands up to 2 s after she turns, and the 2026-10-16 deaths sat right on the edge (+60, -57)
 constexpr float kOnyWedgeGapDeg   = 3.0f;    // between the widened cone edge and the first row of the wedge
-constexpr float kOnyWedgeLoDeg    = kOnyFrontHalfDeg + kOnyConeMarginDeg + kOnyWedgeGapDeg;
+constexpr float kOnyCaveKeepOutRadius = 12.0f;   // the static whelps' pull range (see the data file), no wider
+constexpr float kOnyWedgeLoDeg    =kOnyFrontHalfDeg + kOnyConeMarginDeg + kOnyWedgeGapDeg;
 constexpr float kOnyWedgeHiDeg    = 180.0f - kOnyTailHalfDeg - kOnyConeMarginDeg - kOnyWedgeGapDeg;
 constexpr float kOnyWedgeCentreDeg = 0.5f * (kOnyWedgeLoDeg + kOnyWedgeHiDeg);
 constexpr float kOnyWedgeHalfDeg   = 0.5f * (kOnyWedgeHiDeg - kOnyWedgeLoDeg);
@@ -118,7 +121,15 @@ struct StandByAura { uint32_t enemy; uint32_t aura; float bearing; float distanc
 // the carriers that heal or tank are cleansed first.
 // hurtBelowPct: dispel only while the carrier is at or under this health (a weak damage-over-time that costs more mana to remove
 // than it does harm); 0 = always. See DispelWorth.h.
-struct Dispel { uint32_t aura; DispelKind kind; bool urgent = false; int hurtBelowPct = 0; };
+// Impending Doom: three healers per plan are enough, the rest keep healing (live kill: up to 11 orders a round, 27 rounds).
+constexpr uint32_t kImpendingDoomDispelOrders = 3;
+// maxOrders: at most this many dispel orders per plan for the aura (each cast costs the mana a heal would); 0 = no cap of its own.
+struct Dispel { uint32_t aura; DispelKind kind; bool urgent = false; int hurtBelowPct = 0; uint32_t maxOrders = 0; };
+
+// The group coordinator's crowd control (icon marks, the automatic picks) never holds this enemy in this raid. For an enemy the fight is
+// better off killed than held (Lucifron's Flamewaker Protectors: the mage sheep, the raid loses a target and the Protector's Dominate
+// Mind still lands).
+struct NoControl { uint32_t enemy; };
 
 // An enemy carrying <aura> should be purged (priest Dispel Magic / shaman Purge). Tranquilizing Shot is not a raid rule:
 // the PvE coordinator's PlanTranq ranks the hunters for any aura the shot removes.
@@ -145,6 +156,18 @@ struct ThreatDrop { uint32_t enemy; float percent; };
 // Do not use area damage while this enemy is alive within 40 yards (adds that explode or must not be pulled).
 struct NoAoe { uint32_t enemy; };
 
+// While a living <gateEnemy> stands, nobody (tanks included) attacks a <enemy> at or under <belowPct> health: an add that must not die before
+// its boss (Garr's Firesworn: each one that dies hastens Garr by 9 percent, stacking, and erupts). The tank holding it keeps the threat
+// and stops swinging; every other order (banish, dispel, heals) is unchanged.
+constexpr float kGolemaggEarthquakePct = 10.0f;    // Golemagg health under which Earthquake (1500 physical, 18 y, every 3 s) starts
+constexpr float kGolemaggEarthquakeLeave = 22.0f;  // 18 y plus the victim's reach and a margin
+constexpr uint32_t kGolemaggSplashStacks = 20;     // Magma Splash stacks (50 fire a tick each, cap 50) at which a melee bot backs off
+constexpr float kGolemaggSplashBackoff = 12.0f;
+constexpr float kGeddonMeleeLeavePct = 8.0f;      // Geddon health under which the melee leave him (Armageddon fires at 2)
+constexpr float kGarrFireswornSparePct = 25.0f;   // Firesworn health at which the raid stops hitting it while Garr lives
+struct Spare { uint32_t enemy; float belowPct; uint32_t gateEnemy; };
+inline bool SpareNow(Spare const& rule, float enemyHpPct, bool gateAlive) { return gateAlive && enemyHpPct <= rule.belowPct; }
+
 // Tank swap: while <enemy>'s current victim is a tank that carries at least <stacks> stacks of <debuffAura>, ONE other tank
 // that does not carry the aura (the lowest-GUID one whose taunt is ready) taunts the enemy. A tank carrying the aura stops
 // attacking that enemy while a clean tank exists, so the swap is not undone. Paladins have no taunt in 1.12, so only
@@ -153,7 +176,13 @@ struct TankSwap { uint32_t enemy; uint32_t debuffAura; uint32_t stacks; };
 
 // While <enemy> is alive and fighting, matching bots stay at least <radius> yards from it (point-blank AoE such as Blast Wave).
 // Do not use Who::Tank / Anyone for melee-range bosses: only bots that do not have to stand next to the enemy.
-struct AvoidEnemy { uint32_t enemy; float radius; Who who; float hpMax = 100.0f; float hpMin = 0.0f; };
+// <pad>: a bot inside the circle walks out to <pad> yards beyond its edge, not to the edge. An enemy that follows its tank moves the circle under a bot
+// that stopped at the edge, and the bot is inside again a few seconds later (Majordomo 2026-10-17: 1.4 to 2.4 leave-hazard moves a second for the ranged).
+struct AvoidEnemy { uint32_t enemy; float radius; Who who; float hpMax = 100.0f; float hpMin = 0.0f; float pad = 0.0f; };
+
+// While a matching bot carries at least <stacks> stacks of <aura> (a debuff the enemy puts on whoever hits it: Golemagg's Magma Splash), it stays
+// <radius> yards from every <enemy> that is not hitting it, until the aura falls off. The bot the enemy is hitting (its tank) is never moved.
+struct AvoidOnStacks { uint32_t enemy; uint32_t aura; uint32_t stacks; float radius; Who who; };
 
 // Line hazard for a breath that sweeps a straight corridor (Onyxia's Deep Breath). When <enemy> is casting <castSpell> (or carries
 // it as an aura), or is flying at >= 2.5x run speed (the breath pass itself), the corridor is latched for about 10 seconds: it
@@ -202,7 +231,13 @@ struct CancelAura { uint32_t enemy; uint32_t aura; Who who; };
 // hound of the pack is still up 10 seconds later the downed ones rise again at full health). Damage is spread instead of
 // focused: a downed member (carrying <downAura>, or at 1 hp) is never attacked, DPS bots leave members that are more than
 // <spreadPct> health percent below the healthiest one alone, and the healthiest one is the DPS fallback target.
-struct KillTogether { uint32_t enemy; uint32_t downAura; float spreadPct; };
+// pack: further entries that belong to the same pack when its members differ (Zul'Gurub's Thekal, Zath and Lor'Khan: each one feigns death
+// at 1 hp and a standing one resurrects the fallen within 10 s, so all three have to go down together).
+struct KillTogether { uint32_t enemy; uint32_t downAura; float spreadPct; std::vector<uint32_t> pack = {}; };
+inline bool InPack(KillTogether const& rule, uint32_t entry)
+{
+    return entry == rule.enemy || std::find(rule.pack.begin(), rule.pack.end(), entry) != rule.pack.end();
+}
 
 // While <enemy> is alive and fighting, matching bots stay within <radius> yards of it (an Anubisath Defender's Meteor is
 // split among everybody within 8 yards, its Shadow Storm only hits beyond 25). A bot further out walks back to 60% of the
@@ -263,10 +298,13 @@ struct RaidRules
     std::vector<Dispel> dispel;
     std::vector<PurgeEnemy> purge;
     std::vector<CrowdControl> crowdControl;
+    std::vector<NoControl> noControl;
     std::vector<Priority> priority;
     std::vector<NoAoe> noAoe;
+    std::vector<Spare> spare;
     std::vector<TankSwap> tankSwap;
     std::vector<AvoidEnemy> avoidEnemy;
+    std::vector<AvoidOnStacks> avoidOnStacks;
     std::vector<AvoidBreath> avoidBreath;
     std::vector<BreathSafe> breathSafe;
     std::vector<MeleeSoak> meleeSoak;
@@ -325,6 +363,10 @@ bool OwnsAura(uint32_t mapId, uint32_t aura);
 // True when the map's rules say this cast is kicked before any other cast in reach (an enemy heal, a polymorph). Rules are
 // static data, so the PvE coordinator may call it from its planning pass.
 bool InterruptFirst(uint32_t mapId, uint32_t spell);
+// Where the cast stands on the map's interruptFirst list (0 = taken before everything else; Molten Core: Dark Mending), kNotInterruptFirst
+// when the list does not name it. The kick election sorts the casts it sees by this (KickRules.h CastBefore).
+constexpr size_t kNotInterruptFirst = SIZE_MAX;
+size_t InterruptOrder(uint32_t mapId, uint32_t spell);
 
 // True when the map's rules list <entry> as an add the tanks do not hold (Firelord's Lava Spawns): the tank assignment gives a
 // tank such a mob only when no other engaged mob is free, and the tank roster does not grow for it.
@@ -359,5 +401,7 @@ void RegisterBlackwingMovement(RaidRules& rules);
 void RegisterOnyxia(RaidRules& rules);
 void RegisterNaxxramas(RaidRules& rules);
 void RegisterTempleOfAhnQiraj(RaidRules& rules);
+void RegisterRuinsOfAhnQiraj(RaidRules& rules);
+void RegisterZulGurub(RaidRules& rules);
 
 } // namespace Playerbot::Raid

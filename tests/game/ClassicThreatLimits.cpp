@@ -42,3 +42,31 @@ TEST_CASE("A raid's DPS wait eight seconds after the tank's first hit on a boss"
     CHECK(kPartyDpsWaitTimeoutMs == 6000u);
     CHECK(kRaidDpsWaitTimeoutMaxMs > kPartyDpsWaitTimeoutMs);
 }
+
+// Past the hard limit the hold waits for the tank's threat to rise. A tank that is stunned, feared, dead or out of reach never raises it
+// (audit 2026-10-16: DPS and healers idle for whole stuns and Infernos), so the wait ends after six seconds of the tank standing still;
+// a tank that keeps building threat keeps the hold.
+TEST_CASE("A hold past the hard limit releases after six seconds of a tank whose threat does not move", "[ClassicThreatLimits]")
+{
+    CHECK(kStalledTankHoldMs == 6000u);
+
+    StalledTankClock stalled;
+    CHECK_FALSE(StalledTankHoldExpired(stalled, 10000u, 5000.0f, 4000u));   // first poll starts the clock
+    CHECK_FALSE(StalledTankHoldExpired(stalled, 13000u, 5000.0f, 4000u));   // 3 s, still waiting
+    CHECK_FALSE(StalledTankHoldExpired(stalled, 15900u, 5000.0f, 4000u));   // just under
+    CHECK(StalledTankHoldExpired(stalled, 16000u, 5000.0f, 4000u));         // 6 s at a standstill: released
+
+    StalledTankClock building;
+    CHECK_FALSE(StalledTankHoldExpired(building, 10000u, 5000.0f, 4000u));
+    CHECK_FALSE(StalledTankHoldExpired(building, 14000u, 5600.0f, 4000u));  // the tank gained: the clock restarts here
+    CHECK_FALSE(StalledTankHoldExpired(building, 16000u, 5600.0f, 4000u));  // 2 s since the gain
+    CHECK_FALSE(StalledTankHoldExpired(building, 19900u, 5600.0f, 4000u));
+    CHECK(StalledTankHoldExpired(building, 20000u, 5600.0f, 4000u));        // 6 s since the last gain
+
+    StalledTankClock gap;
+    CHECK_FALSE(StalledTankHoldExpired(gap, 10000u, 5000.0f, 4000u));
+    CHECK_FALSE(StalledTankHoldExpired(gap, 15000u, 5000.0f, 4000u));       // 5 s unpolled: a new hold, the clock restarts
+    CHECK_FALSE(StalledTankHoldExpired(gap, 20000u, 5000.0f, 4000u));       // another 5 s gap
+    CHECK_FALSE(StalledTankHoldExpired(gap, 23000u, 5000.0f, 4000u));
+    CHECK(StalledTankHoldExpired(gap, 26000u, 5000.0f, 4000u));             // 6 s of steady polls
+}

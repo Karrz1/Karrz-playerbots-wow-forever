@@ -9,6 +9,7 @@
 #include "Bot/BotIntentEmitter.h"
 #include "Bot/Raid/RaidCombat.h"                 // raid encounter orders (MC/BWL/Onyxia/Naxx)
 #include "Bot/Raid/RaidEncounters.h"             // Raid::Retaunts
+#include "Bot/Raid/RaidFightScript.h"            // Raid::Script::FightFor
 #include "Bot/RunToTankRules.h"                 // EnemyBlocksRunToTank
 #include "Bot/ClassicUpkeep.h"                   // Classic::PickCombatHealthItem / PickCombatManaItem
 #include "Bot/ClassTables.h"                     // ClassOocHeal — combat:pve_heal_focus
@@ -635,6 +636,23 @@ bool PartyOverThreatExpired(BotSnapshotView const& s, ObjectGuid target)
     return HoldClockExpired(g_party_hold_mu, g_party_hold, s, target, kPartyOverThreatMaxMs, kPartyOverThreatGapMs);
 }
 
+// Past the hard limit the hold has no timed release: it waits for the tank's threat to rise (Bot/ThreatLimits.h, StalledTankHoldExpired).
+// One clock per bot and target, polled with the tank's threat; it expires after kStalledTankHoldMs at a standstill.
+constexpr uint32 kStalledTankHoldGapMs = 4000;
+std::mutex g_stalled_hold_mu;
+std::unordered_map<uint64, StalledTankClock> g_stalled_hold;
+
+bool TankStalledUnderHold(BotSnapshotView const& s, ObjectGuid target, float tank_threat)
+{
+    const uint32 now = s.published_at_ms();
+    const uint64 key = (uint64(s.raw().guid.GetCounter()) << 32) | uint64(uint32(target.GetCounter()));
+    std::lock_guard<std::mutex> lock(g_stalled_hold_mu);
+    if (g_stalled_hold.size() > 1024)
+        for (auto it = g_stalled_hold.begin(); it != g_stalled_hold.end();)
+            it = (now - it->second.last_ms > 60'000u) ? g_stalled_hold.erase(it) : std::next(it);
+    return StalledTankHoldExpired(g_stalled_hold[key], now, tank_threat, kStalledTankHoldGapMs);
+}
+
 // Majordomo Executus' Damage Shield, on himself and his Flamewakers (the Magic Reflection twin, 20619, is refused by the cast API).
 constexpr uint32 kDamageShieldAura = 21075;
 
@@ -661,6 +679,11 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
                 s.name(), u->entry, target.GetCounter());
         return ThreatHold::ShieldUp;
     }
+
+    // A fight script's boss that is not a kill target (Majordomo): the threat wait of a bot that is not meant to kill him is no hold at all.
+    if (s.is_in_raid())
+        if (Raid::Script::Fight const* fs = Raid::Script::FightFor(s.map_id(), u->entry); fs && Raid::Script::BossIsNoKillTarget(*fs, u->entry))
+            return ThreatHold::None;
 
     if (s.is_in_raid() && LooseRaidEliteOnMember(s, *u, g) && !LooseHoldExpired(s, target, Raid::Retaunts(s.map_id(), u->entry)))
     {
@@ -718,6 +741,17 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
             TC_LOG_INFO("playerbot.v2",
                 "[party_threat] {} stops holding on entry {} ({}) after {} ms over the tank's threat mine={:.0f} tank={:.0f}",
                 s.name(), u->entry, target.GetCounter(), kPartyOverThreatMaxMs, u->my_threat, u->tank_threat);
+        h = ThreatHold::None;
+    }
+    // Past the hard limit the hold waits for the tank to build; a tank that is stunned, feared, dead or out of reach never does, and the
+    // bot sat idle for the whole stun or Inferno (audit 2026-10-16). After kStalledTankHoldMs with the tank's threat at a standstill the
+    // hold releases and plain fighting takes over (the class threat drop has run during the hold, TryThreatDrop).
+    if (h == ThreatHold::OverThreat && past_hard_limit && TankStalledUnderHold(s, target, u->tank_threat))
+    {
+        if (RaidLogDue(RaidLogKey(s, RaidLogKind::ThreatHold), s.published_at_ms(), 5000u))
+            TC_LOG_INFO("playerbot.v2",
+                "[raid_threat] {} stops holding on entry {} ({}): tank threat stalled at {:.0f} for {} ms, mine={:.0f}",
+                s.name(), u->entry, target.GetCounter(), u->tank_threat, kStalledTankHoldMs, u->my_threat);
         h = ThreatHold::None;
     }
     if (h == ThreatHold::OverThreat && s.is_in_raid() &&
