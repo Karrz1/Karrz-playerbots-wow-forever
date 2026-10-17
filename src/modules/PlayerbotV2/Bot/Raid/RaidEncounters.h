@@ -176,9 +176,7 @@ struct TankSwap { uint32_t enemy; uint32_t debuffAura; uint32_t stacks; };
 
 // While <enemy> is alive and fighting, matching bots stay at least <radius> yards from it (point-blank AoE such as Blast Wave).
 // Do not use Who::Tank / Anyone for melee-range bosses: only bots that do not have to stand next to the enemy.
-// <pad>: a bot inside the circle walks out to <pad> yards beyond its edge, not to the edge. An enemy that follows its tank moves the circle under a bot
-// that stopped at the edge, and the bot is inside again a few seconds later (Majordomo 2026-10-17: 1.4 to 2.4 leave-hazard moves a second for the ranged).
-struct AvoidEnemy { uint32_t enemy; float radius; Who who; float hpMax = 100.0f; float hpMin = 0.0f; float pad = 0.0f; };
+struct AvoidEnemy { uint32_t enemy; float radius; Who who; float hpMax = 100.0f; float hpMin = 0.0f; };
 
 // While a matching bot carries at least <stacks> stacks of <aura> (a debuff the enemy puts on whoever hits it: Golemagg's Magma Splash), it stays
 // <radius> yards from every <enemy> that is not hitting it, until the aura falls off. The bot the enemy is hitting (its tank) is never moved.
@@ -253,6 +251,10 @@ struct StayNear { uint32_t enemy; float radius; Who who; float hpMax = 100.0f; f
 constexpr float kNoBearing = 1000.0f;
 struct FaceAway { uint32_t enemy; float hpMax = 100.0f; float hpMin = 0.0f; float bearingDeg = kNoBearing; };
 
+// While <anchor> is fighting, the players that hold an <enemy> stand <reach> yards past the spot the anchor stood on when the fight began, away from the
+// raid's centre at that moment, side by side <spacing> yards apart (Majordomo: his tank drags him out, each Elite tank one Elite, all visibly apart).
+struct TankSpot { uint32_t anchor; uint32_t enemy; float reach; float spacing; };
+
 // While <enemy> is alive and fighting, matching bots stand in the sector behind it: <halfAngleDeg> either side of the line
 // straight behind where it faces, between <minDist> and <maxDist> yards. A bot outside walks to the nearest such spot on its
 // own side. Pair with FaceAway so the tank decides which way "behind" is.
@@ -315,6 +317,7 @@ struct RaidRules
     std::vector<KillTogether> killTogether;
     std::vector<StayNear> stayNear;
     std::vector<FaceAway> faceAway;
+    std::vector<TankSpot> tankSpot;
     std::vector<StandBehind> standBehind;
     std::vector<StandFlank> standFlank;
     std::vector<ResistPotion> resistPotion;
@@ -325,6 +328,7 @@ struct RaidRules
     std::vector<uint32_t> noTank;   // summoned adds the DPS burns down: tanks hold every other mob first and never count them as a roster need
     std::vector<uint32_t> tankOrder;   // mobs the tanks take in this order, first listed first (Majordomo: Healers, then Elites); unlisted mobs come after
     std::vector<uint32_t> tankLast;    // a mob the tanks take only when no other free mob is left (Majordomo: he does little damage and cannot die)
+    std::vector<uint32_t> offTankMob;  // a boss the second tank holds from the first second (Majordomo); no area taunt while he is up, the tanks keep their mobs
     std::vector<uint32_t> interruptFirst;   // casts the PvE coordinator's kick election takes before any other (heals, sheep)
 };
 
@@ -377,6 +381,9 @@ uint32_t TankOrder(uint32_t mapId, uint32_t entry);
 
 // True when the map's rules list <entry> in RaidRules::tankLast.
 bool TankLast(uint32_t mapId, uint32_t entry);
+
+// True when the map's rules list <entry> in RaidRules::offTankMob.
+bool OffTankMob(uint32_t mapId, uint32_t entry);
 
 // True when the map's rules list <entry> as a boss whose threat a scripted reset or a Blink can leave on a non-tank (RaidRules::retaunt): a
 // tank taunts it back at once, so the raid's wait for that tank is short.

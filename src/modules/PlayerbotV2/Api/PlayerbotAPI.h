@@ -192,7 +192,9 @@ public:
     // split would NoPath and refuse. Distance-capped; movement-lock guards apply.
     // drop=true: a committed one-way drop off a ledge (BG ledge-to-landing legs recorded by hand): a low jump move from the ledge to the
     // landing, with the fall damage a player would take applied on arrival. Refused unless the landing is 4..40 y below within 40 y.
-    Result move_to(float x, float y, float z, bool run = true, bool direct = false, bool drop = false);
+    // follow_drop=true: (x,y,z) is the owner. When he stands lower (or across a gap) and the walking route to him is missing or a long detour,
+    // the bot walks to the nearest ledge and drops or leaps to his floor ([follow_drop] logs); otherwise this is the ordinary pathed move.
+    Result move_to(float x, float y, float z, bool run = true, bool direct = false, bool drop = false, bool follow_drop = false);
     // Ground height at (x,y) searched from above `z_hint` (Playerbot.Behavior.GroundSnap); returns z_hint when none found.
     float  ground_z(float x, float y, float z_hint, char const* where = "api");
     // clear_generators=true pops all MotionMaster generators (Clear + MoveIdle)

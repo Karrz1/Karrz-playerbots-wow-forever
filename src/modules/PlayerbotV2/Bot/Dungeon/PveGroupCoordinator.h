@@ -77,11 +77,6 @@ public:
     // loses the mob and is given another one by the next plan. World thread only, same contract as Update().
     void ReassignTankTarget(uint64 group_low, uint32 map_id, uint64 tank_low, ObjectGuid mob);
 
-    // A tank that taunted <mob> back from a non-tank (Raid::ElectRetaunt): ReassignTankTarget, and the automatic tank markers of the retaker
-    // and of the tank who held <mob> before are swapped, so the marker pass keeps the assignment instead of undoing it (TankMarkSwap.h).
-    // Markers set by the owner (tank symbols, tank orders) are not touched. World thread only.
-    void RetakeTankTarget(uint64 group_low, uint32 map_id, uint64 tank_low, ObjectGuid mob);
-
 private:
     struct Member
     {

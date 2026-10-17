@@ -44,6 +44,7 @@
 #include "DetourNavMeshQuery.h"
 #include "PlayerbotV2.h"     // path-outcome telemetry, bot-leader battleground queue
 #include "PlayerbotMovement.h"  // unified bot-movement helpers
+#include "FollowDrop.h"          // follow_drop: ledge plan toward an owner who dropped or jumped down
 #include "Fleet/CityLayer.h"      // same-level moves across a drop, NoPath storm
 #include "Bot/World/ZonePicker.h" // IsVanillaCapitalZone
 #include "Fleet/InstanceEntry.h"  // PrepareInstanceEntry: a stale raid lock must not keep a companion out of its owner's instance
@@ -118,6 +119,90 @@ namespace Playerbot {
 // (helper-namespace BotMovement). Bring it into local scope so existing
 // callers below read naturally.
 using BotMovement::SehSafeCalculatePath;
+
+// Follow-drop planning (move_to follow_drop): the walking-route verdict, then the ledge plan (Api/FollowDrop.h). World thread.
+namespace
+{
+    struct FollowDropPlan
+    {
+        FollowDrop::Mode mode = FollowDrop::Mode::None;
+        FollowDrop::Vec  ledge, land;
+    };
+
+    FollowDropPlan PlanFollowDropFor(Player* p, float ox, float oy, float oz)
+    {
+        FollowDropPlan out;
+        if (!p->IsAlive() || p->IsFlying() || p->IsInFlight() || p->GetVehicle() || p->GetTransport() || p->IsInWater() || p->IsFalling() ||
+            p->IsMounted() || p->IsInCombat())
+            return out;
+        float const bx = p->GetPositionX(), by = p->GetPositionY(), bz = p->GetPositionZ();
+        // Cheap gate: the owner is lower by a real drop, or about level (a gap). A bot already close to him just follows.
+        float const dxy = std::sqrt((ox - bx) * (ox - bx) + (oy - by) * (oy - by));
+        if (dxy > FollowDrop::kMaxOwnerDistXY || dxy < 6.0f || bz - oz < -3.0f)
+            return out;
+
+        // The walking route is judged once a second per bot: fine (a normal path not much longer than the straight line) or not.
+        struct Verdict { uint32 at = 0; bool fine = true; };
+        static std::unordered_map<uint64, Verdict> s_verdict;
+        uint32 const now = GameTime::GetGameTimeMS();
+        Verdict& v = s_verdict[p->GetGUID().GetCounter()];
+        if (v.at == 0 || now - v.at >= 1000u)
+        {
+            v.at = now ? now : 1u;
+            PathGenerator path(p);
+            path.SetDisableRoadBonus(true);
+            bool const ok = SehSafeCalculatePath(path, ox, oy, oz);
+            PathType const pt = path.GetPathType();
+            bool fine = false;
+            if (ok && (pt & PATHFIND_NORMAL) && !(pt & PATHFIND_NOPATH) && !(pt & PATHFIND_INCOMPLETE) && !(pt & PATHFIND_SHORTCUT) && !(pt & PATHFIND_SHORT))
+            {
+                float len = 0.f;
+                auto const& pts = path.GetPath();
+                for (size_t i = 1; i < pts.size(); ++i)
+                    len += std::sqrt((pts[i].x - pts[i - 1].x) * (pts[i].x - pts[i - 1].x) + (pts[i].y - pts[i - 1].y) * (pts[i].y - pts[i - 1].y) +
+                                     (pts[i].z - pts[i - 1].z) * (pts[i].z - pts[i - 1].z));
+                float const straight = std::sqrt(dxy * dxy + (bz - oz) * (bz - oz));
+                fine = len <= 2.0f * straight + 15.0f;
+            }
+            v.fine = fine;
+        }
+        if (v.fine)
+            return out;
+
+        FollowDrop::Plan const plan = FollowDrop::PlanFollowDrop(
+            FollowDrop::Vec{ bx, by, bz }, FollowDrop::Vec{ ox, oy, oz }, false,
+            [p](float x, float y, float hint, float& z) { return BotMovement::ProbeGround(p, x, y, hint, z); },
+            [p](FollowDrop::Vec const& a, FollowDrop::Vec const& b) { return BotMovement::LineIsClear(p, a.x, a.y, a.z, b.x, b.y, b.z); });
+        if (plan.mode == FollowDrop::Mode::None)
+        {
+            static std::unordered_map<uint64, uint32> s_noLedgeLog;
+            uint32& at = s_noLedgeLog[p->GetGUID().GetCounter()];
+            if (at == 0 || now - at >= 10000u)
+            {
+                at = now ? now : 1u;
+                TC_LOG_INFO("playerbot.v2", "[follow_drop] {} found no ledge toward the owner: bot=({:.1f},{:.1f},{:.1f}) owner=({:.1f},{:.1f},{:.1f}) dist={:.1f}",
+                            p->GetName(), bx, by, bz, ox, oy, oz, dxy);
+            }
+            return out;
+        }
+        if (plan.mode == FollowDrop::Mode::Walk)
+        {
+            static std::unordered_map<uint64, uint32> s_walkLog;
+            uint32& at = s_walkLog[p->GetGUID().GetCounter()];
+            if (at == 0 || now - at >= 3000u)
+            {
+                at = now ? now : 1u;
+                TC_LOG_INFO("playerbot.v2", "[follow_drop] {} walks to the ledge ({}): ledge=({:.1f},{:.1f},{:.1f}) {:.1f} y away, owner=({:.1f},{:.1f},{:.1f})",
+                            p->GetName(), plan.leap ? "leap" : "drop", plan.ledge.x, plan.ledge.y, plan.ledge.z, plan.walk, ox, oy, oz);
+            }
+        }
+        out.mode = plan.mode;
+        out.ledge = plan.ledge;
+        out.land = plan.land;
+        return out;
+    }
+}
+
 
 // Per-world-tick pathfinding budget (declared PlayerbotAPI.h). World-thread only,
 // no synchronization. g_active gates the window: outside a Begin/End pair (e.g. a
@@ -1006,7 +1091,7 @@ float API::ground_z(float x, float y, float z_hint, char const* where)
     return BotMovement::GroundZ(p_, x, y, z_hint, where);
 }
 
-Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
+Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop, bool follow_drop)
 {
     if (!p_) return Result::Other;
 
@@ -1108,6 +1193,41 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     if (p_->GetMotionMaster()->GetCurrentMovementGeneratorType() ==
             FLIGHT_MOTION_TYPE)
         return Result::Locked;
+
+    // Follow the owner off a ledge. (x,y,z) is the owner. When his floor is only reached by a drop or a jump (UBRS stadium, 2026-10-17: he
+    // dropped 11 y into the arena and his bots, with only the walking route, went round through the Blackhand packs and died) and the walking
+    // route to him is missing or a long detour, walk to the nearest ledge and leave it; otherwise fall through to the ordinary pathed move.
+    if (follow_drop && !direct && !drop)
+    {
+        FollowDropPlan const fd = PlanFollowDropFor(p_, x, y, z);
+        if (fd.mode == FollowDrop::Mode::Walk)
+        {
+            p_->GetMotionMaster()->MovePoint(0, fd.ledge.x, fd.ledge.y, fd.ledge.z, /*generatePath*/ false);
+            return Result::Ok;
+        }
+        if (fd.mode == FollowDrop::Mode::Drop)
+        {
+            TC_LOG_INFO("playerbot.v2", "[follow_drop] {} drops to the owner's floor: ledge=({:.1f},{:.1f},{:.1f}) landing=({:.1f},{:.1f},{:.1f}) owner=({:.1f},{:.1f},{:.1f})",
+                        p_->GetName(), fd.ledge.x, fd.ledge.y, fd.ledge.z, fd.land.x, fd.land.y, fd.land.z, x, y, z);
+            return move_to(fd.land.x, fd.land.y, fd.land.z, true, false, /*drop*/ true);
+        }
+        if (fd.mode == FollowDrop::Mode::Leap)
+        {
+            static std::unordered_map<uint64, uint32> s_leapUntil;
+            uint64 const lg = p_->GetGUID().GetCounter();
+            uint32 const lnow = GameTime::GetGameTimeMS();
+            if (auto it = s_leapUntil.find(lg); it != s_leapUntil.end() && lnow < it->second)
+                return Result::Locked;                               // already in the air
+            s_leapUntil[lg] = lnow + 2500u;
+            Position dest = p_->GetPosition();
+            dest.Relocate(fd.land.x, fd.land.y, fd.land.z);
+            p_->SetFacingTo(std::atan2(fd.land.y - p_->GetPositionY(), fd.land.x - p_->GetPositionX()));
+            p_->GetMotionMaster()->MoveJump(/*id*/ 0, dest, /*speedXY*/ 7.0f);
+            TC_LOG_INFO("playerbot.v2", "[follow_drop] {} leaps the gap to the owner's side: ledge=({:.1f},{:.1f},{:.1f}) landing=({:.1f},{:.1f},{:.1f}) owner=({:.1f},{:.1f},{:.1f})",
+                        p_->GetName(), fd.ledge.x, fd.ledge.y, fd.ledge.z, fd.land.x, fd.land.y, fd.land.z, x, y, z);
+            return Result::Ok;
+        }
+    }
 
     // Already there. A rule holding a spot (raid/dungeon positioning, hold,
     // stand-at-NPC) keeps re-emitting the same destination after arrival; the

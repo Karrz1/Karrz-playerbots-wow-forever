@@ -167,6 +167,9 @@ bool TryCast(View const& s, Emit& emit, ObjectGuid target)
         return LogRefusal(low, now, s.name().c_str(), "the raid's kill target", u->entry, TypeOf(*u), 0.f), false;
     if (u->max_hp > 0 && u->hp * 2 < u->max_hp)
         return LogRefusal(low, now, s.name().c_str(), "mob under half health, being killed", u->entry, TypeOf(*u), 0.f), false;
+    // Magic Reflection (Majordomo's adds): the spell comes back onto the caster (nl99 pull 2: Orinero was polymorphed for 50 s by his own sheep).
+    if (u->magic_buff_spell == 20619 && s.cls() != CLASS_ROGUE)
+        return LogRefusal(low, now, s.name().c_str(), "the mob reflects spells", u->entry, TypeOf(*u), 0.f), false;
     if (u->root_caster == s.guid())
         return false;   // our own Entangling Roots still holds it (a root is not a CC lock)
     bool const ooc = !s.in_combat() && !u->unit_in_combat;

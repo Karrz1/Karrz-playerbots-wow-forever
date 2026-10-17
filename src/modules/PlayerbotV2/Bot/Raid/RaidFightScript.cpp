@@ -70,6 +70,8 @@ void ApplyFightScript(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& order
     if (grp)
         for (uint8_t icon : { kSkullIcon, kCrossIcon })
         {
+            if (fight->skullOnly && icon != kSkullIcon)
+                continue;
             ObjectGuid const g = grp->GetTargetIcon(icon);
             if (g.IsEmpty())
                 continue;
@@ -106,6 +108,12 @@ void ApplyFightScript(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& order
         if (m.tank || m.healer)
             continue;
 
+        // Skull only: everything else of the fight, marked or sheeped or not, is off limits for this bot.
+        if (fight->skullOnly)
+            for (Unit* enemy : mine)
+                if (enemy->GetGUID() != ownerMark)
+                    o.forbidden_targets.push_back(enemy->GetGUID());
+
         std::vector<Script::Enemy> view;
         view.reserve(mine.size());
         for (Unit* enemy : mine)
@@ -126,7 +134,18 @@ void ApplyFightScript(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& order
             if (pick && enemy->GetGUID().GetCounter() == pick)
                 focus = enemy->GetGUID();
         if (focus.IsEmpty())
+        {
+            // The skull carries a shield this bot must not strike (Damage Shield for melee, Magic Reflection for casters): it stands, the
+            // generic pickers would start an attack on the skull each tick and every swing is reflected (nl99: nine deaths "melee by self").
+            if (fight->skullOnly && !ownerMark.IsEmpty() &&
+                std::find(o.forbidden_targets.begin(), o.forbidden_targets.end(), ownerMark) != o.forbidden_targets.end())
+            {
+                o.script_owns = true;
+                o.script_focus = ownerMark;
+                o.hold_target = ownerMark;
+            }
             continue;   // nothing the script can name for this bot: the generic rules keep it
+        }
 
         o.script_owns = true;
         o.script_focus = focus;

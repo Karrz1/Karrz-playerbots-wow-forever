@@ -36,6 +36,8 @@ struct OwnerBinding
     uint64 player_guid = 0;
     // On the owner's saved companion roster (`.bot save`): `.bot call all` brings back only these. Migration 0018.
     bool saved = false;
+    // The character whose roster it is on (0 = any character on the account, a roster saved before migration 0030). Migration 0030.
+    uint64 saved_by = 0;
 };
 
 class OwnerRegistry
@@ -64,7 +66,9 @@ public:
     bool IsOwner(BotId bot, uint32 sender_account, uint64 sender_guid) const;
 
     // Puts the bot on (or takes it off) its owner's saved roster. Writes immediately to the DB. No-op for an unowned bot.
-    void SetSaved(BotId bot, bool saved);
+    // The roster is per character: only the character `by` sees the bot as saved.
+    void SetSaved(BotId bot, bool saved, uint64 by = 0);
+    bool SavedBy(BotId bot, uint64 character) const;
 
     // A hunter companion's starter pet (the Taming the Beast pet it never quests for) is granted once per bot, ever:
     // after that a pet the owner abandons stays abandoned and the owner's own Tame Beast is free. Migration 0020.

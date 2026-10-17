@@ -117,6 +117,12 @@ bool TankLast(uint32_t mapId, uint32_t entry)
     return rules && std::find(rules->tankLast.begin(), rules->tankLast.end(), entry) != rules->tankLast.end();
 }
 
+bool OffTankMob(uint32_t mapId, uint32_t entry)
+{
+    RaidRules const* rules = RulesForMap(mapId);
+    return rules && std::find(rules->offTankMob.begin(), rules->offTankMob.end(), entry) != rules->offTankMob.end();
+}
+
 bool Retaunts(uint32_t mapId, uint32_t entry)
 {
     RaidRules const* rules = RulesForMap(mapId);

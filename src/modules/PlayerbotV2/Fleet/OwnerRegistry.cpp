@@ -14,7 +14,7 @@ auto& Db() { return CharacterDatabase; }
 size_t OwnerRegistry::LoadFromDb()
 {
     auto result = Db().Query(
-        "SELECT character_guid_low, owner_account_id, owner_player_guid, companion_saved, starter_pet_granted, gear_varied, companion_role, companion_subgroup, companion_spec, companion_order "
+        "SELECT character_guid_low, owner_account_id, owner_player_guid, companion_saved, starter_pet_granted, gear_varied, companion_role, companion_subgroup, companion_spec, companion_order, companion_saved_by "
         "FROM playerbot_v2_character "
         "WHERE owner_account_id != 0 OR companion_role != 0");
     auto gear_modes = Db().Query("SELECT owner_account_id, gear_mode FROM playerbot_v2_owner_gear");
@@ -42,6 +42,7 @@ size_t OwnerRegistry::LoadFromDb()
         b.account_id    = f[1].GetUInt32();
         b.player_guid   = f[2].GetUInt64();
         b.saved         = f[3].GetUInt8() != 0;
+        b.saved_by      = f[10].GetUInt64();
         if (b.account_id != 0)
             owners_[bot] = b;
         if (f[4].GetUInt8() != 0)
@@ -159,6 +160,7 @@ uint64 OwnerRegistry::OwnerCharacter(BotId bot) const
 
 void OwnerRegistry::SetOwner(BotId bot, uint32 account_id, uint64 player_guid)
 {
+    uint64 saved_by = 0;
     bool saved = false;   // a bot stays on the roster only while the same account owns it
     {
         std::unique_lock lk(mtx_);
@@ -172,7 +174,8 @@ void OwnerRegistry::SetOwner(BotId bot, uint32 account_id, uint64 player_guid)
         {
             auto it = owners_.find(bot);
             saved = it != owners_.end() && it->second.account_id == account_id && it->second.saved;
-            owners_[bot] = OwnerBinding{account_id, player_guid, saved};
+            saved_by = saved ? it->second.saved_by : 0;
+            owners_[bot] = OwnerBinding{account_id, player_guid, saved, saved_by};
         }
     }
     // Persist. UPDATE only — the bot row must already exist (it's
@@ -182,12 +185,19 @@ void OwnerRegistry::SetOwner(BotId bot, uint32 account_id, uint64 player_guid)
     // bot — next mutation will succeed.
     Db().DirectPExecute(
         "UPDATE playerbot_v2_character "
-        "SET owner_account_id = {}, owner_player_guid = {}, companion_saved = {} "
+        "SET owner_account_id = {}, owner_player_guid = {}, companion_saved = {}, companion_saved_by = {} "
         "WHERE character_guid_low = {}",
-        account_id, player_guid, saved ? 1 : 0, bot);
+        account_id, player_guid, saved ? 1 : 0, saved_by, bot);
 }
 
-void OwnerRegistry::SetSaved(BotId bot, bool saved)
+bool OwnerRegistry::SavedBy(BotId bot, uint64 character) const
+{
+    std::shared_lock lk(mtx_);
+    auto it = owners_.find(bot);
+    return it != owners_.end() && it->second.saved && (it->second.saved_by == 0 || it->second.saved_by == character);
+}
+
+void OwnerRegistry::SetSaved(BotId bot, bool saved, uint64 by)
 {
     {
         std::unique_lock lk(mtx_);
@@ -195,9 +205,10 @@ void OwnerRegistry::SetSaved(BotId bot, bool saved)
         if (it == owners_.end())
             return;
         it->second.saved = saved;
+        it->second.saved_by = saved ? by : 0;
     }
-    Db().DirectPExecute("UPDATE playerbot_v2_character SET companion_saved = {} WHERE character_guid_low = {}",
-        saved ? 1 : 0, bot);
+    Db().DirectPExecute("UPDATE playerbot_v2_character SET companion_saved = {}, companion_saved_by = {} WHERE character_guid_low = {}",
+        saved ? 1 : 0, saved ? by : 0, bot);
 }
 
 bool OwnerRegistry::StarterPetGranted(BotId bot) const

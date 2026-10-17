@@ -83,7 +83,9 @@ struct SetStandStateIntent   { uint8 stand_state; };
 // endpoints are human-verified ground truth (playerbot_nav_links); a pathfound
 // move toward the far side of a real navmesh split would NoPath and refuse.
 // drop = a committed one-way drop off a ledge (a jump move to the landing, fall damage applied on arrival); see API::move_to.
-struct MoveToIntent          { float x, y, z; bool run; bool direct = false; bool drop = false; };
+// follow_drop = a move toward the owner that leaves a ledge when the walking route to him is missing or a long detour (he dropped or jumped
+// down); see API::move_to. Otherwise it is the ordinary pathed move.
+struct MoveToIntent          { float x, y, z; bool run; bool direct = false; bool drop = false; bool follow_drop = false; };
 struct TeleportToIntent      { uint32 map_id; float x, y, z, o; };
 // clear_generators=false (default) only halts the active spline (Player::
 // StopMoving). clear_generators=true pops EVERY MotionMaster generator back to

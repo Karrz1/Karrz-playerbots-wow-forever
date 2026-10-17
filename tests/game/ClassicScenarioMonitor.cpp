@@ -755,9 +755,8 @@ TEST_CASE("ScenarioDefs: the Molten Core scenarios are a 40-man raid with 4 tank
                 if (i) CHECK(((i > 1 && std::tolower(m.name[i]) == std::tolower(m.name[i - 1]) && std::tolower(m.name[i]) == std::tolower(m.name[i - 2])) == false));
             }
         }
-        // Majordomo's court is nine mobs: his squad has five tanks and eleven healers.
-        CHECK(tanks == (r.boss_entry == 12018 ? 5u : 4u));
-        CHECK(healers == (r.boss_entry == 12018 ? 11u : 12u));
+        CHECK(tanks == 4);
+        CHECK(healers == 12);
         CHECK(warlocks >= 3);                                   // Banish for Garr's Firesworn
         CHECK(names.size() == 40);
         // The raid is one faction: Alliance races only.

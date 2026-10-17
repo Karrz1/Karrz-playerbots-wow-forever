@@ -63,12 +63,70 @@ bool IsMeleeClass(uint8 cls, uint32 spec)
 
 } // anonymous
 
+// A ready check is answered by every grouped bot, dead or busy rezzing or not: a bot that skips it holds the whole check open until it times out.
+static void AnswerReadyCheck(BotAI& ai, BotSnapshotView const& snapshot, GroupSnapshotView const& group, BotIntentEmitter& emit)
+{
+    // Auto-respond ready when the leader starts a ready check. Bots that don't
+    // answer block the rest of the group from pulling. Edge-triggered: emit
+    // exactly once per active window (cleared when the snapshot reports the
+    // check no longer active). Server-side response is idempotent but the
+    // intent still costs queue slots, so dedup is worth it.
+    if (group.ready_check_active())
+    {
+        if (!ai.ready_check_acked())
+        {
+            // Real information (the owner's ReadyCheckAction): badly low health, a mana
+            // user badly low on mana or broken gear answers not ready and says why
+            // in party chat; the out-of-combat recovery rules then drink / eat
+            // / repair. The check is advisory, nothing else waits on the answer.
+            // A bot a little under (just arrived, a buff cast) is ready: the whole raid answering
+            // "not ready" after a call-up read as broken (playtest 2026-10-13).
+            bool ready = true;
+            char const* why = nullptr;
+            if (!snapshot.is_alive())
+            { ready = false; why = "dead"; }
+            else if (Services::Config().behavior_ready_check_info())
+            {
+                if (snapshot.hp_pct() < 35)
+                { ready = false; why = "low hp, eating first"; }
+                else if (snapshot.max_power(POWER_MANA) > 0 && snapshot.power_pct(POWER_MANA) < 35)
+                { ready = false; why = "low on mana, drinking first"; }
+                else if (snapshot.lowest_equipped_durability_pct() < 15)
+                { ready = false; why = "my gear is broken, need a repair"; }
+            }
+            emit.emit(GroupReadyResponseIntent{ready});
+            TC_LOG_INFO("playerbot.v2", "[ready_check] {} answers {}{}{}", snapshot.name(), ready ? "ready" : "not ready", why ? ": " : "", why ? why : "");
+            if (why)
+            {
+                if (snapshot.is_alive())
+                    emit.say(why);
+            }
+            else if (ready)
+            {
+                // Now and then a plain "ready" in chat, like a person (Playerbot.Behavior.PartyBanter).
+                std::string line = BotChatter::BanterLine(BotChatter::Banter::Ready, ai, snapshot);
+                if (!line.empty())
+                    emit.say(std::move(line));
+            }
+            ai.set_ready_check_acked(true);
+            ai.set_last_rule_fired("ingroup:ready_check_ack");
+        }
+    }
+    else if (ai.ready_check_acked())
+    {
+        ai.set_ready_check_acked(false);
+    }
+}
+
+
 void DispatchInGroup(BotAI& ai,
                      BotSnapshotView snapshot,
                      GroupSnapshotView group,
                      BotIntentEmitter& emit)
 {
     if (!group.exists()) return;
+
+    AnswerReadyCheck(ai, snapshot, group, emit);
 
     // Raid: raise the dead (the owner first) before anything else; out of combat the raid never reaches the idle cascade's ooc_rez.
     if (RaidOocRez(snapshot, ai, group, emit))
@@ -306,51 +364,6 @@ void DispatchInGroup(BotAI& ai,
     }
 
     if (!snapshot.is_alive()) return;
-
-    // Auto-respond ready when the leader starts a ready check. Bots that don't
-    // answer block the rest of the group from pulling. Edge-triggered: emit
-    // exactly once per active window (cleared when the snapshot reports the
-    // check no longer active). Server-side response is idempotent but the
-    // intent still costs queue slots, so dedup is worth it.
-    if (group.ready_check_active())
-    {
-        if (!ai.ready_check_acked())
-        {
-            // Real information (the owner's ReadyCheckAction): badly low health, a mana
-            // user badly low on mana or broken gear answers not ready and says why
-            // in party chat; the out-of-combat recovery rules then drink / eat
-            // / repair. The check is advisory, nothing else waits on the answer.
-            // A bot a little under (just arrived, a buff cast) is ready: the whole raid answering
-            // "not ready" after a call-up read as broken (playtest 2026-10-13).
-            bool ready = true;
-            char const* why = nullptr;
-            if (Services::Config().behavior_ready_check_info())
-            {
-                if (snapshot.hp_pct() < 35)
-                { ready = false; why = "low hp, eating first"; }
-                else if (snapshot.max_power(POWER_MANA) > 0 && snapshot.power_pct(POWER_MANA) < 35)
-                { ready = false; why = "low on mana, drinking first"; }
-                else if (snapshot.lowest_equipped_durability_pct() < 15)
-                { ready = false; why = "my gear is broken, need a repair"; }
-            }
-            emit.emit(GroupReadyResponseIntent{ready});
-            if (why)
-                emit.say(why);
-            else if (ready)
-            {
-                // Now and then a plain "ready" in chat, like a person (Playerbot.Behavior.PartyBanter).
-                std::string line = BotChatter::BanterLine(BotChatter::Banter::Ready, ai, snapshot);
-                if (!line.empty())
-                    emit.say(std::move(line));
-            }
-            ai.set_ready_check_acked(true);
-            ai.set_last_rule_fired("ingroup:ready_check_ack");
-        }
-    }
-    else if (ai.ready_check_acked())
-    {
-        ai.set_ready_check_acked(false);
-    }
 
     // Owner's fallback order: the rally anchor and the target choice belong to States::FallbackTick
     // (idle:fallback / the top of DispatchInCombat); the follow / assist below would pull the bot
@@ -1171,6 +1184,22 @@ void DispatchInGroup(BotAI& ai,
          (ai.is_manual_mode(snapshot.published_at_ms()) && ai.owner_command() == BotAI::OwnerCommand::Engage)) &&
         dist < kDetourMaxRange;
     bool const refollow = ai.take_formation_refollow();
+    // The anchor stands 4+ y lower, near: he dropped or jumped down (UBRS stadium 2026-10-17: he went 11 y down into the arena and his bots,
+    // which only follow the walking route, went round through the Blackhand packs and died). Go toward him with follow_drop: when his floor is
+    // only reached by a ledge, API::move_to walks to the nearest one and drops (or leaps a gap); when the walking route is fine it is the
+    // ordinary pathed move. Gated like the follow below, so an order, a hold, a fight or a detour still wins.
+    if (!in_active_bg && !dungeon_run_owns_movement && !detour_leased && !holding_position && !order_owns_movement &&
+        !snapshot.is_rooted() && !snapshot.in_combat() && !snapshot.raw().movement.is_mounted &&
+        dist > 6.0f && dist <= 40.0f && bz - anchor->z >= 4.0f)
+    {
+        bool const pushed = emit.move_to(anchor->x, anchor->y, anchor->z, /*run=*/true, false, false, /*follow_drop=*/true);
+        // A refused move (the owner's spot is off the mesh) leaves the plain follow below to work; a deduped one is a walk to the ledge under way.
+        if (pushed || !ai.move_refused_recently(anchor->x, anchor->y, anchor->z, formation_now_ms))
+        {
+            ai.set_last_rule_fired("ingroup:follow_drop");
+            return;
+        }
+    }
     // Owner formation: the bot's goal is its SLOT, recomputed every tick from the owner's live position and facing,
     // not "within the recall slack of the owner" (a slot ring wider than the slack, or any spot inside the ring,
     // used to count as arrived, so most of a big group stood still while the owner ran). The destination is only
@@ -1323,7 +1352,8 @@ void DispatchInGroup(BotAI& ai,
                     }
                 }
             }
-            emit.move_to(tx, ty, tz, /*run*/ true);
+            // Toward the owner himself (not the escape node): a gap across his side, level with the bot, is leapt from its edge (API::move_to follow_drop).
+            emit.move_to(tx, ty, tz, /*run*/ true, false, false, /*follow_drop*/ stale < kFollowEscapeTicks);
             ai.set_last_rule_fired("ingroup:follow_recall_repath");
         }
         else

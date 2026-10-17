@@ -25,11 +25,13 @@
 #include "CreatureData.h"
 #include "DB2Structure.h"
 #include "GameObject.h"
+#include "GameEventSender.h"
 #include "GameObjectAI.h"
 #include "InstanceScript.h"
 #include "Map.h"
 #include "MapReference.h"
 #include "MotionMaster.h"
+#include "ObjectAccessor.h"
 #include "MovementDefines.h"
 #include "Player.h"
 #include "Random.h"
@@ -913,6 +915,28 @@ public:
             else
                 _stadiumCheckTimer -= diff;
 
+            // The door also opens by proximity: a player carrying the Seal of Ascension within 12 yards of it. The area trigger
+            // (2046) stays as it was, but it fires only when the client reports the trigger volume, and it skipped GM players.
+            if (GetData(TYPE_EVENT_DOOR_UBRS) != DONE)
+            {
+                if (_ubrsDoorCheckTimer <= diff)
+                {
+                    _ubrsDoorCheckTimer = 1000;
+                    if (GameObject* door = instance->GetGameObject(_ubrsDoorGUID))
+                        for (MapReference const& ref : instance->GetPlayers())
+                        {
+                            Player* player = ref.GetSource();
+                            if (player && player->IsAlive() && player->IsWithinDist(door, 12.0f) && player->HasItemCount(ITEM_SEAL_OF_ASCENSION, 1))
+                            {
+                                SetData(TYPE_EVENT_DOOR_UBRS, DONE);
+                                break;
+                            }
+                        }
+                }
+                else
+                    _ubrsDoorCheckTimer -= diff;
+            }
+
             if (_ubrsDoorTimer)
             {
                 if (_ubrsDoorTimer <= diff)
@@ -1341,6 +1365,7 @@ public:
 
         uint32 _ubrsDoorTimer;
         uint32 _ubrsDoorStep;
+        uint32 _ubrsDoorCheckTimer = 1000;
 
         uint32 _stadiumEventTimer;
         uint8 _stadiumWaves;
@@ -1486,11 +1511,177 @@ class classic_spell_ubrs_freeze_rookery_egg : public SpellScript
     }
 };
 
+/*######
+## go_blackrock_altar
+######*/
+
+// The Blackrock Altar (175706, summoning ritual, three casters). The core ritual completes the instant the third player has
+// used it, so a bot that walks up and taps it looks like a lockbox. Here every user takes the altar spell (16532, "Emberseer
+// Object Visual": a 600 s aura, not a channel) and must keep it and stay at the altar; the ritual completes (event 4884) only
+// after three grouped players have held it together for three seconds. A user who dies, walks off, loses the aura or waits
+// two minutes alone leaves the ritual, and the aura comes off whoever leaves.
+struct classic_go_blackrock_altar : public GameObjectAI
+{
+    enum
+    {
+        SPELL_ALTAR_CHANNEL     = 16532,
+        EVENT_ALTAR_COMPLETE    = 4884,
+        ALTAR_CASTERS           = 3,
+        ALTAR_RANGE             = 8,
+        ALTAR_HOLD_MS           = 3000,
+        ALTAR_WAIT_MS           = 120000,
+        ALTAR_TICK_MS           = 500
+    };
+
+    struct AltarUser
+    {
+        ObjectGuid guid;
+        uint32 waitedMs = 0;
+    };
+
+    classic_go_blackrock_altar(GameObject* go) : GameObjectAI(go), _tickMs(ALTAR_TICK_MS), _holdMs(0) { }
+
+    bool OnGossipHello(Player* player) override
+    {
+        InstanceScript* instance = me->GetInstanceScript();
+        if (!instance || instance->GetData(TYPE_EMBERSEER) == IN_PROGRESS || instance->GetData(TYPE_EMBERSEER) == DONE)
+            return true;
+
+        Prune();
+        if (!_users.empty())
+        {
+            Player* first = ObjectAccessor::GetPlayer(*me, _users.front().guid);
+            if (first && !player->IsInSameRaidWith(first))
+                return true;
+        }
+
+        for (AltarUser const& user : _users)
+            if (user.guid == player->GetGUID())
+                return true;
+
+        AltarUser user;
+        user.guid = player->GetGUID();
+        _users.push_back(user);
+        player->CastSpell(player, SPELL_ALTAR_CHANNEL, CastSpellExtraArgs(TRIGGERED_FULL_MASK));
+        return true;
+    }
+
+    void UpdateAI(uint32 diff) override
+    {
+        if (_users.empty())
+            return;
+
+        if (_tickMs > diff)
+        {
+            _tickMs -= diff;
+            return;
+        }
+        _tickMs = ALTAR_TICK_MS;
+
+        for (AltarUser& user : _users)
+        {
+            user.waitedMs += ALTAR_TICK_MS;
+        }
+
+        size_t const before = _users.size();
+        Prune();
+        if (_users.size() != before)
+            _holdMs = 0;
+
+        if (_users.size() < ALTAR_CASTERS)
+        {
+            _holdMs = 0;
+            return;
+        }
+
+        _holdMs += ALTAR_TICK_MS;
+        if (_holdMs < ALTAR_HOLD_MS)
+            return;
+
+        Player* starter = ObjectAccessor::GetPlayer(*me, _users.front().guid);
+        for (AltarUser const& user : _users)
+            if (Player* player = ObjectAccessor::GetPlayer(*me, user.guid))
+                player->RemoveAurasDueToSpell(SPELL_ALTAR_CHANNEL);
+        _users.clear();
+        _holdMs = 0;
+        if (starter)
+            GameEvents::Trigger(EVENT_ALTAR_COMPLETE, starter, me);
+    }
+
+private:
+    void Prune()
+    {
+        _users.erase(std::remove_if(_users.begin(), _users.end(), [this](AltarUser const& user)
+        {
+            Player* player = ObjectAccessor::GetPlayer(*me, user.guid);
+            bool const leaves = !player || !player->IsAlive() || !player->IsWithinDist(me, float(ALTAR_RANGE))
+                || !player->HasAura(SPELL_ALTAR_CHANNEL) || (_users.size() < ALTAR_CASTERS && user.waitedMs > ALTAR_WAIT_MS);
+            if (leaves && player)
+                player->RemoveAurasDueToSpell(SPELL_ALTAR_CHANNEL);
+            return leaves;
+        }), _users.end());
+    }
+
+    std::vector<AltarUser> _users;
+    uint32 _tickMs;
+    uint32 _holdMs;
+};
+
+/*######
+## go_rookery_egg
+######*/
+
+// Rookery Egg (175124). The vanilla chain is trap spell 16474 -> trap 175622 -> spell 15745 -> Rookery Whelp 10161 and depends
+// on those spells existing in the client data. The egg's trap radius is zeroed in the database so the core trap stays quiet and
+// this script hatches the whelp itself: a living player within three yards of an egg that is not frozen (VMaNGOS radius 3).
+struct classic_go_rookery_egg : public GameObjectAI
+{
+    enum
+    {
+        NPC_ROOKERY_WHELP   = 10161,
+        EGG_RADIUS          = 3,
+        EGG_TICK_MS         = 500
+    };
+
+    classic_go_rookery_egg(GameObject* go) : GameObjectAI(go), _tickMs(EGG_TICK_MS) { }
+
+    void UpdateAI(uint32 diff) override
+    {
+        if (_tickMs > diff)
+        {
+            _tickMs -= diff;
+            return;
+        }
+        _tickMs = EGG_TICK_MS;
+
+        if (!me->isSpawned() || me->getLootState() != GO_READY || me->GetGoState() != GO_STATE_READY)
+            return;
+
+        for (MapReference const& ref : me->GetMap()->GetPlayers())
+        {
+            Player* player = ref.GetSource();
+            if (!player || !player->IsAlive() || !player->IsWithinDist(me, float(EGG_RADIUS)))
+                continue;
+
+            if (Creature* whelp = me->SummonCreature(NPC_ROOKERY_WHELP, me->GetPosition(), TEMPSUMMON_CORPSE_TIMED_DESPAWN, 30s))
+                if (whelp->AI())
+                    whelp->AI()->AttackStart(player);
+            me->DespawnOrUnsummon(0ms, 5min);
+            return;
+        }
+    }
+
+private:
+    uint32 _tickMs;
+};
+
 void AddSC_classic_instance_blackrock_spire()
 {
     new classic_instance_blackrock_spire();
     new classic_at_blackrock_spire();
     RegisterGameObjectAI(classic_go_father_flame);
+    RegisterGameObjectAI(classic_go_blackrock_altar);
+    RegisterGameObjectAI(classic_go_rookery_egg);
     new classic_at_ubrs_the_beast();
     RegisterSpellScript(classic_spell_ubrs_freeze_rookery_egg);
 }

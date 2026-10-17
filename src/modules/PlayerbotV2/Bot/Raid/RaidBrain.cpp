@@ -651,10 +651,9 @@ bool Escape(Player* bot, std::vector<Circle> const& circles, RaidOrder& out, std
     for (int pass = 0; pass < 2; ++pass)
     {
     pathChecks = 0;
-    for (float ring : { 2.0f, 5.0f, 9.0f, 14.0f, 20.0f })
+    for (float extra : { 2.0f, 5.0f, 9.0f, 14.0f, 20.0f })
         for (int k = 0; k < 24; ++k)
         {
-            float const extra = ring + c.pad;
             float const offset = k == 0 ? 0.0f : float((k + 1) / 2) * (float(M_PI) / 12.0f) * ((k % 2) ? 1.0f : -1.0f);
             float const px = c.x + (c.r + extra) * std::cos(base + offset);
             float const py = c.y + (c.r + extra) * std::sin(base + offset);
@@ -1047,7 +1046,7 @@ std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t no
                 // only drags it through the raid and into the next pack (MC 2026-10-06, loose Molten Giants chased their
                 // casters across the room). The bot stays for a tank's taunt instead.
                 if (enemy->GetEntry() == rule.enemy && enemy->GetVictim() != bot && InPhase(enemy, rule.hpMax, rule.hpMin))
-                    circles.push_back({ enemy->GetPositionX(), enemy->GetPositionY(), rule.radius, rule.pad });
+                    circles.push_back({ enemy->GetPositionX(), enemy->GetPositionY(), rule.radius });
     for (AvoidOnStacks const& rule : rules.avoidOnStacks)
         if (Matches(rule.who, self, plan.mainTank))
             if (Aura const* carried = bot->GetAura(rule.aura); carried && carried->GetStackAmount() >= rule.stacks)
@@ -1264,6 +1263,54 @@ struct FaceAxisLock { float bossX = 0, bossY = 0, bearing = 0; uint32_t seenMs =
 std::unordered_map<uint64_t, FaceAxisLock> g_faceAxis;
 constexpr float kAxisDrift = 8.0f;
 constexpr uint32_t kAxisStaleMs = 30000;
+
+// The spot a fight began at and the bearing from the raid's centre to it, locked for the fight (TankSpot): tanks stand relative to this, not to
+// mobs that move with them.
+struct TankSpotLock { float x = 0, y = 0, bearing = 0; uint32_t seenMs = 0; };
+std::unordered_map<uint64_t, TankSpotLock> g_tankSpot;
+std::unordered_map<uint64_t, uint32_t> g_lastTankSpot;
+
+bool TankSpotFor(Plan const& plan, TankSpot const& rule, Player* bot, uint32_t now, float& outX, float& outY)
+{
+    uint64_t const key = (plan.groupLow << 32) ^ rule.anchor;
+    TankSpotLock& lock = g_tankSpot[key];
+    if (!lock.seenMs || now - lock.seenMs >= kAxisStaleMs)
+    {
+        Unit* anchor = nullptr;
+        for (Unit* enemy : plan.enemies)
+            if (enemy->GetEntry() == rule.anchor && enemy->IsAlive())
+                anchor = enemy;
+        if (!anchor)
+            return false;
+        float sx = 0.0f, sy = 0.0f;
+        int n = 0;
+        for (Member const& m : plan.members)
+        {
+            if (m.tank || Dist2D(m.p->GetPositionX(), m.p->GetPositionY(), anchor->GetPositionX(), anchor->GetPositionY()) > 60.0f)
+                continue;
+            sx += m.p->GetPositionX(); sy += m.p->GetPositionY();
+            ++n;
+        }
+        if (n < 4)
+            return false;
+        lock = { anchor->GetPositionX(), anchor->GetPositionY(), geo::Bearing(sx / float(n), sy / float(n), anchor->GetPositionX(), anchor->GetPositionY()), now ? now : 1u };
+    }
+    lock.seenMs = now ? now : 1u;
+    // The holders of <enemy>, in guid order: this tank's slot in the row.
+    std::vector<uint64_t> holders;
+    for (Unit* enemy : plan.enemies)
+        if (enemy->GetEntry() == rule.enemy && enemy->IsAlive() && enemy->GetVictim() && enemy->GetVictim()->GetTypeId() == TYPEID_PLAYER)
+            holders.push_back(enemy->GetVictim()->GetGUID().GetCounter());
+    std::sort(holders.begin(), holders.end());
+    holders.erase(std::unique(holders.begin(), holders.end()), holders.end());
+    auto const at = std::find(holders.begin(), holders.end(), bot->GetGUID().GetCounter());
+    if (at == holders.end())
+        return false;
+    float const lateral = (float(at - holders.begin()) - float(holders.size() - 1) * 0.5f) * rule.spacing;
+    outX = lock.x + rule.reach * std::cos(lock.bearing) + lateral * std::cos(lock.bearing + float(M_PI) * 0.5f);
+    outY = lock.y + rule.reach * std::sin(lock.bearing) + lateral * std::sin(lock.bearing + float(M_PI) * 0.5f);
+    return true;
+}
 
 bool FaceAxisFor(Plan const& plan, Unit* enemy, uint32_t now, float& axis, float fixedBearingDeg = kNoBearing)
 {
@@ -1750,6 +1797,26 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                 return;
             }
 
+    // 3b2. Tank spots (Majordomo): a player that holds a ruled enemy walks to its place in the row, every 3 s at most.
+    for (TankSpot const& rule : rules.tankSpot)
+    {
+        float tx = 0.0f, ty = 0.0f, tz = 0.0f;
+        if (!TankSpotFor(plan, rule, bot, now, tx, ty) || Dist2D(bot->GetPositionX(), bot->GetPositionY(), tx, ty) < 3.0f)
+            continue;
+        uint32_t& at = g_lastTankSpot[bot->GetGUID().GetCounter()];
+        if (now - at < 3000)
+            continue;
+        at = now;
+        if (!circles.empty() && InsideAny(circles, tx, ty, 0.5f))
+            continue;
+        if (Usable(bot, tx, ty, bot->GetPositionZ(), tz, /*urgent*/ true))
+        {
+            TC_LOG_INFO("playerbot.v2.raid", "[raid_tank_spot] {} walks to its place for entry {} ({:.0f},{:.0f})", bot->GetName(), rule.enemy, tx, ty);
+            SetMove(out, tx, ty, tz, "tank spot");
+            return;
+        }
+    }
+
     // 3c. Stand behind (Magmadar): matching bots stand in the sector behind the enemy, wherever the tank has turned it.
     // At most one step per bot every 4 s, so a boss that turns a little does not make the raid hop.
     for (StandBehind const& rule : rules.standBehind)
@@ -2166,7 +2233,7 @@ void ElectRetaunt(Election& e)
                     o->cast_spell = id;
                     o->cast_target = enemy->GetGUID();
                     e.busy.insert(m.p->GetGUID().GetCounter());
-                    Services::PveCoordinator().RetakeTankTarget(plan.groupLow, plan.mapId, m.p->GetGUID().GetCounter(), enemy->GetGUID());
+                    Services::PveCoordinator().ReassignTankTarget(plan.groupLow, plan.mapId, m.p->GetGUID().GetCounter(), enemy->GetGUID());
                     e.dump << "  " << m.p->GetName() << ": re-taunts " << enemy->GetName() << " off " << holder->GetName() << "\n";
                     static std::unordered_map<uint64_t, uint32_t> lastLog;
                     uint32_t const now = GameTime::GetGameTimeMS();
@@ -3024,7 +3091,6 @@ constexpr BossNeed kBossNeeds[] = {
     { 12098, "interrupt (Dark Mending)", kKickers, 3 },
     { 12098, "purge (Inspire)", kPurgers, 1 },
     { 12018, "purge (Magic Reflection / Damage Shield)", kPurgers, 2 },
-    { 12018, "polymorph (Flamewaker Healers)", kPolymorphers, 3 },
     { 12018, "interrupt (Flamewaker Healers)", kKickers, 3 },
     { 11502, "banish (Sons of Flame)", kBanishers, 2 },
     // Onyxia's Lair

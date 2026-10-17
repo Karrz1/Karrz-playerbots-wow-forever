@@ -28,6 +28,7 @@
 #include "Item.h"
 #include "LFGMgr.h"
 #include "Log.h"
+#include <algorithm>
 #include "Loot.h"
 #include "MapManager.h"
 #include "MiscPackets.h"
@@ -1515,6 +1516,8 @@ void Group::EndReadyCheck(void)
 {
     if (!m_readyCheckStarted)
         return;
+
+    TC_LOG_INFO("network", "[ready_check] ended ({} members, {} had not answered)", GetMembersCount(), uint32(std::count_if(m_memberSlots.begin(), m_memberSlots.end(), [](MemberSlot const& m) { return !m.readyChecked; })));
 
     m_readyCheckStarted = false;
     m_readyCheckTimer = Milliseconds::zero();

@@ -107,43 +107,16 @@ TEST_CASE("Garr spares his Firesworn near death while he lives, and the 17 y run
         }
 }
 
-// ---- Majordomo: three Healers sheeped, the Elites tanked ----
+// ---- Majordomo: the Elites are never sheeped; the Healers are the owner's, by icon only ----
 
-TEST_CASE("Majordomo: three Healers are sheeped one at a time, the Elites never", "[ClassicRaidDispel]")
+TEST_CASE("Majordomo's Elites are never crowd-controlled, the Healers only by the owner's icons", "[ClassicRaidDispel]")
 {
     RaidRules const* mc = RulesForMap(409);
     REQUIRE(mc != nullptr);
     auto never = [&](uint32_t entry) { return std::any_of(mc->noControl.begin(), mc->noControl.end(), [&](NoControl const& n) { return n.enemy == entry; }); };
     CHECK_FALSE(never(11663));
-    CHECK(never(11664));                                // Elites cannot be sheeped: the tanks hold them
+    CHECK(never(11664));
     CHECK_FALSE(never(12018));
-    int healerRules = 0;
-    for (CrowdControl const& c : mc->crowdControl)
-    {
-        CHECK(c.enemy != 11664);
-        if (c.enemy != 11663)
-            continue;
-        ++healerRules;
-        CHECK(c.kind == CcKind::Polymorph);
-        CHECK(c.maxActive == 3);                        // the fourth Healer is the raid's first kill
-        CHECK(c.oneAtATime);                            // then one sheep is broken at a time
-    }
-    CHECK(healerRules == 1);
-}
-
-TEST_CASE("Majordomo's Healers: casters and healers keep out of the 20 yard Shadow Shock", "[ClassicRaidDispel]")
-{
-    RaidRules const* mc = RulesForMap(409);
-    REQUIRE(mc != nullptr);
-    bool ranged = false, healer = false;
-    for (AvoidEnemy const& a : mc->avoidEnemy)
-        if (a.enemy == 11663)
-        {
-            CHECK(a.radius > 20.f);                     // Shadow Shock 20603 reaches 20 y around the Healer
-            ranged = ranged || a.who == Who::Ranged;
-            healer = healer || a.who == Who::Healer;
-            CHECK(a.who != Who::Melee);                 // melee must stand at a Healer to kill it
-        }
-    CHECK(ranged);
-    CHECK(healer);
+    for (CrowdControl const& c : mc->crowdControl)       // no automatic pick on any of them
+        CHECK((c.enemy != 11663 && c.enemy != 11664));
 }

@@ -268,6 +268,31 @@ float GroundZ(Player* p, float x, float y, float zHint, char const* where, bool*
     return g;
 }
 
+bool ProbeGround(Player* p, float x, float y, float zHint, float& out)
+{
+    if (!p)
+        return false;
+    Map* m = p->GetMap();
+    if (!m)
+        return false;
+    constexpr float kProbeUp   = 3.0f;
+    constexpr float kProbeDown = 40.0f;
+    m->LoadGrid(x, y);
+    float g = INVALID_HEIGHT;
+    try
+    {
+        g = m->GetHeight(p->GetPhaseShift(), x, y, zHint + kProbeUp, /*vmap*/ true, kProbeUp + kProbeDown);
+    }
+    catch (...)
+    {
+        g = INVALID_HEIGHT;   // BIH churn race (see SnapToGround)
+    }
+    if (g <= INVALID_HEIGHT)
+        return false;
+    out = g;
+    return true;
+}
+
 // ---- NearestNavPoint --------------------------------------------------------
 
 bool NearestNavPoint(Player* p, float tx, float ty, float tz,

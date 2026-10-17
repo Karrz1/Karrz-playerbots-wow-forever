@@ -341,7 +341,7 @@ bool BotIntentEmitter::move_already_emitted(float x, float y, float z) const
     return ai_ && ai_->move_to_recently_emitted(x, y, z, GameTime::GetGameTimeMS());
 }
 
-bool BotIntentEmitter::move_to(float x, float y, float z, bool run, bool direct, bool drop)
+bool BotIntentEmitter::move_to(float x, float y, float z, bool run, bool direct, bool drop, bool follow_drop)
 {
     // Per-bot dedup: skip if the previous move_to went to ~the same XYZ
     // within the lockout window. See BotAI::kMoveToEmitLockoutMs / the long
@@ -393,7 +393,7 @@ bool BotIntentEmitter::move_to(float x, float y, float z, bool run, bool direct,
             }
             return false;
         }
-        const bool pushed = emit(MoveToIntent{x, y, z, run, direct, drop});
+        const bool pushed = emit(MoveToIntent{x, y, z, run, direct, drop, follow_drop});
         if (pushed)
             ai_->note_move_to_emitted(x, y, z, now_ms);
         else
@@ -405,7 +405,7 @@ bool BotIntentEmitter::move_to(float x, float y, float z, bool run, bool direct,
         }
         return pushed;
     }
-    return emit(MoveToIntent{x, y, z, run, direct, drop});
+    return emit(MoveToIntent{x, y, z, run, direct, drop, follow_drop});
 }
 
 // The global cooldown a cast of this spell starts, in ms (0 = off the GCD: stances,

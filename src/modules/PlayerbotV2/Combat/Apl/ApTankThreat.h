@@ -19,6 +19,7 @@
 
 #include "Bot/BotSnapshotView.h"
 #include "Bot/ClassicUpkeep.h"     // Classic::BossFight
+#include "Bot/Raid/RaidEncounters.h"   // Raid::OffTankMob
 #include "Bot/ThreatDiscipline.h"
 #include "Log.h"
 #include "SpellInfo.h"
@@ -192,6 +193,10 @@ inline NearbyUnit const* CcLockedWithin(BotSnapshotView const& s, float range)
 // the loose mobs nobody else was given, and no crowd-controlled mob in reach.
 inline bool AreaTauntWorth(BotSnapshotView const& s, float range, char const* what)
 {
+    // Majordomo: every tank holds its own add, a shout would pull all eight onto one tank (2026-10-17 pull).
+    for (NearbyUnit const& u : s.nearby_enemies())
+        if (Engaged(u) && Raid::OffTankMob(s.map_id(), u.entry))
+            return false;
     if (UnclaimedLooseWithin(s, range) < 3) return false;
     if (NearbyUnit const* cc = CcLockedWithin(s, range))
     {

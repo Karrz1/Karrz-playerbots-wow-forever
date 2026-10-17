@@ -9,7 +9,6 @@
 #include "Bot/BotIntentEmitter.h"
 #include "Bot/Raid/RaidCombat.h"                 // raid encounter orders (MC/BWL/Onyxia/Naxx)
 #include "Bot/Raid/RaidEncounters.h"             // Raid::Retaunts
-#include "Bot/Raid/RaidFightScript.h"            // Raid::Script::FightFor
 #include "Bot/RunToTankRules.h"                 // EnemyBlocksRunToTank
 #include "Bot/ClassicUpkeep.h"                   // Classic::PickCombatHealthItem / PickCombatManaItem
 #include "Bot/ClassTables.h"                     // ClassOocHeal — combat:pve_heal_focus
@@ -679,11 +678,6 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
                 s.name(), u->entry, target.GetCounter());
         return ThreatHold::ShieldUp;
     }
-
-    // A fight script's boss that is not a kill target (Majordomo): the threat wait of a bot that is not meant to kill him is no hold at all.
-    if (s.is_in_raid())
-        if (Raid::Script::Fight const* fs = Raid::Script::FightFor(s.map_id(), u->entry); fs && Raid::Script::BossIsNoKillTarget(*fs, u->entry))
-            return ThreatHold::None;
 
     if (s.is_in_raid() && LooseRaidEliteOnMember(s, *u, g) && !LooseHoldExpired(s, target, Raid::Retaunts(s.map_id(), u->entry)))
     {

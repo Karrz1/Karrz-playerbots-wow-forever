@@ -150,6 +150,9 @@ public:
     // talents and gear, bring it to the owner and put it in the owner's group (made a raid when full). Dropped if the
     // bot does not log in within a minute or the owner is offline by then. World thread only.
     void QueueCompanionSetup(BotId bot, uint64 owner_guid_low, uint8 role);
+    // Brings an owned companion to its owner at once, in the open world or inside an instance (see the definition). Empty = on its way,
+    // else why not (also logged as [summon]). World thread.
+    std::string BringToOwner(Player* owner, Player* bot, char const* why);
 
     // Resolves and pins a companion's role: `requested` (the owner's word) if not Role::Unknown, else the role stored with
     // the companion (OwnerRegistry::DeclaredRole, migration 0024), else the one its talents say. Sets the BotAI role

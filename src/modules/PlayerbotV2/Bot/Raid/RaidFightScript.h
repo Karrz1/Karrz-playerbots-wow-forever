@@ -24,12 +24,13 @@ struct Fight
     uint32_t killOrder[4];         // creature entries, first dies first, 0 ends the list
     uint32_t startWaitMs;          // DPS wait this long from the first engaged enemy, then attack
     char const* name;              // log only
+    bool skullOnly = false;        // the owner's skull is the only enemy the DPS hit; no skull, no damage (the kill order is not used)
 };
 
 // Lucifron (MC 409): the two Flamewaker Protectors first, then Lucifron. The start wait is the raid's one boss opening wait (Playerbot::kRaidBossOpenWaitMs, 8 s: the main tank takes a while to run in); there is no threat cap after
 // that (a bot that pulls a Protector is taunted back by the loose-mob rule).
-// Majordomo Executus (MC 409), version B: the four Flamewaker Healers, then the four Elites, one at a time. Majordomo is not on the list (he cannot be
-// killed, he yields when the eight are dead) so he is never the focus; three Healers are sheeped (the CrowdControl rule), a sheeped one is not the focus.
+// Majordomo Executus (MC 409): the owner's skull is the only thing the DPS hit (skullOnly). The owner sheeps with his icons, so nothing else is
+// attacked, marked or not; with no skull the DPS stand. He is never the focus (he cannot be killed, he yields when the eight are dead).
 // Golemagg (MC 409): Golemagg only. The Core Ragers are not on the list: they stay off every DPS bot's target (Priority -1) and the off tank keeps them.
 // Sulfuron Harbinger (MC 409): the four Flamewaker Priests one at a time, then Sulfuron. The priests are immune to every crowd control, so the script
 // dropping CC on its own enemies changes nothing here.
@@ -44,7 +45,7 @@ inline constexpr Fight kFights[] = {
     { 409, 12264, { 12264, 0, 0, 0 }, kRaidBossOpenWaitMs, "Shazzrah" },
     { 409, 12098, { 11662, 12098, 0, 0 }, kRaidBossOpenWaitMs, "Sulfuron Harbinger" },
     { 409, 11988, { 11988, 0, 0, 0 }, kRaidBossOpenWaitMs, "Golemagg" },
-    { 409, 12018, { 11663, 11664, 0, 0 }, kRaidBossOpenWaitMs, "Majordomo Executus" },
+    { 409, 12018, { 11663, 11664, 0, 0 }, kRaidBossOpenWaitMs, "Majordomo Executus", true },
 };
 
 // The fight an engaged enemy belongs to on this map (nullptr: none).
@@ -72,13 +73,6 @@ inline size_t RankOf(Fight const& f, uint32_t entry)
     return 99;
 }
 
-// True when <entry> is the fight's named boss but not on its kill order (Majordomo): nobody kills him, so no DPS bot waits on his tank's threat
-// before opening on him (MC 2026-10-17: five casters sat 8 s on "Majordomo tank_threat=786/900" after each yank while the Healers lived).
-inline bool BossIsNoKillTarget(Fight const& f, uint32_t entry)
-{
-    return f.boss == entry && RankOf(f, entry) == 99;
-}
-
 struct Enemy
 {
     uint64_t guid = 0;
@@ -93,6 +87,13 @@ struct Enemy
 // Lowest rank first; inside a rank the most hurt one (finish what was started), then the lowest guid.
 inline uint64_t PickFocus(Fight const& f, Enemy const* enemies, size_t n, uint64_t ownerMark, uint64_t previous)
 {
+    if (f.skullOnly)
+    {
+        for (size_t i = 0; i < n; ++i)
+            if (ownerMark && enemies[i].eligible && enemies[i].guid == ownerMark)
+                return ownerMark;
+        return 0;
+    }
     if (ownerMark)
         for (size_t i = 0; i < n; ++i)
             if (enemies[i].eligible && enemies[i].guid == ownerMark)

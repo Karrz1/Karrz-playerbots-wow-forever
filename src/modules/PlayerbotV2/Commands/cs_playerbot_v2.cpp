@@ -843,7 +843,7 @@ public:
         Player const* me = sess->GetPlayer();
         Group const* group = me ? me->GetGroup() : nullptr;
         for (Playerbot::BotId id : CompanionsMatching(sess, "all"))
-            if (Playerbot::Services::Owners().GetOwner(id).saved ||
+            if (Playerbot::Services::Owners().SavedBy(id, me ? me->GetGUID().GetCounter() : 0) ||
                 (group && group->IsMember(ObjectGuid::Create<HighGuid::Player>(id))))
                 out.push_back(id);
         return out;
@@ -903,14 +903,14 @@ public:
         {
             std::vector<Playerbot::BotId> savedOnly;
             for (Playerbot::BotId id : CompanionsMatching(sess, "all"))
-                if (Playerbot::Services::Owners().GetOwner(id).saved)
+                if (Playerbot::Services::Owners().SavedBy(id, me->GetGUID().GetCounter()))
                     savedOnly.push_back(id);
             if (!savedOnly.empty())
             {
                 Group* grp = me->GetGroup();
                 uint32 removed = 0;
                 for (Playerbot::BotId id : ids)
-                    if (!Playerbot::Services::Owners().GetOwner(id).saved)
+                    if (!Playerbot::Services::Owners().SavedBy(id, me->GetGUID().GetCounter()))
                     {
                         ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(id);
                         if (grp && grp->IsMember(guid))
@@ -1167,7 +1167,7 @@ public:
                     ++with_group;
             // A group with none of the owner's bots in it saves nothing and must not wipe the roster.
             for (Playerbot::BotId id : CompanionsMatching(sess, "all"))
-                if (with_group && Playerbot::Services::Owners().GetOwner(id).saved && !(grp && grp->IsMember(ObjectGuid::Create<HighGuid::Player>(id))))
+                if (with_group && Playerbot::Services::Owners().SavedBy(id, me->GetGUID().GetCounter()) && !(grp && grp->IsMember(ObjectGuid::Create<HighGuid::Player>(id))))
                 {
                     Playerbot::Services::Owners().SetSaved(id, false);
                     TC_LOG_INFO("playerbot.v2", "[roster_save] {} was saved earlier and is not in the group: unsaved", CompanionName(id));
@@ -1185,7 +1185,7 @@ public:
                 if (!ObjectAccessor::FindConnectedPlayer(guid) || !group || !group->IsMember(guid))
                     continue;
             }
-            Playerbot::Services::Owners().SetSaved(id, true);
+            Playerbot::Services::Owners().SetSaved(id, true, me->GetGUID().GetCounter());
             // Its role is stored with it (a bot nobody ever gave a role would be re-read from its talents at the next call).
             if (Player* online = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id)))
             {
@@ -1233,7 +1233,7 @@ public:
             return false;
         uint32 removed = 0;
         for (Playerbot::BotId id : CompanionsMatching(sess, who))
-            if (Playerbot::Services::Owners().GetOwner(id).saved)
+            if (Playerbot::Services::Owners().SavedBy(id, sess->GetPlayer() ? sess->GetPlayer()->GetGUID().GetCounter() : 0))
             {
                 Playerbot::Services::Owners().SetSaved(id, false);
                 ++removed;
@@ -1318,7 +1318,7 @@ public:
                 continue;
             handler->PSendSysMessage("%s: level %u %s, %s%s", info->Name.c_str(), uint32(info->Level),
                                      ClassName(info->Class), ObjectAccessor::FindConnectedPlayer(guid) ? "online" : "offline",
-                                     Playerbot::Services::Owners().GetOwner(id).saved ? ", saved" : "");
+                                     Playerbot::Services::Owners().SavedBy(id, handler->GetSession() && handler->GetSession()->GetPlayer() ? handler->GetSession()->GetPlayer()->GetGUID().GetCounter() : 0) ? ", saved" : "");
         }
         return true;
     }
@@ -4290,7 +4290,7 @@ public:
     // without changing anything, useful for verifying the toggle.
     // `.playerbot lazy`: one press casts the next spell of the warlock rotation on the target (the add-on's "Lazy lock" key runs this
     // line as a secure macro, so it works in combat).
-    static bool HandleLazy(ChatHandler* handler, std::string const& /*arg*/)
+    static bool HandleLazy(ChatHandler* handler)
     {
         WorldSession* sess = handler->GetSession();
         if (!sess || !sess->GetPlayer())

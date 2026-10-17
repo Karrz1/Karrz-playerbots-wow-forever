@@ -83,6 +83,10 @@ bool SnapToGround(Player* p, float x, float y, float& z);
 // Playerbot.Behavior.GroundSnap = 0 restores the plain hint passthrough.
 float GroundZ(Player* p, float x, float y, float zHint, char const* where, bool* ok = nullptr);
 
+// GroundZ without the [ground] log and without touching `out` on a miss: the highest surface at or 3 y above zHint, searched 40 y down.
+// For callers that sample many points (the follow-drop ray walk); false when there is none.
+bool ProbeGround(Player* p, float x, float y, float zHint, float& out);
+
 // Snap target (tx,ty,tz) to the nearest WALKABLE navmesh polygon point as
 // seen from `p` (its map / instance / phase), searching a box of half-extents
 // `hxy` horizontal and `hz` vertical around the target. Unlike SnapToGround

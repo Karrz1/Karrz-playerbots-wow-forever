@@ -1607,23 +1607,12 @@ bool OwnerWordOrder(Player* sender, Player* bot, std::string const& n)
     if (n == "summon")
     {
         auto refuse = [&](char const* why) { say(fmt::format("{}: can't be summoned, {}", me, why)); return true; };
-        if (!bot->IsAlive())
-            return refuse("I am dead - release or revive me first");
-        if (bot->IsInCombat())
-            return refuse("I am in combat");
         if (sender->IsInCombat())
             return refuse("you are in combat");
-        Map const* sm = sender->GetMap();
-        Map const* bm = bot->GetMap();
-        if (sm && sm->IsBattlegroundOrArena() && bot->GetMapId() != sender->GetMapId())
-            return refuse("you are in a battleground");
-        if (bm && bm->Instanceable() && bot->GetMapId() != sender->GetMapId())
-            return refuse("I am inside an instance - walk out first");
-        // Into the owner's instance only as a member of the owner's group (the door checks and their log are API::teleport_to's).
-        if (sm && sm->Instanceable() && bot->GetMapId() != sender->GetMapId() && !(bot->GetGroup() && bot->GetGroup() == sender->GetGroup()))
-            return refuse("you are inside an instance - invite me and walk in with the group");
-        Push(bot, TeleportToIntent{sender->GetMapId(), sender->GetPositionX(), sender->GetPositionY(),
-                                   sender->GetPositionZ(), sender->GetOrientation()});
+        // Wherever the bot is, inside the owner's instance too: it is put in the group, revived if dead elsewhere and ported to the owner
+        // (BotPopulationManager::BringToOwner logs every refusal as [summon]).
+        if (std::string const why = Services::Population().BringToOwner(sender, bot, "summon order"); !why.empty())
+            return refuse(why.c_str());
         if (BotAI* ai = Services::Registry().ai(bid))
         {
             ai->enter_manual(BotAI::OwnerCommand::Follow, sender->GetGUID(), GameTime::GetGameTimeMS());
@@ -2702,13 +2691,14 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
     }
     if (cmd == "come" || cmd == "summon")
     {
-        // Teleport the bot to the sender. The API guards against in-combat
-        // and casting bots — caller can re-issue when the bot reports back.
-        Push(bot, TeleportToIntent{sender->GetMapId(),
-                                   sender->GetPositionX(),
-                                   sender->GetPositionY(),
-                                   sender->GetPositionZ(),
-                                   sender->GetOrientation()});
+        // Bring the bot to the sender, in the open world or inside an instance (BotPopulationManager::BringToOwner: group, revive,
+        // door check, ring spot). A refusal is logged as [summon] and told to the sender, so no bot goes missing without a reason.
+        if (std::string const why = Services::Population().BringToOwner(sender, bot, "come"); !why.empty())
+        {
+            if (why != "in combat")   // a bot in the fight answers when it is over; no line per fighter
+                ChatHandler(sender->GetSession()).PSendSysMessage("%s cannot come: %s.", bot->GetName().c_str(), why.c_str());
+            return true;
+        }
         // After /come the owner usually wants the bot to stay nearby —
         // enter Follow manual mode so the bot doesn't immediately
         // resume questing across the map.
@@ -2725,13 +2715,9 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
         // Teleport all registered group-mate bots to the sender. Each bot
         // may individually refuse (in-combat / casting) — same gates as the
         // single-bot variant. Bot dispatching the command is included.
-        TeleportToIntent tp{sender->GetMapId(),
-                            sender->GetPositionX(),
-                            sender->GetPositionY(),
-                            sender->GetPositionZ(),
-                            sender->GetOrientation()};
-        Push(bot, tp);
-        uint32 broadcast_count = 1;
+        uint32 broadcast_count = 0;
+        if (Services::Population().BringToOwner(sender, bot, "come all").empty())
+            ++broadcast_count;
         if (Group const* grp = bot->GetGroup())
         {
             for (GroupReference const& itr : grp->GetMembers())
@@ -2740,8 +2726,8 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
                 if (!member || member == bot) continue;
                 const BotId mid = member->GetGUID().GetCounter();
                 if (!Services::Registry().has(mid)) continue;
-                Push(member, tp);
-                ++broadcast_count;
+                if (Services::Population().BringToOwner(sender, member, "come all").empty())
+                    ++broadcast_count;
             }
         }
         Push(bot, WhisperIntent{sender->GetName(),

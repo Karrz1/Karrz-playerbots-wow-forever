@@ -1,7 +1,6 @@
 // PveGroupCoordinator implementation. See header for the design contract.
 
 #include "PveGroupCoordinator.h"
-#include "TankMarkSwap.h"
 #include "Bot/SpellFamily.h"
 #include "Bot/DeathCause.h"
 #include "DungeonScript.h"
@@ -1171,21 +1170,6 @@ void PveGroupCoordinator::ReassignTankTarget(uint64 group_low, uint32 map_id, ui
         o->second.tank_target = mob;
 }
 
-void PveGroupCoordinator::RetakeTankTarget(uint64 group_low, uint32 map_id, uint64 tank_low, ObjectGuid mob)
-{
-    const uint64 bkey = (group_low << 16) ^ uint64(map_id);
-    uint64 previous = 0;
-    if (auto st = last_tank_target_.find(bkey); st != last_tank_target_.end())
-        for (auto const& [tl, m] : st->second)
-            if (m == mob && tl != tank_low)
-                previous = tl;
-    if (previous)
-        if (auto ai = tank_mark_auto_.find(bkey); ai != tank_mark_auto_.end() && SwapTankMarks(ai->second, tank_low, previous))
-            TC_LOG_INFO("playerbot.v2", "[raid_tank] group={} map={} tank markers of {} and {} swapped with the retaunt", group_low, map_id,
-                tank_low, previous);
-    ReassignTankTarget(group_low, map_id, tank_low, mob);
-}
-
 // The CC switch of the human who runs the group (OwnerRegistry::CcEnabled, group order "crowdcontrol on|off"): the leader when it is a
 // player, else the first player in the group. A group without a player has no switch and keeps crowd control on.
 static bool GroupCcSwitchOn(Group const* grp)
@@ -1799,6 +1783,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                 if (!t || !t->is_bot) continue;
                 Mob const* mm = find_mob(mk_grp->GetTargetIcon(mkr));
                 if (!mm) continue;
+                if (Raid::OffTankMob(map_id, mm->u->entry)) continue;   // the second tank's, whatever tank the icon was given to (Majordomo nl99: swapped every second)
                 if (auto sit = sticky.find(tl); sit != sticky.end() && sit->second == mm->u->guid) continue;
                 for (auto it = sticky.begin(); it != sticky.end();)
                     it = it->second == mm->u->guid ? sticky.erase(it) : std::next(it);
@@ -1927,6 +1912,32 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                     return true;
             return false;
         };
+        // A boss the rules give the second tank (Majordomo): the off tank holds him whatever it held, and whoever held him takes a
+        // free mob below. The owner's plan: off tank on him, the other tanks one Elite each, the main tank the skull.
+        if (off_tank)
+            if (auto ot = by_low.find(off_tank); ot != by_low.end() && ot->second->is_bot && ot->second->alive && !user_sym.count(off_tank))
+                for (auto const& m : mobs)
+                {
+                    if (!Raid::OffTankMob(map_id, m.u->entry)) continue;
+                    if (auto sit = sticky.find(off_tank); sit != sticky.end() && sit->second == m.u->guid) break;
+                    if (auto sit = sticky.find(off_tank); sit != sticky.end())
+                    {
+                        taken.erase(std::remove(taken.begin(), taken.end(), sit->second), taken.end());
+                        sticky.erase(sit);
+                    }
+                    for (auto it = sticky.begin(); it != sticky.end();)
+                    {
+                        if (it->second == m.u->guid)
+                        {
+                            taken.erase(std::remove(taken.begin(), taken.end(), it->second), taken.end());
+                            it = sticky.erase(it);
+                        }
+                        else
+                            ++it;
+                    }
+                    assign(ot->second, m, "off_tank_mob");
+                    break;
+                }
         // The main tank chooses first: the mob it already hits (its pull), else the mob engaged with it, else the
         // nearest. Without this a spare tank that ran at the pull target before the main tank had a victim of its own
         // would be handed the main tank's mob, and the main tank the next one.
@@ -1956,7 +1967,8 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             if (!t->is_bot || sticky.count(t->guid_low)) continue;
             for (auto const& m : mobs)
                 if (auto const hold = cc_held.find(m.u->guid.GetCounter());
-                    hold != cc_held.end() && hold->second.tank_low == t->guid_low && !is_taken(m.u->guid) && !Raid::NoTank(map_id, m.u->entry))
+                    hold != cc_held.end() && hold->second.tank_low == t->guid_low && !is_taken(m.u->guid) && !Raid::NoTank(map_id, m.u->entry) &&
+                    !cc_owned(m))   // a sheep the owner gave a mage broke: the mage recasts it, the tank does not hit it (Majordomo nl99 pull 2: every 3 s)
                 {
                     assign(t, m, "cc_released");
                     break;
@@ -1965,7 +1977,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
         for (Member const* t : tanks)
         {
             if (!t->is_bot || sticky.count(t->guid_low)) continue;
-            if (Mob const* cur = find_mob(t->src->victim); cur && !is_taken(cur->u->guid) && !Raid::NoTank(map_id, cur->u->entry) &&
+            if (Mob const* cur = find_mob(t->src->victim); cur && !is_taken(cur->u->guid) && !Raid::NoTank(map_id, cur->u->entry) && !cc_owned(*cur) &&
                 !(Raid::TankLast(map_id, cur->u->entry) && other_free_mob(cur->u->guid)))
                 assign(t, *cur, "already_on_it");
         }
@@ -1997,6 +2009,10 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                 for (Member const* t : tanks)
                 {
                     if (!t->is_bot || !t->alive || user_sym.count(t->guid_low)) continue;
+                    // The tank on a boss the rules give the second tank keeps him.
+                    if (auto sit = sticky.find(t->guid_low); sit != sticky.end())
+                        if (Mob const* held = find_mob(sit->second); held && Raid::OffTankMob(map_id, held->u->entry))
+                            continue;
                     // A tank already on the other kill mark keeps it.
                     if (auto sit = sticky.find(t->guid_low); sit != sticky.end() &&
                         (sit->second == mk_grp->GetTargetIcon(7) || sit->second == mk_grp->GetTargetIcon(6)))

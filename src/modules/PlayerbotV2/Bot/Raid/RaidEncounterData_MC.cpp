@@ -1,6 +1,6 @@
 #include "RaidEncounters.h"
 
-// Ported from Karrz's raid10-revamp ike3 bots (the ike3-based playerbot code). Script references (mc/..., bwl/..., ony/...) point at the
+// Ported from Karrz's raid10-revamp ike3 bots (Karrz1/wow-1.12). Script references (mc/..., bwl/..., ony/...) point at the
 // VMaNGOS scripts that Forever's scripts/Custom/Classic instances were ported from; the ids are the same.
 
 namespace Playerbot::Raid {
@@ -85,40 +85,29 @@ namespace Playerbot::Raid {
         // He surrenders when the adds are dead and cannot be killed (mc/boss_majordomo_executus.cpp:335,379): never a target.
         // Every 30s one of Magic Reflection / Damage Shield is cast on ALL living adds (:485-501): dispel them off before attacking.
         r.priority.push_back({ 12018, -1 });                   // Majordomo Executus (mc/boss_majordomo_executus.cpp:335)
-        // The retail plan (2026-10-17): one tank holds Majordomo, away from the raid, and the tanks take the Elites (they cannot be sheeped).
-        // Mages sheep three Healers; the raid kills the fourth, then one sheep is broken at a time and that Healer is killed (CrowdControl
-        // maxActive 3, oneAtATime), then the Elites. Casters stop on Magic Reflection, melee on Damage Shield. He surrenders when all eight
-        // adds are dead.
+        // The owner's plan: the second tank holds Majordomo from the first second, the other tanks take one Elite each (the Healers last), the
+        // main tank takes the owner's skull Healer. Mages sheep the Healers the owner marks; only the skull is attacked (RaidFightScript.h).
+        r.offTankMob.push_back(12018);
+        // Healer Shadow Shock 20603 (instant, 20 yards, no kick): casters and healers stay out of it; Polymorph reaches 30.
+        r.avoidEnemy.push_back({ 11663, 21.0f, Who::Ranged });
+        r.avoidEnemy.push_back({ 11663, 21.0f, Who::Healer });
         // The adds' casts go first for the kickers: Shadow Bolt (Healer) and Fireball (Elite) were interrupted four times in 95 s (n38).
         r.interruptFirst.push_back(21077);
         r.interruptFirst.push_back(20420);
         // Flamewaker Elite: Blast Wave 20229 hits everyone within about 10 yards for 1100-1300 (n38: seven raiders dead in 3 s, hunters,
         // rogues, a healer and a warrior beside the tanks holding the Elites). Casters, hunters and healers keep 13 yards from them.
-        r.avoidEnemy.push_back({ 11664, 13.0f, Who::Ranged, 100.0f, 0.0f, 3.0f });
-        r.avoidEnemy.push_back({ 11664, 13.0f, Who::Healer, 100.0f, 0.0f, 3.0f });
-        // Flamewaker Healer: Shadow Shock 20603 is instant (never seen as a cast to kick), 800 base, radius 20 around the Healer: about 1,100-1,250
-        // on everyone within 20 yards. With five tanks holding all nine mobs (mc_majordomo local-next-90) the first Healer died at 28 s, then
-        // eight raiders died in two seconds to Shocks, all 7-14 y from the casting Healer. Casters and healers stay 21 yards from every Healer;
-        // melee must stand at the Healers to kill them and are healed through it.
-        r.avoidEnemy.push_back({ 11663, 21.0f, Who::Ranged, 100.0f, 0.0f, 5.0f });
-        r.avoidEnemy.push_back({ 11663, 21.0f, Who::Healer, 100.0f, 0.0f, 5.0f });
-        r.tankOrder.push_back(12018);
+        r.avoidEnemy.push_back({ 11664, 13.0f, Who::Ranged });
+        r.avoidEnemy.push_back({ 11664, 13.0f, Who::Healer });
         r.tankOrder.push_back(11664);
         r.tankOrder.push_back(11663);
-        // The Healers are the mages' (sheep), not the tanks': a tank that grabs one at the pull keeps it, the crowd-control election skips every mob a
-        // tank holds, and the sheep never land (mc_majordomo nl96, 1023: one Polymorph in 116 s, two tanks on Healers at 9 s while Elites ran loose).
-        // The tanks take a Healer only when no Majordomo or Elite is left free: a released sheep, or the fourth Healer once the rest are held.
-        r.tankLast.push_back(11663);
         // The brain already refuses to hit an add under either shield (Raid::kMagicReflection / kDamageShield) but nothing took
         // them off, so the raid stood idle for up to 30 s per cast. Priests and shamans purge them (Election::Assign purge).
         r.purge.push_back({ 20619 });                          // Magic Reflection (classic_boss_majordomo_executus.cpp:50)
         r.purge.push_back({ 21075 });                          // Damage Shield (classic_boss_majordomo_executus.cpp:51)
         r.priority.push_back({ 11664, 4 });                    // Flamewaker Elite (MCRaidPolicy.h:100)
         r.priority.push_back({ 11663, 5 });                    // Flamewaker Healer (MCRaidPolicy.h:99)
-        // Three Healers are sheeped (humanoid); skip the ones that carry the crowd-control Immunity he puts on the rest after four adds have died
-        // (classic_boss_majordomo_executus.cpp). The fight script kills the unheld Healer first, then each released one, then the Elites.
-        r.crowdControl.push_back({ 11663, CcKind::Polymorph, 21087, 3, true });   // Flamewaker Healer
-        r.noControl.push_back({ 11664 });                      // Flamewaker Elite: the wiki lists the Healers only as sheepable
+        // The Elites cannot be sheeped; the Healers are the owner's to sheep with his icons (no automatic crowd control).
+        r.noControl.push_back({ 11664 });                      // Flamewaker Elite (polymorph-immune anyway)
 
         // RAGNAROS - boss 11502
         // Submerged phase: it ends early when every Son of Flame is banished (mc/boss_ragnaros.cpp:347-363).

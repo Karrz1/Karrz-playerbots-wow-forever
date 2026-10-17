@@ -113,6 +113,10 @@ inline constexpr WalkLink kWalkLinks[] =
     { 1, 2722.0f, -3880.6f, 100.9f, 2310.5f, -2554.7f, 101.9f, 1773.0f },
     { 1, 5068.4f, -337.2f, 367.4f, 4006.0f, -1288.4f, 254.4f, 1813.0f },
     { 2991, 2037.1f, 1529.9f, 648.5f, 3288.7f, 1757.9f, 824.5f, 1422.0f },
+    // third run, 2026-10-17: the Classic 1.60 isle (map 2991), checked on its own mmaps
+    { 2991, 2262.7f, 917.6f, 675.3f, 1993.6f, 545.6f, 658.7f, 485.0f },
+    { 2991, 2037.1f, 1529.9f, 648.5f, 2262.7f, 917.6f, 675.3f, 687.0f },
+    { 2991, 2037.1f, 1529.9f, 648.5f, 1993.6f, 545.6f, 658.7f, 1094.0f },
 };
 
 // A link end is a graph node's own position, written with one decimal; the node it names is the nearest within this many yards.

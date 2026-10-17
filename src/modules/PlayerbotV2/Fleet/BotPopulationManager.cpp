@@ -1642,6 +1642,57 @@ void BotPopulationManager::FinishCompanionSetup(Player* bot, Player* owner, uint
                                                           uint32(bot->GetLevel()), joinFailure.c_str());
 }
 
+// The one way an owner's order brings a companion to them ("come", "summon", `.bot summon <name|all>`, the add-on's Come button), in
+// the open world or inside an instance, wherever the bot is: a bot dead on another map is revived as a summon does, one outside
+// the group is put in it first (the door checks look at the group's instance), the door is checked and every refusal is logged and
+// returned in words, so no bot goes missing without a reason. Empty string = it is on its way.
+std::string BotPopulationManager::BringToOwner(Player* owner, Player* bot, char const* why)
+{
+    auto refuse = [&](std::string reason)
+    {
+        TC_LOG_INFO("playerbot.v2", "[summon] {} not brought to {} ({}): {}", bot->GetName(), owner->GetName(), why, reason);
+        return reason;
+    };
+    if (!owner || !bot || !owner->IsInWorld() || !bot->IsInWorld())
+        return refuse("not in the world");
+    if (!bot->IsAlive())
+    {
+        if (bot->GetMapId() == owner->GetMapId())
+            return refuse("dead where you are: it waits for a rez");
+        TC_LOG_INFO("playerbot.v2", "[summon] {} dead on map {}: revived to join {}", bot->GetName(), bot->GetMapId(), owner->GetName());
+        bot->ResurrectPlayer(1.0f);
+        bot->SpawnCorpseBones();
+    }
+    if (bot->IsInCombat())
+        return refuse("in combat");
+    if (bot->IsBeingTeleported())
+        return refuse("already on its way");
+    Map const* ownerMap = owner->GetMap();
+    if (ownerMap && ownerMap->IsBattlegroundOrArena())
+        return refuse("you are in a battleground");
+
+    bool const alreadyGrouped = owner->GetGroup() && bot->GetGroup() == owner->GetGroup();
+    std::string capFull;
+    if (!alreadyGrouped && CompanionSpawnFull(owner, bot->GetGUID().GetCounter(), capFull))
+        return refuse(capFull);
+    if (!alreadyGrouped)
+        if (std::string const joinFailure = JoinOwnerGroup(owner, bot); !joinFailure.empty())
+            return refuse(joinFailure);
+
+    FormationOffset offset{ 5.0f, 0.0f };
+    if (BotAI const* ai = Services::Registry().ai(bot->GetGUID().GetCounter()))
+        offset = ComputeFormationOffset(ai->formation_type(), ai->formation_slot(), ai->follow_distance() > 0.f ? ai->follow_distance() : 5.0f);
+    float x, y, z;
+    owner->GetNearPoint(bot, x, y, z, offset.distance, owner->GetOrientation() + offset.angle_radians);
+    TransferAbortReason const door = Fleet::PrepareInstanceEntry(bot, owner->GetMapId());
+    if (door != TRANSFER_ABORT_NONE)
+        return refuse(Fleet::TransferAbortName(door));
+    if (!::Playerbot::BotMovement::SafeTeleport(bot, owner->GetMapId(), x, y, z, owner->GetOrientation(), 0))
+        return refuse("the teleport was refused");
+    TC_LOG_INFO("playerbot.v2", "[summon] {} brought to {} on map {} ({})", bot->GetName(), owner->GetName(), owner->GetMapId(), why);
+    return {};
+}
+
 bool BotPopulationManager::RegearNow(Player* p)
 {
     if (!p || !p->IsInWorld()) return false;

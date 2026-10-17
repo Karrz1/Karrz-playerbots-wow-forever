@@ -184,24 +184,6 @@ inline constexpr RaidRow kMcRaid[] = {
     { "Mcshad",   ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Dps,    2 },
 };
 
-// Majordomo's court is nine mobs (him, four Elites, four Healers) and the plan gives each a tank (RaidEncounterData_MC.cpp): five tanks and
-// eleven healers, the other 24 as above. With four tanks four or five mobs stood loose on the healers from the first seconds and no add
-// died in 52 s (mc_majordomo local-next-89, 2026-10-17).
-inline constexpr RaidRow kMcRaidFiveTanks[] = {
-    { "Mctankw",  ScnRace::Human,    ScnClass::Warrior, ScenarioRoleKind::Tank,   4 },
-    { "Mctankd",  ScnRace::NightElf, ScnClass::Druid,   ScenarioRoleKind::Tank,   1 },
-    { "Mcheals",  ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Healer, 4 },
-    { "Mchealp",  ScnRace::Human,    ScnClass::Paladin, ScenarioRoleKind::Healer, 4 },
-    { "Mchealdr", ScnRace::NightElf, ScnClass::Druid,   ScenarioRoleKind::Healer, 3 },
-    { "Mcmage",   ScnRace::Human,    ScnClass::Mage,    ScenarioRoleKind::Dps,    5 },
-    { "Mclock",   ScnRace::Human,    ScnClass::Warlock, ScenarioRoleKind::Dps,    5 },
-    { "Mcrogue",  ScnRace::Human,    ScnClass::Rogue,   ScenarioRoleKind::Dps,    4 },
-    { "Mchunt",   ScnRace::Dwarf,    ScnClass::Hunter,  ScenarioRoleKind::Dps,    4 },
-    { "Mcwarr",   ScnRace::Dwarf,    ScnClass::Warrior, ScenarioRoleKind::Dps,    3 },
-    { "Mcret",    ScnRace::Human,    ScnClass::Paladin, ScenarioRoleKind::Dps,    1 },
-    { "Mcshad",   ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Dps,    2 },
-};
-
 inline std::vector<ScenarioMember> RaidSquad(RaidRow const* rows, std::size_t n)
 {
     std::vector<ScenarioMember> squad;
@@ -290,8 +272,6 @@ inline ScenarioDef MakeRaidScenario(RaidBossRow const& r, RaidEntrance const& e,
 
 inline ScenarioDef MakeMcScenario(RaidBossRow const& r)
 {
-    if (r.boss_entry == 12018)   // Majordomo Executus
-        return MakeRaidScenario(r, kMcEntrance, RaidSquad(kMcRaidFiveTanks, sizeof(kMcRaidFiveTanks) / sizeof(kMcRaidFiveTanks[0])));
     return MakeRaidScenario(r, kMcEntrance, RaidSquad(kMcRaid, sizeof(kMcRaid) / sizeof(kMcRaid[0])));
 }
 

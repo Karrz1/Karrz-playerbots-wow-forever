@@ -194,22 +194,37 @@ TEST_CASE("Golemagg's script names him alone; the Core Ragers are never the focu
 
 // ---- Majordomo, version B ----
 
-TEST_CASE("Majordomo: the Healers die first, then the Elites, and he is never the focus", "[ClassicRaidFightScript]")
+TEST_CASE("Majordomo: only the owner's skull is hit, and he is never the focus", "[ClassicRaidFightScript]")
 {
     constexpr uint32_t kMajordomo = 12018, kHealer = 11663, kElite = 11664;
     Fight const* f = FightFor(kMc, kMajordomo);
     REQUIRE(f != nullptr);
+    CHECK(f->skullOnly);
     CHECK(FightFor(kMc, kHealer) == f);
     CHECK(FightFor(kMc, kElite) == f);
     CHECK(f->startWaitMs == Playerbot::kRaidBossOpenWaitMs);
     Enemy const all[] = { E(1, kMajordomo, 100.f), E(2, kElite, 50.f), E(3, kElite, 100.f), E(4, kHealer, 100.f), E(5, kHealer, 80.f) };
-    CHECK(PickFocus(*f, all, 5, 0, 0) == 5);             // a Healer, the most hurt one, before any Elite
-    // Magic Reflection on both Healers (not eligible): the Elites, not Majordomo
-    Enemy const shielded[] = { E(1, kMajordomo, 100.f), E(2, kElite, 50.f), E(3, kElite, 100.f), E(4, kHealer, 100.f, false), E(5, kHealer, 80.f, false) };
-    CHECK(PickFocus(*f, shielded, 5, 0, 0) == 2);
-    // The eight dead: only Majordomo is left, and the script names nobody (he yields).
-    Enemy const last[] = { E(1, kMajordomo, 100.f) };
-    CHECK(PickFocus(*f, last, 1, 0, 0) == 0);
+    CHECK(PickFocus(*f, all, 5, 0, 0) == 0);              // no skull: nobody is hit, however hurt
+    CHECK(PickFocus(*f, all, 5, 4, 5) == 4);              // the skull, not the last pick
+    Enemy const sheeped[] = { E(1, kMajordomo, 100.f), E(4, kHealer, 100.f, false), E(5, kHealer, 80.f) };
+    CHECK(PickFocus(*f, sheeped, 3, 4, 0) == 0);          // a skull that cannot be hit is not replaced by another
+}
+
+TEST_CASE("Majordomo: the second tank holds him, the Healers' Shock circle is 21 yards", "[ClassicRaidFightScript]")
+{
+    CHECK(Playerbot::Raid::OffTankMob(kMc, 12018));
+    CHECK_FALSE(Playerbot::Raid::OffTankMob(kMc, 11664));
+    Playerbot::Raid::RaidRules const* mc = Playerbot::Raid::RulesForMap(kMc);
+    REQUIRE(mc != nullptr);
+    CHECK(mc->tankSpot.empty());
+    int shock = 0;
+    for (auto const& a : mc->avoidEnemy)
+        if (a.enemy == 11663)
+        {
+            CHECK(a.radius == 21.0f);
+            ++shock;
+        }
+    CHECK(shock == 2);
 }
 
 // Majordomo's shields take half the raid off an add, not all of it: Magic Reflection the casters, Damage Shield the melee DPS. A hunter and a

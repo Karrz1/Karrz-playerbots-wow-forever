@@ -102,7 +102,8 @@ public:
     // When ai_ is null (test harness) the dedup is a no-op.
     // direct=true = straight MovePoint spline, no pathfinding (committed
     // traversal-link crossings only — see MoveToIntent).
-    bool move_to(float x, float y, float z, bool run = true, bool direct = false, bool drop = false);
+    // follow_drop=true: a pathed move toward the owner that takes the ledge when his floor is only reachable by a drop or a jump (API::move_to).
+    bool move_to(float x, float y, float z, bool run = true, bool direct = false, bool drop = false, bool follow_drop = false);
     // A move_to to ~(x,y,z) was already emitted in the last 1.5 s (the one move_to dedups, returning false). That is a move under way,
     // not a refusal: callers that count false results as path refusals ask this first.
     bool move_already_emitted(float x, float y, float z) const;
