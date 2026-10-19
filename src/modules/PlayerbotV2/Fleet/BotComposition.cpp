@@ -300,14 +300,22 @@ namespace {
 // and filters by sObjectMgr->GetPlayerInfo. Cheap; ~25 entries max.
 uint8 PickRaceForClass(uint8 cls)
 {
-    std::vector<RaceWeight> legal;
-    legal.reserve(kAllianceRaces.size() + kHordeRaces.size() + 2);
-    for (RaceWeight rw : kAllianceRaces)
-        if (IsLegalCombo(rw.race, cls)) legal.push_back(rw);
-    for (RaceWeight rw : kHordeRaces)
-        if (IsLegalCombo(rw.race, cls)) legal.push_back(rw);
-    if (IsLegalCombo(RACE_DRACTHYR_ALLIANCE, cls))
-        legal.push_back({RACE_DRACTHYR_ALLIANCE, kDracthyrAllianceWeight});
+    // The faction is rolled first, 50/50, like the unhinted roll: weighting the union of both race tables made a class-hinted roll
+    // (raid, battleground and dungeon fill) about 84% Alliance among level 60 bots (2026-10-20 census: 716 Alliance, 136 Horde).
+    // A faction with no legal race for the class gives way to the other.
+    auto legal_for = [cls](bool alliance)
+    {
+        std::vector<RaceWeight> legal;
+        for (RaceWeight rw : (alliance ? kAllianceRaces : kHordeRaces))
+            if (IsLegalCombo(rw.race, cls)) legal.push_back(rw);
+        if (alliance && IsLegalCombo(RACE_DRACTHYR_ALLIANCE, cls))
+            legal.push_back({RACE_DRACTHYR_ALLIANCE, kDracthyrAllianceWeight});
+        return legal;
+    };
+    bool const first_alliance = std::uniform_int_distribution<int>(0, 1)(Rng()) == 0;
+    std::vector<RaceWeight> legal = legal_for(first_alliance);
+    if (legal.empty())
+        legal = legal_for(!first_alliance);
     if (legal.empty()) return 0;
     return PickFromRaceWeights(legal);
 }

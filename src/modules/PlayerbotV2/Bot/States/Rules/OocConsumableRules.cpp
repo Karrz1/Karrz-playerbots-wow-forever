@@ -20,10 +20,12 @@
 #include "Bot/BotIntentEmitter.h"
 #include "Bot/BotIntent.h"
 #include "Bot/ClassicUpkeep.h"
+#include "Bot/DrinkSayRule.h"
 #include "Bot/States/MaintainHelpers.h"   // States::DungeonLootRoll
 #include "SharedDefines.h"
 #include "RaceMask.h"        // RACE_UNDEAD_PLAYER
 #include "GameTime.h"
+#include "Log.h"
 #include "Services.h"
 #include "Util/ConfigReader.h"
 
@@ -245,6 +247,13 @@ bool OocEatFoodFire(BotSnapshotView const& s, BotAI& ai,
     if (pick.item)
     {
         emit.emit(UseItemByEntryIntent{pick.item, s.raw().guid});
+        if (pick.drink)
+        {
+            Classic::SayDrinkingIfDue(s, ai, emit, now_ms);
+            // The same line the dungeon autopilot's drink writes: a led group never reaches that path, and its drinks were invisible.
+            if (s.in_group() && ai.tank_diag_due(now_ms))
+                TC_LOG_INFO("playerbot.v2", "[healer_drink] {} drinks item {} at mana {}% (group, idle:ooc_eat_food)", s.name(), pick.item, s.power_pct(POWER_MANA));
+        }
         ai.set_last_rule_fired("idle:ooc_eat_food");
         return true;
     }
@@ -407,6 +416,9 @@ bool LootRollFire(BotSnapshotView const& s, BotAI& ai,
 // ---------- idle:equip_upgrade ----------
 bool EquipUpgradeGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32 now_ms)
 {
+    // Raid resistance gear on (idle:classic_resist_gear): the own pieces score higher and would go straight back on.
+    if (ai.resist_gear_school() != 0)
+        return false;
     if (s.in_combat() || s.is_casting())
     {
         if (ai.pending_equip_upgrade_at_ms() != 0)

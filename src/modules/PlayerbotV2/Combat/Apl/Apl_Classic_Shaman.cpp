@@ -391,7 +391,7 @@ bool ShouldEnhEarthShockInterrupt(ApPredicateContext const& ctx)
 
 bool ShouldStormstrike(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && ManaPct(ctx) >= 10 && (Ready(ctx, STORMSTRIKE) && ctx.bot.victim_in_spell_range(STORMSTRIKE)) && DistToVictim(ctx) <= 6.f;
+    return HasLiveTarget(ctx) && ManaPct(ctx) >= 10 && (Ready(ctx, STORMSTRIKE) && ctx.bot.victim_in_spell_range(STORMSTRIKE));
 }
 void DoStormstrike(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(STORMSTRIKE, ctx.bot.victim()); }
 

@@ -190,6 +190,15 @@ namespace Trainer
                 if (tally) ++tally->battle_pet;
                 continue;
             }
+            // Riding is not the trainer's to give here: a retail trainer opens the tiers by level (Journeyman at 40), vanilla gives 75 at 40
+            // and 150 at 60, and API::learn_riding_free sets exactly that.
+            if (SpellInfo const* info = sSpellMgr->GetSpellInfo(trainerSpell.SpellId, DIFFICULTY_NONE))
+                if (std::any_of(info->GetEffects().begin(), info->GetEffects().end(), [](SpellEffectInfo const& eff)
+                    { return eff.IsEffect(SPELL_EFFECT_SKILL) && eff.MiscValue == SKILL_RIDING; }))
+                {
+                    if (tally) ++tally->skill_line;
+                    continue;
+                }
             if (!CanTeachSpell(player, &trainerSpell))
             {
                 if (tally)

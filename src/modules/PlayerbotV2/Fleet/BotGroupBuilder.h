@@ -91,7 +91,8 @@ public:
     // group-invite handler. Subsequent post-form behavior (queue
     // start, walk-to-staging) is enqueued by the specific
     // signal handler that called BuildGroup.
-    uint32 BuildGroup(GroupRequest const& req);
+    // `leader_out`, when given, receives the guid counter of the leader of the group that was formed.
+    uint32 BuildGroup(GroupRequest const& req, uint64* leader_out = nullptr);
 
     // D.4: pending-finish drain. After BuildGroup emits invites, the
     // builder stamps a `PendingFinish` record; ~10s later (after the

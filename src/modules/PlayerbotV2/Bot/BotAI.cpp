@@ -1,5 +1,6 @@
 ﻿#include "BotAI.h"
 #include "TownLife.h"
+#include "Fleet/GateDuels.h"
 #include "BotSnapshotView.h"
 #include "TradeRule.h"
 #include "BotTrade.h"
@@ -696,7 +697,7 @@ void BotAI::update_dungeon_autopilot_hold(BotSnapshotView s, GroupSnapshotView g
             bool const present = human_seen_ms_ != 0 && now_ms - human_seen_ms_ < 30000u;
             int64_t const steady = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
-            lead_hold = present && steady >= human_release_until_.load(std::memory_order_relaxed);
+            lead_hold = present && steady >= orders_.release_until.load(std::memory_order_relaxed);
         }
         else
             human_seen_ms_ = 0;
@@ -784,9 +785,12 @@ void BotAI::dispatch_layers(BotSnapshotView s, GroupSnapshotView g,
                 const int32 diff = int32(s.level()) - int32(s.duel_initiator_level());
                 const uint32 h = ((uint32(s.bot_id()) + 1u) * 2654435761u) ^
                                  (uint32(s.duel_initiator().GetCounter()) * 2246822519u) ^ ((now_ms / 60000u) * 3266489917u);
-                const bool close = diff >= -5 && diff <= 5;
+                // Playerbot.World.GateDuels.Enable: a player who wants a duel gets one from any idle bot within 10 levels (the
+                // nostalgic duel outside the gate); otherwise about one time in three within 5.
+                const bool gate_duels = Services::Config().gate_duels_enable();
+                const bool close = gate_duels ? V2::GateDuels::PlayerDuelOk(s.level(), s.duel_initiator_level()) : (diff >= -5 && diff <= 5);
                 const bool fit = s.hp_pct() >= 70 && !s.in_combat() && s.is_alive() && !s.is_moving();
-                if (close && fit && ((h >> 9) % 3u) == 0u)
+                if (close && fit && (gate_duels || ((h >> 9) % 3u) == 0u))
                 {
                     em.duel_accept();
                     em.say_world("alright, you're on");

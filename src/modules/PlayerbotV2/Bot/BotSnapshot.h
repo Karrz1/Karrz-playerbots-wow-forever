@@ -1555,6 +1555,9 @@ struct MovementState
     bool is_flying   = false;
     bool is_mounted  = false;
     bool is_moving   = false;
+    // Terrain height under the bot (INVALID_HEIGHT when not measured: only a grouped bot that stands still is measured). Diagnostics only: the
+    // [formation_stuck] line compares it with the bot's z (a bot standing on a model is higher than the ground).
+    float ground_z   = -100000.0f;
     // True while the CORE is flying the bot on a taxi path (UNIT_STATE_IN_
     // FLIGHT). The bot logic must do NOTHING during a taxi flight — the
     // FlightPathMovementGenerator owns movement; any idle rule that emits a
@@ -2666,6 +2669,16 @@ struct BotSnapshot
     // The owner is in the bot's group: the bot is a companion and does what its owner's party does, not world-bot
     // errands (questing, vendors, gathering, travel). See IdleRuleRegistry::tick.
     bool owner_in_group = false;
+    // The bot is in a group with a player who controls it although it has no owner in that group: a world bot the player invited
+    // (or a companion whose owner is not in the group). Same duty as a companion: it does what the group does, no errands, and the
+    // controller's orders reach it. controller_guid is that player (the group leader when human, else the first human member).
+    bool led_by_player = false;
+    ObjectGuid controller_guid;
+    // The bot starts no fight of its own and must not tag a pack with an AoE (stance Passive, or no stance picked while led by a
+    // player): mirrored from BotAI by the builder. Read by the AoE gate (ThreatDiscipline FindAoeHazard).
+    bool no_tag_stance = false;
+    // The controller told the bot to Stay / Hold: a tank does not walk after a loose mob (a taunt, which moves nobody, still works).
+    bool holding_position = false;
     // Flat distance to the owner when it is on the bot's map, else -1. nearby_friends keeps only the 12 nearest friends, so in a raid
     // the owner is rarely in it (companion_may_sit).
     float owner_dist = -1.0f;
@@ -2948,6 +2961,10 @@ struct BotSnapshot
         owner_name.clear();
         owner_guid = ObjectGuid::Empty;
         owner_in_group = false;
+        led_by_player = false;
+        controller_guid = ObjectGuid::Empty;
+        no_tag_stance = false;
+        holding_position = false;
         owner_dist = -1.0f;
         tactic_burn = false;
         tactic_save_mana = false;

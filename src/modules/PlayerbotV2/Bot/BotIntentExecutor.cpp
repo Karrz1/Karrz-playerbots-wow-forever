@@ -10,6 +10,7 @@
 #include "../Util/ConfigReader.h"
 #include "../Fleet/BotGuildCharter.h"
 #include "../Fleet/BotGuildMgr.h"
+#include "../Fleet/BotPopulationManager.h"   // SwapResistGear
 #include "../Fleet/CraftOrderBoard.h"
 #include "../Fleet/JunkQuestResolver.h"
 #include "../Threading/IntentQueue.h"
@@ -34,6 +35,9 @@
 #include "ObjectAccessor.h"
 #include "GameTime.h"
 #include "Log.h"
+#include "Bot/DrainOrder.h"
+#include "Bot/ReactionTiming.h"
+#include "Combat/Apl/ApInterrupt.h"
 #include <chrono>
 #include <variant>
 #include <fmt/format.h>
@@ -131,6 +135,15 @@ struct IntentVisitor
                 Combat::ClassicHeal::ReleaseHealClaim(bp->GetGUID().GetCounter(), i.target, GameTime::GetGameTimeMS());
         if (r == Result::Ok && bot_ai)
             bot_ai->set_last_cast_spell_id(i.spell_id);
+        if (r == Result::Ok)
+            if (Player const* bp = api.player())
+            {
+                namespace In = Combat::Interrupt;
+                bool const kick = i.spell_id == In::PUMMEL || i.spell_id == In::SHIELD_BASH || i.spell_id == In::KICK || i.spell_id == In::KIDNEY_SHOT ||
+                                  i.spell_id == In::COUNTERSPELL || i.spell_id == In::EARTH_SHOCK || i.spell_id == In::SILENCE || i.spell_id == In::BASH;
+                if (kick) ReactionTiming::Instance().OnKick(bp->GetGUID().GetCounter(), GameTime::GetGameTimeMS());
+                else      ReactionTiming::Instance().OnCast(bp->GetGUID().GetCounter(), GameTime::GetGameTimeMS());
+            }
         // [cast_fail] per-reason tally, logged every 10 s per bot with failures.
         if (bot_ai)
             if (Player const* bp = api.player())
@@ -223,12 +236,16 @@ struct IntentVisitor
     Result operator()(MoveToIntent const& i)
     {
         Result const r = api.move_to(i.x, i.y, i.z, i.run, i.direct, i.drop, i.follow_drop);
+        if (r == Result::Ok)
+            if (Player const* bp = api.player())
+                ReactionTiming::Instance().OnMove(bp->GetGUID().GetCounter(), GameTime::GetGameTimeMS());
         if (i.follow_drop && bot_ai && r != Result::Locked)
         {
             // A ledge walk or flight commits the follow; an ordinary pathed move means the walking route is fine (State_InGroup HonorFollowDrop).
+            // No ledge found is neither: the bot tries again at the next attempt (a ledge may come in reach, the owner may land).
             if (api.follow_drop_acted())
                 bot_ai->commit_follow_drop(GameTime::GetGameTimeMS());
-            else
+            else if (api.follow_drop_route_fine())
                 bot_ai->note_follow_drop_fine(GameTime::GetGameTimeMS());
         }
         return r;
@@ -310,7 +327,7 @@ struct IntentVisitor
     Result operator()(TradeDeclineIntent const& i)     { return i.accept ? api.trade_with(i.owner, i.gift) : api.decline_trade(); }
     Result operator()(UseItemByEntryIntent const& i)   { return api.use_item_by_entry(i.item_entry, i.target); }
     Result operator()(UseItemIntent const& i)          { return api.use_item_by_slot(i.bag, i.slot, i.target); }
-    Result operator()(LootIntent const& i)              { return api.loot_corpse(i.corpse_or_object); }
+    Result operator()(LootIntent const& i)              { return api.loot_corpse(i.corpse_or_object, i.quest_only); }
     Result operator()(InteractWithNpcIntent const& i)  { return api.interact_with_npc(i.npc); }
     Result operator()(GossipSelectIntent const& i)     { return api.gossip_select_by_index(i.npc, i.option); }
     Result operator()(UseObjectIntent const& i)        { return api.use_game_object(i.object); }
@@ -321,7 +338,7 @@ struct IntentVisitor
     Result operator()(VehicleSpellIntent const& i)     { return api.cast_vehicle_spell(i.spell_id, i.target); }
     Result operator()(VehicleGroundSpellIntent const& i) { return api.cast_vehicle_spell_at(i.spell_id, i.x, i.y, i.z); }
     Result operator()(QuestAcceptIntent const& i)      { return api.accept_quest(i.npc, i.quest_id); }
-    Result operator()(QuestCompleteIntent const& i)    { return api.complete_quest(i.npc, i.quest_id, i.reward_choice); }
+    Result operator()(QuestCompleteIntent const& i)    { return api.complete_quest(i.npc, i.quest_id, i.reward_choice, i.copy_leader); }
     Result operator()(QuestAbandonIntent const& i)     { return api.abandon_quest(i.quest_id); }
     Result operator()(QuestSharedAcceptIntent const&)  { return api.accept_shared_quest(); }
     Result operator()(ResolveJunkQuestsIntent const&)
@@ -519,6 +536,13 @@ struct IntentVisitor
                 return api.restock_class_supplies();
             else if constexpr (std::is_same_v<T, EconomyOp::StockRaidConsumable>)
                 return api.stock_raid_consumable(op.item);
+            else if constexpr (std::is_same_v<T, EconomyOp::ResistGear>)
+            {
+                Player* bot = api.player();
+                if (!bot || !Services::Config().raid_resist_gear()) return Result::ServerRefused;
+                Services::Population().SwapResistGear(bot, op.school);
+                return Result::Ok;
+            }
             else                                                      return Result::Other;
         }, ei.op);
     }
@@ -664,7 +688,7 @@ size_t V2::Module::DrainIntents()
     constexpr auto kDrainBudget = std::chrono::milliseconds(30);
     const auto drain_start = std::chrono::steady_clock::now();
     bool over_budget = false;
-    reg.for_each([&](BotId id, BotRegistryEntry const& entry)
+    auto const drain_bot = [&](BotId id, BotRegistryEntry const& entry)
     {
         if (over_budget) return;
         if (!entry.intents) return;
@@ -975,7 +999,31 @@ size_t V2::Module::DrainIntents()
                 perf_slowest_intent_kind_ = batch_slowest_kind;
             }
         }
-    });
+    };
+    // The pass starts at a different bot each time one was cut short (the 30 ms limit, or a pathfind request that found the window spent):
+    // with a fixed order the same bots at the tail waited every frame, and a bot told to wait for minutes looks like one that will not
+    // move. The bots before the start index go last in the same pass.
+    static size_t s_start = 0;
+    static uint32 s_stat_ms = 0, s_passes = 0, s_refused = 0, s_cut = 0;
+    size_t const n_bots = reg.size();
+    size_t const start = n_bots ? s_start % n_bots : 0;
+    size_t idx = 0;
+    reg.for_each([&](BotId id, BotRegistryEntry const& entry) { if (idx++ >= start) drain_bot(id, entry); });
+    if (start)
+    {
+        idx = 0;
+        reg.for_each([&](BotId id, BotRegistryEntry const& entry) { if (idx++ < start) drain_bot(id, entry); });
+    }
+    bool const refused = Playerbot::PathBudget::Refused();
+    ++s_passes; s_refused += refused ? 1u : 0u; s_cut += over_budget ? 1u : 0u;
+    s_start = NextDrainStart(start, n_bots, refused || over_budget);
+    if (uint32 const now_stat = GameTime::GetGameTimeMS(); !s_stat_ms || now_stat - s_stat_ms >= 60000u)
+    {
+        if (s_stat_ms && (s_refused || s_cut))
+            TC_LOG_INFO("playerbot.v2", "[drain] last minute: {} passes, {} had a pathfind request refused (window spent), {} cut by the 30 ms limit, {} bots; next pass starts at bot {}",
+                        s_passes, s_refused, s_cut, n_bots, s_start);
+        s_stat_ms = now_stat; s_passes = s_refused = s_cut = 0;
+    }
     // Close the pathfinding-budget window so it never throttles a pathfind issued
     // outside DrainIntents (HasBudget fails open when inactive).
     Playerbot::PathBudget::EndWorldTick();

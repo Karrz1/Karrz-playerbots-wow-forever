@@ -23,6 +23,8 @@
 #include "Player.h"
 #include "UnitDefines.h"
 #include "Travel/WalkLinkTable.h"
+#include "Travel/TransportWaitMemory.h"
+#include "GameTime.h"
 
 #include <algorithm>
 #include <iterator>
@@ -74,6 +76,7 @@ constexpr float kTransitMapPenalty = 600.0f;
 // the navmesh can't realize. ConnectIslands() patches the longer hops
 // via Bridge nodes.
 constexpr float kMaxWalkEdgeYds = 600.0f;
+constexpr float kFarAttachYds   = 1500.0f;   // reach for a source or goal with no node inside kMaxWalkEdgeYds
 // Max vertical gap a same-map walk edge may span. Above this the only routable
 // path between the two floors is an EdgeKind::Elevator edge (see BuildWalkEdges).
 // 18y: an elevated FM (z~103) still links to the lift's TOP stop (z~90, dz 13)
@@ -82,7 +85,7 @@ constexpr float kMaxWalkEdgeYds = 600.0f;
 constexpr float kMaxWalkEdgeDz = 18.0f;
 // The Classic 1.60 maps (ids from 2000) are mountain islands with tiers up to 350 y apart in height; a distance-and-height rule cannot say
 // whether two places on them are joined by ground. Their walk edges come only from the checked link table (WalkLinkTable.h), never from the
-// 600 y / 18 y rule or from a Bridge node: an unchecked edge sent bots to a hub they could not reach (Zephras Isle, 2026-10-16: "partial
+// 600 y / 18 y rule or from a Bridge node: an unchecked edge sent bots to a hub they could not reach (Zephras Isle: "partial
 // routes toward (3289,1758,824)" and a 91 s wedge at the starter hub), where no edge sends them to the places they can.
 constexpr uint32 kForeverMapFrom = 2000;
 constexpr float kLinkCandidateYds = 1600.0f;   // the farthest two pieces are tried for a link by the offline check (tools/walk_link_check)
@@ -333,7 +336,23 @@ void UnifiedTravelGraph::LoadDungeonEntries()
     // false when no entrance is defined (GM-only maps). We register
     // the entry on the PARENT map so ground travel + flights can
     // route to it; the area-trigger handles the actual teleport.
-    uint32 added = 0;
+    uint32 added = 0, with_height = 0;
+    // The map entry gives x and y only. The walk-in triggers that lead into the instance carry the height: without it every
+    // entrance node sat at z 0 and a bot walking to one asked for (-8349,517,0) in Stormwind, 90 y below the city
+    // floor (soak 127: Haim, 53 asks in 13 minutes, a path failure each time).
+    struct EntranceTrigger { uint32 parent_map; float x, y, z; };
+    std::unordered_map<uint32, std::vector<EntranceTrigger>> entrance_triggers;   // instance map id -> triggers into it
+    if (QueryResult res = WorldDatabase.Query("SELECT ID FROM areatrigger_teleport"))
+    {
+        do
+        {
+            uint32 const trigger_id = (*res)[0].GetUInt32();
+            AreaTriggerEntry const* at = sAreaTriggerStore.LookupEntry(trigger_id);
+            WorldSafeLocsEntry const* dest = at ? sObjectMgr->GetAreaTrigger(trigger_id) : nullptr;
+            if (dest && dest->Loc.GetMapId() != at->ContinentID)
+                entrance_triggers[dest->Loc.GetMapId()].push_back({ at->ContinentID, at->Pos.X, at->Pos.Y, at->Pos.Z });
+        } while (res->NextRow());
+    }
     for (MapEntry const* me : sMapStore)
     {
         if (!me) continue;
@@ -344,19 +363,33 @@ void UnifiedTravelGraph::LoadDungeonEntries()
             continue;
         if (parent_map < 0) continue;
 
+        float ez = 0.f;
+        {
+            constexpr float kMaxTriggerYds = 150.f;
+            float best = kMaxTriggerYds * kMaxTriggerYds;
+            if (auto it = entrance_triggers.find(me->ID); it != entrance_triggers.end())
+                for (EntranceTrigger const& t : it->second)
+                {
+                    if (t.parent_map != uint32(parent_map)) continue;
+                    float const d2 = (t.x - ex) * (t.x - ex) + (t.y - ey) * (t.y - ey);
+                    if (d2 < best) { best = d2; ez = t.z; }
+                }
+            if (ez != 0.f) ++with_height;
+        }
+
         GraphNode n;
         n.kind        = NodeKind::DungeonEntry;
         n.map_id      = uint32(parent_map);
         n.x           = ex;
         n.y           = ey;
-        n.z           = 0.f;
+        n.z           = ez;
         char const* map_name = me->MapName[LOCALE_enUS];
         n.name        = std::string("Entrance to ") + (map_name ? map_name : "?");
         n.payload_id  = me->ID;
         AppendNode(std::move(n));
         ++added;
     }
-    TC_LOG_INFO("playerbot.v2", "[UnifiedTravelGraph] LoadDungeonEntries: {} nodes", added);
+    TC_LOG_INFO("playerbot.v2", "[UnifiedTravelGraph] LoadDungeonEntries: {} nodes, {} with the height of their walk-in trigger", added, with_height);
 }
 
 void UnifiedTravelGraph::LoadAreaTriggerTeleports()
@@ -1280,6 +1313,10 @@ bool EdgeUsable(Player const* bot,
                 bool allow_hearth)
 {
     if (!allow_hearth && edge.kind == EdgeKind::Hearth) return false;
+    // A same-map ride that bots waited for in vain (Travel/TransportWaitMemory.h) is left out of the routes for a while.
+    if (edge.kind == EdgeKind::Ship && edge.payload_id != 0 &&
+        TransportWaitMemory::Instance().Unusable(edge.payload_id, GameTime::GetGameTimeMS()))
+        return false;
     // Source-node faction gate: flight masters / portals tagged Alliance
     // or Horde aren't usable by the opposing team. Neutral (faction=0)
     // is fine for anyone.
@@ -1468,14 +1505,21 @@ Route UnifiedTravelGraph::FindRoute(RouteRequest const& req) const
         // the attach and the walk leg NoPathed forever instead of riding the lift.
         std::vector<std::pair<float, NodeId>> cand;   // (attach_cost, node)
         const uint32 from_region = RegionForPosition(req.from_map, req.from_x, req.from_y);
-        for (NodeId nid : it->second)
+        // A bot far from every node (Burning Steppes: the nearest flight master is 700-900 y away) found no attach within the walk
+        // limit, and the route failed with from_attach=0 for the whole zone (soak 127). With none inside it, the search reaches out
+        // to kFarAttachYds; the bot walks to the nearest node and the rest of the route is the usual one.
+        for (float const radius : { kMaxWalkEdgeYds, kFarAttachYds })
         {
-            const float d = Dist2D(req.from_x, req.from_y, _nodes[nid].x, _nodes[nid].y);
-            if (d > kMaxWalkEdgeYds) continue;
-            if (RegionForPosition(req.from_map, _nodes[nid].x, _nodes[nid].y) != from_region) continue;
-            if (std::fabs(_nodes[nid].z - req.from_z) >
-                std::max(kMaxWalkEdgeDz, d * 0.25f)) continue;
-            cand.emplace_back(attach_cost(d, _nodes[nid].z - req.from_z), nid);
+            for (NodeId nid : it->second)
+            {
+                const float d = Dist2D(req.from_x, req.from_y, _nodes[nid].x, _nodes[nid].y);
+                if (d > radius) continue;
+                if (RegionForPosition(req.from_map, _nodes[nid].x, _nodes[nid].y) != from_region) continue;
+                if (std::fabs(_nodes[nid].z - req.from_z) >
+                    std::max(kMaxWalkEdgeDz, d * 0.25f)) continue;
+                cand.emplace_back(attach_cost(d, _nodes[nid].z - req.from_z), nid);
+            }
+            if (!cand.empty()) break;
         }
         std::sort(cand.begin(), cand.end(),
                   [](auto const& a, auto const& b) { return a.first < b.first; });
@@ -1493,15 +1537,19 @@ Route UnifiedTravelGraph::FindRoute(RouteRequest const& req) const
     if (auto it = _nodes_by_map.find(req.to_map); it != _nodes_by_map.end())
     {
         const uint32 to_region = RegionForPosition(req.to_map, req.to_x, req.to_y);
-        for (NodeId nid : it->second)
+        for (float const radius : { kMaxWalkEdgeYds, kFarAttachYds })
         {
-            if (RegionForPosition(req.to_map, _nodes[nid].x, _nodes[nid].y) != to_region) continue;
-            const float d = Dist2D(req.to_x, req.to_y, _nodes[nid].x, _nodes[nid].y);
-            if (std::fabs(_nodes[nid].z - req.to_z) >
-                std::max(kMaxWalkEdgeDz, d * 0.25f)) continue;
-            if (d <= kMaxWalkEdgeYds)
-                to_attach.push_back({nid,
-                    attach_cost(d, _nodes[nid].z - req.to_z)});
+            for (NodeId nid : it->second)
+            {
+                if (RegionForPosition(req.to_map, _nodes[nid].x, _nodes[nid].y) != to_region) continue;
+                const float d = Dist2D(req.to_x, req.to_y, _nodes[nid].x, _nodes[nid].y);
+                if (std::fabs(_nodes[nid].z - req.to_z) >
+                    std::max(kMaxWalkEdgeDz, d * 0.25f)) continue;
+                if (d <= radius)
+                    to_attach.push_back({nid,
+                        attach_cost(d, _nodes[nid].z - req.to_z)});
+            }
+            if (!to_attach.empty()) break;
         }
     }
     out.from_attach_count = uint32(from_attach.size());

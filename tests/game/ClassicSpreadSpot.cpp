@@ -79,3 +79,37 @@ TEST_CASE("SpreadSpot: a small hub keeps its crowd on its own ground", "[spreads
         CHECK(std::sqrt(dx * dx + dy * dy) <= 3.01f);
     }
 }
+
+TEST_CASE("SpreadSpot: bots walking to one single-giver hub aim at different spots, none on the giver (hubs hold two or more givers, so a real radius)", "[spreadspot]")
+{
+    std::set<std::pair<int, int>> spots;
+    for (std::uint64_t seed = 1000; seed < 1040; ++seed)
+    {
+        float x = 0.f, y = 0.f;
+        HubStandPoint(2126.6f, 1305.9f, 20.0f, seed, x, y);
+        REQUIRE(std::hypot(x - 2126.6f, y - 1305.9f) >= 0.5f);    // never on the giver's own coordinates
+        REQUIRE(std::hypot(x - 2126.6f, y - 1305.9f) <= kSpreadMaxOffset);
+        spots.insert({ int(x * 2.0f), int(y * 2.0f) });
+    }
+    REQUIRE(spots.size() >= 36);                                    // 40 bots, at most a few share a half-yard cell
+}
+
+TEST_CASE("GiverStandPoint keeps bots off the giver and spreads them", "[ClassicSpreadSpot]")
+{
+    using namespace Playerbot::V2::World;
+    std::set<std::pair<int, int>> spots;
+    for (std::uint64_t seed = 2000; seed < 2040; ++seed)
+    {
+        float x = 0.f, y = 0.f;
+        GiverStandPoint(2126.6f, 1305.9f, 2140.0f, 1290.0f, seed, x, y);
+        float const d = std::hypot(x - 2126.6f, y - 1305.9f);
+        REQUIRE(d >= 1.95f);
+        REQUIRE(d <= 4.05f);                    // inside the 4.5 yd accept reach
+        spots.insert({ int(x * 2.0f), int(y * 2.0f) });
+    }
+    REQUIRE(spots.size() >= 24);
+    float ax = 0.f, ay = 0.f, bx = 0.f, by = 0.f;     // the same bot approaching from two nearby positions keeps (nearly) its spot
+    GiverStandPoint(0.f, 0.f, 20.0f, 1.0f, 77u, ax, ay);
+    GiverStandPoint(0.f, 0.f, 8.0f, 0.5f, 77u, bx, by);
+    REQUIRE(std::hypot(ax - bx, ay - by) < 0.01f);
+}

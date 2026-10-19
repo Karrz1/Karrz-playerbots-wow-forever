@@ -23,7 +23,7 @@ using namespace Playerbot::Classic;
 
 namespace
 {
-constexpr std::uint32_t kMoltenCore = 409, kNaxxramas = 533, kAhnQiraj = 531, kDeadmines = 36, kOpenWorld = 0;
+constexpr std::uint32_t kMoltenCore = 409, kNaxxramas = 533, kBlackwingLair = 469, kAhnQiraj = 531, kDeadmines = 36, kOpenWorld = 0;
 std::span<InstanceSchool const> const kTable = kInstanceSchools;
 }
 
@@ -35,6 +35,7 @@ TEST_CASE("Shadow Protection is wanted only where the bosses deal shadow damage"
     CHECK_FALSE(InstanceDealsSchool(kTable, kDeadmines, Resist::Shadow));
     CHECK_FALSE(InstanceDealsSchool(kTable, kOpenWorld, Resist::Shadow));
     CHECK(InstanceDealsSchool(kTable, kNaxxramas, Resist::Shadow));
+    CHECK(InstanceDealsSchool(kTable, kBlackwingLair, Resist::Shadow));   // Shadow Flame (Ebonroc, Flamegor, Nefarian)
 }
 
 TEST_CASE("An instance deals every school listed for it, and a buff that is no resistance is always wanted", "[ClassicInstanceSchools]")
@@ -51,5 +52,6 @@ TEST_CASE("The main school of an instance is its first row", "[ClassicInstanceSc
     CHECK(InstanceMainSchool(kTable, kMoltenCore) == Resist::Fire);
     CHECK(InstanceMainSchool(kTable, kNaxxramas) == Resist::Frost);   // not Shadow, listed second
     CHECK(InstanceMainSchool(kTable, kAhnQiraj) == Resist::Nature);
+    CHECK(InstanceMainSchool(kTable, kBlackwingLair) == Resist::Fire);   // Shadow listed second
     CHECK(InstanceMainSchool(kTable, kDeadmines) == Resist::None);
 }

@@ -6,7 +6,7 @@
 // so the creature entries and spell ids carry over unchanged.
 //
 // A rule set is registered per MAP ID (409 Molten Core, 469 Blackwing Lair,
-// 249 Onyxia's Lair, 309 Zul'Gurub, 509 Ruins of Ahn'Qiraj, 531 Temple of Ahn'Qiraj, 533 Naxxramas). RaidBrain.cpp reads these tables on the
+// 249 Onyxia's Lair, 531 Temple of Ahn'Qiraj, 533 Naxxramas). RaidBrain.cpp reads these tables on the
 // world thread and turns them into per-bot raid orders (move out of hazards,
 // spread, stand at role positions, taunt swaps, dispels, purges, crowd
 // control, forbidden targets). The data files (RaidEncounterData_*.cpp)
@@ -65,16 +65,16 @@ struct CarrierRun { uint32_t aura; float clearDistance; Who who = Who::NonTank; 
 // (Magmadar). Off for a boss whose raid stands on fixed flank wedges (Onyxia): there the turn sends her breath across the wedges, the whole
 // ranged group has to re-position each time, and onyxia_full n57 run 1 saw the main tank do it every 9 s for four minutes (1880 "leave cone" steps).
 // marginDeg: the bot leaves, and no stand point may lie, inside the cone widened by this many degrees. A cast that lands 2 s after the enemy
-// turns a few degrees cannot be dodged from inside the exact edge (Onyxia's Flame Breath, onyxia_full live 2026-10-16: 27 dead of 38).
+// turns a few degrees cannot be dodged from inside the exact edge.
 struct AvoidFrontal { uint32_t enemy; float radius; float halfAngleDeg; Who who; float facingOffsetDeg = 0.0f; float hpMax = 100.0f; float hpMin = 0.0f; bool tankTurns = true; float marginDeg = 0.0f; };
 
 // Onyxia's ground phases (RaidEncounterData_ONY.cpp): the front cone and the tail sweep, in degrees off her facing, the margin both carry, and
 // the wedge on each flank between them where the raid stands. The wedge is derived, so that a change to either arc moves it too.
-// Client spell data (SpellTargetRestrictions, read 2026-10-16): Flame Breath 18435 and Wing Buffet 18500 are a 120 degree cone in front (the core's
+// Client spell data: Flame Breath 18435 and Wing Buffet 18500 are a 120 degree cone in front (the core's
 // HasInArc takes the whole arc: 60 either side), Tail Sweep 15847 is -120, the rear arc (60 either side of straight behind her).
 constexpr float kOnyFrontHalfDeg  = 60.0f;   // Flame Breath, Wing Buffet: each side of her facing
 constexpr float kOnyTailHalfDeg   = 60.0f;   // Tail Sweep: each side of the line straight behind her
-constexpr float kOnyConeMarginDeg = 12.0f;   // a cast lands up to 2 s after she turns, and the 2026-10-16 deaths sat right on the edge (+60, -57)
+constexpr float kOnyConeMarginDeg = 12.0f;   // a cast lands up to 2 s after she turns, and the deaths seen sat right on the edge (+60, -57)
 constexpr float kOnyWedgeGapDeg   = 3.0f;    // between the widened cone edge and the first row of the wedge
 constexpr float kOnyCaveKeepOutRadius = 12.0f;   // the static whelps' pull range (see the data file), no wider
 constexpr float kOnyWedgeLoDeg    =kOnyFrontHalfDeg + kOnyConeMarginDeg + kOnyWedgeGapDeg;
@@ -201,7 +201,7 @@ struct BreathSafe { uint32_t enemy; uint32_t castSpell; float x, y; };
 // hover (fixedPath only): the corridor is open while <enemy> is airborne and stands at, or flies to, the path's first point (ax,ay), not only
 // while the spell is being cast. Onyxia starts a breath wherever she hovers when her movement timer runs out, from the waypoint she stands at, so
 // the line she may breathe along next is known the moment she arrives; the 5 s cast is too short a warning for a raid standing in the middle of
-// a hall 70 y across (onyxia_full live 2026-10-16: 16 of 40 dead in one second, eight of them 45 y or more from the nearest safe point).
+// a hall 70 y across.
 struct AvoidBreath { uint32_t enemy; uint32_t castSpell; float halfWidth; float length; Who who; bool windup = false;
                      bool fixedPath = false; float ax = 0.0f, ay = 0.0f, bx = 0.0f, by = 0.0f; bool hover = false; };
 

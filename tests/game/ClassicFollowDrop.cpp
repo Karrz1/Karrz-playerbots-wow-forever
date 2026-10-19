@@ -75,9 +75,9 @@ TEST_CASE("Follow drop: a walking route that is fine means no drop", "[ClassicFo
     CHECK(PlanFollowDrop(bot, owner, true, Stadium, AlwaysClear).mode == Mode::None);
 }
 
-TEST_CASE("Follow drop: an owner more than 40 y away is not followed off a ledge", "[ClassicFollowDrop]")
+TEST_CASE("Follow drop: an owner more than 50 y away is not followed off a ledge", "[ClassicFollowDrop]")
 {
-    Vec const bot{ 147.f, -380.f, 122.f }, owner{ 148.f, -425.f, 110.9f };
+    Vec const bot{ 147.f, -350.f, 122.f }, owner{ 148.f, -425.f, 110.9f };
     CHECK(PlanFollowDrop(bot, owner, false, Stadium, AlwaysClear).mode == Mode::None);
 }
 
@@ -128,4 +128,30 @@ TEST_CASE("Follow drop: a gap wider than a jump is not leapt", "[ClassicFollowDr
     };
     Vec const bot{ 4.f, 0.f, 100.f }, owner{ 30.f, 0.f, 100.f };
     CHECK(PlanFollowDrop(bot, owner, false, wide, AlwaysClear).mode == Mode::None);
+}
+
+TEST_CASE("Follow drop: a bot that walked along the rim still finds the edge toward the owner", "[ClassicFollowDrop]")
+{
+    Vec const bot{ 110.f, -392.f, 122.f }, owner{ 148.f, -420.f, 110.9f };
+    Plan const p = PlanFollowDrop(bot, owner, false, Stadium, AlwaysClear);
+    REQUIRE(p.mode == Mode::Walk);
+    CHECK(p.land.z == Catch::Approx(110.9f).margin(0.01));
+}
+
+TEST_CASE("Follow drop: an edge sideways of the owner (bearing 90 degrees off) is found", "[ClassicFollowDrop]")
+{
+    // The edge is behind the bot's right shoulder: only the wide bearings reach it.
+    auto side = [](float x, float, float hint, float& z)
+    {
+        float const floor_z = x > 20.f ? 110.0f : 122.0f;
+        if (floor_z > hint + 3.0f)
+            return false;
+        z = floor_z;
+        return true;
+    };
+    Vec const bot{ 10.f, 0.f, 122.f }, owner{ 12.f, 40.f, 110.f };
+    // The owner is 40 y north on the low floor of a ledge that runs along x = 20, i.e. due east of the bot.
+    Plan const p = PlanFollowDrop(bot, owner, false, side, AlwaysClear);
+    REQUIRE(p.mode == Mode::Walk);
+    CHECK(p.ledge.x == Catch::Approx(20.f).margin(1.6));
 }

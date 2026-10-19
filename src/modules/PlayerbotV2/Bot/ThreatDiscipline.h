@@ -164,11 +164,13 @@ inline AoeHazard FindAoeHazard(BotSnapshotView const& s, float cx, float cy, flo
         { hit = { &u, AoeHazardKind::CrowdControlled }; return true; }
         if (school_avoided(u))
         { hit = { &u, AoeHazardKind::SchoolAvoided }; return true; }
-        if (hit.unit || !tanked || !u.has_threat_list) return false;   // keep the first soft hazard
+        // A bot told to start nothing (Passive, or led by a player with no stance picked) never tags a pack with an AoE either: a mob
+        // nobody has engaged is a hazard whether or not the group has a tank.
+        if (hit.unit || !(tanked || s.no_tag_stance()) || !u.has_threat_list) return false;   // keep the first soft hazard
         if (!u.unit_in_combat)
         { hit = { &u, AoeHazardKind::Unpulled }; return false; }
         // Raid only: a party's AoE is not held for the tank's lead (the Unpulled and CC guards above still apply).
-        if (s.is_in_raid() && !me_tank && ThreatVictim(u.victim_kind) == ThreatVictim::Tank && TankNotSecured(s, u))
+        if (tanked && s.is_in_raid() && !me_tank && ThreatVictim(u.victim_kind) == ThreatVictim::Tank && TankNotSecured(s, u))
         { hit = { &u, AoeHazardKind::NotTanked }; return false; }
         return false;
     };

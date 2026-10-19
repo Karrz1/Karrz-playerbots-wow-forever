@@ -146,16 +146,13 @@ TEST_CASE("a combat potion is stocked but never used before the pull", "[classic
     stock = NextRaidConsumableToStock(RaidConsumableRole::Tank, holds_all_but_potion, flask_buffed);
     REQUIRE(stock != nullptr);
     CHECK(stock->item == 13457);
-    // Every role carries one (Ragnaros' Might hits 20 y round a random mana user), and only that one is a combat potion.
+    // Every role carries the four Greater Protection Potions (fire 13457, shadow 13459, nature 13458, frost 13456), and only those are combat potions.
     for (RaidConsumableRole role : { RaidConsumableRole::Melee, RaidConsumableRole::Caster, RaidConsumableRole::Healer, RaidConsumableRole::Hunter })
     {
-        int combat = 0;
+        std::set<uint32> combat;
         for (RaidConsumable const& c : RaidConsumablesFor(role))
             if (c.combat)
-            {
-                ++combat;
-                CHECK(c.item == 13457);
-            }
-        CHECK(combat == 1);
+                combat.insert(c.item);
+        CHECK(combat == std::set<uint32>{ 13457, 13459, 13458, 13456 });
     }
 }

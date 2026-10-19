@@ -35,7 +35,7 @@ struct Fight
 // Sulfuron Harbinger (MC 409): the four Flamewaker Priests one at a time, then Sulfuron. The priests are immune to every crowd control, so the script
 // dropping CC on its own enemies changes nothing here.
 // Shazzrah (MC 409): one boss. After his Gate he stands on a non-tank for a moment; the DPS stay on him and the retaunt rule gives him back.
-// Baron Geddon (MC 409): one boss, no adds. The script's worth here is the one start wait in place of the threat hold (n44: four DPS held for 20 s).
+// Baron Geddon (MC 409): one boss, no adds. The script's worth here is the one start wait in place of the threat hold (four DPS were held for 20 s).
 // Garr (MC 409): Garr only. The Firesworn are not on the list, so the warlocks' Banish jobs on them stay, and the Spare rule (RaidEncounters.h)
 // keeps them alive until he falls; once he is dead the generic rules finish them.
 inline constexpr Fight kFights[] = {

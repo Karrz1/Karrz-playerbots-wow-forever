@@ -22,6 +22,7 @@
 #include "Services.h"
 #include "Travel/QuestHubDatabase.h"
 #include "Travel/RegionMapper.h"
+#include "Bot/World/SpreadSpot.h"
 #include "ObjectAccessor.h"
 #include "UnitDefines.h"
 #include "Log.h"
@@ -316,11 +317,10 @@ bool QuestAcceptFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
     // not a cross-zone trek (far givers stay with the travel/hub cascade).
     if (near_dsq < 60.0f * 60.0f && !s.in_combat())
     {
-        const float dist = std::sqrt(near_dsq);
-        const float scale = (dist - 2.5f) / dist;   // stop 2.5y — inside the 3.5y accept-emit margin
-        emit.move_to(bx + (near_gx - bx) * scale,
-                     by + (near_gy - by) * scale,
-                     near_gz, /*run*/ true);
+        // The bot's own spot 2-4 yd from the giver (inside the accept margin), not one shared point on the line to him.
+        float stand_x = near_gx, stand_y = near_gy;
+        ::Playerbot::V2::World::GiverStandPoint(near_gx, near_gy, bx, by, s.guid().GetCounter(), stand_x, stand_y);
+        emit.move_to(stand_x, stand_y, near_gz, /*run*/ true);
         ai.grant_detour(s.published_at_ms());
         ai.set_last_rule_fired(s.is_in_dungeon() ? "idle:dungeon_quest_approach"
                                                  : "idle:quest_accept_approach");
@@ -639,7 +639,12 @@ bool WalkToKnownHubFire(BotSnapshotView const& s, BotAI& ai,
         if (!found) continue;
         const float dx = gx - bx, dy = gy - by, dz = gz - bz;
         const float dsq = dx*dx + dy*dy + dz*dz;
-        if (dsq < best_dsq) { best_dsq = dsq; bx_t = gx; by_t = gy; bz_t = gz; have_target = true; }
+        if (dsq < best_dsq)
+        {
+            // The bot's own spot beside the giver, not the giver's coordinates (every bot walked onto him and stood inside him).
+            best_dsq = dsq; bz_t = gz; have_target = true;
+            ::Playerbot::V2::World::GiverStandPoint(gx, gy, bx, by, s.guid().GetCounter(), bx_t, by_t);
+        }
     }
 
     // FIX 5b: else prefer the nearest SAME-MAP QuestHubDatabase hub that STILL
@@ -653,7 +658,6 @@ bool WalkToKnownHubFire(BotSnapshotView const& s, BotAI& ai,
         if (Player* self = ObjectAccessor::FindConnectedPlayer(s.raw().guid))
         {
             ::Playerbot::V2::Travel::QuestHub const* picked = nullptr;
-            float picked_dsq = std::numeric_limits<float>::infinity();
             // Collect same-map appropriate hubs nearest-first, then take the
             // first with a doable quest (early-exit predicate keeps this cheap).
             std::vector<std::pair<float, ::Playerbot::V2::Travel::QuestHub const*>> near;
@@ -674,15 +678,16 @@ bool WalkToKnownHubFire(BotSnapshotView const& s, BotAI& ai,
                 // instead of re-targeting the same unreachable/empty hub.
                 if (ai.hub_recently_tried(dh.second->hubId, wk_now_ms)) continue;
                 if (::Playerbot::HubHasDoableQuest(self, *dh.second))
-                { picked = dh.second; picked_dsq = dh.first; break; }
+                { picked = dh.second; break; }
             }
 
             if (picked)
             {
-                best_dsq = picked_dsq;
-                bx_t = picked->location.GetPositionX();
-                by_t = picked->location.GetPositionY();
+                // The bot's own spot in the hub, not its centre: a hub of one giver is that giver's spot, and every bot walked onto it.
+                ::Playerbot::V2::World::HubStandPoint(picked->location.GetPositionX(), picked->location.GetPositionY(), picked->radius,
+                                                      s.guid().GetCounter(), bx_t, by_t);
                 bz_t = picked->location.GetPositionZ();
+                best_dsq = (bx_t - bx) * (bx_t - bx) + (by_t - by) * (by_t - by) + (bz_t - bz) * (bz_t - bz);
                 picked_hub_id = picked->hubId;
                 have_target = true;
             }

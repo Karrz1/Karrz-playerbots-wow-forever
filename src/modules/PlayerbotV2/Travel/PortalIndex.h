@@ -174,8 +174,11 @@ public:
     // running between the same two stations (several cars share one track and
     // any of them takes the rider to the other end). Thread-safe after Initialize.
     bool ServesSameRoute(uint32 route_entry, uint32 candidate) const;
+    // Spawn ids of the shuttle cars (tram cars) on `map_id`; empty for a map without any. Thread-safe after Initialize.
+    std::vector<uint64> const& ShuttleSpawnIds(uint32 map_id) const;
 
 private:
+    std::unordered_map<uint32, std::vector<uint64>> _shuttle_spawn_ids;   // map id -> spawn ids of its shuttle cars
     // Horizontal shuttles (type-11 GOs whose TransportAnimation dwells at two or
     // more stations far apart, e.g. the Deeprun Tram cars on map 369). Collected
     // from the gameobject spawns during Initialize.

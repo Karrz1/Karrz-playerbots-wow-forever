@@ -58,6 +58,7 @@ The `.bot` commands for your own bots work for every account, no GM needed; each
 | Command | What it does |
 |---|---|
 | `.bot add <class> [tank\|healer\|dps] [race] [male\|female]` | Creates a companion bound to you, levels it to you, teaches spells, sets role/talents/gear, brings it over and groups it. The role is kept across relog and `.bot call`. |
+| `.bot lfg [tank\|healer\|dps]` | Fills the missing tank / healer / damage places of your group (1 tank, 1 healer, 3 damage) with level-matched companions, now. The word is your own role. The Group Finder does the same on its own: post a dungeon listing and, if nobody joins within `Playerbot.Lfg.BotFillSeconds` (default 180), the missing roles are filled. |
 | `.bot call <name\|all>` | Brings back a companion (logs it in, joins your group). `all` = your saved roster plus every bot in your group. |
 | `.bot summon <name\|all\|saved>` | Every player, own bots only: `.bot summon all` brings only the bots that are in your group right now (it never logs anyone in), `.bot summon saved` your saved roster plus the grouped bots (logging them in), `.bot summon <name>` one of your companions. Any other name: "You can only summon your own bots". The GM `.summon` (other players) is unchanged and stays GM-only. |
 | `.bot save <name\|all>` | Puts a companion (or every bot with you) on your roster. |
@@ -351,7 +352,8 @@ The module logs nothing unless `Logger.playerbot.v2=3` is set. Grep the server l
 
 ## 14. Known gaps
 
-- `trade`, and the ike3 strategy toggles `co`/`nc`/`ss` (+/- strategy lists), are **not implemented**. The
+- The ike3 strategy toggles `co`/`nc`/`ss` (+/- strategy lists) are **not implemented**. Trade is: the bot takes
+  gifts from its owner or a group mate (see Gifts by trade) and a free world bot buys what you put in. The
   nearest equivalents are `max dps` / `save mana` / `normal`, `aoe`, `hold`/`defensive`/`aggressive`.
 - `sell grey` and `repair` act at once only when the vendor is within interaction reach; from up to 60 yards the
   bot walks over and you repeat the order. There is no standing "go and sell, then come back" order; the bots'
@@ -389,7 +391,7 @@ Level-60 (level-cap) companions are geared for raiding by role (`Playerbot.Behav
 | `Playerbot.Gear.RaidIlvlCap` | 0 | Explicit item level ceiling; above 0 it overrides `MaxTier`. |
 | `Playerbot.Behavior.AcceptOwnerTrade` | 1 | A companion accepts a trade its owner opens, once the owner has accepted (gear and money gifts). The bot never offers anything, so nothing can be taken back through the window. Anyone else's trade is declined. Mail is not read by bots, so gifts go by trade. |
 
-Gifts by trade: open a trade with the bot, put the items in, accept. The bot accepts, then its auto-equip rules wear what is an upgrade for its role (within a few minutes in the open world, at once in a dungeon, or say `equip upgrades`); the rest stays in its bags.
+Gifts by trade: open a trade with the bot, put the items in, accept. Gold, gear that is an upgrade and reagents of a recipe the bot knows are gifts; anything else the bot buys at a fair price. The bot accepts, then its auto-equip rules wear what is an upgrade for its role (within a few minutes in the open world, at once in a dungeon, or say `equip upgrades`); the rest stays in its bags.
 
 | Say or whisper | What the bot does |
 |---|---|

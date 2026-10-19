@@ -91,6 +91,13 @@ public:
     std::string const& owner_name() const { return s_->owner_name; }
     bool   has_owner_character()   const { return !s_->owner_name.empty(); }
     bool   is_companion_with_owner() const { return s_->owner_in_group; }
+    // In a group with a player who commands it: a companion, or a world bot a player invited. Neither runs world errands.
+    bool   is_led_by_player() const { return s_->owner_in_group || s_->led_by_player; }
+    // A bot of the world: no owner, not in any group, not led by a player.
+    bool   is_free_world_bot() const { return s_->owner_guid.IsEmpty() && s_->owner_name.empty() && s_->group.group_guid.IsEmpty() && !s_->led_by_player; }
+    bool   no_tag_stance() const { return s_->no_tag_stance; }
+    bool   holding_position() const { return s_->holding_position; }
+    ObjectGuid controller_guid() const { return s_->owner_in_group ? s_->owner_guid : s_->controller_guid; }
     bool   tactic_burn()      const { return s_->tactic_burn; }        // owner "max dps"
     bool   tactic_save_mana() const { return s_->tactic_save_mana; }   // owner "save mana"
     // A companion may sit down to eat or drink only when its owner has stopped next to it: otherwise the group follow
@@ -276,6 +283,9 @@ public:
     // in_spell_range against victim_info(); true when the victim is not in the
     // snapshot lists (no distance to judge) - the API's own gate still holds.
     bool victim_in_spell_range(uint32 spell_id, float slack = 1.0f) const;
+    // The core's minimum range for a hostile cast at `t` (Spell::GetMinMaxRange): the range entry's own minimum, plus the melee range (both
+    // combat reaches + 4/3, at least 5 y) for a spell with the ranged flag. 0 when the spell has no minimum.
+    float spell_min_range(uint32 spell_id, NearbyUnit const& t) const;
     NearbyUnit const* lowest_hp_friend() const;
     NearbyUnit const* highest_threat_attacker() const;
     // First attacker in the threat list that is currently casting an

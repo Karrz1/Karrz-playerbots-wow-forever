@@ -4,7 +4,8 @@
 -- Counterattack Rank 1 19306). The class trainers imported from the vanilla data (trainer 1000000 + creature entry) only have
 -- Aimed Shot Ranks 2-6 and Counterattack Ranks 3-4, so the first ranks could not be learned and the later ranks were stuck behind them.
 -- Every trainer that teaches Aimed Shot Rank 2 gets the two missing rows.
-INSERT IGNORE INTO `trainer_spell` (`TrainerId`,`SpellId`,`MoneyCost`,`ReqSkillLine`,`ReqSkillRank`,`ReqAbility1`,`ReqAbility2`,`ReqAbility3`,`ReqLevel`,`VerifiedBuild`)
+DELETE FROM `trainer_spell` WHERE `SpellId` IN (19434, 1242634) AND `TrainerId` IN (SELECT `TrainerId` FROM (SELECT DISTINCT `TrainerId` FROM `trainer_spell` WHERE `SpellId` = 20900) AS `t`);
+INSERT INTO `trainer_spell` (`TrainerId`,`SpellId`,`MoneyCost`,`ReqSkillLine`,`ReqSkillRank`,`ReqAbility1`,`ReqAbility2`,`ReqAbility3`,`ReqLevel`,`VerifiedBuild`)
 SELECT DISTINCT `TrainerId`, 19434, 2100, 0, 0, 0, 0, 0, 20, 70124 FROM `trainer_spell` WHERE `SpellId` = 20900;
-INSERT IGNORE INTO `trainer_spell` (`TrainerId`,`SpellId`,`MoneyCost`,`ReqSkillLine`,`ReqSkillRank`,`ReqAbility1`,`ReqAbility2`,`ReqAbility3`,`ReqLevel`,`VerifiedBuild`)
+INSERT INTO `trainer_spell` (`TrainerId`,`SpellId`,`MoneyCost`,`ReqSkillLine`,`ReqSkillRank`,`ReqAbility1`,`ReqAbility2`,`ReqAbility3`,`ReqLevel`,`VerifiedBuild`)
 SELECT DISTINCT `TrainerId`, 1242634, 7600, 0, 0, 19306, 0, 0, 30, 70124 FROM `trainer_spell` WHERE `SpellId` = 20900;

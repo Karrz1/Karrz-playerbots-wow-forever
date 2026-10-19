@@ -23,18 +23,22 @@
 
 using namespace Playerbot::V2::Fleet;
 
-TEST_CASE("PoolBalance: levels map to five brackets", "[poolbalance]")
+TEST_CASE("PoolBalance: levels map to six brackets, 1-9 included", "[poolbalance]")
 {
-    CHECK(PoolBracketOf(10) == 0);
-    CHECK(PoolBracketOf(19) == 0);
-    CHECK(PoolBracketOf(20) == 1);
-    CHECK(PoolBracketOf(49) == 3);
-    CHECK(PoolBracketOf(50) == 4);
-    CHECK(PoolBracketOf(60) == 4);
-    CHECK(PoolBracketOf(5) == 0);
-    CHECK(PoolBracketLo(4) == 50);
-    CHECK(PoolBracketHi(4) == 60);
-    CHECK(PoolBracketHi(1) == 29);
+    CHECK(PoolBracketOf(1) == 0);
+    CHECK(PoolBracketOf(9) == 0);
+    CHECK(PoolBracketOf(10) == 1);
+    CHECK(PoolBracketOf(19) == 1);
+    CHECK(PoolBracketOf(20) == 2);
+    CHECK(PoolBracketOf(49) == 4);
+    CHECK(PoolBracketOf(50) == 5);
+    CHECK(PoolBracketOf(60) == 5);
+    CHECK(PoolBracketLo(0) == 1);
+    CHECK(PoolBracketHi(0) == 9);
+    CHECK(PoolBracketLo(5) == 50);
+    CHECK(PoolBracketHi(5) == 60);
+    CHECK(PoolBracketHi(2) == 29);
+    CHECK(PoolBracketCap(3000) == 500);
 }
 
 namespace
@@ -46,8 +50,8 @@ struct Rolls { double v = 0.0; double next() { v = std::fmod(v + 0.6180339887498
 TEST_CASE("PoolBalance: only the Horde side of a lopsided pool is created, in proportion to what each bracket lacks", "[poolbalance]")
 {
     PoolCounts c;
-    c.alliance = { 386, 376, 375, 416, 594 };       // the live census of 69b0d8c2
-    c.horde    = { 0, 0, 0, 0, 76 };
+    c.alliance = { 0, 386, 376, 375, 416, 594 };       // the live census of 69b0d8c2
+    c.horde    = { 0, 0, 0, 0, 0, 76 };
     Rolls r;
     std::array<int, kPoolBrackets> made{};
     for (int i = 0; i < 100; ++i)
@@ -57,16 +61,16 @@ TEST_CASE("PoolBalance: only the Horde side of a lopsided pool is created, in pr
         made[s.bracket]++;
         c.horde[s.bracket]++;
     }
-    for (std::size_t b = 0; b < 4; ++b)
+    for (std::size_t b = 1; b < 5; ++b)   // bracket 0 is empty on both sides: the ratio rule alone has nothing to compare there
         CHECK(made[b] >= 15);                        // every empty bracket gets Horde at once, not after the 50-60s are done
-    CHECK(made[4] >= 10);
+    CHECK(made[5] >= 10);
 }
 
 TEST_CASE("PoolBalance: a lopsided pool is brought to the ratio in every bracket, then grows evenly", "[poolbalance]")
 {
     PoolCounts c;
-    c.alliance = { 470, 480, 500, 490, 450 };
-    c.horde    = { 20, 15, 10, 30, 5 };
+    c.alliance = { 470, 480, 500, 490, 450, 460 };
+    c.horde    = { 20, 15, 10, 30, 5, 8 };
     Rolls r;
     std::uint32_t horde_made = 0;
     for (int i = 0; i < 6000; ++i)
@@ -84,7 +88,7 @@ TEST_CASE("PoolBalance: a lopsided pool is brought to the ratio in every bracket
 TEST_CASE("PoolBalance: the target ratio is honoured", "[poolbalance]")
 {
     PoolCounts c;
-    c.alliance = { 100, 100, 100, 100, 100 };
+    c.alliance = { 100, 100, 100, 100, 100, 100 };
     Rolls r;
     for (int i = 0; i < 2000; ++i)
     {
@@ -99,9 +103,40 @@ TEST_CASE("PoolBalance: the target ratio is honoured", "[poolbalance]")
 TEST_CASE("PoolBalance: a balanced pool reports nothing lacking", "[poolbalance]")
 {
     PoolCounts c;
-    c.alliance = { 10, 10, 10, 10, 10 };
+    c.alliance = { 10, 10, 10, 10, 10, 10 };
     c.horde = c.alliance;
     CHECK(PickSeed(c, 50, 0.5).deficit <= 0);
     PoolAdd(c, false, 33);
-    CHECK(c.horde[2] == 11);
+    CHECK(c.horde[3] == 11);
+}
+
+TEST_CASE("PoolBalance: with a bracket cap the short side of the short bracket is filled first and a full one is never grown", "[poolbalance]")
+{
+    // cap 100 per bracket, 50/50: each (faction, bracket) targets 50. Alliance is full everywhere and Horde is empty in the 1-9 bracket.
+    PoolCounts c;
+    c.alliance = { 50, 50, 50, 50, 50, 50 };
+    c.horde    = { 0, 50, 50, 50, 50, 50 };
+    SeedChoice s = PickSeed(c, 50, 0.3, 100);
+    CHECK_FALSE(s.alliance);
+    CHECK(s.bracket == 0);
+    CHECK(s.deficit == 50);
+    // Everything at its target: nothing is created.
+    c.horde[0] = 50;
+    CHECK(PickSeed(c, 50, 0.3, 100).deficit <= 0);
+    // A lopsided bracket (Alliance over its share) is not grown, only the short side.
+    c.alliance[3] = 90;
+    c.horde[3] = 10;
+    s = PickSeed(c, 50, 0.9, 100);
+    CHECK_FALSE(s.alliance);
+    CHECK(s.bracket == 3);
+}
+
+TEST_CASE("PoolBalance: a faction at its share of a bracket has no room, the other faction does", "[poolbalance]")
+{
+    PoolCounts c;
+    c.alliance[0] = 50;
+    c.horde[0] = 3;
+    CHECK_FALSE(PoolHasRoom(c, 5, true, 100, 50));
+    CHECK(PoolHasRoom(c, 5, false, 100, 50));
+    CHECK(PoolHasRoom(c, 30, true, 100, 50));   // another bracket is empty
 }

@@ -60,6 +60,14 @@ struct GearGenerationContext
     // What the owner asked for (Owned::GearMode, already reduced by Owned::EffectiveMode): at the cap T1 / T2 / T3 put the class tier set on
     // and raise the ceiling to that tier for the other slots; Best ignores the owner's own gear level. Ignored for world bots.
     Owned::GearMode gear_mode = Owned::GearMode::Match;
+    // A fight the bot gears resistance for (a SpellSchools value; 0 = none): at the cap, in a tier or best-in-slot mode, every armour and
+    // jewellery slot takes the piece with the most resistance to that school under the mode's item level (Gear::ResistPoints), the tier
+    // set filling the rest, as a vanilla raid dressed for Princess Huhuran. Weapons, trinkets and the ranged slot keep their picks.
+    // Ignored for world bots.
+    uint8  resist_school = 0;
+    // A piece worn for the fight whatever it scores (an item entry; 0 = none): the Onyxia Scale Cloak, whose aura is what the drakes' Shadow
+    // Flame checks. It goes on over the pick, the tier piece or the resistance piece in its slot. Ignored for world bots.
+    uint32 wear_entry = 0;
     bool   world_bot() const { return ::Playerbot::Pool::UsesWorldGear(role); }
 };
 

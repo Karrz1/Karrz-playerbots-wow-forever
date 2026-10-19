@@ -30,13 +30,20 @@ if(NOT BUILD_PLAYERBOT_V2)
     ClassicAddonHint.cpp
     ClassicBotConversation.cpp
     ClassicFollowDrop.cpp
+    ClassicGroupControl.cpp
     ClassicGroupOrderText.cpp
     ClassicInstanceFullHold.cpp
+    ClassicBotListedGroupPlan.cpp
+    ClassicLfgRoleGap.cpp
     ClassicRaidConsumables.cpp
     ClassicRaidDispel.cpp
     ClassicRaidFightScript.cpp
     ClassicRaidGeometry.cpp
-    ClassicRaidRagnaros.cpp)
+    ClassicRaidRagnaros.cpp
+    ClassicRaidResistPotions.cpp
+    ClassicDrinkSay.cpp
+    ClassicReactionTiming.cpp
+    ClassicReactionWake.cpp)
   foreach(_test_source ${TESTS_MODULE_ONLY_SOURCES})
     set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/game/${_test_source} PROPERTIES HEADER_FILE_ONLY TRUE)
   endforeach()

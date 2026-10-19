@@ -4,6 +4,7 @@
 
 #include "StateBase.h"
 #include "Bot/BotAI.h"
+#include "Diagnostics/DamageParity.h"
 #include "Bot/Formation.h"                      // StableJitter / MeleeArcSpot (SpreadOut)
 #include "Bot/BotSnapshotView.h"
 #include "Bot/BotIntentEmitter.h"
@@ -27,6 +28,7 @@
 #include "Combat/ApRegistry.h"
 #include "Combat/ApRotation.h"
 #include "Combat/Apl/ApClassicHeal.h"            // ClassicHeal::RankHeal - raid overheal cancel
+#include "Combat/Apl/AplPetThrottle.h"           // one pet_attack order per target per 3 s
 #include "Combat/Apl/ApTankThreat.h"             // TankThreat::TauntReach - [tank_loose] logs the reach the Taunt rule uses
 #include "SpellInfo.h"
 #include "SpellMgr.h"
@@ -738,7 +740,7 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
         h = ThreatHold::None;
     }
     // Past the hard limit the hold waits for the tank to build; a tank that is stunned, feared, dead or out of reach never does, and the
-    // bot sat idle for the whole stun or Inferno (audit 2026-10-16). After kStalledTankHoldMs with the tank's threat at a standstill the
+    // bot sat idle for the whole stun or Inferno. After kStalledTankHoldMs with the tank's threat at a standstill the
     // hold releases and plain fighting takes over (the class threat drop has run during the hold, TryThreatDrop).
     if (h == ThreatHold::OverThreat && past_hard_limit && TankStalledUnderHold(s, target, u->tank_threat))
     {
@@ -813,7 +815,7 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
     // A party's DPS wait for the owner's Attack after a Pull / Pull back and open by themselves this long after the tank's first hit
     // (playtest 2026-10-15: six seconds, in case the owner forgets).
     constexpr uint32 kPartyOpenWaitMs    = 6000;
-    // A raid's boss: eight seconds from the tank's first hit, because the tank takes a while to run in (playtest 2026-10-16); the config wait
+    // A raid's boss: eight seconds from the tank's first hit, because the tank takes a while to run in; the config wait
     // is honoured when longer. A party's boss keeps the six-second bound.
     uint32 wait_ms = !u->unit_in_combat ? kMaxUnpulledOwnerWaitMs
                    : boss ? (s.is_in_raid() ? std::max<uint32>(kRaidBossOpenWaitMs, cfg.threat_opening_wait_boss_ms())
@@ -875,14 +877,7 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
 // one is ready (the owner's bots used the same set). Returns true on an emit.
 bool TryThreatDrop(BotSnapshotView const& s, ObjectGuid target, BotIntentEmitter& emit)
 {
-    struct Drop { uint8 cls; uint32 spell; uint32 needs_aura; bool on_target; };
-    static constexpr Drop kDrops[] = {
-        { CLASS_PRIEST, 586,  0,   false },   // Fade
-        { CLASS_HUNTER, 5384, 0,   false },   // Feign Death
-        { CLASS_ROGUE,  1966, 0,   true  },   // Feint
-        { CLASS_DRUID,  8998, 768, true  },   // Cower (Cat Form)
-    };
-    for (Drop const& d : kDrops)
+    for (ThreatDrop const& d : kThreatDrops)   // Bot/ThreatLimits.h: the one table of class threat drops
     {
         if (d.cls != s.cls() || !s.knows_spell(d.spell) || !s.is_ready(d.spell)) continue;
         if (d.needs_aura && !s.has_aura(d.needs_aura)) continue;
@@ -1695,6 +1690,14 @@ void DispatchInCombat(BotAI& ai,
     // Reports a damage bot that ends this tick with nothing to do ([dps_idle_reason]).
     CombatIdleProbe const idle_probe{ ai, snapshot, emit, emit.combat_action_count(), ai.rule_fire_seq() };
     ReFaceVictim(snapshot, emit);
+    // The Stay left by a "use <object>" ends with the fight: the bot is in the group's combat now and must fight (UBRS 132f 22:25: a rogue
+    // pinned by the altar's Stay stood idle through the Emberseer fight).
+    if (ai.use_stay())
+    {
+        ai.clear_use_stay();
+        if (ai.holding_position(snapshot.published_at_ms()))
+            ai.exit_manual();
+    }
     ApPredicateContext ctx{ snapshot, group, ai.aoe_preference(), {} };
     // PvP context — populated for BG/arena ticks. Default-constructed is
     // PvE-mode (all false / empty); PvP-aware predicates gate on
@@ -1794,7 +1797,10 @@ void DispatchInCombat(BotAI& ai,
     // by the enemy-fighting-the-group scan: real fights have mobs whose
     // victim is a member (or the bot's pet). clear_ghost_combat drops the
     // PvE refs server-side, guarded there on an empty attacker list.
-    if (snapshot.victim().IsEmpty() &&
+    // A damage_parity leg is no ghost: the dummy never hits back, so the bot has no attackers by design, and dropping the combat refs
+    // made the dummy evade (auras gone, health reset) every ~15 s, the warlock measured 148 s idle of 180 (2026-10-20).
+    if (!Diagnostics::Parity::Active() &&
+        snapshot.victim().IsEmpty() &&
         snapshot.raw().combat.attackers.empty() &&
         !snapshot.is_casting() &&
         snapshot.combat_duration_ms() >= 10'000)
@@ -2078,7 +2084,8 @@ void DispatchInCombat(BotAI& ai,
                 // pull pickers don't re-acquire it, letting the bot resume
                 // questing (which walks it out of range and breaks combat).
                 if (!snapshot.is_in_instance() && !group.exists() &&
-                    !quest_target && !vu->is_elite_or_rare && !(vu->is_dungeon_boss || vu->is_boss_rank))
+                    !quest_target && !vu->is_elite_or_rare && !(vu->is_dungeon_boss || vu->is_boss_rank) &&
+                    !Diagnostics::Parity::IsDummy(vg))   // the damage_parity dummy is unkillable by design
                 {
                     const int32 vmax = vu->max_hp > 0 ? vu->max_hp : 1;
                     // kStuckMs is a HARD time cap on a single NORMAL-mob fight.
@@ -2396,6 +2403,63 @@ void DispatchInCombat(BotAI& ai,
         }
     }
 
+    // ---- 5-man tank out of its healer's sight ----
+    // The healer stands within its 30 y leash but a floor apart from the tank (a balcony, the top of a stair) with no sight line:
+    // every heal fails LINE_OF_SIGHT and the healer's own sight step finds no path up (SFK 2026-10-20 run 4: Scnwarrior fought two
+    // Bleak Worgs 9 y above Scnpriest for 42 s, 60 heals refused, and died with the healer at full mana). After kTankSightLostMs
+    // the tank brings the fight to the healer: a walkable step toward the healer's spot each tick (the mobs follow) until a healer
+    // sees it again, for at most kTankSightWalkMs. A same-floor sight problem (a pillar, a corner) stays the healer's to solve.
+    if (!snapshot.in_battleground() && snapshot.is_in_dungeon() && !snapshot.is_in_raid() &&
+        ai.effective_role(snapshot) == Role::Tank && snapshot.is_alive() && group.exists() &&
+        Services::Config().behavior_dungeon_flow())
+    {
+        constexpr uint32 kTankSightLostMs = 4000;
+        constexpr uint32 kTankSightWalkMs = 15000;
+        constexpr float kHealerSightLeashYd = 30.0f;   // BotSnapshotView::beyond_healer_leash
+        constexpr float kHealerFloorDz = 4.0f;         // kRaidSlotMaxTankDz: a stand point on the tank's floor lies within this
+        constexpr float kTankSightStepYd = 20.0f;
+        float bx, by, bz;
+        snapshot.position(bx, by, bz);
+        NearbyUnit const* blind = nullptr;   // the nearest healer that cannot see the tank from another floor
+        bool a_healer_sees = false;
+        float blind_d2 = kHealerSightLeashYd * kHealerSightLeashYd;
+        for (auto const& f : snapshot.raw().combat.nearby_friends)
+        {
+            if (f.role != Role::Healer || f.hp <= 0 || f.guid == snapshot.raw().guid) continue;
+            const float hx = f.x - bx, hy = f.y - by, d2 = hx * hx + hy * hy;
+            if (d2 > kHealerSightLeashYd * kHealerSightLeashYd) continue;
+            if (f.in_los || std::fabs(f.z - bz) <= kHealerFloorDz) { a_healer_sees = true; break; }
+            if (d2 < blind_d2) { blind_d2 = d2; blind = &f; }
+        }
+        const uint32 sight_now_ms = snapshot.published_at_ms();
+        const uint32 lost_ms = ai.healer_sight_lost_ms(blind && !a_healer_sees, sight_now_ms);
+        if (blind && !a_healer_sees && lost_ms >= kTankSightLostMs && lost_ms <= kTankSightLostMs + kTankSightWalkMs &&
+            !snapshot.is_casting())
+        {
+            float sx, sy, sz;
+            bool off = false;
+            const bool stepped = DungeonStepTowardTank(snapshot.raw().guid, blind->x, blind->y, blind->z, kTankSightStepYd, sx, sy, sz, off) &&
+                                 !RaidStandPointBlocked(snapshot, sx, sy, sz);
+            if (RaidLogDue(RaidLogKey(snapshot, RaidLogKind::ThreatHold) ^ 0x73696768u, sight_now_ms, 5000u))
+            {
+                if (stepped)
+                    TC_LOG_INFO("playerbot.v2",
+                                "[tank_sight] {} brings the fight back to its healer: {:.0f} y {} it, no sight line for {} s -> ({:.1f},{:.1f},{:.1f})",
+                                snapshot.name(), std::fabs(blind->z - bz), blind->z < bz ? "below" : "above", lost_ms / 1000u, sx, sy, sz);
+                else
+                    TC_LOG_INFO("playerbot.v2", "[tank_sight] {} cannot step toward its healer ({:.0f} y {} it, no sight line for {} s): no walkable step",
+                                snapshot.name(), std::fabs(blind->z - bz), blind->z < bz ? "below" : "above", lost_ms / 1000u);
+            }
+            if (stepped)
+            {
+                if (!emit.move_already_emitted(sx, sy, sz))
+                    emit.move_to(sx, sy, sz, /*run*/ true);
+                ai.set_last_rule_fired("combat:tank_to_healer_sight");
+                return;
+            }
+        }
+    }
+
     // ---- Healer STAY-IN-RANGE of the tank (Deadmines harbor, 2026-06-26) ----
     // ROOT CAUSE of the harbor wipe + the chronic dungeon cohesion lag: heal
     // spells cast at <=40y, but when the tank pulls beyond that (a fast boss-
@@ -2645,8 +2709,7 @@ void DispatchInCombat(BotAI& ai,
         }
         Role const sk_role = ai.effective_role(snapshot);
         // A boss fight script picks the target (it already honours the skull): this rule would be a second voice.
-        bool const script_target = snapshot.raw().raid_order.active && snapshot.raw().raid_order.script_owns &&
-            !snapshot.raw().raid_order.script_focus.IsEmpty();
+        bool const script_target = snapshot.raw().raid_order.script_names_target();
         if (!skull.IsEmpty() && snapshot.victim() != skull && sk_role != Role::Tank && sk_role != Role::Healer &&
             !HeldByOwner(ai, snapshot) && !script_target)
             for (auto const& u : snapshot.nearby_enemies())
@@ -2681,8 +2744,7 @@ void DispatchInCombat(BotAI& ai,
         if (kf_po.active && !kf_po.kill_focus.IsEmpty() &&
             snapshot.is_alive() && !snapshot.is_casting() && !on_owner_attack &&
             snapshot.victim() != kf_po.kill_focus &&
-            !(snapshot.raw().raid_order.active && snapshot.raw().raid_order.script_owns &&
-              !snapshot.raw().raid_order.script_focus.IsEmpty()))   // a boss fight script picks the target
+            !snapshot.raw().raid_order.script_names_target())   // a boss fight script picks the target
         {
             for (auto const& u : snapshot.nearby_enemies())
             {
@@ -3522,7 +3584,7 @@ void DispatchInCombat(BotAI& ai,
             // we close distance. Past the cap → drop the chase to free the
             // bot from terrain-induced infinite gap-close loops.
             if (chase_blocked)
-                ai.set_last_rule_fired("combat:melee_hold_hazard");
+                ai.set_last_rule_fired(HeldByOwner(ai, snapshot) ? "combat:melee_hold_stay" : "combat:melee_hold_hazard");
             else if (d2 > kMeleeRange * kMeleeRange && vu->is_fleeing && snapshot.is_in_dungeon() && d2 > kFleeLeashYd * kFleeLeashYd)
             {
                 // A mob running for help is not chased (Deadmines 2026-10-13: the tank followed a fleeing Miner into the next
@@ -3725,10 +3787,16 @@ void DispatchInCombat(BotAI& ai,
     // zero behavioral gain. pet_victim() lags by one snapshot (~250ms) after
     // the pet switches, so at most 1-2 duplicate emits slip through per
     // target change.
+    // This is the only pet_attack site (the warlock / hunter rotation rules are gone): a new victim is ordered at once, the same
+    // one again after 3 s (AplPetThrottle.h), so a pet that cannot take the order does not flood the queue.
     if (snapshot.has_pet() && !snapshot.victim().IsEmpty() &&
         snapshot.pet_victim() != snapshot.victim() &&
-        !ThreatHoldActive(ai, snapshot, snapshot.victim(), &group))   // threat discipline: no pet on a held mob
+        !ThreatHoldActive(ai, snapshot, snapshot.victim(), &group) &&   // threat discipline: no pet on a held mob
+        Playerbot::AplPet::PetAttackDue(snapshot.raw().guid.GetCounter(), snapshot.victim(), snapshot.published_at_ms()))
+    {
+        Playerbot::AplPet::NotePetAttack(snapshot.raw().guid.GetCounter(), snapshot.victim(), snapshot.published_at_ms());
         emit.pet_attack(snapshot.victim());
+    }
 
     // Battle-rez: cast a class-appropriate combat-castable rez on the first
     // dead group member. Spells:

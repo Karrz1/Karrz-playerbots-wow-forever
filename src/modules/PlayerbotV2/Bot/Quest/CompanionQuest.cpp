@@ -130,7 +130,10 @@ void BuildState(Player* bot, BotAI* ai, BotSnapshot& snap)
 {
     CompanionQuestState& cq = snap.companion_quest;
     cq.reset();
-    if (!bot || !snap.owner_in_group || snap.owner_guid.IsEmpty() || !bot->IsAlive())
+    // The quest partner is the owner, or, for a world bot a player invited (no owner), the player who leads the group: he gets the same
+    // accept / turn-in / share / quest-object help (a grouped world bot used to leave a finished quest unrewarded).
+    ObjectGuid const partner = snap.owner_in_group ? snap.owner_guid : (snap.led_by_player ? snap.controller_guid : ObjectGuid::Empty);
+    if (!bot || partner.IsEmpty() || !bot->IsAlive())
         return;
     if (bot->InBattleground() || bot->InArena())
         return;
@@ -142,7 +145,7 @@ void BuildState(Player* bot, BotAI* ai, BotSnapshot& snap)
     if (!want_accept && !want_share && !want_turnin && !want_loot)
         return;
 
-    Player* owner = ObjectAccessor::FindConnectedPlayer(snap.owner_guid);
+    Player* owner = ObjectAccessor::FindConnectedPlayer(partner);
     if (!owner || !owner->IsInWorld() || owner->GetMapId() != bot->GetMapId() || owner == bot)
         return;
     cq.owner_here = true;
@@ -210,6 +213,48 @@ void BuildState(Player* bot, BotAI* ai, BotSnapshot& snap)
             a.quest_id = tin.quest_id;
             a.via_order = !owner_at;
             cq.turn_in.push_back(a);
+        }
+    }
+
+    // ---- copy the leader: he handed a quest in that the bot still holds open (a collect quest: grouped bots never loot) ---------------
+    if (want_turnin)
+    {
+        for (auto const& q : snap.quest_log.quests)
+        {
+            if (cq.turn_in.size() >= kMaxPerList) break;
+            if (bot->GetQuestStatus(q.quest_id) != QUEST_STATUS_INCOMPLETE || !owner->GetQuestRewardStatus(q.quest_id))
+                continue;
+            for (auto const& u : snap.combat.nearby_friends)
+            {
+                if (!(u.npc_flags & uint32(UNIT_NPC_FLAG_QUESTGIVER))) continue;
+                if (Dist2d(bx, by, u.x, u.y) > kBotReachYd || Dist2d(cq.owner_x, cq.owner_y, u.x, u.y) > kOwnerAtGiverYd) continue;
+                QuestRelationResult const rel = sObjectMgr->GetCreatureQuestInvolvedRelations(u.entry);
+                if (std::find(rel.begin(), rel.end(), q.quest_id) == rel.end() || ListHas(cq.turn_in, u.guid, q.quest_id)) continue;
+                CompanionQuestAction a;
+                a.giver = u.guid;
+                a.quest_id = q.quest_id;
+                a.copy_leader = true;
+                cq.turn_in.push_back(a);
+                break;
+            }
+            // An ender that is a game object (a quest board, a chest of orders) is the same.
+            bool queued = false;
+            for (auto const& t : cq.turn_in)
+                if (t.quest_id == q.quest_id) { queued = true; break; }
+            if (queued) continue;
+            for (auto const& o : snap.world_objects.nearby_objects)
+            {
+                if (o.go_type != GAMEOBJECT_TYPE_QUESTGIVER) continue;
+                if (Dist2d(bx, by, o.x, o.y) > kBotReachYd || Dist2d(cq.owner_x, cq.owner_y, o.x, o.y) > kOwnerAtGiverYd) continue;
+                QuestRelationResult const rel = sObjectMgr->GetGOQuestInvolvedRelations(o.entry);
+                if (std::find(rel.begin(), rel.end(), q.quest_id) == rel.end() || ListHas(cq.turn_in, o.guid, q.quest_id)) continue;
+                CompanionQuestAction a;
+                a.giver = o.guid;
+                a.quest_id = q.quest_id;
+                a.copy_leader = true;
+                cq.turn_in.push_back(a);
+                break;
+            }
         }
     }
 

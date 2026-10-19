@@ -47,9 +47,9 @@ namespace Playerbot::Raid {
         r.priority.push_back({ 12099, 0 });                    // see correction above
         // (removed) noAoe on Garr himself: nothing in the script justifies it.
         // A Firesworn that dies explodes (Massive Eruption 19497, radius 15, mc/boss_garr.cpp:232-249) and hastens Garr. None dies before Garr:
-        // at 25 percent nobody attacks it, the tank that holds it included (n24 mc_garr 2026-10-14: the holding tanks killed five of eight
+        // at 25 percent nobody attacks it, the tank that holds it included (scenario run: the holding tanks killed five of eight
         // before Garr fell). With no eruption in the fight there is no reason for ranged and healers to keep 17 y from every live add; the
-        // old Ranged / Healer rule made them run (MC Garr 2026-10-10: a healer died running), and the Movement table keeps the one rule
+        // old Ranged / Healer rule made them run, and the Movement table keeps the one rule
         // for a dying add (healers, under 15 percent). Fight script: Bot/Raid/RaidFightScript.h.
         r.spare.push_back({ 12099, kGarrFireswornSparePct, 12057 });
 
@@ -62,7 +62,7 @@ namespace Playerbot::Raid {
         r.priority.push_back({ 11672, -1 });                   // Core Rager (mc/boss_golemagg.cpp:275-284)
         r.noAoe.push_back({ 11672 });                          // no AoE on the Ragers: they heal to full at 50% and only die with Golemagg (ike3)
         // Earthquake (19798): below 10 percent he casts it every 3 s (mc/boss_golemagg.cpp:80), instant, 1500 physical to everything within 18 y
-        // (golemagg-spell-data 2026-10-16). Everyone but the tanks leaves his 22 y and the ranged finish him; the bot he is hitting is never moved.
+        //. Everyone but the tanks leaves his 22 y and the ranged finish him; the bot he is hitting is never moved.
         r.avoidEnemy.push_back({ 11988, kGolemaggEarthquakeLeave, Who::NonTank, kGolemaggEarthquakePct });
         // Magma Splash (13880): a melee hit on him procs it (25 percent), up to 50 stacks for 30 s, 50 fire a tick and -250 resistance per stack.
         // A bot carrying 20 stacks stays 12 y off until it fades. No tank swap on it: the swap takes the nearest clean tank, which could be the
@@ -77,7 +77,7 @@ namespace Playerbot::Raid {
         // Flamewaker Priests cast it (spell list 116620), and so do Majordomo's Flamewaker Healers since the world SQL
         // 2026_10_16_00_world_classic_flamewaker_healer_dark_mending (every 5-10 s on an ally under 80%, 27750-32250 healed).
         r.interruptFirst.push_back(19775);
-        r.interruptFirst.push_back(20603);   // Flamewaker Healer: Shadow Shock (VMaNGOS creature_spells 116630)
+        r.interruptFirst.push_back(20603);   // Flamewaker Healer: Shadow Shock (vanilla spell id)
         r.dispel.push_back({ 19776, DispelKind::Magic });      // Flamewaker Priest: Shadow Word: Pain (vanilla_smartai, VMaNGOS spell list 116620)
         r.dispel.push_back({ 20294, DispelKind::Magic });      // Flamewaker Priest: Immolate (same list)
 

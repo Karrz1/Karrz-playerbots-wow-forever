@@ -271,6 +271,7 @@ Player::Player(WorldSession* session) : Unit(true), m_sceneMgr(this)
     m_titanGripPenaltySpellId = 0;
 
     m_temporaryUnsummonedPetNumber = 0;
+    m_petResummonDelay = 0;
     //cache for CreatedBySpell to allow
     //returning reagents for temporarily removed pets
     //when dying/logging out
@@ -955,6 +956,32 @@ void Player::Update(uint32 p_time)
     SetCanDelayTeleport(true);
     Unit::Update(p_time);
     SetCanDelayTeleport(false);
+
+    // The pet remembered at login comes back a moment after the player is in the world, as a summon during play does. Created while the
+    // Classic 1.60 client is still on its loading screen, the client froze on the pet (warlock demon out at logout, 20 Oct).
+    if (m_petResummonDelay)
+    {
+        if (p_time >= m_petResummonDelay)
+        {
+            m_petResummonDelay = 0;
+            ResummonPetTemporaryUnSummonedIfAny();
+        }
+        else
+            m_petResummonDelay -= p_time;
+    }
+
+    // A bot has no client to send CMSG_SET_SHEATHED: after a kill it keeps its bow or weapon drawn and stands in the aim pose.
+    // A moment with no fight and no victim puts the weapons away, as a player's client does.
+    if (GetSession()->IsBot())
+    {
+        if (GetSheath() == SHEATH_STATE_UNARMED || IsInCombat() || GetVictim() || !IsAlive())
+            m_botSheathIdleMs = 0;
+        else if ((m_botSheathIdleMs += p_time) >= 3000)
+        {
+            m_botSheathIdleMs = 0;
+            SetSheath(SHEATH_STATE_UNARMED);
+        }
+    }
 
     DeathRecap::RecordFrame(this, p_time);
     DeathRecap::UpdateViewer(this);
@@ -10263,6 +10290,16 @@ bool Player::NeedsAmmo() const
     }
 }
 
+uint32 Player::GetAmmoDisplayId(ItemTemplate const* proto)
+{
+    if (!proto)
+        return 0;
+    if (ItemModifiedAppearanceEntry const* modifiedAppearance = TransmogMgr::GetItemModifiedAppearance(proto->GetId(), 0))
+        if (ItemAppearanceEntry const* itemAppearance = sItemAppearanceStore.LookupEntry(modifiedAppearance->ItemAppearanceID))
+            return itemAppearance->ItemDisplayInfoID;
+    return 0;
+}
+
 // Arrows for bows and crossbows, bullets for guns; without a ranged weapon any ammo can be chosen.
 bool Player::IsAmmoUsableWithRangedWeapon(ItemTemplate const* proto) const
 {
@@ -10291,21 +10328,32 @@ bool Player::SetAmmo(uint32 itemId)
 
 void Player::AutoSelectAmmo()
 {
+    // A bot has no client to choose its ammo: it takes a stack that is drawn with a model, not the generic white-box display.
+    bool const preferDrawable = GetSession() && GetSession()->IsBot();
     if (uint32 current = GetAmmoId())
-        if (HasItemCount(current) && IsAmmoUsableWithRangedWeapon(sObjectMgr->GetItemTemplate(current)))
+        if (HasItemCount(current) && IsAmmoUsableWithRangedWeapon(sObjectMgr->GetItemTemplate(current)) &&
+            (!preferDrawable || HasDrawableAmmoDisplay(sObjectMgr->GetItemTemplate(current))))
             return;
 
     uint32 found = 0;
+    uint32 foundDrawable = 0;
     ForEachItem(ItemSearchLocation::Inventory, [&](Item* item)
     {
         ItemTemplate const* proto = item->GetTemplate();
         if (proto->GetClass() == ITEM_CLASS_PROJECTILE && IsAmmoUsableWithRangedWeapon(proto) && CanUseItem(proto) == EQUIP_ERR_OK)
         {
-            found = item->GetEntry();
-            return ItemSearchCallbackResult::Stop;
+            if (!found)
+                found = item->GetEntry();
+            if (!preferDrawable || HasDrawableAmmoDisplay(proto))
+            {
+                foundDrawable = item->GetEntry();
+                return ItemSearchCallbackResult::Stop;
+            }
         }
         return ItemSearchCallbackResult::Continue;
     });
+    if (foundDrawable)
+        found = foundDrawable;
     SetAmmo(found);
 }
 
@@ -15100,14 +15148,24 @@ uint32 Player::GetGossipTextId(uint32 menuId, WorldObject* source)
 
     GossipMenusMapBounds menuBounds = sObjectMgr->GetGossipMenusMapBounds(menuId);
 
+    // Classic 1.60: a text whose conditions are met wins over an unconditioned one (vanilla content marks the
+    // special case with conditions and leaves the default text without)
+    bool conditionalText = false;
     for (GossipMenusContainer::const_iterator itr = menuBounds.first; itr != menuBounds.second; ++itr)
     {
         // continue if only checks menuid instead of text
         if (!itr->second.TextID)
             continue;
 
+        bool hasConditions = !itr->second.Conditions.IsEmpty();
+        if (conditionalText && !hasConditions)
+            continue;
+
         if (itr->second.Conditions.Meets(this, source))
+        {
             textId = itr->second.TextID;
+            conditionalText = hasConditions;
+        }
     }
 
     return textId;
@@ -20084,7 +20142,11 @@ void Player::_LoadInventory(PreparedQueryResult result, PreparedQueryResult arti
     //NOTE2: the "order by `slot`" is needed because mainhand weapons are (wrongly?)
     //expected to be equipped before offhand items (@todo fixme)
 
-    UpdateInventorySlotCount();
+    // The saved slot count was set from the character row. The +4 account-secured slots are only granted at the end of the login
+    // (WorldSession::HandlePlayerLogin, SetAccountSecured), so recomputing here would drop a secured character to 16 slots and
+    // mail every item stored in the extra slots; SetAccountSecured(false) takes the slots away later if the account lost them.
+    if (GetInventorySlotCount() < INVENTORY_DEFAULT_SIZE)
+        UpdateInventorySlotCount();
 
     std::unordered_map<ObjectGuid::LowType, ItemAdditionalLoadInfo> additionalData;
     ItemAdditionalLoadInfo::Init(&additionalData, artifactsResult, azeriteResult, azeriteItemMilestonePowersResult,
@@ -26791,14 +26853,24 @@ Player* Player::GetTrader() const
     return m_trade ? m_trade->GetTrader() : nullptr;
 }
 
-bool Player::IsSpellFitByClassAndRace(uint32 spell_id) const
+bool Player::IsSpellFitByClassAndRace(uint32 spell_id, uint32 learnSpellDepth /*= 0*/) const
 {
     uint8 race  = GetRace();
     uint32 classmask = GetClassMask();
 
     SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spell_id);
     if (bounds.first == bounds.second)
+    {
+        // spells without skill line abilities of their own (trainer spells that only teach other spells) fit when every spell they teach fits
+        // the depth limit stops learn spell loops
+        if (learnSpellDepth < 5)
+            if (SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE))
+                for (SpellEffectInfo const& spellEffectInfo : spellInfo->GetEffects())
+                    if (spellEffectInfo.IsEffect(SPELL_EFFECT_LEARN_SPELL) && !IsSpellFitByClassAndRace(spellEffectInfo.TriggerSpell, learnSpellDepth + 1))
+                        return false;
+
         return true;
+    }
 
     bool primaryProfFitsByMasks = false;
     for (SkillLineAbilityMap::const_iterator _spell_idx = bounds.first; _spell_idx != bounds.second; ++_spell_idx)

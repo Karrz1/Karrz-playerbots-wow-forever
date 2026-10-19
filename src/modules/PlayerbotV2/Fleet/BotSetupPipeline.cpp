@@ -718,25 +718,9 @@ bool BotSetupPipeline::DoLearnProfessions(Player* bot)
 
 bool BotSetupPipeline::DoAcquireMount(Player* bot)
 {
-    // Classic 1.60: vanilla riding is level 40 (Apprentice, 60% mount) and 60
-    // (Journeyman, 100% epic mount). The retail tiers below would hand a L20
-    // bot Apprentice Riding and a L60 bot Expert flying. learn_riding_free
-    // sets the riding skill and teaches the race's vanilla mount (what
-    // `.bot add` companions and the gear backfill use); below 40 it does
-    // nothing. Hunters still get their pet below.
-    bool const vanilla = ::Playerbot::IsVanillaRealm();
-    if (vanilla)
-        ::Playerbot::API(bot).learn_riding_free();
-    else if (bot->GetLevel() < 20)
-        return true;  // gated
-
-    // Train the riding *skill* (Apprentice / Journeyman / Expert / Artisan /
-    // Master) at the level-appropriate tier. This is a skill, not a racial
-    // mount spell — the spell IDs are documented Blizzard skill-tier IDs
-    // that have been stable across many patches.
-    uint32 riding_spell = vanilla ? 0 : World::RidingSpellForLevel(bot->GetLevel());
-    if (riding_spell && !bot->HasSpell(riding_spell))
-        bot->LearnSpell(riding_spell, false);
+    // Riding has one rule (Bot/World/RidingTier.h): none below 40, Apprentice (75, the race's normal mount) from 40, Journeyman (150, the swift mount)
+    // from 60. learn_riding_free applies it, and takes it away again from a bot that holds more than its level allows.
+    ::Playerbot::API(bot).learn_riding_free();
 
     // We intentionally do NOT pre-grant the racial mount via LearnSpell.
     // Racial mount spell IDs drift across patches and were previously

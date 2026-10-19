@@ -420,6 +420,24 @@ void SetDummyArmor(Creature* d, int armor)
     d->UpdateArmor();
 }
 
+// A caster is measured from a spot it can cast from: the dummy is put on the bot's own level (a bot standing on a bridge or a roof has ground
+// 20 y below the 15 y spot in front of it: path_fail, level_guard, then the opener gave up on an "unreachable" dummy and shielded it for
+// five minutes, 2026-10-19 Stormwind) and in line of sight, trying a few distances and directions. False when no spot works.
+bool DummyOnBotLevel(Player* p, Creature* d, float distance)
+{
+    auto good = [&] { return std::fabs(d->GetPositionZ() - p->GetPositionZ()) <= 2.5f && d->IsWithinLOSInMap(p); };
+    if (good())
+        return true;
+    for (float const dist : { distance, 12.0f, 8.0f, 5.0f })
+        for (float const angle : { 0.0f, 1.5708f, -1.5708f, 3.1416f, 0.7854f, -0.7854f })
+        {
+            d->NearTeleportTo(p->GetNearPosition(dist, angle));
+            if (good())
+                return true;
+        }
+    return false;
+}
+
 Creature* SpawnDummy(Player* p, float distance, int armor, std::string& error)
 {
     std::uint32_t const entry = FindDummyEntry();
@@ -447,6 +465,8 @@ Creature* SpawnDummy(Player* p, float distance, int armor, std::string& error)
     s->SetRegenerateHealth(false);
     s->SetMaxHealth(2000000000u);
     s->SetFullHealth();
+    if (!DummyOnBotLevel(p, s, distance))
+        TC_LOG_INFO("playerbot.v2", "[dmg_parity] no spot on {}'s level with line of sight to the dummy: bot z={:.1f} dummy z={:.1f}", p->GetName(), p->GetPositionZ(), s->GetPositionZ());
     SetDummyArmor(s, armor);
     g.dummy = s->GetGUID();
     g.dummy_name = s->GetName();
@@ -596,13 +616,27 @@ void BeginLegSetup(Player* p)
 {
     Leg const& leg = kLegs[g.leg];
     ::Playerbot::V2::Fleet::BotPopulationManager::SetGearModeOverride(p->GetGUID().GetCounter(), leg.gear == 0 ? -1 : (leg.gear == 1 ? 2 : 4));
+    // RegearNow does nothing in combat: the mage was still fighting the dummy when the tier 3 leg began, kept its tier 1 gear and measured
+    // 265 dps with it as "tier 3" (2026-10-19).
+    if (Creature* fighting = DummyCreature(p); fighting && fighting->IsAlive())
+    {
+        fighting->AttackStop();
+        fighting->CombatStop(true);
+    }
+    p->AttackStop();
+    p->CombatStop(true);
     if (leg.gear == 0)
         StripGear(p);
     else
         ::Playerbot::Services::Population().RegearNow(p);
     ApplyBonuses(p, leg.sp, leg.ap);
     if (Creature* d = DummyCreature(p))
+    {
         SetDummyArmor(d, leg.armor);
+        DummyOnBotLevel(p, d, 15.0f);   // the bot may have walked off in the last leg
+        if (BotAI* ai = ::Playerbot::Services::Registry().ai(p->GetGUID().GetCounter()))
+            ai->note_engage(d->GetGUID(), GameTime::GetGameTimeMS(), 1u);   // an earlier leg's opener give-up must not shield the dummy now
+    }
     TopUp(p);
     p->CombatStop(true);
     g.step = Step::Settle;
@@ -1829,6 +1863,62 @@ bool IncomingStep(Player* p, std::string& failure)
 
 bool Active() { return g_measuring.load(std::memory_order_relaxed); }
 
+// Any thread: the rules ask it before they give up on a target.
+bool IsDummy(ObjectGuid const& guid)
+{
+    if (!g_measuring.load(std::memory_order_relaxed))
+        return false;
+    std::lock_guard<std::mutex> lock(g_mu);
+    return !guid.IsEmpty() && guid == g_dummy;
+}
+
+// A spot to measure from: ground that is flat for `distance` y in a direction, with line of sight along it, so the dummy can stand on the bot's
+// own level (the Stormwind staging spot is on a ledge: the ground 15 y ahead is 11 y lower, no dummy spot had line of sight, and the casters
+// ran 33 and 14 dps with LINE_OF_SIGHT failures, 2026-10-19). The bot's own spot first, then rings around it on the same level.
+bool FindOpenSpot(Player* p, float distance, float& x, float& y, float& z, float& o)
+{
+    Map* const map = p->GetMap();
+    if (!map)
+        return false;
+    PhaseShift const& ps = p->GetPhaseShift();
+    float const z0 = p->GetPositionZ();
+    auto const ground = [&](float gx, float gy, float ref) { return map->GetHeight(ps, gx, gy, ref + 1.0f, true, 4.0f); };
+    auto const flat_along = [&](float bx, float by, float bz, float angle)
+    {
+        for (float const f : { 0.25f, 0.5f, 0.75f, 1.0f })
+        {
+            float const h = ground(bx + std::cos(angle) * distance * f, by + std::sin(angle) * distance * f, bz);
+            if (h <= INVALID_HEIGHT + 1.0f || std::fabs(h - bz) > 1.0f)
+                return false;
+        }
+        return map->isInLineOfSight(ps, bx, by, bz + 1.5f, bx + std::cos(angle) * distance, by + std::sin(angle) * distance, bz + 1.5f,
+                                    LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::Nothing);
+    };
+    float const pi = 3.14159265f;
+    for (float radius = 0.0f; radius <= 48.0f; radius += 6.0f)
+    {
+        int const steps = radius == 0.0f ? 1 : 12;
+        for (int i = 0; i < steps; ++i)
+        {
+            float const around = 2.0f * pi * float(i) / float(steps);
+            float const bx = p->GetPositionX() + std::cos(around) * radius, by = p->GetPositionY() + std::sin(around) * radius;
+            float const bz = radius == 0.0f ? z0 : ground(bx, by, z0);
+            if (bz <= INVALID_HEIGHT + 1.0f || std::fabs(bz - z0) > 3.0f)
+                continue;
+            for (int k = 0; k < 8; ++k)
+            {
+                float const angle = 2.0f * pi * float(k) / 8.0f;
+                if (flat_along(bx, by, bz, angle))
+                {
+                    x = bx; y = by; z = bz; o = angle;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 void NoteEnergize(Unit* target, std::uint32_t spell_id, std::int32_t gained, std::uint8_t power)
 {
     if (!g_energy_on.load(std::memory_order_relaxed) || power != POWER_MANA || !target)
@@ -2184,6 +2274,10 @@ bool Step(std::string& failure)
             return false;
         case Step::Measure:
         {
+            // The bot's own errands (a bag run, a walk to the vendor) take it off its spot between fights: bring the dummy to where it stands
+            // rather than measure a priest that cast into a wall (LINE_OF_SIGHT x30 a leg, 50 dps, 2026-10-20).
+            if (!p->HasUnitState(UNIT_STATE_CASTING) && (p->GetExactDist(d) > 30.0f || !d->IsWithinLOSInMap(p) || std::fabs(d->GetPositionZ() - p->GetPositionZ()) > 2.5f))
+                DummyOnBotLevel(p, d, 15.0f);
             if (p->GetVictim() != d && !p->HasUnitState(UNIT_STATE_CASTING))
                 Engage(p, d);
             if (p->HasUnitState(UNIT_STATE_CASTING))
@@ -2195,7 +2289,9 @@ bool Step(std::string& failure)
             if (d->GetHealthPct() < 60.0)
                 d->SetFullHealth();
             Powers const pt = p->GetPowerType();
-            if (pt == POWER_MANA && p->GetMaxPower(pt) && p->GetPower(pt) * 10u < p->GetMaxPower(pt) * 3u)
+            // Refilled above every floor a rotation keeps: the casters wand below 35 % mana, so a refill at 30 % left a priest sitting at 31-35 %
+            // shooting its wand for a whole leg (T1: 31 s casting, 149 s wanding, 197 dps; 2026-10-20). The legs measure the rotation with mana to spare.
+            if (pt == POWER_MANA && p->GetMaxPower(pt) && p->GetPower(pt) * 20u < p->GetMaxPower(pt) * 9u)
             {
                 p->SetPower(pt, p->GetMaxPower(pt));
                 ++g.mana_refills;

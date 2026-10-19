@@ -59,6 +59,13 @@ public:
     // Clearing pulls the next deadlines back inside one tier period.
     void set_pvp_floor(BotId id, Ms floor, Ms now);
 
+    // Wake-on-busy: a Combat bot whose global cooldown or cast ends in `busy_ms` is woken on the world tick it ends in, instead of at its
+    // next regular slot (see Threading/ReactionWake.h for when that gains anything). Pulls both the snapshot build and the bot tick
+    // forward, never back. Call after set_tier in the publish pass, with the busy time read off the snapshot just built. Returns
+    // true when a wake was armed. Other tiers and unregistered bots: false.
+    bool wake_after_busy(BotId id, int64 busy_ms, Ms now);
+    uint64 wakes_total() const { return n_wakes_; }
+
     // Diagnostics
     size_t bot_count() const;
     // Bots per effective tier: Combat, Active, Cruise, Idle, Parked (world thread only).
@@ -76,6 +83,7 @@ private:
     uint32 lazy_ms_budget_ = 0;
     uint32 lazy_frame_start_ms_ = 0;
     uint64 n_budget_denied_ = 0;
+    uint64 n_wakes_ = 0;
 public:
     void set_lazy_ms_budget(uint32 ms) { lazy_ms_budget_ = ms; }
     uint64 budget_denied_total() const { return n_budget_denied_; }
@@ -100,6 +108,10 @@ private:
         uint8        idle_streak  = 0;
         // PvP reaction floor on the tier period (see set_pvp_floor); 0 = none.
         Ms           pvp_floor{0};
+        // When the last wake-on-busy was armed (0 = never), for the minimum gap between wakes.
+        Ms           last_wake{0};
+        // Armed wake-on-busy time (0 = none): the snapshot build and the bot tick are due at it as well as at their regular deadlines.
+        Ms           wake_at{0};
     };
 
     AiWorkerPool& pool_;

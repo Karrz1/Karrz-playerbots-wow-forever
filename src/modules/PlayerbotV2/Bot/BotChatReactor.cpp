@@ -4,6 +4,7 @@
 
 #include "BotChatReactor.h"
 #include "BotConversation.h"
+#include "../LfgBotFill.h"
 
 #include "BotAI.h"
 #include "BotIntent.h"
@@ -541,7 +542,18 @@ bool BuildSmallTalkReply(Player* bot, BotAI* ai, std::string const& msg, Player*
 {
     if (!Services::Config().chatter_conversation())
         return false;
-    return V2::ConvReply(MakeConvContext(bot, ai, sender), V2::ConvNormalize(msg), msg, sel, addressed, out);
+    V2::ConversationContext ctx = MakeConvContext(bot, ai, sender);
+    std::string const norm = V2::ConvNormalize(msg);
+    // A member of a bot group listed in the Group Finder says yes to a player without a group who asks to join, and the player
+    // is in the group (and its leader) at once, the same as sending the invite from the list.
+    bool const joins = addressed && V2::ConvClassify(norm) == V2::ConvIntent::GroupInvite && V2::LfgBotGroupCanTake(bot, sender);
+    if (joins)
+        ctx.in_group = false;
+    if (!V2::ConvReply(ctx, norm, msg, sel, addressed, out))
+        return false;
+    if (joins)
+        V2::LfgBotGroupJoinRequest(bot, sender);
+    return true;
 }
 
 // True when the message carries a pause cue ("wait"/"hold"/"stop"/"back"/

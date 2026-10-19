@@ -161,7 +161,9 @@ bool MeleeSpreadSpot(BotSnapshotView const& s, GroupSnapshotView const& g, Nearb
 // rejects such a point, so no step of ours walks into the next pack (MC
 // 2026-10-06: Lava Annihilator and Firelord joined a Molten Giant pull).
 // Definition in State_Idle.cpp.
-bool RaidPointInUnpulledReach(BotSnapshotView const& s, float x, float y, float z);
+// exempt_victim_pack false: the pack of the bot's own victim counts too (a caster's approach step must not walk into the
+// neighbours of the mob it is after).
+bool RaidPointInUnpulledReach(BotSnapshotView const& s, float x, float y, float z, bool exempt_victim_pack = true);
 
 // Instance LoS step ([raid_los]). A ranged / healer bot whose cast target
 // (healer: its anchor tank; ranged: its victim) is out of line of sight steps

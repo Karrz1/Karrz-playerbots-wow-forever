@@ -34,7 +34,7 @@ struct Kicker
     uint64_t low;
 };
 
-// The free kickers first (rank 0 kicks on sight, which a bot mid-cast cannot: three 2026-10-15 Majordomo fights, most kicks landed
+// The free kickers first (rank 0 kicks on sight, which a bot mid-cast cannot: Majordomo fights showed most kicks landed
 // in the last 550 ms by the backups), then the nearest, then the lowest guid.
 inline bool KickerBefore(Kicker const& a, Kicker const& b)
 {

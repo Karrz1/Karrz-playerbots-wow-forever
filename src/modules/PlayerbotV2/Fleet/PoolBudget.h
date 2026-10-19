@@ -5,7 +5,7 @@
 //             level 1-9 Skyborne for a new character, a low-level town for a new player - and deleted again once they have been
 //             offline for VariableTtl with nobody needing them.
 //
-// Playtest 2026-10-16: the core was full (5506/3000, mostly level 60), so every creation was refused and a new character on
+// the core was full (5506/3000, mostly level 60), so every creation was refused and a new character on
 // Zephras Isle met 12 bots. A full core must not keep the world empty around a new player, and the extra bots must not pile up.
 // Pure: no game types, tested in tests/game/ClassicPoolBudget.cpp.
 
@@ -32,6 +32,14 @@ constexpr PoolSlot ChoosePoolSlot(PoolBudget const& b, bool isle_resident)
     if (!isle_resident && b.core < b.core_max)
         return PoolSlot::Core;
     return b.variable < b.variable_max ? PoolSlot::Variable : PoolSlot::None;
+}
+
+// With a level census the standing roster takes a creation when its (faction, level bracket) is below its share of the bracket cap, whatever
+// the roster total is (a roster that grew past core_max earlier would otherwise send every missing low-level bot to the temporary pool).
+constexpr PoolBudget BalancedBudget(PoolBudget b, bool bracket_has_room)
+{
+    b.core_max = bracket_has_room ? b.core + 1 : 0;
+    return b;
 }
 
 constexpr void PoolCountCreated(PoolBudget& b, PoolSlot slot)

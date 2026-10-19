@@ -187,10 +187,11 @@ void DoEvasion(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(EVASION)
 // Feint when close to pulling the tank's aggro (VMaNGOS medium-threat trigger: 60% of the tank's threat).
 bool ShouldFeint(ApPredicateContext const& ctx)
 {
-    return ctx.bot.in_combat() && ctx.group.members() && Ready(ctx, FEINT)
+    return ctx.bot.in_combat() && ctx.group.members() && HasLiveTarget(ctx) && (Ready(ctx, FEINT) && ctx.bot.victim_in_spell_range(FEINT))
         && ThreatDump::ThreatPct(ctx.bot) >= ThreatDump::kMediumThreatPct;
 }
-void DoFeint(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(FEINT); }
+// Feint is cast on the mob (ThreatLimits kThreatDrops): cast with no target it is refused BAD_TARGETS (onyxia 115: 93 refusals, one loop).
+void DoFeint(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(FEINT, ctx.bot.victim()); }
 
 bool ShouldKick(ApPredicateContext const& ctx)
 {

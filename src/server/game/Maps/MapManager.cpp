@@ -208,8 +208,8 @@ static ObjectGuid GetInstanceOwner(Player const* player, Group const* group, Map
 
 // A bot goes where its group's human is: the instance a human member of the bot's group stands in for this map. A group formed while
 // the human was already inside (a re-formed raid, bots called in after) names no instance, or one led by a bot that holds no save, and
-// the first bot in would open a second copy of the dungeon the human can only reach with a summon (UBRS 2026-10-17: `.appear` on the
-// bots landed in a separate raid). Null when the player is not a bot, has no group or no human member is in such an instance.
+// the first bot in would open a second copy of the dungeon the human can only reach with a summon (`.appear` on the bots landed
+// in a separate raid). Null when the player is not a bot, has no group or no human member is in such an instance.
 static InstanceMap* FindGroupHumanInstance(Player const* player, uint32 mapId)
 {
     Group const* group = player->GetGroup();

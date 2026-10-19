@@ -54,4 +54,30 @@ inline void SpreadOffset(std::uint64_t seed, float hub_radius, float& dx, float&
     dy = std::sin(angle) * r;
 }
 
+// Where a bot walking to a hub aims: the hub centre moved by the bot's own offset. A hub of a single giver has that giver's
+// spot as its centre, and every bot sent there walked onto the same coordinates (six to eight bots in one pile at Calvin
+// Montague in Deathknell). Same offset rule as the placement above, so a walk and a placement agree.
+inline void HubStandPoint(float hub_x, float hub_y, float hub_radius, std::uint64_t seed, float& out_x, float& out_y)
+{
+    float dx = 0.f, dy = 0.f;
+    SpreadOffset(seed, hub_radius, dx, dy);
+    out_x = hub_x + dx;
+    out_y = hub_y + dy;
+}
+
+// Where a bot stands to talk to a quest giver: on a ring 2 to 4 yd from the giver (inside the accept reach), on the side the bot
+// comes from. The side is the bearing from the giver to the bot rounded to one of eight sectors and moved by a per-bot angle inside the
+// sector, so a bot does not change its spot step by step as it walks, and bots from one direction fan out over the arc. Every bot used to
+// walk to the giver's own coordinates (or to the same point 2.5 yd from him) and stood inside him (Calvin Montague, Grelin Whitebeard).
+inline void GiverStandPoint(float giver_x, float giver_y, float from_x, float from_y, std::uint64_t seed, float& out_x, float& out_y)
+{
+    constexpr float kPi = 3.14159265358979f;
+    float const bearing = std::atan2(from_y - giver_y, from_x - giver_x);
+    float const sector = std::round(bearing / (kPi / 4.0f)) * (kPi / 4.0f);
+    float const jit = (float(std::fmod(double(seed % 1000003u) * 0.6180339887498949, 1.0)) - 0.5f) * 1.5f;      // +-0.75 rad, sector half-width is 0.785
+    float const r = 2.0f + 2.0f * float(std::fmod(double(seed % 999983u) * 0.7548776662466927, 1.0));
+    out_x = giver_x + std::cos(sector + jit) * r;
+    out_y = giver_y + std::sin(sector + jit) * r;
+}
+
 } // namespace Playerbot::V2::World

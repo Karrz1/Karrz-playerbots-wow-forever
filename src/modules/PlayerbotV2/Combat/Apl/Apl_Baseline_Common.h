@@ -4,7 +4,7 @@
 //
 // Each class baseline is registered separately via its own
 // RegisterApl_Baseline_<Class>() function. Apl_Baseline.cpp owns the
-// top-level RegisterApl_Baseline() aggregator that fans out to all 13.
+// top-level RegisterApl_Baseline() aggregator that fans out to the non-vanilla classes (the nine vanilla ones have only the Classic rotations).
 //
 // Why this split: the previous monolithic Apl_Baseline.cpp (~1180 lines
 // covering all 13 classes) made parallel coverage work impossible —
@@ -190,17 +190,8 @@ inline void DoAutoAttack(ApPredicateContext const& ctx, BotIntentEmitter& e)
 
 // Per-class registration entry points — called by RegisterApl_Baseline()
 // in Apl_Baseline.cpp. Each per-class .cpp defines exactly one of these.
-void RegisterApl_Baseline_Warrior();
-void RegisterApl_Baseline_Paladin();
-void RegisterApl_Baseline_Hunter();
-void RegisterApl_Baseline_Rogue();
-void RegisterApl_Baseline_Priest();
 void RegisterApl_Baseline_DK();
-void RegisterApl_Baseline_Shaman();
-void RegisterApl_Baseline_Mage();
-void RegisterApl_Baseline_Warlock();
 void RegisterApl_Baseline_Monk();
-void RegisterApl_Baseline_Druid();
 void RegisterApl_Baseline_DH();
 void RegisterApl_Baseline_Evoker();
 

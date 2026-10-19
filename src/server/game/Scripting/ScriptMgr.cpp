@@ -2237,6 +2237,24 @@ void ScriptMgr::OnPlayerLfgJoin(Player* player, uint32 dungeonId, uint8 roles)
     FOREACH_SCRIPT(PlayerScript)->OnLfgJoin(player, dungeonId, roles);
 }
 
+void ScriptMgr::OnPlayerGroupFinderListing(Player* player, uint32 categoryId, std::vector<uint32> const& activities, bool listed)
+{
+    FOREACH_SCRIPT(PlayerScript)->OnGroupFinderListing(player, categoryId, activities, listed);
+}
+
+void ScriptMgr::OnPlayerGroupFinderSearch(Player* searcher)
+{
+    FOREACH_SCRIPT(PlayerScript)->OnGroupFinderSearch(searcher);
+}
+
+bool ScriptMgr::OnPlayerGroupFinderJoinRequest(Player* member, Player* applicant)
+{
+    FOR_SCRIPTS_RET(PlayerScript, itr, end, false)
+        if (itr->second->OnGroupFinderJoinRequest(member, applicant))
+            return true;
+    return false;
+}
+
 void ScriptMgr::OnPlayerLfgProposal(Player* player, uint32 proposalId)
 {
     FOREACH_SCRIPT(PlayerScript)->OnLfgProposal(player, proposalId);
@@ -3202,6 +3220,19 @@ void PlayerScript::OnBattlegroundPortFailed(Player* /*player*/, uint8 /*reason*/
 }
 
 void PlayerScript::OnLfgJoin(Player* /*player*/, uint32 /*dungeonId*/, uint8 /*roles*/)
+{
+}
+
+void PlayerScript::OnGroupFinderListing(Player* /*player*/, uint32 /*categoryId*/, std::vector<uint32> const& /*activities*/, bool /*listed*/)
+{
+}
+
+bool PlayerScript::OnGroupFinderJoinRequest(Player* /*member*/, Player* /*applicant*/)
+{
+    return false;
+}
+
+void PlayerScript::OnGroupFinderSearch(Player* /*searcher*/)
 {
 }
 

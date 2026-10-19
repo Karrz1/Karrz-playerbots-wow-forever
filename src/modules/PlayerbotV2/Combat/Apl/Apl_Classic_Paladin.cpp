@@ -242,7 +242,7 @@ void DoSeal(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(DpsSeal
 
 bool ShouldJudgement(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && HasAnySeal(ctx) && Ready(ctx, JUDGEMENT) && DistToVictim(ctx) <= 9.f;
+    return HasLiveTarget(ctx) && HasAnySeal(ctx) && (Ready(ctx, JUDGEMENT) && ctx.bot.victim_in_spell_range(JUDGEMENT));
 }
 void DoJudgement(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(JUDGEMENT, ctx.bot.victim()); }
 
@@ -251,7 +251,7 @@ bool ShouldHammerOfJustice(ApPredicateContext const& ctx)
     // Stun an enemy that is casting (nothing better to interrupt with in 1.12).
     NearbyUnit const* v = ctx.bot.victim_info();
     return HasLiveTarget(ctx) && v && v->is_casting && v->is_interruptible && !(v->is_dungeon_boss || v->is_boss_rank)
-        && (Ready(ctx, HAMMER_OF_JUSTICE) && ctx.bot.victim_in_spell_range(HAMMER_OF_JUSTICE)) && DistToVictim(ctx) <= 9.f;
+        && (Ready(ctx, HAMMER_OF_JUSTICE) && ctx.bot.victim_in_spell_range(HAMMER_OF_JUSTICE));
 }
 void DoHammerOfJustice(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(HAMMER_OF_JUSTICE, ctx.bot.victim()); }
 

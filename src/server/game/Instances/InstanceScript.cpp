@@ -416,6 +416,8 @@ bool InstanceScript::SetBossState(uint32 id, EncounterState state)
                     InitializeCombatResurrections(1, resInterval);
                     SendClassicEncounterStart(bossInfo->GetDungeonEncounterForDifficulty(instance->GetDifficultyID()));
                     SendEncounterStart(1, 9, resInterval, resInterval);
+                    // Vanilla: a dead player can always release, boss fight or not.
+                    instance->SendToPlayers(WorldPackets::Instance::InstanceEncounterAllowReleaseInProgress().Write());
 
                     instance->DoOnPlayers([](Player* player)
                     {
@@ -426,7 +428,7 @@ bool InstanceScript::SetBossState(uint32 id, EncounterState state)
                 case NOT_STARTED:
                     // The classic boss scripts leave a fight by Reset() -> NOT_STARTED, never FAIL: without this the client was sent
                     // the encounter start and never the end, stayed "in an encounter" and greyed out Release Spirit
-                    // ("A member of your group is in combat", Onyxia and Majordomo wipes 2026-10-15).
+                    // ("A member of your group is in combat" after a wipe).
                     if (bossInfo->state != IN_PROGRESS)
                         break;
                     [[fallthrough]];

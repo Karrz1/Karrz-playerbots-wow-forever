@@ -918,7 +918,8 @@ void AuctionBotSeller::AddNewAuctions(SellerConfiguration& config)
     }
     CharacterDatabase.CommitTransaction(trans);
 
-    TC_LOG_DEBUG("ahbot", "AHBot: Added {} items to auction", count);
+    if (count)
+        TC_LOG_INFO("ahbot", "AHBot: sold {} items into the {} house", count, AuctionBotConfig::GetHouseTypeName(config.GetHouseType()));
 }
 
 bool AuctionBotSeller::Update(AuctionHouseType houseType)

@@ -69,4 +69,10 @@ M = {
         dict(spell=15636, target='self', first=(18000, 18000), repeat=(18000, 18000), hp=(100, 0), note='Avatar of Flame'),
         dict(spell=15642, target='self', first=(9000, 9000), repeat=(20000, 25000), hp=(100, 0), note='Ironfoe'),
     ]),
+    # Razorfen Downs: Amnennar's EventAI (735804 / 735805, sql/custom/world/2026_09_28_15_world_vanilla_smartai.sql). The summons are
+    # linked actions of health events, whose window the reader leaves at 100-0: the windows by hand.
+    7358: dict(src='creature_ai_scripts 735804 / 735805 (EventAI, the linked summon actions)', rows=[
+        dict(spell=12642, target='self', first=(0, 0), repeat=(0, 0), hp=(66, 33), note='Frost Spectres at 66%: kill the adds, then back on him'),
+        dict(spell=12642, target='self', first=(0, 0), repeat=(0, 0), hp=(33, 1), note='Frost Spectres again at 33%'),
+    ]),
 }

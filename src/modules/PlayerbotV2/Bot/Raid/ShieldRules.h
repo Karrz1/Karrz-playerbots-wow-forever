@@ -1,9 +1,9 @@
 // ShieldRules - what a bot does about an enemy that carries a shield, as pure rules (tests/game/ClassicRaidFightScript.cpp).
 //
 // Majordomo Executus puts one of two shields on all eight of his adds every 30 s for 10 s (classic_boss_majordomo_executus.cpp:541-548):
-// Magic Reflection sends spells back at the caster, Damage Shield hurts whoever strikes the add in melee. Until 2026-10-16 either shield took the
+// Magic Reflection sends spells back at the caster, Damage Shield hurts whoever strikes the add in melee. Until now either shield took the
 // add off everybody's target list and the cast API refused every harmful spell at it, abilities included, so the whole raid idled for a third
-// of the fight and the tanks lost Taunt, Sunder Armor, Revenge, Heroic Strike and Shield Slam for the same 10 s (n124 Majordomo 2026-10-15:
+// of the fight and the tanks lost Taunt, Sunder Armor, Revenge, Heroic Strike and Shield Slam for the same 10 s (Majordomo:
 // "API_TARGET_REFLECTS x4 (78 6572 7386 23922)" on three tanks while their adds walked onto the healers).
 
 #pragma once

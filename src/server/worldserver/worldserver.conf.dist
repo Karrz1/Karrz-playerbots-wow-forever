@@ -4814,6 +4814,14 @@ Classic.OfficialFeatureFlags = 1
 
 Classic.MountIndoorsRules = 1
 
+#    Classic.SecuredBagSlotsForAll
+#        Description: Every account gets the 4 extra backpack slots (and no "attach an Authenticator" prompt) that the
+#                     client otherwise shows locked until the Battle.net account has an authenticator.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled, only accounts with an authenticator)
+
+Classic.SecuredBagSlotsForAll = 1
+
 #    Classic.Shop.Enabled
 #        Description: In-game Store: shop points, products from world.shop_* (.shop reload), the Gold Market, character
 #                     services, realm transfers and the character screen boost. 0 answers like the official server

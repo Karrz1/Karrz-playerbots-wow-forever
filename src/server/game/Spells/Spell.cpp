@@ -64,6 +64,8 @@
 #include "TradeData.h"
 #include "TraitPackets.h"
 #include "TransmogMgr.h"
+#include <mutex>
+#include <unordered_set>
 #include "UniqueTrackablePtr.h"
 #include "Util.h"
 #include "VMapFactory.h"
@@ -4913,6 +4915,23 @@ void Spell::SendSpellGo()
         castData.MissileTrajectory.Pitch = m_targets.GetPitch();
     }
 
+    // The missile is launched by this packet: without the ammo display the client draws it as a white box. Shots whose cast start is
+    // never sent (Auto Shot's repeats, other triggered ranged spells) were left with display 0 (PC 20 Oct, squares on some of a hunter's moves).
+    if (castFlags & CAST_FLAG_PROJECTILE)
+    {
+        castData.AmmoDisplayID = GetSpellCastDataAmmo();
+        static std::mutex missileLogMutex;
+        static std::unordered_set<uint32> missileLogged;
+        bool first;
+        {
+            std::lock_guard<std::mutex> lock(missileLogMutex);
+            first = m_caster->IsPlayer() && missileLogged.insert(m_spellInfo->Id).second;
+        }
+        if (first)
+            TC_LOG_INFO("playerbot.v2", "[missile] spell {} visual {} ammo display {} cast flags 0x{:X} triggered 0x{:X}", m_spellInfo->Id,
+                m_SpellVisual.SpellXSpellVisualID, castData.AmmoDisplayID, castFlags, uint32(_triggeredCastFlags));
+    }
+
     packet.LogData.Initialize(this);
 
     m_caster->SendCombatLogMessage(&packet);
@@ -4977,12 +4996,20 @@ int32 Spell::GetSpellCastDataAmmo()
         {
             ammoInventoryType = pItem->GetTemplate()->GetInventoryType();
             if (ammoInventoryType == INVTYPE_THROWN)
+            {
                 ammoDisplayID = pItem->GetDisplayId(playerCaster);
+                // A thrown weapon with the generic 1.60 display, or none, is drawn by the client as a white square (UBRS and Red Cloud Mesa, 20 Oct).
+                if (!ammoDisplayID || ammoDisplayID >= 500000)
+                    ammoDisplayID = 23211;
+            }
             else if (ItemTemplate const* ammo = sObjectMgr->GetItemTemplate(playerCaster->GetAmmoId()))   // Classic 1.60 ammo slot
             {
-                if (ItemModifiedAppearanceEntry const* modifiedAppearance = TransmogMgr::GetItemModifiedAppearance(ammo->GetId(), 0))
-                    if (ItemAppearanceEntry const* itemAppearance = sItemAppearanceStore.LookupEntry(modifiedAppearance->ItemAppearanceID))
-                        ammoDisplayID = itemAppearance->ItemDisplayInfoID;
+                // The ammo's own display, as a real player's cast sends it. The generic 1.60 ammo display (737992 / 737993) has no model and the
+                // client draws a white box for it (PC log 20 Oct); bots take ammo that has its own display (Player::AutoSelectAmmo), so
+                // this is the fallback only: an arrow model, for bullets too (every classic bullet has the generic display).
+                ammoDisplayID = Player::GetAmmoDisplayId(ammo);
+                if (!Player::HasDrawableAmmoDisplay(ammo))
+                    ammoDisplayID = 23211;   // an arrow display seen to draw (item 19082); no classic bullet has a display of its own
                 ammoInventoryType = INVTYPE_AMMO;
             }
             else if (playerCaster->HasAura(46699))      // Requires No Ammo

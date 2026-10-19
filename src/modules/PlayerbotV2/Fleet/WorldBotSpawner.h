@@ -27,6 +27,7 @@
 #include <string>
 
 #include "AreaCap.h"
+#include "GateDuels.h"
 #include "StrandedWatch.h"
 #include "WorldLoadFacts.h"
 #include "WorldFactionMix.h"
@@ -65,6 +66,7 @@ private:
         uint32 bots_per_player  = 25;      // target per real player (within ActivityRadius)
         uint32 city_bots        = 0;       // target when the player is in a capital/town (0 = BotsPerPlayer)
         uint32 zone_bots        = 0;       // target when the player is in a leveling zone (0 = BotsPerPlayer)
+        uint32 start_zone_bots  = 50;      // the same in a start zone (Mulgore, Durotar, ...), where a real realm has a few new characters (0 = ZoneBots)
         float  activity_radius  = 300.0f;  // a bot this close to an anchor counts toward it
         float  despawn_radius   = 450.0f;  // a bot farther than this from every anchor is logged out
         float  ring_min         = 60.0f;   // spawn ring (placement distance from the anchor)
@@ -93,6 +95,7 @@ private:
         uint32 jump_grace_ms    = 20000;   // bots around the place a player jumped away from are kept this long (an instance trip: ZoneGraceSec)
         uint32 area_cap_outdoors = 14;     // most world bots within area_radius of one another outdoors (0 = no cap; Fleet/AreaCap.h)
         uint32 area_cap_town    = 40;      // the same in a capital
+        uint32 area_cap_start   = 10;      // the same in a start zone: one camp and one quest giver for every new character
         float  area_radius      = 45.0f;
         uint32 pool_horde_pct   = 50;      // share of the roster that should be Horde, in every level bracket (PoolBalance.h)
         uint32 variable_max     = 2000;    // temporary residents allowed to exist next to the core roster (PoolBudget.h); 0 = none
@@ -154,9 +157,11 @@ private:
     void DriveLeaving(uint32 now_ms, std::vector<Anchor> const& anchors);
     // A crowd over the area cap sends its extras to other spots next to the nearest player (Fleet/AreaCap.h).
     void DriveCrowd(uint32 now_ms, std::vector<Anchor> const& anchors);
+    void DriveGateDuels(uint32 now_ms, std::vector<Anchor> const& anchors);   // pairs of bots duelling outside a capital gate (GateDuels.h)
     // Level range of the bots around this anchor: its zone's, lifted to MinLevel, except on Zephras Isle (Fleet/SkyborneIsle.h).
     void WindowFor(Anchor const& a, uint8& lo, uint8& hi) const;
     bool PlaceNear(Player* bot, Player* anchor);
+    uint32 AreaCapFor(uint32 zone) const;
     void StepOffStack(Player* bot);
     uint32 CountAmbientNear(Anchor const& a) const;
     std::unordered_map<uint32, uint32> AwakeByZone(Anchor const& a) const;
@@ -166,6 +171,14 @@ private:
     struct Ghost { Anchor a; uint32 until_ms; };   // where a player was before an instance / far jump: keeps its bots for a grace
     std::vector<Ghost> ghosts_;
     std::unordered_map<uint64, Anchor> prev_anchor_;
+    struct PlaceDest { float x = 0.0f, y = 0.0f; uint32 until_ms = 0; };
+    std::unordered_map<uint64, PlaceDest> place_dest_;   // where a bot sent by PlaceNear is walking to, for a while: the crowd count uses it, not its position on the way
+    // World bots under level 10 made before they stopped being given a generated set (migration 0031): each is stripped to its starter outfit once, on login.
+    std::unordered_set<uint64> gear_reset_pending_, gear_reset_tried_;
+    bool gear_reset_loaded_ = false, gear_reset_inflight_ = false;
+    void LoadGearResetPending();
+    void ResetStarterGearOnce(Player* bot);
+    float last_place_x_ = 0.0f, last_place_y_ = 0.0f, last_place_z_ = 0.0f;   // where the last PlaceNear sent the bot (it lands later)
     float last_place_dist_ = 0.0f;                  // ring distance chosen by the last PlaceNear (the teleport lands later)
     BotPopulationManager& owner_;
     Config cfg_;
@@ -208,6 +221,13 @@ private:
     uint64 n_placed_ = 0;
     uint64 n_despawned_ = 0;
     uint64 n_abandoned_ = 0;
+    // Why PlaceNear's candidate spots were refused (index: 0 no ground, 1 water, 2 no navmesh point, 3 lava, 4 no complete path, 5 area full) and
+    // how many calls found none at all; reported in the [world] line so a placement that never succeeds names its cause.
+    uint64 n_place_reject_[6] = {};
+    uint64 n_place_none_ = 0;
+    uint64 n_place_calls_ = 0;
+    uint32 last_have_ = 0, last_target_ = 0;   // the last anchor a spawn pass found at its bubble target: how many it has and what it may have ([world] line)
+    uint64 n_at_target_ = 0;                   // passes that skipped an anchor because its bubble was full
     struct Seeding { uint32 started_ms = 0; uint32 setup_done_ms = 0; };
     std::unordered_map<uint64, Seeding> seeding_;
     uint32 last_grad_ms_ = 0;
@@ -215,6 +235,20 @@ private:
     uint32 last_ledger_ms_ = 0;
     std::unordered_map<uint64, uint32> ledger_ms_;   // per bot: when its last ledger line was written
     uint32 last_crowd_ms_ = 0;
+    // Gate duels: the gate found per city (state 0 = not tried, 1 = known, 2 = no gate found, tried again at retry_ms), the pairs in
+    // progress, and the bots resting after a duel.
+    struct GateState { uint8 state = 0; uint32 retry_ms = 0; float x = 0, y = 0, z = 0; };
+    struct GateSlot
+    {
+        uint32 city = 0, slot = 0, since_ms = 0, started_ms = 0;
+        uint64 a = 0, b = 0, watch[2] = { 0, 0 };
+        bool started = false;
+    };
+    GateState gate_state_[GateDuels::kCityCount];
+    std::vector<GateSlot> gate_slots_;
+    std::unordered_map<uint64, uint32> gate_rest_;
+    uint32 gate_why_ms_[6] = {};   // last "why no duels" line per city (kCityCount)
+    uint32 last_gate_ms_ = 0;
     std::unordered_map<uint64, uint32> leaving_;   // bot guid low -> module ms when it was sent walking away
     uint64 n_arrived_walking_ = 0;
     uint64 n_left_walking_ = 0;

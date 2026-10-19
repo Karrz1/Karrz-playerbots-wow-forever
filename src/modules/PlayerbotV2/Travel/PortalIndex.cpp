@@ -603,6 +603,12 @@ void PortalIndex::AddShuttleAnchors(std::vector<ShuttleSpawn> const& spawns)
                 best->floor_offset == 0.f ? " (car floor height unknown: rider stands at the pivot height)" : "");
         }
     }
+    // The cars of those routes, by map: the snapshot looks them up by spawn id, because the 30 y object scan around a bot waiting
+    // on a platform does not reach a car standing on the track (Deeprun soak 127: "transports in sight 0" for every wait, 36 waits
+    // of 300 s dropped).
+    for (ShuttleSpawn const& sp : spawns)
+        if (_route_leader.count(sp.entry))
+            _shuttle_spawn_ids[sp.map].push_back(sp.spawn_id);
     TC_LOG_INFO("server.loading",
         "[PlayerbotV2 PortalIndex] Added {} shuttle (tram) station anchors from {} type-11 spawns.",
         added, spawns.size());
@@ -611,6 +617,13 @@ void PortalIndex::AddShuttleAnchors(std::vector<ShuttleSpawn> const& spawns)
 bool PortalIndex::IsSameMapTransport(uint32 go_entry) const
 {
     return _route_leader.count(go_entry) != 0;
+}
+
+std::vector<uint64> const& PortalIndex::ShuttleSpawnIds(uint32 map_id) const
+{
+    static std::vector<uint64> const none;
+    auto it = _shuttle_spawn_ids.find(map_id);
+    return it != _shuttle_spawn_ids.end() ? it->second : none;
 }
 
 bool PortalIndex::ServesSameRoute(uint32 route_entry, uint32 candidate) const

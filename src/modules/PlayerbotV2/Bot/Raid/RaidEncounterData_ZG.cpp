@@ -27,6 +27,8 @@ namespace Playerbot::Raid {
         r.priority.push_back({ 14965, 4 });
         r.avoidGameObject.push_back({ 177764, 6.0f, Who::Anyone });
         r.dispel.push_back({ 16098, DispelKind::Curse });
+        // Pierce Armor 12097 on her tank (-armor for 20 s, vanilla data: no dispel type): a tank without it takes her over, as on Ebonroc.
+        r.tankSwap.push_back({ 14517, 12097, 1 });
 
         // ---------------------------------------------------------------------------------------------------------------
         // HIGH PRIEST VENOXIS (14507, zg/classic_boss_venoxis.cpp): the four Razzashi Cobras 11373 come with the pull; Renew 23895 on
@@ -36,8 +38,11 @@ namespace Playerbot::Raid {
         r.priority.push_back({ 11373, 3 });
         r.priority.push_back({ 14884, 5 });
         r.purge.push_back({ 23895 });
-        r.spread.push_back({ 14507, 8.0f, Who::Ranged });
-        r.spread.push_back({ 14507, 8.0f, Who::Healer });
+        // Holy Wrath jumps up to 50 times, 10 yards a jump (Spell::SearchChainTargets, magic chain), and each jump deals 1.3x the last
+        // (vanilla data: dmgMultiplier 1.3). 12 yards apart (the rule moves a bot under 85 percent of it) breaks the chain; at 8 the ranged
+        // stood inside one jump of each other (zg_venoxis 2026-10-20: seven casters 9-44k from one cast at t=98, all within 7 y).
+        r.spread.push_back({ 14507, 12.0f, Who::Ranged });
+        r.spread.push_back({ 14507, 12.0f, Who::Healer });
         r.avoidGroundEffect.push_back({ 14507, 23861, 2.0f, Who::Anyone });
         r.dispel.push_back({ 23862, DispelKind::Poison });
         r.dispel.push_back({ 23860, DispelKind::Magic });

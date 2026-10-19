@@ -136,7 +136,7 @@ void ApplyFightScript(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& order
         if (focus.IsEmpty())
         {
             // The skull carries a shield this bot must not strike (Damage Shield for melee, Magic Reflection for casters): it stands, the
-            // generic pickers would start an attack on the skull each tick and every swing is reflected (nl99: nine deaths "melee by self").
+            // generic pickers would start an attack on the skull each tick and every swing is reflected.
             if (fight->skullOnly && !ownerMark.IsEmpty() &&
                 std::find(o.forbidden_targets.begin(), o.forbidden_targets.end(), ownerMark) != o.forbidden_targets.end())
             {

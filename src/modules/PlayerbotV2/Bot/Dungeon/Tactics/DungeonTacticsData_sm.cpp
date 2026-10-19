@@ -20,15 +20,15 @@ constexpr SpellTactic kSpells_sm_3975[] = {
 };
 constexpr SpellTactic kSpells_sm_3976[] = {
     // spell, name, school, cast_ms, tags, dispel, target, when, first_min, first_max, repeat_min, repeat_max, hp_max, hp_min, ally_hp_max, range_min, range_max, amount, tick, counters, severity, holds_schools, flags
-    { 9257, "", 0, kCastUnknown, Tag::None, Disp::None, Tgt::Invoker, When::Combat, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, Ctr::None, 0, 0, SF::Scripted },
+    { 9257, "Lay on Hands", 2, 0, Tag::Heal, Disp::None, Tgt::Invoker, When::Combat, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, Ctr::None, 0, 0, SF::Scripted },
     { 1020, "Divine Shield", 2, 0, Tag::Buff | Tag::Immune, Disp::None, Tgt::Self, When::Combat, 0, 0, 0, 0, 50, 1, 0, 0, 0, 0, 0, Ctr::StopDamage, 2, 127, SF::None },
     { 14518, "Crusader Strike", 2, kCastUnknown, Tag::Dmg, Disp::None, Tgt::Victim, When::Combat, 6000, 12000, 6000, 18000, 100, 0, 0, 0, 0, 50, 0, Ctr::None, 0, 0, SF::None },
     { 5589, "Hammer of Justice", 16, kCastUnknown, Tag::Stun, Disp::None, Tgt::Victim, When::Combat, 7000, 16000, 60000, 80000, 100, 0, 0, 0, 0, 0, 0, Ctr::None, 2, 0, SF::Unverified },
 };
 constexpr SpellTactic kSpells_sm_3977[] = {
     // spell, name, school, cast_ms, tags, dispel, target, when, first_min, first_max, repeat_min, repeat_max, hp_max, hp_min, ally_hp_max, range_min, range_max, amount, tick, counters, severity, holds_schools, flags
-    { 9256, "", 0, kCastUnknown, Tag::None, Disp::None, Tgt::Self, When::Combat, 0, 0, 0, 0, 50, 0, 0, 0, 0, 0, 0, Ctr::None, 0, 0, SF::None },
-    { 9232, "", 0, kCastUnknown, Tag::None, Disp::None, Tgt::Self, When::Combat, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, Ctr::None, 0, 0, SF::None },
+    { 9256, "Deep Sleep", 32, 0, Tag::Sleep, Disp::None, Tgt::Self, When::Combat, 0, 0, 0, 0, 50, 0, 0, 0, 0, 0, 0, Ctr::None, 2, 0, SF::None },
+    { 9232, "Scarlet Resurrection", 1, 2000, Tag::Heal, Disp::None, Tgt::Friendly, When::Combat, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, Ctr::Interrupt, 3, 0, SF::Unverified },
     { 14515, "Dominate Mind", 32, kCastUnknown, Tag::Charm, Disp::None, Tgt::RandomNotTop, When::Combat, 15000, 30000, 60000, 60000, 100, 0, 0, 0, 0, 0, 0, Ctr::Interrupt, 3, 0, SF::Unverified },
     { 12039, "Heal", 2, 2500, Tag::Heal, Disp::None, Tgt::Friendly, When::Combat, 0, 0, 30000, 60000, 100, 0, 60, 0, 0, 637, 0, Ctr::Interrupt, 3, 0, SF::None },
     { 22187, "Power Word: Shield", 0, kCastUnknown, Tag::Shield, Disp::None, Tgt::Invoker, When::AllyUnbuffed, 0, 0, 10000, 30000, 100, 0, 0, 0, 0, 0, 0, Ctr::None, 2, 0, SF::None },

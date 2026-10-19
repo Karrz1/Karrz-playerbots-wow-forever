@@ -1,5 +1,6 @@
 ﻿#include "BotSnapshotBuilder.h"
 #include "BotRegistry.h"
+#include "GroupControl.h"
 #include "Bot/SpellFamily.h"
 #include "ClassicSpec.h"
 #include "BotAI.h"
@@ -1815,6 +1816,8 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         else if (mc_ai)
             mc_ai->clear_move_corroborate();
         snap->movement.is_moving = moving;
+        if (!moving && p->GetGroup() && p->GetMap())
+            snap->movement.ground_z = p->GetMap()->GetHeight(p->GetPhaseShift(), p->GetPositionX(), p->GetPositionY(), p->GetPositionZ() + 2.0f, true, 10.0f);
     }
     // UNIT_STATE_IN_FLIGHT — the core is flying the bot on a taxi path. The bot logic
     // must stand down entirely (DispatchIdle bails) so no idle/unstick/watchdog
@@ -3257,7 +3260,12 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         uint8 const want = gun ? ITEM_SUBCLASS_BULLET : ITEM_SUBCLASS_ARROW;
         for (auto const& it : snap->inventory.bag_items)
             if (it.item_class == ITEM_CLASS_PROJECTILE && it.item_subclass == want)
-                snap->consumables.ammo_count += it.count;
+            {
+                // A stack the bot cannot use yet (above its level) is no ammo: AutoSelectAmmo skips it as well.
+                ItemTemplate const* ammo_proto = sObjectMgr->GetItemTemplate(it.entry);
+                if (ammo_proto && p->CanUseItem(ammo_proto) == EQUIP_ERR_OK)
+                    snap->consumables.ammo_count += it.count;
+            }
     }
 
     // Wand damage school, the same rule Spell::Spell applies to a wand user's
@@ -3324,9 +3332,36 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
     {
         snap->group.group_guid = g->GetGUID();
         snap->owner_in_group = !snap->owner_guid.IsEmpty() && g->IsMember(snap->owner_guid);
+        // No owner in this group: a human member still commands the bot (GroupControl.h). A world bot a player invited gets the
+        // companion's duties and obeys the group leader; a bot with only bots around it stays autonomous.
+        if (!snap->owner_in_group && Services::Initialized())
+        {
+            std::vector<GroupControl::Member<ObjectGuid>> members;
+            for (GroupReference const& itr : g->GetMembers())
+            {
+                Player const* m = itr.GetSource();
+                if (!m || m == p) continue;
+                members.push_back({ m->GetGUID(), !(m->GetSession() && m->GetSession()->IsBot()) });
+            }
+            ObjectGuid const controller = GroupControl::ResolveController(g->GetLeaderGUID(), members);
+            if (!controller.IsEmpty())
+            {
+                snap->led_by_player = true;
+                snap->controller_guid = controller;
+                if (Player const* c = ObjectAccessor::FindConnectedPlayer(controller); c && c->GetMapId() == p->GetMapId())
+                    snap->owner_dist = p->GetExactDist2d(c);
+            }
+        }
         if (snap->owner_in_group)
             if (Player const* owner = ObjectAccessor::FindConnectedPlayer(snap->owner_guid); owner && owner->GetMapId() == p->GetMapId())
                 snap->owner_dist = p->GetExactDist2d(owner);
+        if (bot_ai)
+        {
+            snap->holding_position = bot_ai->holding_position(snap->published_at_ms);
+            auto const stance = bot_ai->owner_stance();
+            snap->no_tag_stance = stance == BotAI::OwnerStance::Passive ||
+                                  (stance == BotAI::OwnerStance::Auto && (snap->owner_in_group || snap->led_by_player));
+        }
     }
 
     // ---- Spellbook (sorted, binary-searchable in BotSnapshotView::knows_spell) ----
@@ -3979,10 +4014,15 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             if (CreatureTemplate const* act = ac->GetCreatureTemplate())
             {
                 u.creature_type = uint8(act->type);
-                if (act->unit_flags & UNIT_FLAG_PACIFIED)
-                    u.is_pacified = true;
-                if (act->unit_flags & UNIT_FLAG_UNINTERACTIBLE)
-                    u.untargetable = true;
+                // The template flags mark static props. A unit that is hitting somebody is no prop: an event boss
+                // (Pyroguard Emberseer) is spawned with them and its script clears them on the live unit.
+                if (!ac->GetVictim())
+                {
+                    if (act->unit_flags & UNIT_FLAG_PACIFIED)
+                        u.is_pacified = true;
+                    if (act->unit_flags & UNIT_FLAG_UNINTERACTIBLE)
+                        u.untargetable = true;
+                }
             }
         }
         // Attacker-side CC scan — same shape as nearby_enemies. Without
@@ -4627,10 +4667,16 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 {
                     // CreatureType is uint8 in TC; Beast=1, etc.
                     u.creature_type = uint8(ct->type);
-                    if (ct->unit_flags & UNIT_FLAG_PACIFIED)
-                        u.is_pacified = true;
-                    if (ct->unit_flags & UNIT_FLAG_UNINTERACTIBLE)
-                        u.untargetable = true;
+                    // Static props only: a unit that is hitting somebody is no prop. Pyroguard Emberseer is spawned with these flags
+                    // and its script clears them on the live unit, so the template flags kept the attackable boss out of the
+                    // raid tracker and the DPS stood idle (UBRS 20 Oct).
+                    if (!c->GetVictim())
+                    {
+                        if (ct->unit_flags & UNIT_FLAG_PACIFIED)
+                            u.is_pacified = true;
+                        if (ct->unit_flags & UNIT_FLAG_UNINTERACTIBLE)
+                            u.untargetable = true;
+                    }
                     // Elite / RareElite / Rare = legit high-HP, slow kills; the
                     // unkillable-target leash must never abandon them.
                     u.is_elite_or_rare =
@@ -7518,7 +7564,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         const bool truly_stuck =
             snap->quest_discovery.quest_offers.empty() &&
             snap->quest_log.quests.empty();
-        if (truly_stuck && p->GetLevel() < 20)
+        if (truly_stuck && p->GetLevel() < 20 && !snap->owner_in_group && !snap->led_by_player)   // a led bot has no quest autopilot to diagnose
         {
             uint32 giver_npc_count = 0;
             uint32 giver_go_count  = 0;
@@ -8194,6 +8240,49 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                     }
                 }
                 snap->world_objects.nearby_objects.push_back(n);
+            }
+
+            // Tram cars (type-11 GOs that run between two stations on one map, the Deeprun Tram): they sit in the grid, so the
+            // MO-transport set above never holds them, and the 30 y object scan only sees one standing right beside the bot. A
+            // bot waiting on the platform for a ride looked at "transports in sight 0" for 300 s, then gave the route up. The
+            // cars are few and known (PortalIndex), so look them up by spawn id within the same 200 y.
+            if (Services::Initialized() && Services::Portals().IsInitialized())
+            {
+                auto const& car_ids = Services::Portals().ShuttleSpawnIds(p->GetMapId());
+                if (!car_ids.empty())
+                {
+                    static std::atomic<uint32> s_carLogAt{0};
+                    uint32 const cnow = GameTime::GetGameTimeMS();
+                    uint32 last = s_carLogAt.load(std::memory_order_relaxed);
+                    if (cnow - last >= 120000u && s_carLogAt.compare_exchange_strong(last, cnow ? cnow : 1u))
+                    {
+                        size_t in_world = 0;
+                        for (uint64 const id : car_ids)
+                            if (GameObject* c = tmap->GetGameObjectBySpawnId(id); c && c->IsInWorld()) ++in_world;
+                        TC_LOG_INFO("playerbot.v2", "[xport_cars] map {}: {} tram cars known, {} in the world; {} sees {:.0f},{:.0f},{:.0f}",
+                            p->GetMapId(), car_ids.size(), in_world, p->GetName(), p->GetPositionX(), p->GetPositionY(), p->GetPositionZ());
+                    }
+                }
+                for (uint64 const spawn_id : car_ids)
+                {
+                    GameObject* car = tmap->GetGameObjectBySpawnId(spawn_id);
+                    if (!car || !car->IsInWorld()) continue;
+                    const float cdx = car->GetPositionX() - p->GetPositionX();
+                    const float cdy = car->GetPositionY() - p->GetPositionY();
+                    const float cdz = car->GetPositionZ() - p->GetPositionZ();
+                    if (cdx*cdx + cdy*cdy + cdz*cdz > kTransportScanSq) continue;
+                    bool const have = std::any_of(snap->world_objects.nearby_objects.begin(), snap->world_objects.nearby_objects.end(),
+                        [&](BotSnapshot::NearbyObject const& o) { return o.guid == car->GetGUID(); });
+                    if (have) continue;
+                    BotSnapshot::NearbyObject n{};
+                    n.guid    = car->GetGUID();
+                    n.entry   = car->GetEntry();
+                    n.go_type = car->GetGoType();
+                    n.x = car->GetPositionX();
+                    n.y = car->GetPositionY();
+                    n.z = car->GetPositionZ();
+                    snap->world_objects.nearby_objects.push_back(n);
+                }
             }
         }
 
@@ -10575,6 +10664,17 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 snap->craft_orders.want_payment_copper = payment;
             }
         }
+    }
+
+    // Playerbot.World.Questing = 0: a bot of the world (no owner, no group) sees no quests, so nothing sends it to a giver, a hub or a quest
+    // objective; it grinds and roams (idle:grind_roam). A companion keeps its quests (CompanionQuest).
+    if (!Services::Config().world_questing() && snap->owner_guid.IsEmpty() && snap->owner_name.empty() && snap->group.group_guid.IsEmpty() && !snap->led_by_player)
+    {
+        uint16 const completed = snap->quest_log.completed_quest_count;
+        snap->quest_log.reset();
+        snap->quest_log.completed_quest_count = completed;
+        snap->quest_discovery.quest_offers.clear();
+        snap->quest_discovery.quest_turnins.clear();
     }
 
     return snap;

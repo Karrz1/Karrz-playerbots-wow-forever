@@ -175,6 +175,7 @@ playerbot_v2_configure_sublib(playerbot-v2-api)
 add_library(playerbot-v2-core STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/PlayerbotV2.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/PlayerbotV2Scripts.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/LfgBotFill.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/Services.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/Commands/cs_playerbot_v2.cpp
 )
@@ -183,6 +184,7 @@ target_sources(playerbot-v2-core
     FILE_SET headers_root TYPE HEADERS BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
     FILES
       ${CMAKE_CURRENT_SOURCE_DIR}/PlayerbotV2.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/LfgBotFill.h
       ${CMAKE_CURRENT_SOURCE_DIR}/Services.h
       ${CMAKE_CURRENT_SOURCE_DIR}/PCH.h
 )
@@ -233,5 +235,30 @@ trinity_add_module(playerbot-v2 AddSC_playerbot_v2
   CONFIGS
     ${CMAKE_CURRENT_SOURCE_DIR}/conf/playerbot.conf.dist
     ${CMAKE_CURRENT_SOURCE_DIR}/conf/zz-0-playerbot-defaults.conf)
+
+# Default settings (world bots, auction house bot, bot logging) as an active file in worldserver.conf.d, so the bots work
+# out of the box. An existing copy is never overwritten.
+set(PLAYERBOT_V2_DEFAULT_CONF ${CMAKE_CURRENT_SOURCE_DIR}/conf/zz-forever-bots.conf)
+set(PLAYERBOT_V2_COPY_IF_MISSING ${CMAKE_CURRENT_SOURCE_DIR}/conf/CopyIfMissing.cmake)
+if(COPY_CONF)
+  if(UNIX)
+    set(_pbv2_build_conf_dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/../etc/worldserver.conf.d)
+    set(_pbv2_install_conf_dir ${CONF_DIR}/worldserver.conf.d)
+  elseif(WIN32)
+    set(_pbv2_build_conf_dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/worldserver.conf.d)
+    set(_pbv2_install_conf_dir ${CMAKE_INSTALL_PREFIX}/worldserver.conf.d)
+  endif()
+  if(_pbv2_build_conf_dir)
+    # The Looking-for-group settings are a file of their own (zz-forever-lfg.conf), copied the same way.
+    set(PLAYERBOT_V2_LFG_CONF ${CMAKE_CURRENT_SOURCE_DIR}/conf/zz-forever-lfg.conf)
+    add_custom_target(playerbot-v2-default-conf ALL
+      COMMAND ${CMAKE_COMMAND} -DSRC=${PLAYERBOT_V2_DEFAULT_CONF} -DDST_DIR=${_pbv2_build_conf_dir}
+              -P ${PLAYERBOT_V2_COPY_IF_MISSING}
+      COMMAND ${CMAKE_COMMAND} -DSRC=${PLAYERBOT_V2_LFG_CONF} -DDST_DIR=${_pbv2_build_conf_dir}
+              -P ${PLAYERBOT_V2_COPY_IF_MISSING})
+    install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" \"-DSRC=${PLAYERBOT_V2_DEFAULT_CONF}\" \"-DDST_DIR=\$ENV{DESTDIR}${_pbv2_install_conf_dir}\" -P \"${PLAYERBOT_V2_COPY_IF_MISSING}\")")
+    install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" \"-DSRC=${PLAYERBOT_V2_LFG_CONF}\" \"-DDST_DIR=\$ENV{DESTDIR}${_pbv2_install_conf_dir}\" -P \"${PLAYERBOT_V2_COPY_IF_MISSING}\")")
+  endif()
+endif()
 
 message(STATUS "Playerbot V2 module enabled (multi-library: 13 sub-libs)")

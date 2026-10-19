@@ -9,6 +9,8 @@
 
 #include "Diagnostics/DamageParityMath.h"
 
+#include "ObjectGuid.h"
+
 #include <cstdint>
 #include <string>
 
@@ -26,12 +28,19 @@ enum class Kind : std::uint8_t { None = 0, Damage = 1, Finisher = 2, TalentAudit
 // A leg is measuring (one atomic load; the hooks return at once when it is false).
 bool Active();
 
+// The measuring dummy, which no fight can finish by design: the bot's give-up rules (opener stall, unkillable-target leash) leave it alone.
+bool IsDummy(ObjectGuid const& guid);
+
 // From Module::OnHitOutcome / OnDamageTaken: what a swing or direct spell did, and every damage event with its amount. Both ignore everything
 // that is not the subject (or its pet) hitting the dummy.
 void NoteOutcome(Unit* attacker, Unit* victim, std::uint32_t spell_id, std::uint8_t outcome, std::uint32_t damage);
 void NoteDamage(Unit* attacker, Unit* victim, std::int32_t amount, std::uint32_t spell_id);
 // From Module::OnEnergize: power a spell gave the subject. Counted by spell id inside the economy audit's casting-regen window only.
 void NoteEnergize(Unit* target, std::uint32_t spell_id, std::int32_t gained, std::uint8_t power);
+
+// A spot on flat ground with line of sight along `distance` y in direction `o`, nearest to the bot (its own spot first). False when the
+// ground around is not flat. The runner moves the bot there before Begin so the dummy can stand on the bot's level.
+bool FindOpenSpot(Player* p, float distance, float& x, float& y, float& z, float& o);
 
 // Takes over the staged bot. False with `error` when the dummy cannot be made (no suitable creature template).
 bool Begin(Player* subject, Kind kind, std::uint32_t leg_seconds, std::string& error);

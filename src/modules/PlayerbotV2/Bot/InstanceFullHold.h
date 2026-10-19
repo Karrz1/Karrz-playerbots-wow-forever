@@ -1,6 +1,6 @@
 // InstanceFullHold - a companion refused at an instance door because the instance holds its most players waits where it is and asks
 // again later, instead of walking to an entrance it cannot use. Plain function so it is tested without a world
-// (tests/game/ClassicInstanceFullHold.cpp). UBRS 2026-10-16: a 15-bot raid in a 10-player dungeon, Justor refused 'instance full' for
+// (tests/game/ClassicInstanceFullHold.cpp). A 15-bot raid in a 10-player dungeon: a bot refused 'instance full' for
 // minutes, walked the open world to the entrance and died to the Scarshield Sentries, outside the instance where nobody could raise him.
 
 #pragma once

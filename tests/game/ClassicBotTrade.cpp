@@ -272,3 +272,68 @@ TEST_CASE("TradeTalk: an order is matched against the list", "[bottrade]")
     CHECK(TT::ResolveOrder(TT::ParseOrder("buy mageweave"), list) == 2);
     CHECK(TT::ResolveOrder(TT::ParseOrder("buy a sword"), list) == -1);
 }
+
+TEST_CASE("BotTrade: reagents of a recipe the bot knows, from a group mate, are a gift", "[bottrade]")
+{
+    View v;
+    v.gift_partner = true;
+    Line ore = L(2770, 5, 0);                          // worth nothing to the bot, but a recipe of its uses it
+    ore.reagent = true;
+    v.his = { ore };
+    v.his_accepted = true;
+    CHECK(Decide(v).act == Act::Accept);
+
+    View stranger;                                     // a stranger's ore is still goods at their price
+    stranger.his = { ore };
+    CHECK(Decide(stranger).act == Act::Cancel);
+
+    View mixed;                                        // reagents next to other goods are not one deal
+    mixed.gift_partner = true;
+    mixed.his = { ore, L(9, 1, 100) };
+    CHECK(Decide(mixed).act == Act::Wait);
+}
+
+TEST_CASE("BotTrade: a finished craft order is put in the window for the requester", "[bottrade]")
+{
+    View v;
+    v.gift_partner = true;
+    v.has_delivery = true;
+    v.delivery_present = true;
+    CHECK(Decide(v).act == Act::AddDelivery);                // he opens a trade with nothing in it
+
+    v.mine = { L(22044, 1, 0) };                             // the item is in the bot's side
+    CHECK(Decide(v).act == Act::Wait);
+    v.his_accepted = true;
+    CHECK(Decide(v).act == Act::Accept);                     // handed over for nothing once he accepts
+    v.my_accepted = true;
+    CHECK(Decide(v).act == Act::Wait);
+}
+
+TEST_CASE("BotTrade: a delivery that is gone closes the window", "[bottrade]")
+{
+    View v;
+    v.has_delivery = true;
+    v.delivery_present = false;
+    Action const a = Decide(v);
+    CHECK(a.act == Act::Cancel);
+    CHECK(a.say == Say::OrderGone);
+}
+
+TEST_CASE("BotTrade: a delivery does not change what he puts in or asks for", "[bottrade]")
+{
+    View gold;                                               // gold in his side is not a free hand-over
+    gold.has_delivery = true;
+    gold.delivery_present = true;
+    gold.his_money = 500;
+    CHECK(Decide(gold).act != Act::AddDelivery);
+
+    View goods;                                              // reagents he brings are still a gift
+    goods.gift_partner = true;
+    goods.has_delivery = true;
+    goods.delivery_present = true;
+    Line ore = L(2770, 5, 0);
+    ore.reagent = true;
+    goods.his = { ore };
+    goods.his_accepted = true;
+    CHECK(Decide(goods).act == Act::Accept);
+}

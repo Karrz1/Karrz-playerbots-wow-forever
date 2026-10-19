@@ -192,7 +192,7 @@ void DoCleave(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(CLEAV
 
 bool ShouldHeroicStrike(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && Rage(ctx) >= 50 && Ready(ctx, HEROIC_STRIKE);
+    return HasLiveTarget(ctx) && Rage(ctx) >= 50 && (Ready(ctx, HEROIC_STRIKE) && ctx.bot.victim_in_spell_range(HEROIC_STRIKE));
 }
 void DoHeroicStrike(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(HEROIC_STRIKE, ctx.bot.victim()); }
 
@@ -798,7 +798,7 @@ NearbyUnit const* SpreadTarget(ApPredicateContext const& ctx)
 
 bool ShouldRevenge(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && InStance(ctx, DEFENSIVE_STANCE) && Rage(ctx) >= 5 && Ready(ctx, REVENGE);
+    return HasLiveTarget(ctx) && InStance(ctx, DEFENSIVE_STANCE) && Rage(ctx) >= 5 && (Ready(ctx, REVENGE) && ctx.bot.victim_in_spell_range(REVENGE));
 }
 void DoRevenge(ApPredicateContext const& ctx, BotIntentEmitter& e)
 {
@@ -848,7 +848,7 @@ void DoShieldSlam(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(S
 // Build threat with Sunder Armor until 5 stacks, then keep it up.
 bool ShouldSunderBuild(ApPredicateContext const& ctx)
 {
-    if (!HasLiveTarget(ctx) || Rage(ctx) < 15 || !Ready(ctx, SUNDER_ARMOR)) return false;
+    if (!HasLiveTarget(ctx) || Rage(ctx) < 15 || !(Ready(ctx, SUNDER_ARMOR) && ctx.bot.victim_in_spell_range(SUNDER_ARMOR))) return false;
     // Sunder stacks are shared by every caster: a second tank must not keep sundering a mob already at 5 stacks.
     AuraEntry const* up = ctx.bot.find_aura_any_caster(SUNDER_ARMOR, ctx.bot.victim());
     return !up || up->stacks < 5 || up->remaining.count() < 5000;
@@ -875,12 +875,12 @@ void DoDemoShout(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(DEMORA
 
 bool ShouldTankHeroicStrike(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && Rage(ctx) >= 60 && Ready(ctx, HEROIC_STRIKE);
+    return HasLiveTarget(ctx) && Rage(ctx) >= 60 && (Ready(ctx, HEROIC_STRIKE) && ctx.bot.victim_in_spell_range(HEROIC_STRIKE));
 }
 
 bool ShouldSunderFiller(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && Rage(ctx) >= 25 && Ready(ctx, SUNDER_ARMOR);
+    return HasLiveTarget(ctx) && Rage(ctx) >= 25 && (Ready(ctx, SUNDER_ARMOR) && ctx.bot.victim_in_spell_range(SUNDER_ARMOR));
 }
 
 ApRule const kTankRules[] = {

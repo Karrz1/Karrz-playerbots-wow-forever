@@ -98,6 +98,21 @@ TEST_CASE("PlayerCraftOrder: matching a recipe", "[playercraft]")
     CHECK(Match(ParseRequest("craft bandage", 20), ties) == 1);             // same length: lower spell id
 }
 
+TEST_CASE("PlayerCraftOrder: a generic name gets the best rank", "[playercraft]")
+{
+    // "craft water" fitted every Conjure Water rank and the shortest name (rank 1) won: a player asked a level 60 mage and got 151 mana water.
+    std::vector<Option> const water = {
+        { 5504, 5350, 3, "conjured water", 0 * 1000 + 5 },
+        { 10138, 8077, 3, "conjured mineral water", 25 * 1000 + 25 },
+        { 10140, 8079, 10, "conjured crystal water", 45 * 1000 + 45 },
+        { 5505, 1179, 3, "conjured fresh water", 5 * 1000 + 10 },
+    };
+    CHECK(Match(ParseRequest("craft water", 20), water) == 2);              // the best rank
+    CHECK(Match(ParseRequest("craft conjured water", 20), water) == 0);     // an exact name still means exactly that item
+    CHECK(Match(ParseRequest("craft crystal water", 20), water) == 2);
+    CHECK(Match(ParseRequest("craft mineral", 20), water) == 1);
+}
+
 TEST_CASE("PlayerCraftOrder: planning the casts", "[playercraft]")
 {
     Plan p = PlanOrder({ 5, 1, 20, 10 });
@@ -122,4 +137,32 @@ TEST_CASE("PlayerCraftOrder: planning the casts", "[playercraft]")
     CHECK(std::string(p.refusal) == "no_reagents");
     p = PlanOrder({ 5, 30, 20, 3 });           // one cast already makes more than the cap
     CHECK(std::string(p.refusal) == "too_many");
+}
+
+TEST_CASE("PlayerCraftOrder: a unique item the bot already carries is not made again", "[playercraft]")
+{
+    CHECK(CarryRoom(0, 5) == 0xFFFFFFFFu);     // no limit
+    CHECK(CarryRoom(1, 0) == 1);
+    CHECK(CarryRoom(1, 1) == 0);               // Mana Jade: one carried
+    CHECK(CarryRoom(5, 3) == 2);
+
+    Plan p = PlanOrder({ 1, 1, 20, 1000, CarryRoom(1, 1) });
+    CHECK(std::string(p.refusal) == "already_carried");
+
+    p = PlanOrder({ 3, 1, 20, 1000, CarryRoom(1, 0) });      // asked for three, may hold one
+    CHECK(p.refusal == nullptr);
+    CHECK(p.casts == 1);
+    CHECK(p.items == 1);
+    CHECK(p.trimmed);
+
+    p = PlanOrder({ 5, 1, 20, 10, CarryRoom(0, 0) });        // no limit changes nothing
+    CHECK(p.items == 5);
+}
+
+TEST_CASE("PlayerCraftOrder: how a finished order reaches the requester", "[playercraft]")
+{
+    CHECK(DeliveryFor(false, false) == Delivery::Mail);
+    CHECK(DeliveryFor(true, false) == Delivery::Trade);      // conjured: the mail refuses it
+    CHECK(DeliveryFor(false, true) == Delivery::Bound);      // soulbound: neither route
+    CHECK(DeliveryFor(true, true) == Delivery::Bound);
 }

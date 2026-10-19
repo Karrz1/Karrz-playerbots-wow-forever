@@ -403,20 +403,40 @@ void BgTeamCoordinator::PlanCtf(TeamPlanContext& ctx)
             };
             return key(a) < key(b);
         });
-        int k = 0;
-        auto give = [&](Zone const& z, int count, uint8 squad)
+        auto assign_zone = [&](Member& m, Zone const& z, uint8 squad)
         {
-            for (int q = 0; q < count && k < n; ++q, ++k)
-            {
-                Member& m = ctx.members[free_idx[k]];
-                float const ox = float(int((m.guid_low * 7u) % 15u) - 7), oy = float(int((m.guid_low * 11u) % 15u) - 7);
-                AssignOrder(m.guid_low, BgOrder::AttackNode, z.x + ox, z.y + oy, z.z, ObjectGuid::Empty, squad, /*target_entry=*/0);
-                m.assigned = true;
-            }
+            float const ox = float(int((m.guid_low * 7u) % 15u) - 7), oy = float(int((m.guid_low * 11u) % 15u) - 7);
+            AssignOrder(m.guid_low, BgOrder::AttackNode, z.x + ox, z.y + oy, z.z, ObjectGuid::Empty, squad, /*target_entry=*/0);
+            m.assigned = true;
         };
-        give(kMid, n_mid, 3);
-        give(enemy_gy, n_camp, 4);
-        give(own_gy, n_own, 5);
+        Zone const zones[3] = { kMid, enemy_gy, own_gy };
+        int quota[3] = { n_mid, n_camp, n_own };
+        // A bot keeps the zone it already holds while that zone still has room. The free list shrinks and grows as bots become
+        // escorts or hunters, so the hash order alone moved a bot from the middle to the graveyard every few seconds.
+        // A new rotation epoch reshuffles everyone (that is the point of the rotation); within an epoch nobody moves.
+        uint64 const zone_key = (uint64(ctx.instance_id) << 2) | ctx.team;
+        auto ze = zone_epoch_.find(zone_key);
+        bool const same_epoch = ze != zone_epoch_.end() && ze->second == epoch;
+        zone_epoch_[zone_key] = epoch;
+        std::vector<int> rest;
+        for (int idx : free_idx)
+        {
+            Member& m = ctx.members[idx];
+            auto prev = orders_.find(m.guid_low);
+            int const zone = (same_epoch && prev != orders_.end() && prev->second.kind == BgOrder::AttackNode &&
+                              prev->second.squad >= 3 && prev->second.squad <= 5) ? int(prev->second.squad) - 3 : -1;
+            if (zone >= 0 && quota[zone] > 0)
+            {
+                --quota[zone];
+                assign_zone(m, zones[zone], uint8(zone + 3));
+            }
+            else
+                rest.push_back(idx);
+        }
+        size_t k = 0;
+        for (int zone = 0; zone < 3; ++zone)
+            for (; quota[zone] > 0 && k < rest.size(); --quota[zone], ++k)
+                assign_zone(ctx.members[rest[k]], zones[zone], uint8(zone + 3));
     }
     // Remainder stays unordered on pure CTF: the legacy mid-pressure /
     // score-bias roles are already good there, and leaving them free keeps

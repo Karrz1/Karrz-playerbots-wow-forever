@@ -90,6 +90,9 @@ namespace PathBudget
     void BeginWorldTick(uint32 now_ms, uint32 budget_ms);
     void EndWorldTick();
     bool HasBudget(uint32 now_ms);
+    // Did a pathfind request find the window spent since BeginWorldTick? The drain pass then starts at another bot next time, so the
+    // bots at the tail of the registry are not the ones that wait every time.
+    bool Refused();
 }
 
 // API: thin facade over Player and friends. Constructed transiently per call
@@ -198,6 +201,8 @@ public:
     // After a follow_drop move_to: the bot is walking to a ledge, or in the air after leaving one (the follow is committed), as against
     // the ordinary pathed move it fell back to.
     bool follow_drop_acted() const;
+    // After a follow_drop move_to: the walking route to the owner was judged fine (as against no ledge found).
+    bool follow_drop_route_fine() const;
     // Ground height at (x,y) searched from above `z_hint` (Playerbot.Behavior.GroundSnap); returns z_hint when none found.
     float  ground_z(float x, float y, float z_hint, char const* where = "api");
     // clear_generators=true pops all MotionMaster generators (Clear + MoveIdle)
@@ -671,7 +676,8 @@ public:
     // Loot a creature corpse: pick up gold + auto-store all items the bot has
     // permission to take. Skips group-loot blocks (Need/Greed in flight). The
     // caller is responsible for moving the bot into loot range first.
-    Result loot_corpse(ObjectGuid corpse);
+    // quest_items_only: take only the quest drops this bot may loot (a bot a player leads leaves the rest to him).
+    Result loot_corpse(ObjectGuid corpse, bool quest_items_only = false);
 
     // Vendor / repair
     // sell_item_by_entry: sells one stack of the given item to the nearby
@@ -752,7 +758,7 @@ public:
     // Returns Locked when the quest isn't complete or the choice is out
     // of range.
     static constexpr uint32 kRewardChoiceAuto = 0xFF;
-    Result complete_quest(ObjectGuid quest_giver, uint32 quest_id, uint32 reward_choice);
+    Result complete_quest(ObjectGuid quest_giver, uint32 quest_id, uint32 reward_choice, bool copy_leader = false);
     // Drop the quest from the bot's quest log. Used by stuck/obsolete
     // cleanup. Returns NotKnown when the quest isn't in the log.
     Result abandon_quest(uint32 quest_id);
@@ -1066,6 +1072,10 @@ public:
     // Classic riding for a bot: Riding skill 75 from level 40 and 150 at 60 (what MountCapability's ReqRidingSkill
     // checks), and its race's vanilla mount (the swift one at 60) when it knows no mount at all. Returns what changed.
     uint32 learn_riding_free();
+    // Puts a bot into the outfit its character was created with (playercreateinfo_item): each piece straight into its slot, the old piece in that
+    // slot destroyed just before; a piece that cannot be worn leaves the old one on. The slots the outfit does not use are cleared only when
+    // every piece went on (`complete`). Returns the number of equipped items removed. For a world bot under level 10 that wears a generated set.
+    uint32 reset_to_starter_gear(bool& complete);
     Result trainer_buy_all_available(ObjectGuid trainer_npc,
                                      uint32* out_learned = nullptr,
                                      uint32* out_already = nullptr,

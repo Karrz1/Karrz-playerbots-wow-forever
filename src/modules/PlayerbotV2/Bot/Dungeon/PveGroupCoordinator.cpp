@@ -42,6 +42,7 @@
 #include "WorldSession.h"
 
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
@@ -62,7 +63,43 @@ constexpr uint32 kOwnerAttackWindowMs = 10000;
 
 using V2::OwnerAttackRecent;
 
+// Damage done to creatures per player (pets count for their owner), for the [raid_dps] line. Written from the map threads, read and
+// reset on the world thread at the start and end of a pull.
+std::mutex g_dmg_done_mtx;
+std::unordered_map<uint64, uint64> g_dmg_done;
+
+uint64 TakeDamageDone(uint64 guid_low, bool reset)
+{
+    std::lock_guard lk(g_dmg_done_mtx);
+    auto it = g_dmg_done.find(guid_low);
+    if (it == g_dmg_done.end()) return 0;
+    uint64 const v = it->second;
+    if (reset) g_dmg_done.erase(it);
+    return v;
+}
+
+char const* ShortClass(uint8 cls)
+{
+    switch (cls)
+    {
+        case CLASS_WARRIOR: return "War";   case CLASS_PALADIN: return "Pal";  case CLASS_HUNTER: return "Hun";
+        case CLASS_ROGUE:   return "Rog";   case CLASS_PRIEST:  return "Pri";  case CLASS_SHAMAN: return "Sha";
+        case CLASS_MAGE:    return "Mag";   case CLASS_WARLOCK: return "Wlk";  case CLASS_DRUID:  return "Dru";
+        default:            return "?";
+    }
+}
+
 } // namespace
+
+void PveGroupCoordinator::NoteDamageDone(Unit* attacker, Unit* victim, int32 amount)
+{
+    if (!attacker || !victim || amount <= 0 || victim->IsPlayer()) return;
+    Player* owner = attacker->GetCharmerOrOwnerPlayerOrPlayerItself();
+    if (!owner) return;
+    std::lock_guard lk(g_dmg_done_mtx);
+    if (g_dmg_done.size() > 4096) g_dmg_done.clear();
+    g_dmg_done[owner->GetGUID().GetCounter()] += uint64(amount);
+}
 
 void PveGroupCoordinator::Update(uint32 now_ms)
 {
@@ -1294,6 +1331,14 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
             static std::mutex cc_stick_mx;
             static std::unordered_map<uint64, CcStick> cc_stick;
             uint32 const cc_now = GameTime::GetGameTimeMS();
+            // A tank (or the owner) hitting the mob is the call to kill it, the last of its pack: the hold ends, as the automatic
+            // crowd control's does, instead of re-sheeping the tank's target at every break (wc_cobrahn 127).
+            auto const tank_hits = [&](ObjectGuid mob)
+            {
+                for (auto const& m : mem)
+                    if ((!m.is_bot || m.tank) && m.src && m.src->victim == mob) return true;
+                return false;
+            };
             bool kept = false;
             {
                 std::lock_guard lk(cc_stick_mx);
@@ -1305,7 +1350,7 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
                     NearbyUnit const* su = icon_on ? unit_any(st.mob) : nullptr;
                     if (su)
                         st.seen_ms = cc_now;
-                    if (icon_on && (su || uint32(cc_now - st.seen_ms) <= 4000u) &&
+                    if (icon_on && !tank_hits(st.mob) && (su || uint32(cc_now - st.seen_ms) <= 4000u) &&
                         std::find(cc_taken.begin(), cc_taken.end(), st.mob) == cc_taken.end() &&
                         !(su && su->max_hp > 0 && su->hp * 2 < su->max_hp) &&
                         (!su || MarkCc::PickOption(view, e.cls, MarkCc::TypeOf(*su), !e.src->in_combat && !su->unit_in_combat)))
@@ -1326,6 +1371,7 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
                 if (!u || Classic::IsBossUnit(*u) || never_controlled(u->entry)) continue;
                 if (u->guid == icon[7] || u->guid == icon[6]) continue;   // marked skull / cross: killed, never crowd-controlled
                 if (u->max_hp > 0 && u->hp * 2 < u->max_hp) continue;     // under half health: being killed, not held again
+                if (tank_hits(u->guid)) continue;                          // the tank is on it: killed, not held again
                 if (std::find(cc_taken.begin(), cc_taken.end(), u->guid) != cc_taken.end()) continue;
                 const bool ooc = !e.src->in_combat && !u->unit_in_combat;
                 if (!MarkCc::PickOption(view, e.cls, MarkCc::TypeOf(*u), ooc))
@@ -1348,7 +1394,13 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
             // (playtest 2026-10-15). In a raid, an entry the encounter rules already crowd-control (RaidBrain::ElectCrowdControl) is left to them.
             // Never the owner's skull / cross or the raid's kill focus, never a boss or an unpulled mob, never one already under half
             // health; at least three live mobs are on the group (with two, killing them is quicker than holding one).
-            if (po->second.cc_target.IsEmpty())
+            // A healer holds nothing of its own once it is in a fight: its mana is the group's healing (rfd_tutenkash 127: the
+            // priest shackled a fresh ghoul every few seconds between Greater Heals, 94% to 15% mana in 27 s, out of mana three
+            // times, the tank died). Before the pull it still shackles; an icon the owner gave it is still its call.
+            // Not in a raid: ten or more players kill a pack quicker than two of the six damage dealers can hold one mob each, and
+            // the hold broke and re-formed every few seconds as the kill focus moved (UBRS 20 Oct: mark_cc assign / release 66 times
+            // in 5 minutes, two casters' GCDs gone). The raid's encounter rules and the owner's icons still hold mobs.
+            if (!is_raid && po->second.cc_target.IsEmpty() && !(e.healer && e.src->in_combat))
             {
                 static std::mutex auto_cc_mx;
                 static std::unordered_map<uint64, ObjectGuid> auto_cc;   // caster -> the mob it holds
@@ -1783,7 +1835,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                 if (!t || !t->is_bot) continue;
                 Mob const* mm = find_mob(mk_grp->GetTargetIcon(mkr));
                 if (!mm) continue;
-                if (Raid::OffTankMob(map_id, mm->u->entry)) continue;   // the second tank's, whatever tank the icon was given to (Majordomo nl99: swapped every second)
+                if (Raid::OffTankMob(map_id, mm->u->entry)) continue;   // the second tank's, whatever tank the icon was given to
                 if (auto sit = sticky.find(tl); sit != sticky.end() && sit->second == mm->u->guid) continue;
                 for (auto it = sticky.begin(); it != sticky.end();)
                     it = it->second == mm->u->guid ? sticky.erase(it) : std::next(it);
@@ -1968,7 +2020,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             for (auto const& m : mobs)
                 if (auto const hold = cc_held.find(m.u->guid.GetCounter());
                     hold != cc_held.end() && hold->second.tank_low == t->guid_low && !is_taken(m.u->guid) && !Raid::NoTank(map_id, m.u->entry) &&
-                    !cc_owned(m))   // a sheep the owner gave a mage broke: the mage recasts it, the tank does not hit it (Majordomo nl99 pull 2: every 3 s)
+                    !cc_owned(m))   // a sheep the owner gave a mage broke: the mage recasts it, the tank does not hit it
                 {
                     assign(t, m, "cc_released");
                     break;
@@ -2048,8 +2100,8 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             bool const adds_up = tank_last &&
                 std::any_of(mobs.begin(), mobs.end(), [&](Mob const& o) { return o.u->guid != m.u->guid && !Raid::NoTank(map_id, o.u->entry) && !Raid::TankLast(map_id, o.u->entry); });
             // No free tank leaves an add for him while an add is loose: the adds are the threat. Once every bot tank holds something he goes to
-            // the tank with the fewest mobs on it, loose add or not (n44 mc_majordomo: nobody held him, he stood on a healer all fight and
-            // killed two by melee; acmc 2026-10-15: with eight adds one is always loose, so he stood on Lydie and then Zigor for 30 s).
+            // the tank with the fewest mobs on it, loose add or not (Majordomo: nobody held him, he stood on a healer all fight and
+            // killed two by melee; with eight adds one is always loose, so he stood on one add after the other for 30 s).
             bool const free_tank = std::any_of(tanks.begin(), tanks.end(), [&](Member const* t)
                 { return t->is_bot && t->alive && !user_sym.count(t->guid_low) && !sticky.count(t->guid_low); });
             if (adds_up && free_tank && std::any_of(mobs.begin(), mobs.end(), [&](Mob const& o) { return o.loose && !Raid::NoTank(map_id, o.u->entry) && !Raid::TankLast(map_id, o.u->entry); }))
@@ -2452,7 +2504,9 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             // The previous focus is kept while it is still a fair pick: a boss is not once adds are engaged (n31 mc_majordomo: the focus
             // fell on Majordomo in the first second, before the adds were counted, and the stickiness kept it for two minutes while the
             // raid hit a boss that cannot die and the adds killed it).
-            if (Mob const* pm = find_mob(prev); pm && pick && pm != pick && !pick_is_mt && !(adds_alive && is_boss(*pm->u)) && !never_target(*pm->u))
+            // The main tank's target is no reason to leave a mob that a tank holds too: the tank's pick moves with every stun and
+            // drop, and the focus followed it every 2 s (UBRS 20 Oct, 27 -> 30 -> 27), a fresh curse and a new target each time.
+            if (Mob const* pm = find_mob(prev); pm && pick && pm != pick && !(pick_is_mt && !tank_held(*pm)) && !(adds_alive && is_boss(*pm->u)) && !never_target(*pm->u))
             {
                 const bool plu = loose_unowned(*pm);
                 if ((plu || tank_held(*pm)) && (plu || !pick_loose))
@@ -2543,6 +2597,8 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
         fl.mob_hp.clear();
         fl.dmg_total = 0;
         fl.dmg_last_ms = 0;
+        for (auto const& e : mem)
+            TakeDamageDone(e.guid_low, true);
         uint32 alive = 0, tanks = 0, healers = 0;
         for (auto const& e : mem)
         {
@@ -2659,7 +2715,8 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             if (e.src->is_casting) ++dps_cast;
             else if (!e.src->victim.IsEmpty()) ++dps_hit;
             if (!fight_focus.IsEmpty() && e.src->victim == fight_focus) ++dps_focus;
-            else ++dps_none;
+            // Idle = no victim and not casting. A bot on another mob than the focus is fighting (it counts under hitting).
+            if (e.src->victim.IsEmpty() && !e.src->is_casting) ++dps_none;
             if (e.src->max_mana > 0) { dps_mana_sum += Pct(e.src->mana, e.src->max_mana); ++dps_mana_n; }
         }
         uint64 dmg_window = 0;
@@ -2681,7 +2738,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
 
         TC_LOG_INFO("playerbot.v2",
             "[raid_fight] group={} map={} t={}s alive={}/{} deaths={} | tanks: {} | mobs {} (loose {}): {} | "
-            "healers {} mana avg {}% under20% {} casting {} | dps bots {} casting {} hitting {} no target {} (on the focus {}) mana avg {}% | "
+            "healers {} mana avg {}% under20% {} casting {} | dps bots {} casting {} hitting {} idle {} (on the focus {}) mana avg {}% | "
             "raid damage {}/s now, {}/s avg, {} per dps bot",
             group_low, map_id, (now_ms - fl.started_ms) / 1000, alive, uint32(mem.size()), fl.deaths,
             tanks.empty() ? std::string("none alive") : tanks, uint32(mobs.size()), loose,
@@ -2700,6 +2757,21 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             "[raid_fight] group={} map={} pull ended after {}s: alive={}/{} deaths={} | raid damage seen {} ({}/s)",
             group_low, map_id, (now_ms - fl.started_ms) / 1000, alive, uint32(mem.size()), fl.deaths,
             fl.dmg_total, fl.dmg_total / std::max<uint32>((now_ms - fl.started_ms) / 1000, 1));
+        // One line per pull: what each damage dealer did to the mobs (own hits, DoTs and pet), highest first, so per-class tuning has numbers.
+        std::vector<std::pair<uint64, std::string>> rows;
+        uint32 const dur = std::max<uint32>((now_ms - fl.started_ms) / 1000, 1);
+        for (auto const& e : mem)
+        {
+            uint64 const d = TakeDamageDone(e.guid_low, true);
+            if (e.tank || e.healer || !e.is_bot || !d) continue;
+            rows.emplace_back(d, std::string(e.src->name) + "(" + ShortClass(e.cls) + ") " + std::to_string(d) + " (" +
+                                     std::to_string(d / dur) + "/s)");
+        }
+        std::sort(rows.begin(), rows.end(), [](auto const& a, auto const& b) { return a.first > b.first; });
+        std::string txt;
+        for (auto const& r : rows) { if (!txt.empty()) txt += ", "; txt += r.second; }
+        if (!txt.empty())
+            TC_LOG_INFO("playerbot.v2", "[raid_dps] group={} map={} pull of {}s, damage per dps bot: {}", group_low, map_id, dur, txt);
         fl.in_fight = false;
     }
 }

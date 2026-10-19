@@ -51,7 +51,7 @@ bool FindPos(BotSnapshotView const& s, ObjectGuid guid, float& x, float& y, floa
 bool GroupFighting(BotSnapshotView const& s, GroupSnapshotView const& g)
 {
     if (s.in_combat()) return true;
-    ObjectGuid const owner = s.raw().owner_guid;
+    ObjectGuid const owner = s.controller_guid();   // the owner, or the player who leads a world bot he invited
     if (auto const* members = g.members())
         for (GroupMemberSummary const& m : *members)
             if (m.guid == owner)
@@ -129,13 +129,13 @@ bool TurnInFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, B
         if (!PauseOver(s, ai.pending_quest_turnin_at_ms(), &BotAI::set_pending_quest_turnin_at_ms, ai))
             return false;
         emit.face_target(a.giver);
-        emit.complete_quest(a.giver, a.quest_id, /*reward_choice*/ 0xFF);   // 0xFF: best for the class
+        emit.complete_quest(a.giver, a.quest_id, /*reward_choice*/ 0xFF, a.copy_leader);   // 0xFF: best for the class
         ai.note_action_retry(BotAI::ActionKind::CompanionQuest, kTurnInKeyBit | a.quest_id, now_ms);
         ai.set_pending_quest_turnin_at_ms(0);
         ai.grant_detour(now_ms);
         ai.set_last_rule_fired("idle:companion_quest_turnin");
         TC_LOG_INFO("playerbot.v2", "[quest] {} turn_in {} {}{}", s.name(), a.quest_id,
-            CompanionQuest::QuestLabel(a.quest_id), a.via_order ? " (owner order)" : " (with owner)");
+            CompanionQuest::QuestLabel(a.quest_id), a.copy_leader ? " (copying its leader)" : a.via_order ? " (owner order)" : " (with owner)");
         return true;
     }
     if (near_dsq < std::numeric_limits<float>::max() && MayWalk(s, ai))

@@ -76,3 +76,13 @@ TEST_CASE("PoolBudget: only an idle temporary character is retired", "[poolbudge
     RetireFacts group = f;   group.grouped = true;               CHECK_FALSE(CanRetire(group, ttl));
     RetireFacts queue = f;   queue.queue_tagged = true;          CHECK_FALSE(CanRetire(queue, ttl));
 }
+
+TEST_CASE("PoolBudget: with a census the bracket decides, not the roster total", "[poolbudget]")
+{
+    PoolBudget over{ 5420, 3000, 10, 2000 };   // a roster that grew past its cap earlier
+    CHECK(ChoosePoolSlot(over, false) == PoolSlot::Variable);
+    CHECK(ChoosePoolSlot(BalancedBudget(over, true), false) == PoolSlot::Core);        // the 1-9 bracket is short: the roster takes it
+    CHECK(ChoosePoolSlot(BalancedBudget(over, false), false) == PoolSlot::Variable);   // its bracket is full: temporary
+    PoolBudget room{ 10, 3000, 0, 2000 };
+    CHECK(ChoosePoolSlot(BalancedBudget(room, false), false) == PoolSlot::Variable);   // a full (faction, bracket) is refused even with room in total
+}

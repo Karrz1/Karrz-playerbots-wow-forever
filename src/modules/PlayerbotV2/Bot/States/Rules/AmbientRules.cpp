@@ -28,6 +28,7 @@
 #include "Travel/QuestHubDatabase.h"
 #include "Travel/TownNpcIndex.h"
 #include "Bot/TownLife.h"
+#include "Fleet/GateDuels.h"
 #include "Bot/BotRegistry.h"
 #include "Fleet/OwnerRegistry.h"
 #include "Util.h"
@@ -270,89 +271,20 @@ bool YellLfgFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,B
 }
 
 // ---------- idle:ambient_sit ----------
-// Side-effect "sit when resting" — SetStandStateIntent is idempotent
-// server-side so re-emitting on an already-sitting bot is a no-op. Fire
-// returns FALSE so subsequent registry rules still run (the legacy code
-// did this unconditionally as a side effect before any return).
-//
-// Requires sustained idle: 10 seconds of standing still without combat
-// or casting. Without this gate the bot sat on EVERY tiny pause during
-// movement — between path segments, after each enemy kill before
-// re-engaging, while a snapshot tick computed the next destination,
-// etc. Looked frankly broken from the observer's perspective.
-// Verified 2026-05-20: user reported "all bots sit on every tiny stop
-// during movement". 10s threshold matches the standard MMO "out of
-// combat → rest" feel without flooding sit animations.
-bool AmbientSitGate(BotSnapshotView const& s, BotAI& ai,
-                    GroupSnapshotView const&, uint32)
+// No longer sits: a bot sits only while it eats or drinks (idle:ooc_eat_food), never to wait or regenerate. The rule stays because its
+// gate keeps ai.last_moving_ms() current, which the fidget, look-around and wander-pause rules read as "has stood still a while".
+bool AmbientSitGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32)
 {
-    // Common safety gates first — these hold regardless of WHERE the bot
-    // is allowed to sit.
-    if (s.in_combat() || s.is_casting()) return false;
-    if (s.raw().movement.is_mounted) return false;
-    // Don't sit while anything hostile is in pull range. Even in a
-    // hub guards / event mobs / world-PvP attackers can be 40y away.
-    if (s.enemies_within(40.0f) > 0) return false;
-
-    const uint32 now_ms = s.published_at_ms();
     if (s.is_moving())
-    {
-        ai.set_last_moving_ms(now_ms);
-        return false;
-    }
-    // is_moving == false. last_moving_ms == 0 means "never moved since
-    // boot" — those bots just spawned, give them a beat before sitting.
-    const uint32 last_move = ai.last_moving_ms();
-    if (last_move == 0)
-    {
-        ai.set_last_moving_ms(now_ms);
-        return false;
-    }
-    const uint32 idle_ms = now_ms - last_move;
-
-    // I-P3g: broadened sit locations. The original gate was hub-only
-    // (operator-annotated city/village footprint, kind 3/4) — but real
-    // players also rest while parked at a flight master, waiting on a
-    // quest giver, or just standing still in a quiet safe spot after a
-    // while. Three tiers, each with conservative thresholds:
-    //
-    //   1. City / village footprint  — 30s standstill (settled in a hub).
-    //   2. Parked at a flight master or quest giver anywhere — 30s. These
-    //      are natural "I'm waiting here" spots (queuing a taxi, reading
-    //      quest text), so the same hub threshold reads naturally.
-    //   3. Anywhere else that is safe — 90s standstill. Much longer so a
-    //      bot pausing mid-route to recompute a path / scan objectives
-    //      doesn't flop down by the roadside; only a genuinely settled
-    //      bot reaches 90s of continuous standstill.
-    constexpr uint32 kHubIdleMs    = 30u * 1000u;
-    constexpr uint32 kAnywhereIdleMs = 90u * 1000u;
-
-    if (s.in_city() || s.in_village())
-        return idle_ms >= kHubIdleMs;
-
-    if (s.nearest_npc_with_flag(uint32(UNIT_NPC_FLAG_FLIGHTMASTER) |
-                                uint32(UNIT_NPC_FLAG_QUESTGIVER)) != nullptr)
-        return idle_ms >= kHubIdleMs;
-
-    return idle_ms >= kAnywhereIdleMs;
+        ai.set_last_moving_ms(s.published_at_ms());
+    else if (ai.last_moving_ms() == 0)
+        ai.set_last_moving_ms(s.published_at_ms());   // just spawned: count the standstill from now
+    return false;
 }
 
-bool AmbientSitFire(BotSnapshotView const& s, BotAI& ai,
-                    GroupSnapshotView const&,
-                    BotIntentEmitter& emit, uint32)
+bool AmbientSitFire(BotSnapshotView const&, BotAI&, GroupSnapshotView const&, BotIntentEmitter&, uint32)
 {
-    // Edge-paced: one SIT per 60s settled window. The original per-tick
-    // re-emit ("idempotent server-side") still executed ~6 intents/sec per
-    // settled bot — the TOP intent in /diag fleet-wide (Uraimus, Dolanaar
-    // inn, 2026-06-11) — and Unit::SetStandState re-sends the stand-state
-    // self-packet on every call.
-    const uint32 sit_now_ms = s.published_at_ms();
-    if (!ai.action_recently_tried(BotAI::ActionKind::AmbientSit, 0, sit_now_ms))
-    {
-        emit.emit(SetStandStateIntent{1});
-        ai.note_action_retry(BotAI::ActionKind::AmbientSit, 0, sit_now_ms);
-    }
-    return false;   // intentional: side effect only, don't claim the tick
+    return false;
 }
 
 // ---------- idle:look_at_npc ----------
@@ -596,8 +528,6 @@ bool FidgetFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
         emit.perform_emote(11 /*LAUGH*/, ObjectGuid::Empty);
     else if (pick < 16)
         emit.perform_emote(23 /*FLEX*/, ObjectGuid::Empty);
-    else if (pick < 18)
-        emit.emit(SetStandStateIntent{1});                        // sit down for a bit
     else
         emit.perform_emote(10 /*DANCE*/, ObjectGuid::Empty);
     ai.set_last_rule_fired("idle:fidget");
@@ -801,7 +731,7 @@ bool InnRestFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, 
     V2::TownLife::Counters().inn_ticks.fetch_add(1, std::memory_order_relaxed);
     if (s.is_moving()) return false;
     InnLog(s, "rests at the inn", bx, by);
-    emit.sit();
+    // A bot sits only while it eats or drinks, so the inn visit is a stand.
     ai.set_last_rule_fired("idle:inn_rest");
     return true;
 }
@@ -880,6 +810,133 @@ bool TownDuelFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
         V2::TownLife::Counters().duels.fetch_add(1, std::memory_order_relaxed);
         ai.set_last_town_show_ms(now);
         ai.set_last_rule_fired("idle:town_duel");
+        return true;
+    }
+    return false;
+}
+
+// ---------- idle:gate_duel ----------
+// A world bot the gate-duel driver (WorldBotSpawner::DriveGateDuels, Fleet/GateDuels.h) put in a pair walks to its spot outside the
+// capital's gate. The challenger asks the other for a duel (spell 7266, the game's own request: the other accepts through the duel
+// pact in BotAI, the flag and countdown are the game's); an onlooker just stands. The duel is fought by the usual combat code.
+bool GateDuelGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    if (!s.is_alive() || s.in_combat() || s.is_casting() || s.has_owner_character() || s.in_group()) return false;
+    if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground() || s.raw().movement.is_mounted) return false;
+    if (s.raw().social_events.has_duel_request || s.duel_in_progress()) return false;
+    V2::GateDuels::Assignment a;
+    return V2::GateDuels::Board::Get().Find(s.bot_id(), a);
+}
+
+bool GateDuelFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    V2::GateDuels::Assignment a;
+    if (!V2::GateDuels::Board::Get().Find(s.bot_id(), a)) return false;
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    uint32 const now = s.published_at_ms();
+    if (std::hypot(a.x - bx, a.y - by) > 3.0f)
+    {
+        // The game's own navmesh route to the spot, one leg at a time (a leg ends where the path is cut; the next tick, with the bot standing,
+        // routes the rest from there). The straight-line chunk walk is the fallback: it gives up on a goal it cannot step toward, which left
+        // pairs standing in the city and then timing out (117: Sinan 252 yd away, moving=false for the whole 120 s).
+        if (s.is_moving() || emit.move_to(a.x, a.y, a.z) || emit.move_already_emitted(a.x, a.y, a.z)
+            || States::ChunkedWalkToward(s, ai, emit, a.x, a.y, a.z, "idle:gate_duel", now))
+        {
+            ai.set_last_rule_fired("idle:gate_duel");
+            return true;
+        }
+    }
+    if (a.role == V2::GateDuels::Role::Challenger && !s.is_moving())
+    {
+        // Ask once the pair stands together; at most every 8 s, so a pending request is not asked again.
+        if (ai.last_town_show_ms() && now - ai.last_town_show_ms() < 8000u) { ai.set_last_rule_fired("idle:gate_duel"); return true; }
+        for (auto const& u : s.nearby_friends())
+        {
+            if (u.guid.GetCounter() != a.partner || !u.is_player || u.hp <= 0) continue;
+            float const d = std::hypot(u.x - bx, u.y - by);
+            if (d < 2.0f || d > 12.0f) continue;
+            V2::TownLife::PactSet(a.partner, s.bot_id(), now);
+            emit.cast(7266u, u.guid);   // Duel
+            ai.set_last_town_show_ms(now);
+            break;
+        }
+    }
+    ai.set_last_rule_fired("idle:gate_duel");
+    return true;
+}
+
+// ---------- idle:gate_challenge ----------
+// Near a capital's gate a bot now and then challenges a real player of about its level to a duel (Playerbot.World.GateDuels.
+// ChallengePlayers). A player is asked at most once every ChallengeCooldownSec, whoever asks; the player may say no.
+bool GateChallengeGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    auto const& cfg = Services::Config();
+    if (!cfg.gate_duels_enable() || !cfg.gate_duels_challenge()) return false;
+    if (!s.is_alive() || s.in_combat() || s.is_casting() || s.has_owner_character() || s.in_group() || s.is_moving()) return false;
+    if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground() || s.raw().movement.is_mounted) return false;
+    if (s.hp_pct() < 90 || s.level() < 6 || s.enemies_within(40.0f) > 0) return false;
+    if (s.raw().social_events.has_duel_request || s.duel_in_progress()) return false;
+    if (!V2::TownLife::TakesPart(s.bot_id(), 6u, s.published_at_ms(), 5u, 60u * 1000u)) return false;
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    return V2::GateDuels::Board::Get().NearGate(s.map_id(), bx, by, cfg.gate_duels_radius(), s.is_alliance());
+}
+
+bool GateChallengeFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    for (auto const& u : s.nearby_friends())
+    {
+        if (!u.is_player || u.hp <= 0) continue;
+        uint64 const id = u.guid.GetCounter();
+        if (Services::Registry().has(BotId(id))) continue;   // a real player only
+        float const d = std::hypot(u.x - bx, u.y - by);
+        if (d < 4.0f || d > 20.0f || !V2::GateDuels::PlayerDuelOk(s.level(), u.level)) continue;
+        if (!V2::GateDuels::Board::Get().ChallengeTake(id, s.published_at_ms(), Services::Config().gate_duels_challenge_cd_ms())) return false;
+        emit.cast(7266u, u.guid);   // Duel
+        V2::TownLife::Counters().gate_challenges.fetch_add(1, std::memory_order_relaxed);
+        ai.set_last_rule_fired("idle:gate_challenge");
+        return true;
+    }
+    return false;
+}
+
+// ---------- idle:grind_roam ----------
+// Playerbot.World.Questing = 0: a bot of the world levels by killing, so with no mob of its level in reach it walks to the nearest place
+// where such mobs stand (World::FindGrindSpotNear; the mobs themselves are taken by the usual engage rule, which runs below this one).
+// Within 30 yd of the spot, or with a mob to fight in reach, it yields: the local wander and the engage rule do the rest.
+bool GrindRoamGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    if (Services::Config().world_questing() || !s.is_free_world_bot()) return false;
+    if (!s.is_alive() || s.in_combat() || s.is_casting() || s.hp_pct() < 60) return false;
+    if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground() || s.raw().movement.is_mounted) return false;
+    if (V2::World::IsVanillaCapitalZone(s.zone_id())) return false;
+    uint8 const lvl = s.level();
+    for (auto const& u : s.nearby_enemies())
+    {
+        if (!u.guid.IsCreature() || u.no_xp_kill || u.is_pacified || u.untargetable) continue;
+        if (u.level > lvl + 4u || u.hp_pct() < 50 || u.victim != ObjectGuid::Empty) continue;
+        return false;   // something to fight in reach: the engage rule takes it
+    }
+    return true;
+}
+
+bool GrindRoamFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    float gx = 0.f, gy = 0.f, gz = 0.f;
+    if (!V2::World::FindGrindSpotNear(s.is_alliance(), s.map_id(), bx, by, s.level(), s.guid().GetCounter(), 700.0f, gx, gy, gz))
+        return false;
+    if (std::hypot(gx - bx, gy - by) <= 30.0f)
+        return false;
+    uint32 const now = s.published_at_ms();
+    if (s.is_moving() || emit.move_to(gx, gy, gz) || emit.move_already_emitted(gx, gy, gz)
+        || States::ChunkedWalkToward(s, ai, emit, gx, gy, gz, "idle:grind_roam", now))
+    {
+        ai.set_last_rule_fired("idle:grind_roam");
         return true;
     }
     return false;
@@ -1076,6 +1133,30 @@ void RegisterAmbientRules(IdleRuleRegistry& r)
         rule.priority = 137;
         rule.gate     = &TownDuelGate;
         rule.fire     = &TownDuelFire;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:gate_duel";
+        rule.priority = 140;   // above the other town shows: the driver chose this bot and spot
+        rule.gate     = &GateDuelGate;
+        rule.fire     = &GateDuelFire;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:grind_roam";
+        rule.priority = 55;    // just above the autoact cascade (50), which fights what is in reach and wanders
+        rule.gate     = &GrindRoamGate;
+        rule.fire     = &GrindRoamFire;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:gate_challenge";
+        rule.priority = 134;
+        rule.gate     = &GateChallengeGate;
+        rule.fire     = &GateChallengeFire;
         r.register_rule(std::move(rule));
     }
     {

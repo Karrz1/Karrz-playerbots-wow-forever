@@ -112,7 +112,7 @@ struct FollowIntent          { ObjectGuid leader; float distance; float angle_ra
 struct UseItemIntent         { uint8 bag, slot; ObjectGuid target; };
 struct UseItemByEntryIntent  { uint32 item_entry; ObjectGuid target; };
 struct EquipItemIntent       { uint8 from_bag, from_slot; uint8 to_slot; };
-struct LootIntent            { ObjectGuid corpse_or_object; };
+struct LootIntent            { ObjectGuid corpse_or_object; bool quest_only = false; };   // quest_only: take only this bot's quest drops
 struct ReleaseCorpseIntent   {};
 struct ReviveAtCorpseIntent  {};
 // Corpse-run completion: bot is ghost and has walked back into reclaim
@@ -148,7 +148,8 @@ struct QuestAcceptIntent     { ObjectGuid npc; uint32 quest_id; };
 // `reward_choice` selects from the quest's choice-item list (0 = first).
 // Pass 0xFF to let PlayerbotAPI auto-pick (ScoreQuestReward weighs equippable
 // upgrades > vendor value). Quests with only fixed rewards ignore the field.
-struct QuestCompleteIntent   { ObjectGuid npc; uint32 quest_id; uint8 reward_choice; };
+// copy_leader: the bot's copy is finished for it first (a grouped bot that does not loot) because its leader just handed the quest in.
+struct QuestCompleteIntent   { ObjectGuid npc; uint32 quest_id; uint8 reward_choice; bool copy_leader = false; };
 struct QuestAbandonIntent    { uint32 quest_id; };
 // Accept a quest just shared by a group member. The receiver-side popup is
 // driven by `Player::SetQuestSharingInfo`; the API uses GetSharedQuestID for
@@ -528,6 +529,9 @@ namespace EconomyOp {
     // (PlayerbotAPI::stock_raid_consumable; the core refuses anything outside the kits and any
     // map but a raid). Gated by Playerbot.Raid.ProvideConsumables.
     struct StockRaidConsumable { uint32 item; };
+    // Raid preparation: wear the vanilla resistance pieces of `school` (a SpellSchools value) in place of the bot's own, or put its own
+    // back (school 0). BotPopulationManager::SwapResistGear; gated by Playerbot.Raid.ResistGear.
+    struct ResistGear { uint8 school; };
 }
 
 struct EconomyIntent
@@ -542,7 +546,8 @@ struct EconomyIntent
         EconomyOp::CraftPost,
         EconomyOp::CraftClaim,
         EconomyOp::RestockClassSupplies,
-        EconomyOp::StockRaidConsumable
+        EconomyOp::StockRaidConsumable,
+        EconomyOp::ResistGear
     > op;
 };
 

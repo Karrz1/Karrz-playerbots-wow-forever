@@ -192,6 +192,8 @@ private:
     // Per-(instance,team,node) match time at which the enemy's assault on a node was first seen: the contest age the defender picker
     // uses (BgTactics::CanArriveBeforeFlip). Erased as soon as the node is no longer contested.
     std::unordered_map<uint64, uint32> contest_since_;
+    // Per-(instance,team) WSG zone-rotation epoch last planned (PlanCtf): bots keep their zone within an epoch, and a new epoch reshuffles.
+    std::unordered_map<uint64, uint32> zone_epoch_;
     uint32 last_plan_ms_ = 0;
     std::string last_dump_;
 };

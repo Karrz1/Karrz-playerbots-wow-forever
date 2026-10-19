@@ -59,6 +59,13 @@ namespace Playerbot::Raid {
         // everybody near the carrier) when it runs out, so it is dispelled before anything else; balcony phase adds
         // (naxx/classic_boss_noth.cpp).
         r.dispel.push_back({ 29213, DispelKind::Curse, true });
+        // The Wrath hits everybody near a carrier the dispellers did not reach in time: the ranged and the healers keep 10 yards apart.
+        r.spread.push_back({ 15954, 10.0f, Who::Ranged });
+        r.spread.push_back({ 15954, 10.0f, Who::Healer });
+        // Blink 29208-29211 wipes his threat list and he turns on a random raider (classic_boss_noth.cpp BlinkAndRepeatEvent: ResetThreatList,
+        // AttackStart): a tank taunts him back at once (naxx_noth 2026-10-20: 30 melee deaths of casters and healers over 13 minutes, every one
+        // under rule loose_escape, with no retaunt in the log).
+        r.retaunt.push_back(15954);
         r.priority.push_back({ 16983, 3 });     // Plagued Champion
         r.priority.push_back({ 16981, 3 });     // Plagued Guardian
         r.priority.push_back({ 16984, 2 });     // Plagued Warrior
@@ -116,6 +123,10 @@ namespace Playerbot::Raid {
         // PATCHWERK (16028): Hateful Strike hits the highest-health player in melee among his top four on threat, never the main
         // tank while others are in melee (naxx/classic_boss_patchwerk.cpp DoHatefulStrike). Three off tanks stay on him in melee.
         r.meleeSoak.push_back({ 16028, Who::OffTank, 3 });
+        // Hateful Strike is 22,100-29,900 before armour (vanilla data) on anybody within his melee reach, and his reach is long: the ranged
+        // and the healers keep 18 yards off (naxx_patchwerk 2026-10-20: healers and mages 10-13 y from him took 14-28k each; 29 dead in 47 s).
+        r.avoidEnemy.push_back({ 16028, 18.0f, Who::Ranged });
+        r.avoidEnemy.push_back({ 16028, 18.0f, Who::Healer });
 
         // ---------------------------------------------------------------------------------------------------------------
         // GROBBULUS (15931): Mutating Injection 28169 explodes into a poison cloud (creature 16363, triggers 28241 every
@@ -143,11 +154,17 @@ namespace Playerbot::Raid {
         // Stalagg's and Feugen's platforms (ClassicThadAddPositions, :154-157): bearing 2.36 rad points at one, -0.78 at the other.
         r.standByAura.push_back({ 15928, 28059, 2.36f, 9.0f, 4.0f });
         r.standByAura.push_back({ 15928, 28084, -0.78f, 9.0f, 4.0f });
+        // Feugen (15930) burns the mana of everybody within 30 yd of him (Static Field 28135, vanilla data: power burn, radius index 10):
+        // his healers and the ranged on him stand 32 yards off (his tank is still within their 40).
+        r.avoidEnemy.push_back({ 15930, 32.0f, Who::Ranged });
+        r.avoidEnemy.push_back({ 15930, 32.0f, Who::Healer });
 
         // ---------------------------------------------------------------------------------------------------------------
         // SAPPHIRON (15989): Life Drain 28542, Blizzard creatures 16474 that drift around (naxx/classic_boss_sapphiron.cpp),
         // Cleave / Tail Sweep front and back. Life Drain heals him for what it takes, so it goes before any other dispel.
         r.dispel.push_back({ 28542, DispelKind::Curse, true });
+        // Frost Aura, Blizzard and Frost Breath: Greater Frost Protection for everyone.
+        r.resistPotion.push_back({ 15989, 13456, Who::Anyone });
         r.avoidCreature.push_back({ 16474, 8.0f, Who::Anyone });
         r.avoidFrontal.push_back({ 15989, 25.0f, 50.0f, Who::NonTank });
         r.avoidFrontal.push_back({ 15989, 20.0f, 45.0f, Who::NonTank, 180.0f });   // Tail Sweep 15847 behind him
@@ -165,6 +182,9 @@ namespace Playerbot::Raid {
         r.spread.push_back({ 15990, 10.0f, Who::Healer });
         // Phase 1 adds (naxx/classic_naxxramas.h:123-126). Guardians of Icecrown (phase 3) are shackled.
         r.priority.push_back({ 16429, 4 });     // Soul Weaver
+        // Soldiers explode (Dark Blast 28457) when they reach somebody, so the ranged shoot them down on the way in; the melee keep
+        // the Soul Weavers and the Abominations (first matching row per bot wins, so the ranged row comes first).
+        r.priority.push_back({ 16427, 6, Who::Ranged });
         r.priority.push_back({ 16427, 3 });     // Soldier of the Frozen Wastes
         r.priority.push_back({ 16428, 2 });     // Unstoppable Abomination
         // Soul Weaver: Wail of Souls 28459, damage and a knockback in front of it within 30 yd (vanilla data, radius index 10).

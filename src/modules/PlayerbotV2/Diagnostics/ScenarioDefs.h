@@ -20,6 +20,8 @@ namespace Playerbot::Diagnostics {
 
 namespace ScnClass { constexpr std::uint8_t Warrior = 1, Paladin = 2, Hunter = 3, Rogue = 4, Priest = 5, Shaman = 7, Mage = 8, Warlock = 9, Druid = 11; }
 namespace ScnRace  { constexpr std::uint8_t Human = 1, Orc = 2, Dwarf = 3, NightElf = 4, Undead = 5, Tauren = 6, Gnome = 7, Troll = 8; }
+namespace ScnSchool { constexpr std::uint8_t Fire = 2, Nature = 3, Frost = 4, Shadow = 5; }   // SpellSchools values
+namespace ScnItem { constexpr std::uint32_t OnyxiaScaleCloak = 15138; }   // its aura 22683 is what Shadow Flame 22539 checks (SpellEffects.cpp)
 
 struct ScenarioMember
 {
@@ -62,8 +64,14 @@ struct ScenarioDef
     // The raid lands at least this far from that creature (0 = the default 40 y). A boss that aggroes on sight (Onyxia: 58 y) is not held, so a
     // landing inside its reach starts the fight on whoever stands nearest instead of on the tank walking in (onyxia_full n6, 2026-10-14).
     float arrive_min_yards = 0.f;
-    // Staging kills every hostile on the map but the goal boss, its formation and this entry (the boss's own adds); 0 = none.
+    // The school the squad gears resistance for, as a vanilla raid dressed for the fight (nature for Princess Huhuran); 0 = none. Every
+    // armour and jewellery slot takes the piece with the most of it under the tier's item level (GearGenerationContext::resist_school).
+    std::uint8_t resist_school = 0;
+    // A piece every raider wears for the fight whatever it scores (the Onyxia Scale Cloak against the drakes' Shadow Flame); 0 = none.
+    std::uint32_t wear_entry = 0;
+    // Staging kills every hostile on the map but the goal boss, its formation and these entries (the boss's own adds); 0 = none.
     std::uint32_t keep_entry = 0;
+    std::uint32_t keep_entry_b = 0, keep_entry_c = 0;
     // A fight with no boss death to wait for (Majordomo Executus yields when his eight adds are dead): the goal is reached when this many
     // creatures of these two entries have died on the map. 0 = the goal boss's death.
     std::uint32_t goal_adds_a = 0, goal_adds_b = 0, goal_adds_needed = 0;
@@ -207,7 +215,46 @@ struct RaidBossRow
     float arrive_min_yards = 0.f;       // see ScenarioDef::arrive_min_yards
     std::uint32_t goal_adds_a = 0, goal_adds_b = 0, goal_adds_needed = 0;   // see ScenarioDef::goal_adds_needed
     std::uint32_t spare_entry = 0;      // see ScenarioDef::spare_entry
+    std::uint32_t keep_entry_b = 0, keep_entry_c = 0;   // two more entries staging leaves alive (a trio, the other Horsemen); see ScenarioDef::keep_entry
+    std::uint8_t resist_school = 0;     // see ScenarioDef::resist_school
+    std::uint32_t wear_entry = 0;       // see ScenarioDef::wear_entry
 };
+
+// A row whose fight keeps two or three kinds of creature alive (the bug trio, the Four Horsemen): the extra ones, without spelling out
+// every field in between.
+constexpr RaidBossRow Keeps(RaidBossRow r, std::uint32_t b, std::uint32_t c = 0)
+{
+    r.keep_entry_b = b;
+    r.keep_entry_c = c;
+    return r;
+}
+
+// A row whose boss sees players from further than the core's aggro reach (under 20 y): his script's MoveInLineOfSight attacks, or pulls
+// the room, within a distance of its own, so the raid lands <yards> away, that distance plus 8 for the squad's spread round the landing
+// spot. The 124 runs of bwl_broodlord (classic_boss_broodlord_lashlayer.cpp: 40 y in sight) and aq40_huhuran (classic_boss_huhuran.cpp:
+// 80 y, no sight needed) both began in the landing second on a shadow priest, the tanks 39 y from the boss; the vanilla scripts' values
+// are in the instances' classic_boss_*.cpp.
+constexpr RaidBossRow Sight(RaidBossRow r, float yards)
+{
+    r.arrive_min_yards = yards;
+    return r;
+}
+
+// A row whose fight a vanilla raid dressed resistance gear for: the school (ScnSchool) every raider wears in each armour and jewellery slot
+// that has a piece with it under the tier's item level (ScenarioDef::resist_school).
+constexpr RaidBossRow Resist(RaidBossRow r, std::uint8_t school)
+{
+    r.resist_school = school;
+    return r;
+}
+
+// A row whose fight needs one piece on every raider whatever it scores (ScnItem; ScenarioDef::wear_entry): the Onyxia Scale Cloak, without
+// which Shadow Flame puts its 22682 burn on the target (SpellEffects.cpp: 22539 checks aura 22683).
+constexpr RaidBossRow Wears(RaidBossRow r, std::uint32_t entry)
+{
+    r.wear_entry = entry;
+    return r;
+}
 
 // In the order of the raid. Each starts at the boss's room with the encounter pre-spawned (the earlier bosses alive too).
 inline constexpr RaidBossRow kMcBosses[] = {
@@ -233,6 +280,10 @@ struct RaidEntrance { std::uint32_t map; float x, y, z, o_deg; };
 inline constexpr RaidEntrance kMcEntrance  = { 409, 1091.89f, -466.985f, -105.084f, 180.f };   // areatrigger_teleport 1102886
 inline constexpr RaidEntrance kBwlEntrance = { 469, -7673.2f, -1106.2f, 396.65f, 200.f };   // areatrigger_teleport 1103726 (vanilla entrance target)
 inline constexpr RaidEntrance kOnyEntrance = { 249, 30.8916f, -54.079f, -5.02784f, 270.f };    // areatrigger_teleport 1102848
+inline constexpr RaidEntrance kZgEntrance   = { 309, -11916.6f, -1243.52f, 92.5338f, 270.f };  // areatrigger_teleport 1103928
+inline constexpr RaidEntrance kAq20Entrance = { 509, -8436.53f, 1519.17f, 31.907f, 150.f };    // areatrigger_teleport 1104008
+inline constexpr RaidEntrance kAq40Entrance = { 531, -8221.35f, 2014.34f, 129.071f, 50.f };    // areatrigger_teleport 1104010
+inline constexpr RaidEntrance kNaxxEntrance = { 533, 3005.87f, -3435.01f, 293.882f, 0.f };     // areatrigger_teleport 1104055
 
 inline ScenarioDef MakeRaidScenario(RaidBossRow const& r, RaidEntrance const& e, std::vector<ScenarioMember> squad)
 {
@@ -261,10 +312,14 @@ inline ScenarioDef MakeRaidScenario(RaidBossRow const& r, RaidEntrance const& e,
     d.limits.stray_yards = 120.f;                                    // a raid spreads over a room
     d.arrive_near_entry = r.boss_entry;
     d.keep_entry = r.keep_entry;
+    d.keep_entry_b = r.keep_entry_b;
+    d.keep_entry_c = r.keep_entry_c;
     d.goal_adds_a = r.goal_adds_a; d.goal_adds_b = r.goal_adds_b; d.goal_adds_needed = r.goal_adds_needed;
     d.spare_entry = r.spare_entry;
     d.lair_x = r.lair_x; d.lair_y = r.lair_y; d.lair_z = r.lair_z; d.lair_o = r.lair_o;
     d.arrive_min_yards = r.arrive_min_yards;
+    d.resist_school = r.resist_school;
+    d.wear_entry = r.wear_entry;
     d.order_attack = true;
     d.order_delay_ms = 20000;
     return d;
@@ -307,7 +362,7 @@ inline ScenarioDef MakeOnyScenario()
 }
 
 // The same fight judged on the dodge. onyxia_full passes on the kill however many die, which let a live fight lose 38 of 40 (25 to Deep Breath, 11 to
-// Heated Ground, three waves, 2026-10-16) with the boss alive and say nothing. Here the fourth death fails the run and the sixth ends it: the raid
+// Heated Ground, three waves) with the boss alive and say nothing. Here the fourth death fails the run and the sixth ends it: the raid
 // stands off the line of the waypoint she hovers at before the cast, and out of the Heated Ground the pass leaves. Read the run's [raid_breath]
 // lines (the corridor opens on the cast), [raid_death] (spell, position) and [raid_hazard] (Heated Ground exits).
 inline ScenarioDef MakeOnyDodgeScenario()
@@ -332,6 +387,153 @@ inline ScenarioDef MakeBwlRazorgoreScenario()
     static constexpr RaidBossRow kRaz = { "bwl_razorgore", "Blackwing Lair: 40 level 60 raiders to Razorgore the Untamed (a bot takes the Orb of Domination, the eggs, then the kill)",
                                           12435, "Razorgore the Untamed", 20, 12557 };   // 12557 Grethok the Controller
     return MakeRaidScenario(kRaz, kBwlEntrance, RaidSquad(kMcRaid, sizeof(kMcRaid) / sizeof(kMcRaid[0])));
+}
+
+// ---- The other raids, one boss at a time: Blackwing Lair, Zul'Gurub, the Ruins and the Temple of Ahn'Qiraj, Naxxramas ----
+// The same shape as the Molten Core rows: the squad enters at the instance entrance, staging kills the trash, places the raid in sight of
+// the boss and orders the attack. A boss kill passes the run; every death is a warning. Only bosses with a creature row of their own
+// are here. Left out, with the reason: Vaelastrasz (friendly until his gossip event starts the fight), Nefarian (Victor Nefarius' gossip
+// starts phase 1, Nefarian himself is summoned), Arlokk (the gong summons her), General Rajaxx (his seven waves come from Andorov's event),
+// Ouro (a trigger summons him) and Sapphiron (the instance spawns him once the four wings are cleared).
+// Reading a run: the [raid] lines of the bots' decisions (Logger.playerbot.v2=3), [raid_death] (spell, position) and the fight hp in [raid_fight].
+
+// A 20-player raid for Zul'Gurub and the Ruins: 2 tanks, 6 healers, 12 DPS, the same characters as the first half of the 40 (the names repeat).
+inline constexpr RaidRow kRaid20[] = {
+    { "Mctankw",  ScnRace::Human,    ScnClass::Warrior, ScenarioRoleKind::Tank,   2 },
+    { "Mcheals",  ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Healer, 3 },
+    { "Mchealp",  ScnRace::Human,    ScnClass::Paladin, ScenarioRoleKind::Healer, 2 },
+    { "Mchealdr", ScnRace::NightElf, ScnClass::Druid,   ScenarioRoleKind::Healer, 1 },
+    { "Mcmage",   ScnRace::Human,    ScnClass::Mage,    ScenarioRoleKind::Dps,    3 },
+    { "Mclock",   ScnRace::Human,    ScnClass::Warlock, ScenarioRoleKind::Dps,    2 },
+    { "Mcrogue",  ScnRace::Human,    ScnClass::Rogue,   ScenarioRoleKind::Dps,    2 },
+    { "Mchunt",   ScnRace::Dwarf,    ScnClass::Hunter,  ScenarioRoleKind::Dps,    2 },
+    { "Mcwarr",   ScnRace::Dwarf,    ScnClass::Warrior, ScenarioRoleKind::Dps,    2 },
+    { "Mcshad",   ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Dps,    1 },
+};
+
+// Blackwing Lair after Razorgore (bwl_razorgore above has the orb fight). Broodlord: the Suppression Devices of his room stay (game objects),
+// the rogues disarm them. The three drakes: Wing Buffet throws the tank, Shadow Flame is a cone. Chromaggus: five Brood Afflictions, two breaths.
+inline constexpr RaidBossRow kBwlBosses[] = {
+    Sight({ "bwl_broodlord",  "Blackwing Lair: 40 level 60 raiders to Broodlord Lashlayer (Suppression Devices, Mortal Strike, Blast Wave)",
+      12017, "Broodlord Lashlayer", 20 }, 48.f),   // sees 40 y
+    // The three drakes and Nefarian cast Shadow Flame: every raider wears the Onyxia Scale Cloak. Firemaw's Flame Buffet is fire, stacking
+    // on everyone in 100 y: the raid wore fire resistance for him (123: 36 of 38 deaths to Flame Buffet).
+    Resist(Wears({ "bwl_firemaw", "Blackwing Lair: 40 level 60 raiders to Firemaw (Flame Buffet stacks, Wing Buffet, Shadow Flame cone)",
+      11983, "Firemaw",             20 }, ScnItem::OnyxiaScaleCloak), ScnSchool::Fire),
+    Wears({ "bwl_ebonroc",  "Blackwing Lair: 40 level 60 raiders to Ebonroc (Shadow of Ebonroc tank swap, Wing Buffet)",
+      14601, "Ebonroc",             20 }, ScnItem::OnyxiaScaleCloak),
+    Wears({ "bwl_flamegor", "Blackwing Lair: 40 level 60 raiders to Flamegor (Frenzy tranquilized, Wing Buffet, Shadow Flame cone)",
+      11981, "Flamegor",            20 }, ScnItem::OnyxiaScaleCloak),
+    { "bwl_chromaggus", "Blackwing Lair: 40 level 60 raiders to Chromaggus (Brood Afflictions dispelled, Time Lapse tank swap)",
+      14020, "Chromaggus",          25 },
+};
+
+// Zul'Gurub, 20 raiders. Venoxis' four cobras and Hakkar's Sons stand for the fight; Thekal's Zath and Lor'Khan (the three must die together)
+// and Mandokir's Vilebranch Speaker (his death starts the fight; Ohgan is summoned) stay.
+inline constexpr RaidBossRow kZgBosses[] = {
+    { "zg_jeklik",    "Zul'Gurub: 20 level 60 raiders to High Priestess Jeklik (bats, Great Heal kicked, Pierce Armor tank swap)",
+      14517, "High Priestess Jeklik", 20 },
+    { "zg_venoxis",   "Zul'Gurub: 20 level 60 raiders to High Priest Venoxis (cobras, Holy Wrath spread, snake form poison cloud)",
+      14507, "High Priest Venoxis",   20, 11373 },   // Razzashi Cobra
+    { "zg_marli",     "Zul'Gurub: 20 level 60 raiders to High Priestess Mar'li (spawns first, Poison Volley, Corrosive Poison dispel)",
+      14510, "High Priestess Mar'li", 20 },
+    Keeps({ "zg_thekal", "Zul'Gurub: 20 level 60 raiders to High Priest Thekal, Zath and Lor'Khan (the three die together, then the tiger)",
+      14509, "High Priest Thekal", 25, 11348 }, 11347),   // Zath, Lor'Khan
+    { "zg_mandokir",  "Zul'Gurub: 20 level 60 raiders to Bloodlord Mandokir (the Speaker starts it, Ohgan first, Threatening Gaze)",
+      11382, "Bloodlord Mandokir",    25, 11391 },   // Vilebranch Speaker
+    { "zg_jindo",     "Zul'Gurub: 20 level 60 raiders to Jin'do the Hexxer (totems first, Hex, Delusions, brain-washed raiders)",
+      11380, "Jin'do the Hexxer",     20 },
+    { "zg_hakkar",    "Zul'Gurub: 20 level 60 raiders to Hakkar (Corrupted Blood carrier runs, Cause Insanity, Blood Siphon)",
+      14834, "Hakkar",                25, 11357 },   // Son of Hakkar
+    { "zg_gahzranka", "Zul'Gurub: 20 level 60 raiders to Gahz'ranka (Frost Breath cone, Massive Geyser threat reset)",
+      15114, "Gahz'ranka",            15 },
+};
+
+// Ruins of Ahn'Qiraj, 20 raiders. Buru's eggs stay (he must be led over them).
+inline constexpr RaidBossRow kAq20Bosses[] = {
+    { "aq20_kurinnaxx", "Ruins of Ahn'Qiraj: 20 level 60 raiders to Kurinnaxx (Mortal Wound tank swap, Sand Traps, Wide Slash cone)",
+      15348, "Kurinnaxx",              20 },
+    { "aq20_moam",      "Ruins of Ahn'Qiraj: 20 level 60 raiders to Moam (Mana Fiends first, Arcane Eruption, drains kicked)",
+      15340, "Moam",                   20 },
+    { "aq20_buru",      "Ruins of Ahn'Qiraj: 20 level 60 raiders to Buru the Gorger (the chase, eggs, hatchlings, the 20% transform)",
+      15370, "Buru the Gorger",        25, 15514 },   // Buru Egg
+    { "aq20_ayamiss",   "Ruins of Ahn'Qiraj: 20 level 60 raiders to Ayamiss the Hunter (larva first, swarmers, Poison Stinger)",
+      15369, "Ayamiss the Hunter",     20 },
+    { "aq20_ossirian",  "Ruins of Ahn'Qiraj: 20 level 60 raiders to Ossirian the Unscarred (Curse of Tongues, tornados, War Stomp)",
+      15339, "Ossirian the Unscarred", 25 },
+};
+
+// Temple of Ahn'Qiraj, 40 raiders. The bug trio dies Yauj, Kri, Vem (the goal is the last); Sartura's Royal Guards and Vek'lor stand with
+// their boss; C'Thun's eye and tentacles are summoned by the instance when the raid reaches him.
+inline constexpr RaidBossRow kAq40Bosses[] = {
+    Sight({ "aq40_skeram",   "Temple of Ahn'Qiraj: 40 level 60 raiders to The Prophet Skeram (True Fulfillment, Arcane Explosion kicked, images)",
+      15263, "The Prophet Skeram",     20 }, 36.f),   // sees 28 y
+    Sight(Keeps({ "aq40_bugtrio", "Temple of Ahn'Qiraj: 40 level 60 raiders to the bug trio, Yauj then Kri then Vem (Great Heal kicked, Toxic Vapors)",
+      15544, "Vem", 25, 15543 }, 15511), 68.f),   // Princess Yauj, Lord Kri; they see 60 y
+    Sight({ "aq40_sartura",  "Temple of Ahn'Qiraj: 40 level 60 raiders to Battleguard Sartura (guards first, Whirlwinds left)",
+      15516, "Battleguard Sartura",    20, 15984 }, 93.f),   // Sartura's Royal Guard; she sees 85 y
+    Sight({ "aq40_fankriss", "Temple of Ahn'Qiraj: 40 level 60 raiders to Fankriss the Unyielding (Mortal Wound tank swap, spawns, hatchlings)",
+      15510, "Fankriss the Unyielding", 20 }, 108.f),   // sees 100 y
+    // Viscidus's Poison Shock and Poison Bolt Volley are nature: the other nature resistance fight of the temple.
+    Resist(Sight({ "aq40_viscidus", "Temple of Ahn'Qiraj: 40 level 60 raiders to Viscidus (frost to freeze, melee to shatter, globs, toxin clouds)",
+      15299, "Viscidus",               25 }, 103.f), ScnSchool::Nature),   // sees 95 y
+    Resist(Sight({ "aq40_huhuran", "Temple of Ahn'Qiraj: 40 level 60 raiders to Princess Huhuran (Frenzy tranquilized, Noxious Poison, the 30% volley)",
+      15509, "Princess Huhuran",       20 }, 88.f), ScnSchool::Nature),   // sees 80 y, no line of sight needed; worn in nature resistance
+    { "aq40_twins",    "Temple of Ahn'Qiraj: 40 level 60 raiders to the Twin Emperors (physical on Vek'nilash, casters on Vek'lor, teleports)",
+      15275, "Emperor Vek'nilash",   25, 15276 },   // Emperor Vek'lor
+    { "aq40_cthun",    "Temple of Ahn'Qiraj: 40 level 60 raiders to C'Thun (the eye and Dark Glare, tentacles, the stomach)",
+      15727, "C'Thun",                 30 },
+};
+
+// Naxxramas, 40 raiders. The adds that belong to a fight stay: Anub'Rekhan's Crypt Guards, Faerlina's Worshippers and Followers, the
+// Deathknight Understudies, the other three Horsemen, Gluth's Zombie Chows, Stalagg and Feugen.
+inline constexpr RaidBossRow kNaxxBosses[] = {
+    Sight({ "naxx_anubrekhan", "Naxxramas: 40 level 60 raiders to Anub'Rekhan (Locust Swarm kite, Crypt Guards, scarabs)",
+      15956, "Anub'Rekhan",            20, 16573 }, 63.f),   // Crypt Guard; sees 55 y
+    Keeps({ "naxx_faerlina", "Naxxramas: 40 level 60 raiders to Grand Widow Faerlina (Worshipper sacrifice after each Enrage, Rain of Fire)",
+      15953, "Grand Widow Faerlina", 20, 16506 }, 16505),   // Naxxramas Worshipper, Follower
+    Sight({ "naxx_maexxna",    "Naxxramas: 40 level 60 raiders to Maexxna (Web Wrap freed, Necrotic Poison dispelled, Poison Shock cone)",
+      15952, "Maexxna",                20 }, 48.f),   // sees 40 y
+    { "naxx_noth",       "Naxxramas: 40 level 60 raiders to Noth the Plaguebringer (the curse dispelled first, spread, balcony adds)",
+      15954, "Noth the Plaguebringer", 20 },
+    { "naxx_heigan",     "Naxxramas: 40 level 60 raiders to Heigan the Unclean (the eruption dance, Decrepit Fever, Mana Burn range)",
+      15936, "Heigan the Unclean",     20 },
+    { "naxx_loatheb",    "Naxxramas: 40 level 60 raiders to Loatheb (spores, Corrupted Mind heal rotation)",
+      16011, "Loatheb",                25 },
+    { "naxx_razuvious",  "Naxxramas: 40 level 60 raiders to Instructor Razuvious (priests control the understudies that tank him)",
+      16061, "Instructor Razuvious",   20, 16803 },   // Deathknight Understudy
+    { "naxx_gothik",     "Naxxramas: 40 level 60 raiders to Gothik the Harvester (the side split, waves, the gate, teleports)",
+      16060, "Gothik the Harvester",   25 },
+    Sight(Keeps({ "naxx_horsemen", "Naxxramas: 40 level 60 raiders to the Four Horsemen (marks, the tank rotation, Void Zones, Meteor)",
+      16062, "Highlord Mograine", 25, 16063 }, 16064, 16065), 83.f),   // Zeliek, Korth'azz, Blaumeux; they see 75 y
+    { "naxx_patchwerk",  "Naxxramas: 40 level 60 raiders to Patchwerk (Hateful Strike soaked by three off tanks)",
+      16028, "Patchwerk",              15 },
+    { "naxx_grobbulus",  "Naxxramas: 40 level 60 raiders to Grobbulus (Mutating Injection carrier runs, poison clouds, Slime Spray cone)",
+      15931, "Grobbulus",              20 },
+    Sight({ "naxx_gluth",      "Naxxramas: 40 level 60 raiders to Gluth (Mortal Wound tank swap, Frenzy tranquilized, Zombie Chows)",
+      15932, "Gluth",                  20, 16360 }, 57.f),   // Zombie Chow; sees 49 y
+    Keeps({ "naxx_thaddius", "Naxxramas: 40 level 60 raiders to Thaddius (Stalagg and Feugen first, Static Field, Polarity Shift sides)",
+      15928, "Thaddius", 25, 15929 }, 15930),   // Stalagg, Feugen
+    { "naxx_kelthuzad",  "Naxxramas: 40 level 60 raiders to Kel'Thuzad (phase 1 adds, Detonate Mana, Shadow Fissures, Guardians shackled)",
+      15990, "Kel'Thuzad",            30 },
+};
+
+inline std::vector<ScenarioDef> MakeOtherRaidScenarios()
+{
+    std::vector<ScenarioDef> v;
+    auto squad40 = [] { return RaidSquad(kMcRaid, sizeof(kMcRaid) / sizeof(kMcRaid[0])); };
+    auto squad20 = [] { return RaidSquad(kRaid20, sizeof(kRaid20) / sizeof(kRaid20[0])); };
+    for (RaidBossRow const& r : kBwlBosses)
+        v.push_back(MakeRaidScenario(r, kBwlEntrance, squad40()));
+    for (RaidBossRow const& r : kZgBosses)
+        v.push_back(MakeRaidScenario(r, kZgEntrance, squad20()));
+    for (RaidBossRow const& r : kAq20Bosses)
+        v.push_back(MakeRaidScenario(r, kAq20Entrance, squad20()));
+    for (RaidBossRow const& r : kAq40Bosses)
+        v.push_back(MakeRaidScenario(r, kAq40Entrance, squad40()));
+    for (RaidBossRow const& r : kNaxxBosses)
+        v.push_back(MakeRaidScenario(r, kNaxxEntrance, squad40()));
+    return v;
 }
 
 // ---- damage_parity: one level 60 bot per class against a level 63 target dummy ----
@@ -422,6 +624,8 @@ inline std::vector<ScenarioDef> const& ScenarioCatalogue()
         v.push_back(MakeOnyScenario());
         v.push_back(MakeOnyDodgeScenario());
         v.push_back(MakeBwlRazorgoreScenario());
+        for (ScenarioDef& d : MakeOtherRaidScenarios())
+            v.push_back(std::move(d));
         // The names are built once and kept: ScenarioDef carries char const*.
         static std::deque<std::string> s_parity_names;
         for (ParityRow const& r : kParityClasses)

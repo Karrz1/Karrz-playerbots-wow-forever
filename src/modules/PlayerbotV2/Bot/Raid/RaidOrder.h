@@ -83,6 +83,8 @@ struct RaidOrder
     // pickers stand down, the bot attacks script_focus (empty: the generic rules pick). Never set on tanks or healers.
     bool script_owns = false;
     ObjectGuid script_focus;
+    // The boss script names this bot's kill target: it wins over every generic picker (skull, kill focus, fallback).
+    bool script_names_target() const { return active && script_owns && !script_focus.IsEmpty(); }
 
     // Snapshot buffers are recycled: clear everything but keep the vector's capacity.
     void reset()

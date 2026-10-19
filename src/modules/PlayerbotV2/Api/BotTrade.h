@@ -71,6 +71,7 @@ struct Line
     std::uint32_t count = 0;
     std::uint64_t value = 0;     // fair price of the whole stack
     bool upgrade = false;        // equippable and better than what the bot wears there (only meaningful on the player's side)
+    bool reagent = false;        // a reagent of a recipe the bot knows: a gift from the owner or a group mate, so "trade them to me and ask again" works
 };
 
 struct View
@@ -88,6 +89,8 @@ struct View
     std::uint64_t order_price = 0;
     bool order_item_present = false;         // the ordered item is still in the bot's bags (or already in the window)
     bool bot_has_room = true;                // the bot can store everything the player put up
+    bool has_delivery = false;               // a craft order made for this player is waiting in the bot's bags, to be handed over for free
+    bool delivery_present = false;           // that item is still in the bags (or already in the window)
 };
 
 enum class Act : unsigned char
@@ -97,6 +100,7 @@ enum class Act : unsigned char
     Cancel,         // close the window
     SetMoney,       // put `money` in the bot's side (0 clears it)
     AddOrdered,     // put the ordered item in the bot's side
+    AddDelivery,    // put the finished craft order in the bot's side
     ClearMine       // take the bot's items back
 };
 
@@ -119,17 +123,17 @@ struct Action
     Say say = Say::None;
 };
 
-inline bool AllUpgrades(std::vector<Line> const& v)
+inline bool AllGifts(std::vector<Line> const& v)
 {
     for (Line const& l : v)
-        if (!l.upgrade) return false;
+        if (!l.upgrade && !l.reagent) return false;
     return true;
 }
 
-inline bool AnyUpgrade(std::vector<Line> const& v)
+inline bool AnyGift(std::vector<Line> const& v)
 {
     for (Line const& l : v)
-        if (l.upgrade) return true;
+        if (l.upgrade || l.reagent) return true;
     return false;
 }
 
@@ -145,6 +149,15 @@ inline std::uint64_t TotalValue(std::vector<Line> const& v)
 inline Action Decide(View const& v)
 {
     bool const he_gives = !v.his.empty();
+
+    // A finished craft order that could not go by mail: handed over for nothing when he opens a trade with nothing in it.
+    if (!he_gives && v.has_delivery && v.his_money == 0 && v.my_money == 0)
+    {
+        if (v.mine.empty())
+            return v.delivery_present ? Action{ Act::AddDelivery } : Action{ Act::Cancel, 0, Say::OrderGone };
+        if (v.his_accepted && !v.my_accepted) return { Act::Accept };
+        return {};
+    }
 
     // Sell to the player: no items from him, an order on the bot's list.
     if (!he_gives && v.has_order)
@@ -170,15 +183,15 @@ inline Action Decide(View const& v)
         return {};
     }
 
-    // Gear that is an upgrade, from the owner or a group mate: a gift.
-    if (v.gift_partner && AllUpgrades(v.his) && v.mine.empty() && v.my_money == 0)
+    // Gear that is an upgrade, or reagents for a recipe the bot knows, from the owner or a group mate: a gift.
+    if (v.gift_partner && AllGifts(v.his) && v.mine.empty() && v.my_money == 0)
     {
         if (!v.his_accepted || v.my_accepted) return {};
         return v.bot_has_room ? Action{ Act::Accept } : Action{ Act::Cancel, 0, Say::NoRoom };
     }
 
     // A mix of gifts and goods, or goods and gold from the player at once, is not a deal the bot can price.
-    if (v.his_money > 0 || (v.gift_partner && AnyUpgrade(v.his)))
+    if (v.his_money > 0 || (v.gift_partner && AnyGift(v.his)))
         return { Act::Wait, 0, Say::OneWay };
 
     // Buy from the player at the fair price.

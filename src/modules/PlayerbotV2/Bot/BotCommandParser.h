@@ -34,6 +34,11 @@ public:
     // command needs to run, and by tests that bypass the prefix layer.
     static bool DispatchSingle(Player* sender, Player* bot_player, std::string const& msg, char const* via = "whisper");
 
+    // May `sender` give this bot a group order (the panel, a party / raid line)? Its owner, or for a bot with no owner a player
+    // who is its controller in the group they share (GroupControl.h): the group leader when human, else the first human
+    // member. An invited world bot obeys the leader exactly like a companion.
+    static bool ControlsForGroupOrder(Player const* sender, Player const* bot_player);
+
     // The bot's role as its owner set it (`.bot add <class> tank`, setrole), else as its spec reads.
     static Role BotRole(Player* bot_player);
 

@@ -842,6 +842,16 @@ class TC_GAME_API PlayerScript : public ScriptObject
         // Called after a player joined the dungeon finder
         virtual void OnLfgJoin(Player* player, uint32 dungeonId, uint8 roles);
 
+        // Called when a player posts (listed) or removes (!listed) a Classic Group Finder listing
+        virtual void OnGroupFinderListing(Player* player, uint32 categoryId, std::vector<uint32> const& activities, bool listed);
+
+        // Called when `applicant` invites a player who is already in a group (the sign-up of the Group Finder list until its Apply
+        // button is answered). Return true when the script took the request: the usual "already in a group" answer is then not sent.
+        virtual bool OnGroupFinderJoinRequest(Player* member, Player* applicant);
+
+        // Called when a player searches the Classic Group Finder list, before the listings are read
+        virtual void OnGroupFinderSearch(Player* searcher);
+
         // Called when a dungeon finder proposal is sent to a player
         virtual void OnLfgProposal(Player* player, uint32 proposalId);
 };
@@ -1317,6 +1327,9 @@ class TC_GAME_API ScriptMgr
         void OnPlayerBattlegroundInvite(Player* player, uint32 instanceId, uint32 bgTypeId);
         void OnPlayerBattlegroundPortFailed(Player* player, uint8 reason, uint32 instanceId);
         void OnPlayerLfgJoin(Player* player, uint32 dungeonId, uint8 roles);
+        void OnPlayerGroupFinderListing(Player* player, uint32 categoryId, std::vector<uint32> const& activities, bool listed);
+        bool OnPlayerGroupFinderJoinRequest(Player* member, Player* applicant);
+        void OnPlayerGroupFinderSearch(Player* searcher);
         void OnPlayerLfgProposal(Player* player, uint32 proposalId);
         void OnPlayerChoiceResponse(WorldObject* object, Player* player, PlayerChoice const* choice, PlayerChoiceResponse const* response, uint16 clientIdentifier);
 

@@ -93,10 +93,11 @@ constexpr SpellTactic kSpells_rfd_7357[] = {
 };
 constexpr SpellTactic kSpells_rfd_7358[] = {
     // spell, name, school, cast_ms, tags, dispel, target, when, first_min, first_max, repeat_min, repeat_max, hp_max, hp_min, ally_hp_max, range_min, range_max, amount, tick, counters, severity, holds_schools, flags
-    { 12642, "", 0, kCastUnknown, Tag::None, Disp::None, Tgt::Self, When::Combat, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, Ctr::None, 0, 0, SF::None },
+    { 12642, "Summon Frost Spectres", 1, 0, Tag::Summon, Disp::None, Tgt::Self, When::Combat, 0, 0, 0, 0, 66, 33, 0, 0, 0, 0, 0, Ctr::None, 2, 0, SF::Scripted },
+    { 12642, "Summon Frost Spectres", 1, 0, Tag::Summon, Disp::None, Tgt::Self, When::Combat, 0, 0, 0, 0, 33, 1, 0, 0, 0, 0, 0, Ctr::None, 2, 0, SF::Scripted },
     { 15530, "Frostbolt", 16, kCastUnknown, Tag::Nuke | Tag::Dmg, Disp::None, Tgt::Victim, When::Combat, 0, 0, 2000, 2000, 100, 0, 0, 5, 40, 196, 0, Ctr::Interrupt, 2, 0, SF::Ranged },
     { 15531, "Frost Nova", 16, kCastUnknown, Tag::Dmg, Disp::None, Tgt::Victim, When::Combat, 0, 0, 10000, 15000, 100, 0, 0, 0, 5, 120, 0, Ctr::None, 1, 0, SF::None },
-    { 13009, "", 0, kCastUnknown, Tag::None, Disp::None, Tgt::Victim, When::Combat, 8000, 8000, 12000, 12000, 100, 0, 0, 0, 0, 0, 0, Ctr::None, 0, 0, SF::None },
+    { 13009, "Amnennar's Wrath", 1, 0, Tag::Knock, Disp::None, Tgt::Victim, When::Combat, 8000, 8000, 12000, 12000, 100, 0, 0, 0, 0, 0, 0, Ctr::None, 0, 0, SF::None },
 };
 constexpr SpellTactic kSpells_rfd_8567[] = {
     // spell, name, school, cast_ms, tags, dispel, target, when, first_min, first_max, repeat_min, repeat_max, hp_max, hp_min, ally_hp_max, range_min, range_max, amount, tick, counters, severity, holds_schools, flags
@@ -125,7 +126,7 @@ constexpr MobTactic kMobs_rfd[] = {
     { 7355, "Tuten'kash", 40, 40, 1, 6, 0, 0, Mob::Boss, 0, Cc::FreezeTrap | Cc::Shackle, 1, 0x800010u, 0x0u, nullptr, 0, nullptr, 0, "" },
     { 7356, "Plaguemaw the Rotting", 40, 40, 1, 7, 0, 0, Mob::Boss, 0, Cc::Polymorph | Cc::Sap | Cc::FreezeTrap, 1, 0x800010u, 0x0u, nullptr, 0, nullptr, 0, "" },
     { 7357, "Mordresh Fire Eye", 39, 39, 1, 6, 8, 1, Mob::Boss | Mob::Caster, 0, Cc::FreezeTrap | Cc::Shackle, 1, 0x800010u, 0x0u, kSpells_rfd_7357, 2, nullptr, 0, "" },
-    { 7358, "Amnennar the Coldbringer", 41, 41, 1, 6, 2, 1, Mob::Boss | Mob::Caster, 0, Cc::FreezeTrap | Cc::Shackle, 1, 0x800010u, 0x0u, kSpells_rfd_7358, 4, nullptr, 0, "" },
+    { 7358, "Amnennar the Coldbringer", 41, 41, 1, 6, 2, 1, Mob::Boss | Mob::Caster, 0, Cc::FreezeTrap | Cc::Shackle, 1, 0x800010u, 0x0u, kSpells_rfd_7358, 5, nullptr, 0, "" },
     { 8567, "Glutton", 40, 40, 1, 6, 1, 1, Mob::Boss, 0, Cc::FreezeTrap | Cc::Shackle, 1, 0x800010u, 0x0u, kSpells_rfd_8567, 2, nullptr, 0, "" },
 };
 

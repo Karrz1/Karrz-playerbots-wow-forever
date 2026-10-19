@@ -2,6 +2,8 @@
 #include "../Bot/ThreatLimits.h"
 #include "Config.h"
 #include "Log.h"
+#include "StringConvert.h"
+#include "Util.h"
 #include <algorithm>
 
 namespace Playerbot {
@@ -102,7 +104,7 @@ void ConfigReader::apply_from_loaded_config()
     session_rhythm_max_logouts_per_cycle_ = static_cast<uint32>(
         c.GetIntDefault("PlayerbotV2.SessionRhythm.MaxLogoutsPerCycle", 25, true));
 
-    guilds_enabled_                          = c.GetBoolDefault("PlayerbotV2.Guilds.Enabled", false, true);
+    guilds_enabled_                          = c.GetBoolDefault("PlayerbotV2.Guilds.Enabled", true, true);
     guilds_target_count_per_faction_         = static_cast<uint8>(c.GetIntDefault("PlayerbotV2.Guilds.TargetCountPerFaction", 6, true));
     guilds_max_members_per_guild_            = static_cast<uint16>(c.GetIntDefault("PlayerbotV2.Guilds.MaxMembersPerGuild", 75, true));
     guilds_events_enabled_                   = c.GetBoolDefault("PlayerbotV2.Guilds.EventsEnabled", true, true);
@@ -149,6 +151,7 @@ void ConfigReader::apply_from_loaded_config()
     threat_hold_enabled_    = c.GetBoolDefault("PlayerbotV2.Threat.HoldEnabled", true, true);
     raid_dps_wait_attack_   = c.GetBoolDefault("Playerbot.Raid.DpsWaitForAttack", true, true);
     raid_provide_consumables_ = c.GetBoolDefault("Playerbot.Raid.ProvideConsumables", true, true);
+    raid_resist_gear_         = c.GetBoolDefault("Playerbot.Raid.ResistGear", false, true);
     consumables_pve_          = c.GetBoolDefault("Playerbot.Consumables.PvE", true, true);
     consumables_pvp_          = c.GetBoolDefault("Playerbot.Consumables.PvP", false, true);
     raid_dps_wait_timeout_ms_ = uint32(std::clamp<int64>(int64(c.GetIntDefault("Playerbot.Raid.DpsWaitTimeoutMs", int(kRaidDpsWaitTimeoutMaxMs), true)), 1000, int64(kRaidDpsWaitTimeoutMaxMs)));
@@ -188,6 +191,43 @@ void ConfigReader::apply_from_loaded_config()
     bhv_world_bot_say_reply_  = c.GetBoolDefault("Playerbot.Behavior.WorldBotSayReply", true, true);
     bhv_instance_group_cap_   = c.GetBoolDefault("Playerbot.Behavior.InstanceGroupCap", true, true);
     bhv_open_world_group_cap_ = std::clamp<int32>(c.GetIntDefault("Playerbot.Behavior.OpenWorldGroupCap", 40, true), 1, 40);
+    lfg_enable_               = c.GetBoolDefault("Playerbot.Lfg.Enable", true, true);
+    lfg_instant_fill_         = c.GetBoolDefault("Playerbot.Lfg.InstantFillIfNobody", false, true);
+    lfg_trickle_              = c.GetBoolDefault("Playerbot.Lfg.Trickle", true, true);
+    lfg_level_range_          = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.LevelRange", 5, true), 0, 80));
+    lfg_bot_fill_seconds_     = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.BotFillSeconds", 180, true), 0, 3600));
+    lfg_categories_.clear();
+    std::string const lfgCategories = c.GetStringDefault("Playerbot.Lfg.Categories", "", true);
+    for (std::string_view token : Trinity::Tokenize(lfgCategories, ',', false))
+        if (Optional<uint32> id = Trinity::StringTo<uint32>(token))
+            lfg_categories_.push_back(*id);
+    lfg_activity_maps_.clear();
+    std::string const lfgActivityMaps = c.GetStringDefault("Playerbot.Lfg.ActivityMaps", "214272:229", true);
+    for (std::string_view token : Trinity::Tokenize(lfgActivityMaps, ',', false))
+    {
+        size_t const colon = token.find(':');
+        if (colon == std::string_view::npos)
+            continue;
+        Optional<uint32> activity = Trinity::StringTo<uint32>(token.substr(0, colon));
+        Optional<uint32> map = Trinity::StringTo<uint32>(token.substr(colon + 1));
+        if (activity && map)
+            lfg_activity_maps_.emplace_back(*activity, *map);
+    }
+    lfg_bot_groups_max_       = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.BotGroups.Max", 6, true), 0, 20));
+    lfg_bot_groups_max_bots_  = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.BotGroups.MaxBots", 100, true), 0, 400));
+    lfg_bot_groups_category_  = uint32(std::max<int32>(c.GetIntDefault("Playerbot.Lfg.BotGroups.Category", 2, true), 0));
+    lfg_bot_groups_min_seconds_ = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.BotGroups.MinMinutes", 5, true), 1, 120)) * 60;
+    lfg_bot_groups_max_seconds_ = std::max(lfg_bot_groups_min_seconds_,
+        uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.BotGroups.MaxMinutes", 20, true), 1, 240)) * 60);
+    lfg_bot_groups_interval_seconds_ = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.BotGroups.IntervalSeconds", 30, true), 10, 3600));
+    // one entry per vanilla dungeon of the Group Finder: activity id x 256 : map : level min : level max
+    static char const* const kDefaultListedActivities =
+        "203776:43:15:24,204032:289:58:60,204288:389:13:18,204544:36:17:26,204800:33:20:30,205056:48:24:32,"
+        "205312:34:24:32,205568:90:29:38,205824:47:29:38,206080:189:30:38,206336:129:37:46,206592:70:41:51,"
+        "206848:209:44:54,207104:349:46:55,207360:109:50:60,207616:230:52:60,207872:229:55:60,208128:429:54:60,"
+        "208384:429:56:60,208640:429:56:60,208896:329:58:60,211712:189:36:44,211968:189:38:46,212224:189:33:41,"
+        "214272:229:59:60:10";
+    lfg_bot_groups_activities_ = V2::ParseListedActivities(c.GetStringDefault("Playerbot.Lfg.BotGroups.Activities", kDefaultListedActivities, true));
     bhv_bg_human_priority_    = c.GetBoolDefault("Playerbot.Behavior.BgHumanPriority", true, true);
     bhv_tank_markers_         = c.GetBoolDefault("Playerbot.Behavior.TankMarkers", true, true);
     bhv_mark_cc_              = c.GetBoolDefault("Playerbot.Behavior.MarkCc", true, true);
@@ -202,6 +242,8 @@ void ConfigReader::apply_from_loaded_config()
     bhv_ranged_slow_          = c.GetBoolDefault("Playerbot.Behavior.RangedSlow", true, true);
     bhv_ike3_commands_        = c.GetBoolDefault("Playerbot.Behavior.Ike3Commands", true, true);
     bhv_owner_commands_       = c.GetBoolDefault("Playerbot.Behavior.OwnerCommands", true, true);
+    bhv_passive_leash_yd_     = std::max(0.0f, float(c.GetFloatDefault("Playerbot.Behavior.PassiveLeashYd", 25.0f, true)));
+    bhv_aggressive_radius_yd_ = std::max(1.0f, float(c.GetFloatDefault("Playerbot.Behavior.AggressiveRadiusYd", 10.0f, true)));
     bhv_fidget_               = c.GetBoolDefault("Playerbot.Behavior.Fidget", true, true);
     addon_hint_enabled_       = c.GetBoolDefault("Playerbot.AddonHint.Enable", false, true);
     addon_hint_delay_sec_     = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.AddonHint.DelaySec", 30, true), 5, 600));
@@ -212,6 +254,12 @@ void ConfigReader::apply_from_loaded_config()
     bhv_party_banter_         = c.GetBoolDefault("Playerbot.Behavior.PartyBanter", true, true);
     bhv_social_emotes_        = c.GetBoolDefault("Playerbot.Behavior.SocialEmotes", true, true);
     bhv_polite_world_bots_    = c.GetBoolDefault("Playerbot.Behavior.PoliteWorldBots", true, true);
+    world_questing_           = c.GetBoolDefault("Playerbot.World.Questing", false, true);
+    gate_duels_enable_        = c.GetBoolDefault("Playerbot.World.GateDuels.Enable", true, true);
+    gate_duels_pairs_         = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.GateDuels.PairsPerGate", 2, true), 1, 3));
+    gate_duels_radius_        = std::clamp(float(c.GetFloatDefault("Playerbot.World.GateDuels.Radius", 80.0f, true)), 30.0f, 200.0f);
+    gate_duels_challenge_     = c.GetBoolDefault("Playerbot.World.GateDuels.ChallengePlayers", true, true);
+    gate_duels_challenge_cd_ms_ = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.GateDuels.ChallengeCooldownSec", 600, true), 30, 86400)) * 1000u;
     bhv_quest_accept_         = c.GetBoolDefault("Playerbot.Behavior.QuestAccept", true, true);
     bhv_quest_share_          = c.GetBoolDefault("Playerbot.Behavior.QuestShare", true, true);
     bhv_quest_turn_in_        = c.GetBoolDefault("Playerbot.Behavior.QuestTurnIn", true, true);

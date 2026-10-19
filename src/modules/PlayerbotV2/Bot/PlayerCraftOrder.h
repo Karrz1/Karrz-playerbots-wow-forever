@@ -145,10 +145,12 @@ struct Option
     std::uint32_t item = 0;
     std::uint32_t yield = 1;   // items one cast makes
     std::string name;          // lower case item name
+    std::uint32_t rank = 0;    // how good the item is (required level, then item level): the better one wins a name that fits several ranks
 };
 
 // Index of the recipe that answers the request, -1 when none. A link matches by item entry; a name matches exactly, then as a prefix,
-// then as a substring (ties: shorter name, then lower spell id).
+// then as a substring (ties: the better rank, then shorter name, then lower spell id). "craft water" fits every Conjure Water rank and the
+// mage gave the first one; an exact name still gets exactly that item.
 inline int Match(Request const& request, std::span<Option const> options)
 {
     int best = -1;
@@ -171,7 +173,10 @@ inline int Match(Request const& request, std::span<Option const> options)
         if (!better && rank == best_rank)
         {
             Option const& b = options[std::size_t(best)];
-            better = o.name.size() < b.name.size() || (o.name.size() == b.name.size() && o.spell < b.spell);
+            if (o.rank != b.rank && rank != 1)
+                better = o.rank > b.rank;
+            else
+                better = o.name.size() < b.name.size() || (o.name.size() == b.name.size() && o.spell < b.spell);
         }
         if (better)
         {
@@ -188,13 +193,14 @@ struct Facts
     std::uint32_t yield = 1;           // items per cast
     std::uint32_t max_items = 0;       // config cap per order
     std::uint32_t casts_possible = 0;  // casts the bot's reagents allow right now
+    std::uint32_t carry_room = 0xFFFFFFFFu;  // more of the item the bot may hold: a unique item (max count 1) it already carries leaves 0
 };
 
 struct Plan
 {
     std::uint32_t casts = 0;
     std::uint32_t items = 0;           // casts * yield
-    char const* refusal = nullptr;     // "no_reagents" | "too_many" when nothing can be made
+    char const* refusal = nullptr;     // "no_reagents" | "too_many" | "already_carried" when nothing can be made
     bool trimmed = false;              // fewer than wanted
 };
 
@@ -208,18 +214,43 @@ inline Plan PlanOrder(Facts const& f)
         p.refusal = "too_many";
         return p;
     }
+    if (f.carry_room < yield)
+    {
+        p.refusal = "already_carried";
+        return p;
+    }
     if (f.casts_possible == 0)
     {
         p.refusal = "no_reagents";
         return p;
     }
-    std::uint32_t const wanted = std::min(f.wanted, f.max_items);
+    std::uint32_t const wanted = std::min({ f.wanted, f.max_items, f.carry_room });
     std::uint32_t const need = (wanted + yield - 1u) / yield;
-    std::uint32_t const cap = f.max_items / yield;
+    std::uint32_t const cap = std::min(f.max_items, f.carry_room) / yield;
     p.casts = std::min({ need, f.casts_possible, std::max<std::uint32_t>(cap, 1u) });
     p.items = p.casts * yield;
     p.trimmed = p.items < f.wanted;
     return p;
+}
+
+// How many more of an item the bot may hold: a unique item (max count 1, like Mana Jade) it already carries leaves none, 0 max count
+// means no limit.
+constexpr std::uint32_t CarryRoom(std::uint32_t max_count, std::uint32_t carried)
+{
+    if (max_count == 0)
+        return 0xFFFFFFFFu;
+    return max_count > carried ? max_count - carried : 0u;
+}
+
+// A finished order goes to the requester by mail, unless the item cannot travel that way: a conjured item is refused by the mail, so the
+// bot hands it over in a trade window instead. A soulbound item cannot be given away by either route.
+enum class Delivery : std::uint8_t { Mail, Trade, Bound };
+
+constexpr Delivery DeliveryFor(bool conjured, bool soulbound)
+{
+    if (soulbound)
+        return Delivery::Bound;
+    return conjured ? Delivery::Trade : Delivery::Mail;
 }
 
 } // namespace Playerbot::V2::PlayerCraft

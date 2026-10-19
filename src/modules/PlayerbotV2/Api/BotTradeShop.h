@@ -46,6 +46,10 @@ void StoreList(Player const* bot, Player const* buyer, std::vector<Offer> list);
 bool GetList(Player const* bot, Player const* buyer, std::vector<Offer>& out);
 bool PlaceOrder(Player const* bot, Player const* buyer, size_t index, Offer& out);
 
+// A finished craft order that cannot go by mail (a conjured item, or the mail failed): when `requester` opens a trade with the bot
+// within ten minutes, the bot puts the item (`entry`, from its bags) in the window and accepts once he has. One per bot.
+void StoreDelivery(Player const* bot, ObjectGuid requester, uint32 entry);
+
 // "1) Linen Cloth x20 - 40s" lines packed into whisper-sized chunks.
 std::vector<std::string> Describe(std::vector<Offer> const& list);
 

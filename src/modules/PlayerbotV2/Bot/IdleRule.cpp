@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <mutex>
 #include "Log.h"   // TC_LOG_ERROR
+#include "Services.h"
+#include "Util/ConfigReader.h"
 
 namespace Playerbot {
 
@@ -46,6 +48,7 @@ bool IsWorldErrand(std::string_view name)
         "idle:pet_swap_from_stable", "idle:pursue_quest_", "idle:pvp_help_callout", "idle:assist_friend_pvp",
         "idle:quest_", "idle:react_to_passerby", "idle:resolve_junk_quests", "idle:swim_stuck_hearth",
         "idle:swim_stuck_walk_to_hub", "idle:tame_beast", "idle:taxi_discover", "idle:transport_ride", "idle:vendor_visit",
+        "idle:bag_hearth", "idle:fidget", "idle:inn_rest", "idle:mailbox", "idle:town_duel", "idle:wander",
         "idle:walk_",
         "idle:wq_", "idle:yell_lfg", "idle:ambient_sit", "idle:rpg_",
     };
@@ -59,7 +62,11 @@ bool IsWorldErrand(std::string_view name)
 void IdleRuleRegistry::finalize()
 {
     for (IdleRule& rule : rules_)
+    {
         rule.world_errand = IsWorldErrand(rule.name);
+        rule.quest_seek = rule.name == "idle:walk_to_known_hub" || rule.name == "idle:wander_to_quest_hub";
+        rule.fight_exempt = rule.name.starts_with("idle:autoact_dispatch");
+    }
     std::stable_sort(rules_.begin(), rules_.end(),
         [](IdleRule const& a, IdleRule const& b) { return a.priority > b.priority; });
     throttled_ = 0;
@@ -97,7 +104,11 @@ std::string_view IdleRuleRegistry::tick(BotSnapshotView const& s, BotAI& ai,
         if (r.priority < min_priority) break;   // rules_ sorted desc — bail early
         if (!r.enabled) continue;
         if (!r.gate)    continue;
-        if (r.world_errand && s.is_companion_with_owner()) continue;
+        // A bot in a group with a player (its owner, or the player who invited it) never runs world errands.
+        if (r.world_errand && s.is_led_by_player()) continue;
+        // No errand (bag run, vendor, walk to a hub) while fighting or with a victim (auto-attack target): a full-bag bot used to walk off mid-fight.
+        if (r.world_errand && !r.fight_exempt && (s.in_combat() || !s.victim().IsEmpty())) continue;
+        if (r.quest_seek && !Services::Config().world_questing() && s.is_free_world_bot()) continue;
         // Per-rule gate-throttle, kept per bot: a rule with min_interval_ms > 0 is looked at by a given bot no more than once per interval
         // (low-urgency rules such as mail, calendar, auction and charter do not need every tick). The first look is spread over the
         // interval by a hash of bot and rule, so a fleet does not look in the same second.

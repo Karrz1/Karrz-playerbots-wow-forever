@@ -27,6 +27,9 @@
 
 class WorldObject;
 
+// Unlocks the nav lock the calling thread still holds after a caught hardware fault skipped its destructor (MapUpdater). No-op otherwise.
+TC_GAME_API void ReleaseNavLockAfterFault();
+
 // 74*4.0f=296y number_of_points*interval = max_path_len
 // this is way more than actual evade range
 // I think we can safely cut those down even more

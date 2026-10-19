@@ -438,6 +438,10 @@ bool Pet::LoadPetFromDB(Player* owner, uint32 petEntry, uint32 petnumber, bool c
 
         SetGroupUpdateFlag(GROUP_UPDATE_PET_FULL);
 
+        TC_LOG_INFO("entities.pet", "Pet loaded for {}: number {} entry {} type {} level {} display {} scale {} spells {} specialization {}", owner->GetName(),
+            GetCharmInfo() ? GetCharmInfo()->GetPetNumber() : 0, GetEntry(), uint32(getPetType()), uint32(GetLevel()), GetDisplayId(), GetObjectScale(),
+            m_spells.size(), GetSpecialization());
+
         if (getPetType() == HUNTER_PET)
         {
             if (PreparedQueryResult result = holder.GetPreparedResult(PetLoadQueryHolder::DECLINED_NAMES))
@@ -2063,7 +2067,15 @@ float Pet::GetNativeObjectScale() const
     if (creatureFamily && creatureFamily->MinScale > 0.0f && creatureFamily->MaxScale > 0.0f && getPetType() == HUNTER_PET)
         return PetScaling::FamilyScale(*creatureFamily, GetLevel());
 
-    return Guardian::GetNativeObjectScale();
+    // a template without a scale would give the pet ObjectScale 0, which the client asserts on ("scale > FLT_EPSILON") when it draws the pet
+    float const scale = Guardian::GetNativeObjectScale();
+    if (!(scale > 0.01f))
+    {
+        TC_LOG_ERROR("entities.pet", "Pet::GetNativeObjectScale: creature {} has scale {}, using 1", GetEntry(), scale);
+        return 1.0f;
+    }
+
+    return scale;
 }
 
 void Pet::SetDisplayId(uint32 modelId, bool setNative /*= false*/)

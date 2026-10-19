@@ -23,7 +23,11 @@
 #include "MoveSpline.h"
 #include "MoveSplineInit.h"
 #include "PathGenerator.h"
+#include "Player.h"
 #include "Unit.h"
+#include "WorldSession.h"
+
+static constexpr float CHASE_BOT_REPATH_DIST = 2.5f;
 
 static bool HasLostTarget(Unit* owner, Unit* target)
 {
@@ -72,13 +76,15 @@ ChaseMovementGenerator::ChaseMovementGenerator(Unit *target, Optional<ChaseRange
 }
 ChaseMovementGenerator::~ChaseMovementGenerator() = default;
 
-bool ChaseMovementGenerator::Initialize(Unit* /*owner*/)
+bool ChaseMovementGenerator::Initialize(Unit* owner)
 {
     RemoveFlag(MOVEMENTGENERATOR_FLAG_INITIALIZATION_PENDING | MOVEMENTGENERATOR_FLAG_DEACTIVATED);
     AddFlag(MOVEMENTGENERATOR_FLAG_INITIALIZED | MOVEMENTGENERATOR_FLAG_INFORM_ENABLED);
 
     _path = nullptr;
     _lastTargetPosition.reset();
+    Player const* playerOwner = owner->ToPlayer();
+    _throttleRepath = playerOwner && playerOwner->GetSession() && playerOwner->GetSession()->IsBot();
     return true;
 }
 
@@ -151,6 +157,15 @@ bool ChaseMovementGenerator::Update(Unit* owner, uint32 diff)
         owner->SetInFront(target);
         DoMovementInform(owner, target);
     }
+
+    // Playerbot chasers: while a chase spline is in flight, re-path only once the target has drifted CHASE_BOT_REPATH_DIST from where it stood at
+    // the last launch. The stock rule re-paths on ANY step of the target, i.e. every update while a mob walks about, and every launch of a player
+    // unit is a stop packet and a new spline: the client got ten of them a second and showed the bot sliding without the run animation (PC 20 Oct,
+    // mages and hunters ordered at a wandering mob). _lastTargetPosition is left untouched while holding, so the drift accumulates; a finished
+    // spline, a speed change (reset) or a larger drift re-paths exactly as before.
+    if (_throttleRepath && _lastTargetPosition && mutualChase == _mutualChase && owner->HasUnitState(UNIT_STATE_CHASE_MOVE) && !owner->movespline->Finalized()
+        && _lastTargetPosition->GetExactDistSq(target->GetPosition()) < CHASE_BOT_REPATH_DIST * CHASE_BOT_REPATH_DIST)
+        return true;
 
     // if the target moved, we have to consider whether to adjust
     if (!_lastTargetPosition || target->GetPosition() != _lastTargetPosition.value() || mutualChase != _mutualChase)

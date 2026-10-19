@@ -289,7 +289,6 @@ bool Arrive(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit, NearbyU
     if (s.is_mounted())
         emit.dismount();
 
-    bool sit = false;
     if (live)
     {
         st.npc = live->guid;
@@ -310,12 +309,7 @@ bool Arrive(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit, NearbyU
             emit.repair_all(live->guid);
             ai.note_action_retry(BotAI::ActionKind::Repair, low, now_ms);
         }
-        // A rest at the inn now and then (ike3 rpg stay).
-        sit = (st.npc_flags & UNIT_NPC_FLAG_INNKEEPER) && ai.rng().chance_pct(35);
     }
-    if (sit)
-        emit.sit();
-    else
     {
         // Talk, bow, wave, exclaim, ask, laugh, point: all vanilla one-shot emotes.
         static constexpr uint32 kTalkEmotes[] = {

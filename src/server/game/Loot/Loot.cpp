@@ -450,7 +450,7 @@ LootRoll::~LootRoll()
         SendAllPassed();
 
     // every player that was handed this roll must drop the pointer, voters included: a voter keeps it in Player::m_lootRolls
-    // until now, and the next lookup (Player::GetLootRoll, bot roll votes) would read a destroyed roll
+    // until now, and the next lookup (Player::GetLootRoll from a roll vote packet) would read a destroyed roll
     for (auto const& [playerGuid, roll] : m_rollVoteMap)
     {
         Player* player = m_map ? ObjectAccessor::GetPlayer(m_map, playerGuid) : nullptr;

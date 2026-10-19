@@ -250,7 +250,8 @@ void DoFireBlast(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(FI
 
 bool ShouldNuke(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && ManaPct(ctx) >= NukeManaFloor(ctx) && Ready(ctx, NukeSpell(ctx));
+    uint32 const spell = NukeSpell(ctx);
+    return HasLiveTarget(ctx) && ManaPct(ctx) >= NukeManaFloor(ctx) && (Ready(ctx, spell) && ctx.bot.victim_in_spell_range(spell));
 }
 void DoNuke(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(NukeSpell(ctx), ctx.bot.victim()); }
 
@@ -259,7 +260,7 @@ void DoNuke(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(NukeSpe
 // Fireball on fire, Arcane Missiles on arcane), same mana gates as the nuke.
 bool NukeUsable(ApPredicateContext const& ctx, uint32 spell)
 {
-    return HasLiveTarget(ctx) && ManaPct(ctx) >= NukeManaFloor(ctx) && Ready(ctx, spell);
+    return HasLiveTarget(ctx) && ManaPct(ctx) >= NukeManaFloor(ctx) && (Ready(ctx, spell) && ctx.bot.victim_in_spell_range(spell));
 }
 bool ShouldFrostboltNuke(ApPredicateContext const& ctx)      { return NukeUsable(ctx, FROSTBOLT); }
 bool ShouldFireballNuke(ApPredicateContext const& ctx)       { return NukeUsable(ctx, FIREBALL); }
@@ -288,7 +289,7 @@ void DoSchoolNuke(ApPredicateContext const& ctx, BotIntentEmitter& e) { SchoolHi
 
 bool ShouldWand(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && (Ready(ctx, SHOOT_WAND) && ctx.bot.victim_in_spell_range(SHOOT_WAND)) && ctx.bot.current_cast_spell_id() == 0
+    return HasLiveTarget(ctx) && ctx.bot.raw().consumables.wand_school_mask != 0 && (Ready(ctx, SHOOT_WAND) && ctx.bot.victim_in_spell_range(SHOOT_WAND)) && ctx.bot.current_cast_spell_id() == 0
         && ManaPct(ctx) < NukeManaFloor(ctx);
 }
 void DoWand(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(SHOOT_WAND, ctx.bot.victim()); }

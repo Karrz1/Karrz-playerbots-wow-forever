@@ -1,4 +1,5 @@
 ﻿#include "BotCommandParser.h"
+#include "GroupControl.h"
 #include "BotIntent.h"
 #include "BotIntentEmitter.h"
 #include "BotRegistry.h"
@@ -754,7 +755,7 @@ void ReportRaidRoster(Player* sender, Player* bot)
 // a recognised value.
 // Owner "distance <n>" / "follow distance <n>" (Playerbot.Behavior.DistanceOrder; the /fb Distance stepper): pins the bot's
 // follow distance (BotAI::follow_distance, persisted with the squad state) and the formation spacing yards together, so
-// the plain follow, the formation slots and the recall slack all agree. Clamped to 1..20 yards; the group's lowest-guid
+// the plain follow, the formation slots and the recall slack all agree. Clamped to 2..20 yards; the group's lowest-guid
 // bot whispers the confirmation. The spacing yards are memory only (as the spacing presets are); the addon re-sends
 // the value on login. World thread. `rest` is the text after the verb.
 bool OrderDistance(Player* sender, Player* bot, std::string const& rest)
@@ -764,7 +765,7 @@ bool OrderDistance(Player* sender, Player* bot, std::string const& rest)
         return false;
     float yd = 0.f;
     try { yd = std::stof(rest); } catch (...) { return false; }
-    yd = std::clamp(yd, 1.0f, 20.0f);
+    yd = std::clamp(yd, 2.0f, 20.0f);
     BotAI* ai = Services::Registry().ai(bot->GetGUID().GetCounter());
     if (!ai) return true;
     ai->set_follow_distance(yd);
@@ -1473,7 +1474,7 @@ bool OwnerWordOrder(Player* sender, Player* bot, std::string const& n)
             if (bid != lowest)
                 return true;
         }
-        say("Orders (whisper me, or say it in party / raid chat): follow, stay, come, summon, attack, flee, hold, resume, passive, defensive, aggressive.");
+        say("Orders (whisper me, or say it in party / raid chat): follow, stay, come, summon, attack, flee, hold, resume, passive, aggressive.");
         say("Ask: who, stats, gear, quests, inv, money. Quests: accept [all], drop <quest>, turn in, share.");
         say("Town and loot: sell grey, repair, loot / loot all. Raid: pull, pull back, fall back, rally here, formation <x>, spacing <x>, distance <n>, assign, rti.");
         say("The whole verb index: 'commands'. Address several bots: all: / tank: / healer: / dps: / <class>: / <Name>: before the order.");
@@ -1625,7 +1626,7 @@ bool OwnerWordOrder(Player* sender, Player* bot, std::string const& n)
     // Passive: the bot starts nothing (no autopilot pull, no assist on the owner's target) and defends itself and the group
     // until attack / pull (a 15 s window) or aggressive. A fight already under way is not dropped. The stance is the panel's
     // Aggressive / Passive toggle and stays on the bot until changed.
-    if (n == "passive")
+    if (n == "passive" || n == "defensive")   // "defensive" is the retired third stance: it now means passive
     {
         if (BotAI* ai = Services::Registry().ai(bid))
         {
@@ -1646,7 +1647,7 @@ bool OwnerWordOrder(Player* sender, Player* bot, std::string const& n)
         {
             if (ai->set_owner_stance(BotAI::OwnerStance::Aggressive))
                 TC_LOG_INFO("playerbot.v2", "[owner_order] {} <- {}: aggressive (attacks hostiles within {:.0f} yd of the owner)", me,
-                            sender->GetName(), BotAI::kAggressiveRadiusYd);
+                            sender->GetName(), Services::Config().behavior_aggressive_radius_yd());
             // A Stay / Hold stays: aggressive changes the stance only (it used to cancel the Stay silently).
             if (!ai->holding_position(GameTime::GetGameTimeMS()))
             {
@@ -1654,31 +1655,37 @@ bool OwnerWordOrder(Player* sender, Player* bot, std::string const& n)
                 ai->release_owner_lead(false);
             }
         }
-        say(fmt::format("{}: aggressive, attacking anything hostile within {:.0f} yards of you", me, BotAI::kAggressiveRadiusYd));
+        say(fmt::format("{}: aggressive, attacking anything hostile within {:.0f} yards of you", me, Services::Config().behavior_aggressive_radius_yd()));
         return true;
     }
-    if (n == "defensive")
-    {
-        Push(bot, StopMovementIntent{/*clear_generators*/ true});
-        if (BotAI* ai = Services::Registry().ai(bid))
-        {
-            ai->enter_manual(BotAI::OwnerCommand::Hold, ObjectGuid::Empty, GameTime::GetGameTimeMS(), BotAI::kHoldPositionTtlMs);
-            // Defensive replaces an Aggressive stance (a Passive one already fights only what attacks); the Hold does the rest.
-            if (ai->owner_stance() == BotAI::OwnerStance::Aggressive)
-                ai->set_owner_stance(BotAI::OwnerStance::Auto);
-            ai->set_last_owner_name(sender->GetName());
-        }
-        say(me + ": defensive, holding here and fighting only what attacks");
-        return true;
-    }
-
     // ---- invite (whispered: the bot invites its owner) --------------------------------------------------------------
+    // "leave" / "leave group": the bot leaves whatever group it is in (a bots-only remainder after its owner left, for one).
+    if ((n == "leave" || n == "leave group" || n == "leavegroup") && t_direct_whisper)
+    {
+        if (!bot->GetGroup())
+        {
+            say(me + ": I am not in a group");
+            return true;
+        }
+        Push(bot, GroupLeaveIntent{});
+        say(me + ": leaving the group");
+        return true;
+    }
     if (n == "invite" && t_direct_whisper)
     {
         if (Group const* g = bot->GetGroup(); g && g->IsMember(sender->GetGUID()))
         {
             say(me + ": you are already in my group");
             return true;
+        }
+        // In a group of bots only (left behind when its owner left): leave it first, or the invite below could not be made.
+        if (Group const* g = bot->GetGroup())
+        {
+            bool has_player = false;
+            for (auto const& slot : g->GetMemberSlots())
+                if (slot.guid != bot->GetGUID() && !Services::Registry().has(slot.guid.GetCounter())) { has_player = true; break; }
+            if (!has_player)
+                Push(bot, GroupLeaveIntent{});
         }
         Push(bot, InviteToGroupIntent{sender->GetGUID()});
         say(me + ": invite sent");
@@ -1862,6 +1869,26 @@ static void ConfirmWhisperOrder(Player* sender, Player* bot, std::string const& 
     else
         text = fmt::format("{}: {} ok", me, n);
     Push(bot, WhisperIntent{sender->GetName(), std::move(text)});
+}
+
+bool BotCommandParser::ControlsForGroupOrder(Player const* sender, Player const* bot)
+{
+    if (!sender || !bot || sender == bot || !sender->GetSession())
+        return false;
+    BotId const bot_id = bot->GetGUID().GetCounter();
+    if (Services::Owners().GetOwner(bot_id).account_id != 0)
+        return Services::Owners().IsOwner(bot_id, sender->GetSession()->GetAccountId(), sender->GetGUID().GetCounter());
+    Group const* g = bot->GetGroup();
+    if (!g || g != sender->GetGroup() || (sender->GetSession() && sender->GetSession()->IsBot()))
+        return false;
+    std::vector<GroupControl::Member<ObjectGuid>> members;
+    for (GroupReference const& itr : g->GetMembers())
+    {
+        Player const* m = itr.GetSource();
+        if (!m || m == bot) continue;
+        members.push_back({ m->GetGUID(), !(m->GetSession() && m->GetSession()->IsBot()) });
+    }
+    return GroupControl::ResolveController(g->GetLeaderGUID(), members) == sender->GetGUID();
 }
 
 bool BotCommandParser::DispatchSingle(Player* sender, Player* bot, std::string const& msg, char const* via)
@@ -2625,6 +2652,8 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
         if (BotAI* ai = Services::Registry().ai(bot->GetGUID().GetCounter()))
         {
             AutoAssignFormationSlot(bot, *ai);
+            ai->close_owner_order_window();   // a follow ends the attack / pull window: nothing it opened starts a fight again
+            Push(bot, PetSetCommandStateIntent{1});   // and the pet comes along instead of staying on its target
             ai->enter_manual(BotAI::OwnerCommand::Follow, sender->GetGUID(),
                              GameTime::GetGameTimeMS());
             ai->set_last_owner_name(sender->GetName());
@@ -4133,7 +4162,14 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
         // A healer keeps healing on Attack and does not walk in to melee (playtest, Deadmines 2026-10-15): it takes no engage order. Its
         // own fight logic heals first and casts or wands at the group's target only while nobody needs healing.
         if (BotRole(bot) == Role::Healer)
+        {
+            // A Stay left by an earlier order (the altar's "then I stay there", 30 min) pinned both priests at the altar while
+            // Pyroguard Emberseer killed one in melee at 3 y (UBRS 20 Oct 21:02): the Attack ends it, the healer follows and heals again.
+            if (BotAI* heal_ai = Services::Registry().ai(bot->GetGUID().GetCounter()))
+                if (heal_ai->holding_position(GameTime::GetGameTimeMS()))
+                    heal_ai->exit_manual();
             return true;
+        }
         Push(bot, StartAttackIntent{target->GetGUID()});
         if (BotAI* ai = Services::Registry().ai(bot->GetGUID().GetCounter()))
         {
@@ -4311,6 +4347,15 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
     if (cmd == "stop" || cmd == "passive" || cmd == "disengage")
     {
         Push(bot, StopAttackIntent{});
+        // Stop is stop for the pet too (a pet left on its target keeps pulling), and ends the attack / pull window and an engage order
+        // so nothing in the bot's rules starts the fight again.
+        Push(bot, PetSetCommandStateIntent{1});
+        if (BotAI* ai = Services::Registry().ai(bot->GetGUID().GetCounter()))
+        {
+            ai->close_owner_order_window();
+            if (ai->owner_command() == BotAI::OwnerCommand::Engage)
+                ai->exit_manual();
+        }
         // /disengage clears manual mode entirely (vs /stop which is a
         // single-shot break-combat). Cleanly returning to autonomous
         // is the right semantic when the owner says "back off".

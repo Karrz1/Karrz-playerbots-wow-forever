@@ -191,9 +191,18 @@ Common cause: leftover Buildings/dir_bin/ from a previous run. Delete it and ret
     Write-Step "Step 4/4: mmaps_generator (dbc+maps+vmaps -> mmaps/)"
     $mmapArgs = @("--input", "$OutputPath", "--output", "$OutputPath", "--silent")
     if ($Threads -gt 0) { $mmapArgs += @("--threads", "$Threads") }
-    & ".\mmaps_generator.exe" @mmapArgs
-    if ($LASTEXITCODE -ne 0) {
-        Fail "mmaps_generator failed with exit code $LASTEXITCODE.
+    # run it as a process so the progress can be shown: one line per minute with the number of maps finished so far
+    $expect = @{}
+    foreach ($f in Get-ChildItem (Join-Path $OutputPath 'maps') -Filter '*.tilelist' -ErrorAction SilentlyContinue) { if ($f.Name -match '^(\d{4})') { $expect[[int]$Matches[1]] = 1 } }
+    foreach ($d in Get-ChildItem (Join-Path $OutputPath 'vmaps') -Directory -ErrorAction SilentlyContinue) { if ($d.Name -match '^\d+$') { $expect[[int]$d.Name] = 1 } }
+    $gen = Start-Process (Join-Path (Get-Location).Path 'mmaps_generator.exe') -ArgumentList $mmapArgs -WorkingDirectory (Get-Location).Path -NoNewWindow -PassThru
+    while (-not $gen.WaitForExit(60000)) {
+        $done = @(Get-ChildItem (Join-Path $OutputPath 'mmaps') -Filter '*.mmap' -ErrorAction SilentlyContinue).Count
+        Write-Host ("Pathfinding data: {0} of about {1} maps done, still working ({2} minutes so far)..." -f $done, $expect.Count, [math]::Round($clock.Elapsed.TotalMinutes))
+    }
+    $genCode = $gen.ExitCode
+    if ($genCode -ne 0) {
+        Fail "mmaps_generator failed with exit code $genCode.
 Check that dbc/, maps/, and vmaps/0000/*.vmtree exist in OutputPath."
     }
     # Safety net: a map that has game files but still no navmesh (the generator skips "junk"/dev maps by default) is built on its own,

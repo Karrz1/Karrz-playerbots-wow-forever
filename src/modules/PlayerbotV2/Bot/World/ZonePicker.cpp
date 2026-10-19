@@ -522,6 +522,28 @@ std::vector<GrindSpot> const& GrindSpotsFor(bool alliance)
 
 } // anonymous
 
+bool FindGrindSpotNear(bool alliance, uint32 map, float x, float y, uint32 level, uint64 seed, float max_yards, float& ox, float& oy, float& oz)
+{
+    std::vector<GrindSpot> const& gs = GrindSpotsFor(alliance);
+    int best = -1;
+    uint64 best_key = 0;
+    for (std::size_t i = 0; i < gs.size(); ++i)
+    {
+        GrindSpot const& g = gs[i];
+        if (g.map != map) continue;
+        uint32 const gap = g.level > level ? g.level - level : level - g.level;
+        if (gap > kGrindLevelSpread) continue;
+        if (std::hypot(g.x - x, g.y - y) > max_yards) continue;
+        uint64 key = (seed + 1u) * 0x9E3779B97F4A7C15ull ^ (uint64(i) + 1u) * 0xC2B2AE3D27D4EB4Full;
+        key ^= key >> 29;
+        if (best < 0 || key < best_key) { best = int(i); best_key = key; }
+    }
+    if (best < 0)
+        return false;
+    ox = gs[best].x; oy = gs[best].y; oz = gs[best].z;
+    return true;
+}
+
 DestinationPick SpreadWithinZone(DestinationPick d, uint8 level, bool alliance, uint64 seed, bool allow_grind)
 {
     Map* const map = sMapMgr->FindMap(d.map_id, 0);

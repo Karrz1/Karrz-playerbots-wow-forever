@@ -47,6 +47,7 @@
 #include <vector>
 
 class Player;
+class Unit;
 
 namespace Playerbot {
 
@@ -68,6 +69,10 @@ public:
         auto it = orders_.find(bot_guid_low);
         return it == orders_.end() ? nullptr : &it->second;
     }
+
+    // Damage a player (or its pet) did to a creature, tallied per player for the [raid_dps] line. From Module::OnDamageTaken on the
+    // map's thread; takes its own lock.
+    static void NoteDamageDone(Unit* attacker, Unit* victim, int32 amount);
 
     // Human-readable plan dump for `.playerbot pvecoord`.
     std::string DebugDump() const;

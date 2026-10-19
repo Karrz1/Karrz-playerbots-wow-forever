@@ -771,6 +771,66 @@ TEST_CASE("ScenarioDefs: the Molten Core scenarios are a 40-man raid with 4 tank
         CHECK(all.insert(d.name).second);
 }
 
+TEST_CASE("ScenarioDefs: the other raids are one boss each, 40 raiders (BWL, AQ40, Naxxramas) or 20 (ZG, AQ20), their adds kept", "[scenariomonitor]")
+{
+    struct Family { RaidBossRow const* rows; std::size_t n; std::uint32_t map; std::size_t raiders; char const* prefix; };
+    Family const families[] = {
+        { kBwlBosses,  sizeof(kBwlBosses) / sizeof(kBwlBosses[0]),   469, 40, "bwl_" },
+        { kZgBosses,   sizeof(kZgBosses) / sizeof(kZgBosses[0]),     309, 20, "zg_" },
+        { kAq20Bosses, sizeof(kAq20Bosses) / sizeof(kAq20Bosses[0]), 509, 20, "aq20_" },
+        { kAq40Bosses, sizeof(kAq40Bosses) / sizeof(kAq40Bosses[0]), 531, 40, "aq40_" },
+        { kNaxxBosses, sizeof(kNaxxBosses) / sizeof(kNaxxBosses[0]), 533, 40, "naxx_" },
+    };
+    std::set<std::string> found;
+    for (Family const& f : families)
+        for (std::size_t i = 0; i < f.n; ++i)
+        {
+            RaidBossRow const& r = f.rows[i];
+            ScenarioDef const* d = FindScenario(r.name);
+            REQUIRE(d != nullptr);
+            INFO(r.name);
+            CHECK(found.insert(r.name).second);
+            CHECK(std::string(r.name).rfind(f.prefix, 0) == 0);
+            CHECK(d->map == f.map);
+            CHECK(d->level == 60);
+            CHECK(d->squad.size() == f.raiders);
+            CHECK(d->limits.expected_group == f.raiders);
+            CHECK(d->goal_entry == r.boss_entry);
+            CHECK(d->arrive_near_entry == r.boss_entry);
+            CHECK(std::string(d->goal_name).size() > 2);
+            CHECK(d->order_attack);
+            CHECK(d->limits.kill_is_pass);
+            CHECK(d->timeout_ms >= 15u * 60u * 1000u);
+            CHECK(d->keep_entry == r.keep_entry);
+            CHECK(d->keep_entry_b == r.keep_entry_b);
+            CHECK(d->keep_entry_c == r.keep_entry_c);
+            // A kept add is never the boss itself, and the extra ones only come with a first one.
+            CHECK(d->keep_entry != r.boss_entry);
+            if (d->keep_entry_b || d->keep_entry_c)
+                CHECK(d->keep_entry != 0);
+            CHECK(d->limits.bounds.enabled);
+            CHECK(d->x >= d->limits.bounds.min_x);
+            CHECK(d->x <= d->limits.bounds.max_x);
+            std::size_t tanks = 0, healers = 0;
+            std::set<std::string> names;
+            for (ScenarioMember const& m : d->squad)
+            {
+                if (m.role == ScenarioRoleKind::Tank) ++tanks;
+                if (m.role == ScenarioRoleKind::Healer) ++healers;
+                names.insert(m.name);
+                CHECK((m.race == ScnRace::Human || m.race == ScnRace::Dwarf || m.race == ScnRace::NightElf || m.race == ScnRace::Gnome));
+            }
+            CHECK(names.size() == f.raiders);
+            CHECK(tanks == (f.raiders == 40 ? 4u : 2u));
+            CHECK(healers == (f.raiders == 40 ? 12u : 6u));
+        }
+    // The three fights that keep two or three kinds of add: the bug trio (Yauj, Kri), Thekal (Zath, Lor'Khan), the Horsemen (the other three).
+    CHECK(FindScenario("aq40_bugtrio")->keep_entry_c == 0);
+    CHECK(FindScenario("zg_thekal")->keep_entry_b == 11347);
+    CHECK(FindScenario("naxx_horsemen")->keep_entry_c == 16065);
+    CHECK(found.size() == 5 + 8 + 5 + 8 + 14);
+}
+
 TEST_CASE("deadmines_full is a whole-dungeon clear that runall leaves out", "[ScenarioMonitor]")
 {
     auto const* d = Playerbot::Diagnostics::FindScenario("deadmines_full");

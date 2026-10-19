@@ -310,8 +310,8 @@ public:
     { return emit(VehicleGroundSpellIntent{spell_id, x, y, z}); }
     bool accept_quest(ObjectGuid giver, uint32 quest_id)
     { return emit(QuestAcceptIntent{giver, quest_id}); }
-    bool complete_quest(ObjectGuid giver, uint32 quest_id, uint8 reward_choice = 0)
-    { return emit(QuestCompleteIntent{giver, quest_id, reward_choice}); }
+    bool complete_quest(ObjectGuid giver, uint32 quest_id, uint8 reward_choice = 0, bool copy_leader = false)
+    { return emit(QuestCompleteIntent{giver, quest_id, reward_choice, copy_leader}); }
     bool abandon_quest(uint32 quest_id) { return emit(QuestAbandonIntent{quest_id}); }
     bool accept_shared_quest() { return emit(QuestSharedAcceptIntent{}); }
     bool resolve_junk_quests() { return emit(ResolveJunkQuestsIntent{}); }
@@ -397,6 +397,9 @@ public:
     // Raid preparation: hand the bot one flask / elixir / food of its role kit (EconomyOp::StockRaidConsumable).
     bool stock_raid_consumable(uint32 item)
     { return emit(EconomyIntent{EconomyOp::StockRaidConsumable{item}}); }
+    // Raid preparation: resistance gear for `school` on, or the bot's own back on (0) (EconomyOp::ResistGear).
+    bool resist_gear(uint8 school)
+    { return emit(EconomyIntent{EconomyOp::ResistGear{school}}); }
 
     // Battleground / arena queue. `arena_type` 0 = battleground (solo or
     // group-leader), 2/3/5 = arena skirmish bracket (group-leader only).

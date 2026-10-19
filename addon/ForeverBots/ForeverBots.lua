@@ -108,6 +108,20 @@ end
 local THROTTLED = { [3] = true, [8] = true }
 local ORDER_RETRIES = 6
 
+-- Anything the add-on sends on its own (a timer, OnUpdate, an event) is not a player action: the client blocks chat sent from
+-- there ("Interface action failed because of an AddOn", Emberseer 2026-10-20). Those paths run under Auto(), and GroupOrder then
+-- only ever uses the addon message (never SendChatMessage, never the chat box) and drops the order when that fails.
+local inAuto = false
+local function Auto(fn, ...)
+    local was, step = inAuto, currentStep
+    inAuto = true
+    Step("timer/event send")
+    local ok, err = pcall(fn, ...)
+    inAuto = was
+    Step(step)
+    if not ok then Debug("auto: " .. tostring(err)) end
+end
+
 local function GroupOrder(text, attempt)
     attempt = attempt or 0
     local channel
@@ -126,9 +140,13 @@ local function GroupOrder(text, attempt)
         if sent then return end
         if ok then code = tonumber(res) or (res == false and -1 or nil) else errText = tostring(res) end
         if code and THROTTLED[code] and attempt < ORDER_RETRIES and C_Timer and C_Timer.After then
-            C_Timer.After(0.8, function() GroupOrder(text, attempt + 1) end)
+            C_Timer.After(0.8, function() Auto(GroupOrder, text, attempt + 1) end)
             return
         end
+    end
+    if inAuto or attempt > 0 then
+        Debug("order not sent from a timer/event: " .. tostring(text) .. (code and (" (addon message result " .. code .. ")") or ""))
+        return
     end
     if InCombatLockdown and InCombatLockdown() then
         -- The client lets the player's own Enter send chat in combat (typing "pull back" in raid chat works while the button does
@@ -292,7 +310,11 @@ local function RequestList()
     if okI and inInstance and (kind == "pvp" or kind == "arena") then return end
     if InGroupQuiet() then
         local asker = ListAsker()
-        if asker then SendChatMessage("assign list", "WHISPER", nil, asker) end
+        if asker and prefixOk then
+            -- from a timer: an addon whisper (the server reads the FBOTS prefix like a whisper), never SendChatMessage
+            local send = C_ChatInfo and C_ChatInfo.SendAddonMessage or SendAddonMessage
+            pcall(send, ORDER_PREFIX, "assign list", "WHISPER", asker)
+        end
     else
         assignments = {}
         RefreshList()
@@ -582,7 +604,7 @@ local function AddBotWithGear(class, role)
     AddBot(class, role)
     if not sent and C_Timer and C_Timer.After then
         -- no group yet: the first bot makes one, so the gear word follows once it exists (it applies to the next bots)
-        C_Timer.After(2.5, function() SendGear() end)
+        C_Timer.After(2.5, function() Auto(SendGear) end)
     end
 end
 
@@ -635,7 +657,7 @@ local function RaidReady()
     local run = raidReadyRun
     local function After(sec, fn)
         C_Timer.After(sec, function()
-            if run == raidReadyRun and not (InCombatLockdown and InCombatLockdown()) then fn() end
+            if run == raidReadyRun and not (InCombatLockdown and InCombatLockdown()) then Auto(fn) end
         end)
     end
     local function IsRaidNow() return IsInRaid and IsInRaid() end
@@ -1276,11 +1298,11 @@ distFrame:SetScript("OnUpdate", function(self, elapsed)
     self.acc = 0
     local now = Now()
     if distDirtyAt and now - distDirtyAt >= 0.4 and now - distLastSend >= 0.3 then
-        SendDistance(false)
+        Auto(SendDistance, false)
     end
     if self.groupAt and now >= self.groupAt then
         self.groupAt = nil
-        SendDistance(true)
+        Auto(SendDistance, true)
     end
     if self.stanceAt and now >= self.stanceAt then
         self.stanceAt = nil
@@ -1288,7 +1310,7 @@ distFrame:SetScript("OnUpdate", function(self, elapsed)
         -- (new and re-created bots included); a never-picked stance is sent only inside an instance, where Passive is the default.
         local okI, inInstance = pcall(IsInInstance)
         if GroupSize() > 0 and (ForeverBotsDB.stance or (okI and inInstance)) then
-            GroupOrder(StanceIsAggressive() and "aggressive" or "passive")
+            Auto(GroupOrder, StanceIsAggressive() and "aggressive" or "passive")
         end
         RefreshStance()
     end
@@ -1378,7 +1400,8 @@ local function ToggleMinimapMenu()
             b:SetScript("OnClick", function() m:Hide(); it[2]() end)
         end
         m:SetScript("OnUpdate", function(self, elapsed)
-            if MouseIsOver(self) or MouseIsOver(mmButton) then self.away = 0 else self.away = (self.away or 0) + elapsed end
+            -- (the global MouseIsOver no longer exists on this client: "attempt to call a nil value" every frame)
+            if self:IsMouseOver() or mmButton:IsMouseOver() then self.away = 0 else self.away = (self.away or 0) + elapsed end
             if self.away > 1.5 then self:Hide() end
         end)
         m:Hide()
@@ -1505,7 +1528,14 @@ end
 
 local function BotWhisper(text)
     if not botName then return end
-    SendChatMessage(text, "WHISPER", nil, botName)
+    if inAuto then
+        -- from the panel's timer (the coalesced distance order): an addon whisper, a chat whisper would be blocked
+        if not prefixOk then return end
+        local send = C_ChatInfo and C_ChatInfo.SendAddonMessage or SendAddonMessage
+        pcall(send, ORDER_PREFIX, text, "WHISPER", botName)
+    else
+        SendChatMessage(text, "WHISPER", nil, botName)
+    end
     botSentAt = Now()
     SetBotStatus("|cffffff00" .. text .. " ...|r")
 end
@@ -1652,7 +1682,7 @@ local function BuildBotPanel()
         local now = Now()
         if botDistDirtyAt and now - botDistDirtyAt >= 0.4 and botName then
             botDistDirtyAt = nil
-            BotWhisper("distance " .. botDist)
+            Auto(BotWhisper, "distance " .. botDist)
         end
         if botSentAt and now - botSentAt > 4 then
             botSentAt = nil
@@ -1851,16 +1881,20 @@ do
     local seen = {}   -- [editbox] = { text = last non-empty text, at = time }
     local function HookBox(box)
         if not (box and box.HookScript) then return end
+        -- All three hooks do nothing outside a battleground: the secure order buttons run their "/party ..." line through this same
+        -- edit box, so our code stays out of that path everywhere the bg-whisper workaround is not needed.
         pcall(box.HookScript, box, "OnTextChanged", function(self)
+            if not InPvP() then return end
             local ok, text = pcall(self.GetText, self)
             text = ok and SafeStr(text) or nil
             if text and text ~= "" then seen[self] = { text = text, at = GetTime() } end
         end)
-        pcall(box.HookScript, box, "OnEscapePressed", function(self) seen[self] = nil end)
+        pcall(box.HookScript, box, "OnEscapePressed", function(self) if InPvP() then seen[self] = nil end end)
         pcall(box.HookScript, box, "OnEnterPressed", function(self)
+            if not InPvP() then return end
             local rec = seen[self]
             seen[self] = nil
-            if not rec or GetTime() - rec.at > 30 or not InPvP() then return end
+            if not rec or GetTime() - rec.at > 30 then return end
             local name, text = strmatch(rec.text, "^/[cC][wW]%s+(%S+)%s+(.-)%s*$")
             if not name or text == "" then return end
             name = strtrim((strsplit("-", name)))
@@ -2225,6 +2259,19 @@ do
             return
         end
         ForeverBotsDB.lastForbidden = { func = func, at = date and date("%Y-%m-%d %H:%M:%S") or "" }
+        -- which client globals carry our taint (issecurevariable is false and names us), so a report says where it came from
+        local tainted = {}
+        for _, n in ipairs({ "SlashCmdList", "hash_SlashCmdList", "ChatFrame1EditBox", "DEFAULT_CHAT_FRAME", "ChatEdit_SendText", "ChatEdit_ParseText",
+            "ChatFrame_OpenChat", "SendChatMessage", "RunMacroText", "UnitPopup_ShowMenu" }) do
+            local ok, secure, who = pcall(issecurevariable, n)
+            if ok and secure == false then tainted[#tainted + 1] = n .. "<-" .. tostring(who) end
+        end
+        ForeverBotsDB.lastForbidden.tainted = table.concat(tainted, ", ")
+        if func == "RunMacroText" then
+            Print("the client blocked RunMacroText() (an order button's macro) during: " .. (currentStep ~= "" and currentStep or "no step marked")
+                .. "; tainted globals: " .. (#tainted > 0 and table.concat(tainted, ", ") or "none"))
+            return
+        end
         if func:find("SendChatMessage", 1, true) or func:find("SendAddonMessage", 1, true) then
             Print("the client blocked " .. func .. "() (not allowed in this situation)")
             return

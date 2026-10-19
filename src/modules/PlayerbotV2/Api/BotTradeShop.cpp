@@ -9,6 +9,8 @@
 #include "Log.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "TradeData.h"
 #include "TradePackets.h"
 #include "WorldSession.h"
@@ -32,7 +34,15 @@ struct Shelf
     Offer order;
 };
 
+struct Delivery
+{
+    ObjectGuid requester;
+    uint32 entry = 0;
+    uint32 stamp_ms = 0;
+};
+
 std::mutex g_mtx;
+std::unordered_map<uint64, Delivery> g_deliveries;                     // bot -> the craft order waiting to be handed over
 std::unordered_map<uint64, Shelf> g_shelves;                           // (bot << 32) | buyer
 std::unordered_map<uint64, std::pair<uint64, uint32>> g_last_say;      // bot -> (what was said, when)
 
@@ -189,6 +199,13 @@ bool PlaceOrder(Player const* bot, Player const* buyer, size_t index, Offer& out
     return true;
 }
 
+void StoreDelivery(Player const* bot, ObjectGuid requester, uint32 entry)
+{
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (g_deliveries.size() > 4096) g_deliveries.clear();
+    g_deliveries[bot->GetGUID().GetCounter()] = Delivery{ requester, entry, GameTime::GetGameTimeMS() };
+}
+
 std::vector<std::string> Describe(std::vector<Offer> const& list)
 {
     std::vector<std::string> out;
@@ -210,6 +227,23 @@ std::vector<std::string> Describe(std::vector<Offer> const& list)
 }
 
 namespace {
+
+// Is `entry` a reagent of a recipe (a spell that makes an item) the bot knows? Reagents the owner hands over for a craft order are a gift.
+bool IsRecipeReagent(Player const* bot, uint32 entry)
+{
+    for (auto const& [spell_id, ps] : bot->GetSpellMap())
+    {
+        if (ps.state == PLAYERSPELL_REMOVED || !ps.active || ps.disabled)
+            continue;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE);
+        if (!si || !si->HasEffect(SPELL_EFFECT_CREATE_ITEM))
+            continue;
+        for (std::size_t i = 0; i < si->Reagent.size(); ++i)
+            if (si->Reagent[i] > 0 && si->ReagentCount[i] > 0 && uint32(si->Reagent[i]) == entry)
+                return true;
+    }
+    return false;
+}
 
 BotTrade::Line LineOf(Player const* viewer_for_price, Item* it, uint64 unit)
 {
@@ -235,7 +269,11 @@ std::vector<BotTrade::Line> Lines(Player* bot, TradeData* side, bool mark_upgrad
     for (size_t i = 0; i < items.size(); ++i)
     {
         BotTrade::Line l = LineOf(bot, items[i], unit[i]);
-        if (mark_upgrades) l.upgrade = IsUpgrade(bot, items[i]->GetTemplate());
+        if (mark_upgrades)
+        {
+            l.upgrade = IsUpgrade(bot, items[i]->GetTemplate());
+            l.reagent = IsRecipeReagent(bot, items[i]->GetEntry());
+        }
         out.push_back(l);
     }
     if (items_out) *items_out = std::move(items);
@@ -289,6 +327,29 @@ Result Step(Player* bot, TradeData* mine, TradeData* his, bool gift_ok)
         v.order_price = order.price;
         v.order_item_present = oi && oi->GetEntry() == order.entry && oi->GetCount() == order.count && IsTradeable(oi);
     }
+    // A craft order made for this player that could not go by mail: still in the bags, it is handed over in this window.
+    Item* delivery = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto it = g_deliveries.find(bot->GetGUID().GetCounter());
+        if (it != g_deliveries.end())
+        {
+            if (GameTime::GetGameTimeMS() - it->second.stamp_ms > kShelfLifeMs)
+                g_deliveries.erase(it);
+            else if (it->second.requester == partner->GetGUID())
+            {
+                std::vector<Item*> held = bot->GetItemListByEntry(it->second.entry, false);
+                if (held.empty())
+                    g_deliveries.erase(it);
+                else
+                {
+                    delivery = held.front();
+                    v.has_delivery = true;
+                    v.delivery_present = true;
+                }
+            }
+        }
+    }
     // Only look at room when the bot is about to take something in: it is the costly check.
     if (!v.his.empty() && v.his_accepted && !v.my_accepted)
         v.bot_has_room = HasRoomFor(bot, his_items);
@@ -334,6 +395,19 @@ Result Step(Player* bot, TradeData* mine, TradeData* his, bool gift_ok)
                     if (oi->IsBindedNotWith(partner)) return Result::ServerRefused;
                     mine->UpdateClientStateIndex();
                     mine->SetItem(TradeSlots(i), oi);
+                    break;
+                }
+            return Result::Locked;
+        }
+        case BotTrade::Act::AddDelivery:
+        {
+            if (!delivery) return Result::Locked;
+            for (uint8 i = 0; i < TRADE_SLOT_TRADED_COUNT; ++i)
+                if (!mine->GetItem(TradeSlots(i)))
+                {
+                    if (delivery->IsBindedNotWith(partner)) return Result::ServerRefused;
+                    mine->UpdateClientStateIndex();
+                    mine->SetItem(TradeSlots(i), delivery);
                     break;
                 }
             return Result::Locked;

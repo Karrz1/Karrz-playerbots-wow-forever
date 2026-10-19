@@ -193,7 +193,7 @@ inline NearbyUnit const* CcLockedWithin(BotSnapshotView const& s, float range)
 // the loose mobs nobody else was given, and no crowd-controlled mob in reach.
 inline bool AreaTauntWorth(BotSnapshotView const& s, float range, char const* what)
 {
-    // Majordomo: every tank holds its own add, a shout would pull all eight onto one tank (2026-10-17 pull).
+    // Majordomo: every tank holds its own add, a shout would pull all eight onto one tank.
     for (NearbyUnit const& u : s.nearby_enemies())
         if (Engaged(u) && Raid::OffTankMob(s.map_id(), u.entry))
             return false;

@@ -29,6 +29,7 @@
 #include "GameObjectAI.h"
 #include "GameTime.h"
 #include "InstanceScript.h"
+#include "Log.h"
 #include "Map.h"
 #include "MapReference.h"
 #include "MotionMaster.h"
@@ -516,7 +517,10 @@ public:
             {
                 case TYPE_ROOM_EVENT:
                     if (data == DONE)
+                    {
+                        TC_LOG_INFO("scripts.classic", "UBRS room event done: opening Emberseer In ({})", _emberseerInDoorGUID.IsEmpty() ? std::string("door not spawned") : _emberseerInDoorGUID.ToString());
                         DoUseDoorOrButton(_emberseerInDoorGUID);
+                    }
                     _encounter[TYPE_ROOM_EVENT] = data;
                     break;
                 case TYPE_EMBERSEER:
@@ -632,6 +636,7 @@ public:
                     if (!_roomRuneGUID[i].IsEmpty())        // This check is used, to ensure which runes still need processing
                     {
                         _roomEventMobGUIDSorted[i].remove(data);
+                        TC_LOG_INFO("scripts.classic", "UBRS room event: room {} has {} mobs left after {} died", i + 1, _roomEventMobGUIDSorted[i].size(), data.ToString());
                         if (_roomEventMobGUIDSorted[i].empty())
                         {
                             DoUseDoorOrButton(_roomRuneGUID[i]);
@@ -1063,7 +1068,10 @@ public:
 
             for (uint8 i = 0; i < MAX_ROOMS; ++i)
             {
-                if (GameObject* rune = instance->GetGameObject(_roomRuneGUID[i]))
+                GameObject* rune = instance->GetGameObject(_roomRuneGUID[i]);
+                if (!rune)
+                    TC_LOG_ERROR("scripts.classic", "UBRS room event: rune {} (room {}) is not spawned in this instance", i + 1, i + 1);
+                if (rune)
                 {
                     for (ObjectGuid const& guid : _roomEventMobGUIDs)
                     {
@@ -1076,6 +1084,9 @@ public:
                 }
             }
 
+            TC_LOG_INFO("scripts.classic", "UBRS room event started: {} room mobs registered, rooms hold {} {} {} {} {} {} {}", _roomEventMobGUIDs.size(),
+                _roomEventMobGUIDSorted[0].size(), _roomEventMobGUIDSorted[1].size(), _roomEventMobGUIDSorted[2].size(), _roomEventMobGUIDSorted[3].size(),
+                _roomEventMobGUIDSorted[4].size(), _roomEventMobGUIDSorted[5].size(), _roomEventMobGUIDSorted[6].size());
             SetData(TYPE_ROOM_EVENT, IN_PROGRESS);
         }
 

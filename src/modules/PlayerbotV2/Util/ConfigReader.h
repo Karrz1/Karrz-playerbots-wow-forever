@@ -4,8 +4,10 @@
 // Backed by TrinityCore's existing ConfigMgr. No new file format.
 
 #pragma once
+#include <vector>
 
 #include "Bot/BotTypes.h"
+#include "BotListedGroupPlan.h"
 #include <string>
 
 namespace Playerbot {
@@ -296,6 +298,8 @@ public:
     bool   threat_hold_enabled() const         { return threat_hold_enabled_; }
     bool   raid_dps_wait_attack() const        { return raid_dps_wait_attack_; }
     bool   raid_provide_consumables() const    { return raid_provide_consumables_; }
+    // Playerbot.Raid.ResistGear: a raid bot wears resistance gear for the boss it stands before (Bot/ResistGear.h). Default off.
+    bool   raid_resist_gear() const            { return raid_resist_gear_; }
     // Playerbot.Consumables.PvE / .PvP: whether bots use (and are stocked with) flasks, elixirs, buff food, combat
     // potions, healthstones and resistance potions in PvE (open world, dungeons, raids) or in PvP (battlegrounds, arenas).
     bool   consumables_pve() const             { return consumables_pve_; }
@@ -338,6 +342,20 @@ public:
     bool behavior_world_bot_say_reply() const { return bhv_world_bot_say_reply_; }
     bool behavior_instance_group_cap()  const { return bhv_instance_group_cap_; }
     uint32 behavior_open_world_group_cap() const { return bhv_open_world_group_cap_; }
+    bool   lfg_enable()                 const { return lfg_enable_; }
+    bool   lfg_instant_fill_if_nobody() const { return lfg_instant_fill_; }
+    bool   lfg_trickle() const { return lfg_trickle_; }
+    uint32 lfg_level_range()            const { return lfg_level_range_; }
+    uint32 lfg_bot_fill_seconds()       const { return lfg_bot_fill_seconds_; }
+    std::vector<uint32> const& lfg_categories() const { return lfg_categories_; }
+    std::vector<std::pair<uint32, uint32>> const& lfg_activity_maps() const { return lfg_activity_maps_; }
+    uint32 lfg_bot_groups_max()         const { return lfg_bot_groups_max_; }
+    uint32 lfg_bot_groups_max_bots()    const { return lfg_bot_groups_max_bots_; }
+    uint32 lfg_bot_groups_category()    const { return lfg_bot_groups_category_; }
+    uint32 lfg_bot_groups_min_seconds() const { return lfg_bot_groups_min_seconds_; }
+    uint32 lfg_bot_groups_max_seconds() const { return lfg_bot_groups_max_seconds_; }
+    uint32 lfg_bot_groups_interval_seconds() const { return lfg_bot_groups_interval_seconds_; }
+    std::vector<V2::ListedActivity> const& lfg_bot_groups_activities() const { return lfg_bot_groups_activities_; }
     bool behavior_bg_human_priority()   const { return bhv_bg_human_priority_; }
     bool behavior_tank_markers()        const { return bhv_tank_markers_; }
     bool behavior_mark_cc()             const { return bhv_mark_cc_; }
@@ -352,6 +370,10 @@ public:
     bool behavior_ranged_slow()         const { return bhv_ranged_slow_; }
     bool behavior_ike3_commands()       const { return bhv_ike3_commands_; }
     bool behavior_owner_commands()      const { return bhv_owner_commands_; }
+    // Yards from the group's leader: a Passive bot defends a mob only within this of the leader (or of the member it is on), and an
+    // Aggressive one attacks a hostile only within the aggressive radius of the leader. 0 switches the Passive leash off.
+    float behavior_passive_leash_yd()   const { return bhv_passive_leash_yd_; }
+    float behavior_aggressive_radius_yd() const { return bhv_aggressive_radius_yd_; }
     bool behavior_fidget()              const { return bhv_fidget_; }
     // Players who log in without the ForeverBots add-on get one line with its download link.
     bool   addon_hint_enabled()         const { return addon_hint_enabled_; }
@@ -363,6 +385,15 @@ public:
     bool behavior_party_banter()        const { return bhv_party_banter_; }
     bool behavior_social_emotes()       const { return bhv_social_emotes_; }
     bool behavior_polite_world_bots()   const { return bhv_polite_world_bots_; }
+    // Playerbot.World.GateDuels.*: pairs of world bots duelling outside the capitals' gates (Fleet/GateDuels.h)
+    bool   gate_duels_enable()          const { return gate_duels_enable_; }
+    // Playerbot.World.Questing: 1 = world bots pick up and do quests on their own; 0 (default) = they grind mobs and roam, and quest only
+    // as companions (grouped with a player, who shares quests with them).
+    bool   world_questing()             const { return world_questing_; }
+    uint32 gate_duels_pairs()           const { return gate_duels_pairs_; }
+    float  gate_duels_radius()          const { return gate_duels_radius_; }
+    bool   gate_duels_challenge()       const { return gate_duels_challenge_; }
+    uint32 gate_duels_challenge_cd_ms() const { return gate_duels_challenge_cd_ms_; }
     bool behavior_quest_accept()        const { return bhv_quest_accept_; }
     bool behavior_quest_share()         const { return bhv_quest_share_; }
     bool behavior_quest_turn_in()       const { return bhv_quest_turn_in_; }
@@ -495,6 +526,7 @@ private:
     bool   threat_hold_enabled_          = true;
     bool   raid_dps_wait_attack_         = true;
     bool   raid_provide_consumables_     = false;
+    bool   raid_resist_gear_             = false;
     bool   consumables_pve_              = true;
     bool   consumables_pvp_              = false;
     uint32 raid_dps_wait_timeout_ms_     = 8000;
@@ -532,6 +564,20 @@ private:
     bool   bhv_world_bot_say_reply_  = true;
     bool   bhv_instance_group_cap_   = true;
     uint32 bhv_open_world_group_cap_ = 40;
+    bool   lfg_enable_               = true;
+    bool   lfg_instant_fill_         = false;
+    bool   lfg_trickle_              = true;
+    uint32 lfg_level_range_          = 5;
+    uint32 lfg_bot_fill_seconds_     = 180;
+    std::vector<uint32> lfg_categories_;
+    std::vector<std::pair<uint32, uint32>> lfg_activity_maps_;
+    uint32 lfg_bot_groups_max_              = 6;
+    uint32 lfg_bot_groups_max_bots_         = 60;
+    uint32 lfg_bot_groups_category_         = 2;
+    uint32 lfg_bot_groups_min_seconds_      = 300;
+    uint32 lfg_bot_groups_max_seconds_      = 1200;
+    uint32 lfg_bot_groups_interval_seconds_ = 30;
+    std::vector<V2::ListedActivity> lfg_bot_groups_activities_;
     bool   bhv_bg_human_priority_    = true;
     bool   bhv_tank_markers_         = true;
     bool   bhv_mark_cc_              = true;
@@ -546,6 +592,8 @@ private:
     bool   bhv_ranged_slow_          = true;
     bool   bhv_ike3_commands_        = true;
     bool   bhv_owner_commands_       = true;
+    float  bhv_passive_leash_yd_     = 25.0f;
+    float  bhv_aggressive_radius_yd_ = 10.0f;
     bool   bhv_fidget_               = true;
     bool        addon_hint_enabled_   = false;
     uint32      addon_hint_delay_sec_ = 30;
@@ -556,6 +604,12 @@ private:
     bool   bhv_party_banter_         = true;
     bool   bhv_social_emotes_        = true;
     bool   bhv_polite_world_bots_    = true;
+    bool   world_questing_           = false;
+    bool   gate_duels_enable_        = true;
+    uint32 gate_duels_pairs_         = 2;
+    float  gate_duels_radius_        = 80.0f;
+    bool   gate_duels_challenge_     = true;
+    uint32 gate_duels_challenge_cd_ms_ = 600000u;
     bool   bhv_quest_accept_         = true;
     bool   bhv_quest_share_          = true;
     bool   bhv_quest_turn_in_        = true;

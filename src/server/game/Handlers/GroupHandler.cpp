@@ -132,6 +132,10 @@ void WorldSession::HandlePartyInviteOpcode(WorldPackets::Party::PartyInviteClien
         group = invitingPlayer->GetGroupInvite();
 
     Group* group2 = invitedPlayer->GetGroup(packet.PartyIndex);
+    // a bot group listed in the Group Finder takes a player who invites its member as a sign-up
+    if (group2 && !invitingPlayer->GetGroup(packet.PartyIndex) && sScriptMgr->OnPlayerGroupFinderJoinRequest(invitedPlayer, invitingPlayer))
+        return;
+
     // player already in another group or invited
     if (group2 || invitedPlayer->GetGroupInvite())
     {

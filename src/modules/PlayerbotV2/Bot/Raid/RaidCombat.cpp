@@ -137,7 +137,7 @@ bool DispatchRaidOrder(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em
 
     // 3b. A boss fight script owns this DPS bot's target (RaidFightScript.h): during its start wait nothing is attacked, afterwards the one
     //     enemy the script names, whatever the bot was on. The skull / kill-focus pickers in the combat state stand down for it.
-    if (o.script_owns && !o.script_focus.IsEmpty())
+    if (o.script_names_target())
     {
         if (!held.IsEmpty())
         {

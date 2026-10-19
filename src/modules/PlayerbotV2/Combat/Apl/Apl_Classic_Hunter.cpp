@@ -19,7 +19,6 @@
 // raid10-revamp, playerbot/strategy/hunter/*Strategy.cpp, MANGOSBOT_ZERO).
 
 #include "Bot/SpellFamily.h"
-#include "AplPetThrottle.h"
 #include "../ApRegistry.h"
 #include "../ApRotation.h"
 #include "Apl_Baseline_Common.h"
@@ -32,6 +31,8 @@
 #include "Group/GroupSnapshot.h"
 #include "SharedDefines.h"
 #include <cmath>
+#include <mutex>
+#include <unordered_map>
 
 namespace Playerbot::Combat {
 
@@ -77,7 +78,12 @@ bool Ready(ApPredicateContext const& ctx, uint32 spell)
 
 int32 Mana(ApPredicateContext const& ctx) { return ctx.bot.power(POWER_MANA); }
 
-bool VictimInMelee(ApPredicateContext const& ctx) { return DistToVictim(ctx) <= 5.5f; }
+// The core's melee reach counts both combat reaches, so a flat centre distance never reaches a big boss.
+bool VictimInMelee(ApPredicateContext const& ctx)
+{
+    NearbyUnit const* v = ctx.bot.victim_info();
+    return v && ctx.bot.in_spell_range(RAPTOR_STRIKE, *v);
+}
 // Vanilla shots have an 8 yard minimum range.
 // A shot needs a ranged weapon with ammo in the bags: without it the core refuses every one with NO_AMMO (Deadmines 2026-10-14).
 bool VictimInShotRange(ApPredicateContext const& ctx)
@@ -85,7 +91,11 @@ bool VictimInShotRange(ApPredicateContext const& ctx)
     if (ctx.bot.ammo_kind() == 0 || ctx.bot.ammo_count() == 0)
         return false;
     float const d = DistToVictim(ctx);
-    return d >= 8.f && d <= 35.f;
+    // The minimum is the core's own (Spell::GetMinMaxRange): the range entry's minimum plus the melee range for a ranged-flag spell, from the
+    // target's centre. Against Onyxia the dead zone runs far past a flat 8 y and a shot fired from inside it is refused (OUT_OF_RANGE) every tick.
+    NearbyUnit const* v = ctx.bot.victim_info();
+    float const min = v ? ctx.bot.spell_min_range(ARCANE_SHOT, *v) : 8.f;
+    return d >= min && d <= 35.f;
 }
 
 bool VictimIsBossLike(ApPredicateContext const& ctx)
@@ -140,17 +150,6 @@ bool ShouldMendPet(ApPredicateContext const& ctx)
 }
 void DoMendPet(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(MEND_PET); }
 
-bool ShouldPetAttack(ApPredicateContext const& ctx)
-{
-    return ctx.bot.has_pet() && HasLiveTarget(ctx) && ctx.bot.pet_victim() != ctx.bot.victim()
-        && Playerbot::AplPet::PetAttackDue(ctx.bot.guid().GetCounter(), ctx.bot.published_at_ms());
-}
-void DoPetAttack(ApPredicateContext const& ctx, BotIntentEmitter& e)
-{
-    Playerbot::AplPet::NotePetAttack(ctx.bot.guid().GetCounter(), ctx.bot.published_at_ms());
-    e.pet_attack(ctx.bot.victim());
-}
-
 // ======================= Defensive =======================
 
 bool ShouldDeterrence(ApPredicateContext const& ctx)
@@ -158,6 +157,55 @@ bool ShouldDeterrence(ApPredicateContext const& ctx)
     return ctx.bot.in_combat() && ctx.bot.hp_pct() <= 25 && Ready(ctx, DETERRENCE);
 }
 void DoDeterrence(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(DETERRENCE); }
+
+// A hunter stands outside Auto Shot's dead zone: a mob that someone else holds (the tank, a member) and that stands inside the zone is not
+// shot at all (OUT_OF_RANGE on every tick) and the hunter used to close in and swing a Raptor Strike. It steps back to a shooting spot, away from
+// the mob. A mob on the hunter itself keeps the melee kit (Wing Clip, Mongoose Bite, Raptor Strike), as a vanilla hunter fights it.
+std::mutex g_backOffMutex;
+std::unordered_map<uint64, uint32> g_backOffLastMs;   // hunter -> when its last step back went out
+
+bool ShouldBackOffDeadZone(ApPredicateContext const& ctx)
+{
+    BotSnapshotView const& s = ctx.bot;
+    {
+        // One step per 2 s: the walk of the last step is still under way, and the ticks between go to the rotation.
+        std::lock_guard<std::mutex> lock(g_backOffMutex);
+        auto const it = g_backOffLastMs.find(s.guid().GetCounter());
+        if (it != g_backOffLastMs.end() && s.published_at_ms() - it->second < 2000u)
+            return false;
+    }
+    if (!s.in_combat() || !HasLiveTarget(ctx) || s.is_rooted() || s.is_casting() || !s.in_group())
+        return false;
+    if (s.ammo_kind() == 0 || s.ammo_count() == 0)
+        return false;
+    NearbyUnit const* v = s.victim_info();
+    if (!v || v->victim == s.guid() || v->victim.IsEmpty() || v->is_player)
+        return false;
+    return DistToVictim(ctx) < s.spell_min_range(ARCANE_SHOT, *v) + 0.5f;
+}
+void DoBackOffDeadZone(ApPredicateContext const& ctx, BotIntentEmitter& e)
+{
+    BotSnapshotView const& s = ctx.bot;
+    NearbyUnit const* v = s.victim_info();
+    if (!v) return;
+    {
+        std::lock_guard<std::mutex> lock(g_backOffMutex);
+        if (g_backOffLastMs.size() > 4096)
+            g_backOffLastMs.clear();
+        g_backOffLastMs[s.guid().GetCounter()] = s.published_at_ms();
+    }
+    auto const& me = s.raw().position;
+    float dx = me.x - v->x, dy = me.y - v->y;
+    float len = std::sqrt(dx * dx + dy * dy);
+    if (len < 0.5f)
+    {
+        dx = -std::cos(me.o);
+        dy = -std::sin(me.o);
+        len = 1.0f;
+    }
+    float const stand = s.spell_min_range(ARCANE_SHOT, *v) + 4.0f;
+    e.move_to(v->x + dx / len * stand, v->y + dy / len * stand, me.z, /*run*/ true);
+}
 
 // ======================= Cooldowns =======================
 
@@ -263,7 +311,8 @@ void DoSchoolShot(ApPredicateContext const& ctx, BotIntentEmitter& e) { SchoolHi
 
 bool ShouldWingClip(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && VictimInMelee(ctx) && Mana(ctx) >= 40 && (Ready(ctx, WING_CLIP) && ctx.bot.victim_in_spell_range(WING_CLIP))
+    // Bosses are immune to snares: no aura would ever show and the cast would repeat every GCD (Concussive Shot has the same guard).
+    return HasLiveTarget(ctx) && !VictimIsBossLike(ctx) && VictimInMelee(ctx) && Mana(ctx) >= 40 && (Ready(ctx, WING_CLIP) && ctx.bot.victim_in_spell_range(WING_CLIP))
         && !ctx.bot.has_aura(WING_CLIP, ctx.bot.victim());
 }
 void DoWingClip(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(WING_CLIP, ctx.bot.victim()); }
@@ -372,6 +421,7 @@ void DoConcussiveShot(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.ca
 
 ApRule const kRules[] = {
     { ShouldDeterrence,    DoDeterrence,    "classic_hunter:deterrence" },
+    { ShouldBackOffDeadZone, DoBackOffDeadZone, "classic_hunter:back_off_dead_zone" },
     { ShouldConcussiveShot, DoConcussiveShot, "classic_hunter:concussive_shot" },
     { ShouldTranqShot,     DoTranqShot,     "classic_hunter:tranquilizing_shot" },
     { ShouldCallPet,       DoCallPet,       "classic_hunter:call_pet" },
@@ -380,7 +430,6 @@ ApRule const kRules[] = {
     { ShouldAspectHawk,    DoAspectHawk,    "classic_hunter:aspect_of_the_hawk" },
     { ShouldTrueshotAura,  DoTrueshotAura,  "classic_hunter:trueshot_aura" },
     { ShouldPrePullTrap,   DoPrePullTrap,   "classic_hunter:freezing_trap" },
-    { ShouldPetAttack,     DoPetAttack,     "classic_hunter:pet_attack" },
     { ShouldBestialWrath,  DoBestialWrath,  "classic_hunter:bestial_wrath" },
     { ShouldRapidFire,     DoRapidFire,     "classic_hunter:rapid_fire" },
     { ShouldHuntersMark,   DoHuntersMark,   "classic_hunter:hunters_mark" },

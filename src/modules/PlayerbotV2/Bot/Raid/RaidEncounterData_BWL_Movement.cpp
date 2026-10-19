@@ -17,9 +17,10 @@ namespace Playerbot::Raid {
         // Vaelastrasz: his flame breath cleave chains through anyone near the front.
         r.avoidFrontal.push_back({ 13020, 20.0f, 60.0f, Who::NonTank });
         // Broodlord Lashlayer (12017): Blast Wave 23331 is cast on himself (boss_broodlord_lashlayer.cpp:170-173) every 20-35s; it is a
-        // point-blank AoE with knockback, so ranged and healers stay out of 10 yards (radius UNVERIFIED: spell_template is not in the extracts).
-        r.avoidEnemy.push_back({ 12017, 10.0f, Who::Ranged });
-        r.avoidEnemy.push_back({ 12017, 10.0f, Who::Healer });
+        // point-blank AoE with knockback, 2,625-3,375 fire within 20 yards (vanilla data: radius index 9), so ranged and healers stay out of 22
+        // (bwl_broodlord 2026-10-20: four casters died of it standing 10 y off).
+        r.avoidEnemy.push_back({ 12017, 22.0f, Who::Ranged });
+        r.avoidEnemy.push_back({ 12017, 22.0f, Who::Healer });
         // Nefarian (11583): Shadow Flame 22539 and Cleave 20691 to the front (classic_boss_nefarian.cpp:314,341). Tail Lash 23364 behind
         // him: melee stand at his sides.
         r.avoidFrontal.push_back({ 11583, 25.0f, 55.0f, Who::NonTank });

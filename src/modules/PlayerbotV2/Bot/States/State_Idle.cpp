@@ -10,6 +10,7 @@
 #include "Bot/IdleRule.h"
 #include "Bot/QuestDoable.h"
 #include "Travel/ReachMemory.h"
+#include "Travel/TransportWaitMemory.h"
 #include "Bot/ClassTables.h"
 #include "Bot/Gear/BotGearGenerator.h"   // RaidGearActive / RaidEquipUpgrade (raid-gear upgrade test)
 #include "Bot/RecipeDifficulty.h"
@@ -34,6 +35,7 @@
 #include "Travel/QuestHubDatabase.h"
 #include "Fleet/TownGatherSource.h"
 #include "Bot/World/ZonePicker.h"
+#include "Bot/World/SpreadSpot.h"
 #include "MaintainHelpers.h"       // ChunkedWalkToward (idle watch)
 #include "Travel/RepairVendorIndex.h"
 #include "Travel/UnifiedTravelGraph.h"
@@ -47,6 +49,7 @@
 #include "Combat/Apl/ApClassicHeal.h"   // MaintainOocHeal: Classic heal target + downranking
 #include "Combat/Apl/ApInterrupt.h"     // MaintainPet: Classic warlock pet choice
 #include "ClassicSpec.h"                // Classic::IsSingleSpecClass
+#include "Bot/DrinkSayRule.h"
 #include "Bot/ClassicUpkeep.h"          // MaintainOocFood: Classic::SafeToRecover / PickRecovery
 #include "Bot/ThreatDiscipline.h"       // RaidLogDue: [raid_pull] decision log pacing
 #include "Bot/Raid/RaidEncounters.h"    // RulesForMap: the raid layer owns cone avoidance on its maps
@@ -2171,6 +2174,26 @@ GroupMemberSummary const* GroupAnchorTank(BotSnapshotView const& s, BotAI const&
 // An engaged raid elite a ranged bot must keep clear of: alive, targetable,
 // in combat, elite / rare / boss, and fighting a group tank / member / member
 // pet (a mob on THIS bot is left to the tank - running only drags it along).
+// A live mob a group member crowd-controls (a sheep, a shackle) that is in combat with the group: the fight's last business. The
+// coordinator leaves it out of every kill list while it is held, so once its pack is dead nobody would ever kill it: the tank
+// advanced 150 y and pulled on with four while the mage, bound to re-sheep its moon mob, stood by it for 3 minutes (wc_cobrahn 127).
+// The sheep is killed last: the advance holds while it lives and the tank's pull takes it.
+static NearbyUnit const* HeldMobOfTheGroup(BotSnapshotView const& s, GroupSnapshotView const& g)
+{
+    auto const* mems = g.exists() ? g.members() : nullptr;
+    for (auto const& u : s.raw().combat.nearby_enemies)
+    {
+        if (u.hp <= 0 || u.is_player || u.untargetable || u.is_pacified || !u.unit_in_combat || !u.is_cc_locked || u.cc_caster.IsEmpty())
+            continue;
+        bool ours = u.cc_caster == s.guid();
+        if (!ours && mems)
+            for (auto const& m : *mems)
+                if (m.guid == u.cc_caster) { ours = true; break; }
+        if (ours) return &u;
+    }
+    return nullptr;
+}
+
 static bool RaidEngagedElite(NearbyUnit const& u)
 {
     if (u.hp <= 0 || u.is_player || u.untargetable || !u.unit_in_combat) return false;
@@ -2292,7 +2315,7 @@ static NearbyUnit const* UnpulledPackReaching(BotSnapshotView const& s, DungeonA
 // an unpulled mob's aggro reach + kPackAggroMargin than the bot itself stands
 // (any idle mob this bot sees, line of sight or not). A bot already on a
 // pack's edge may still step along or away from it; it never steps further in.
-bool RaidPointInUnpulledReach(BotSnapshotView const& s, float x, float y, float z)
+bool RaidPointInUnpulledReach(BotSnapshotView const& s, float x, float y, float z, bool exempt_victim_pack)
 {
     // Raid and 5-man alike (playtest, Deadmines 2026-10-10: a mage / warlock that was hit ran, and the run took it into the next
     // pack, which pulled too).
@@ -2300,7 +2323,7 @@ bool RaidPointInUnpulledReach(BotSnapshotView const& s, float x, float y, float 
     const uint32 now_ms = s.published_at_ms();
     float pd = 0.f, pr = 0.f;
     NearbyUnit const* engaged = nullptr;
-    if (!s.victim().IsEmpty())
+    if (exempt_victim_pack && !s.victim().IsEmpty())
         for (auto const& e : s.raw().combat.nearby_enemies)
             if (e.guid == s.victim() && e.hp > 0) { engaged = &e; break; }
     NearbyUnit const* pack = UnpulledPackReaching(s, nullptr, x, y, z, 0.0f, /*need_los=*/false, nullptr, now_ms, &pd, &pr, engaged);
@@ -3817,6 +3840,24 @@ bool RaidCastLosStep(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
     const float step = std::min(kLosStep, dist - 2.0f);
     static constexpr float kLosBearings[] = { 0.0f, 0.5236f, -0.5236f, 1.0472f, -1.0472f, 1.5708f, -1.5708f };
     constexpr float kClearOfElite = kRaidRangedTooClose + 2.0f;
+    // In a 5-man every mob is an elite and the tank-held ones stand on the tank, so a step toward a tank 18 y away always lands
+    // within the raid splash clearance of one and every bearing is thrown out (wc_cobrahn 127: the priest 18 y from its tank with
+    // no sight line, "near an engaged elite 7" twice, six heals failed on line of sight and the tank died from 40% in 8 s). A
+    // dungeon mob held by the tank has no cleave to keep clear of: the step stays out of its melee reach only. A mob loose on a
+    // member keeps the raid clearance, since it may turn on the healer.
+    constexpr float kClearOfHeldDungeonElite = 6.0f;
+    const bool five_man = s.is_in_dungeon() && !s.is_in_raid();
+    auto const clear_of_elites = [&](float px, float py) -> bool
+    {
+        for (auto const& u : s.raw().combat.nearby_enemies)
+        {
+            if (!RaidEngagedElite(u)) continue;
+            const float clearance = five_man && ThreatVictim(u.victim_kind) == ThreatVictim::Tank ? kClearOfHeldDungeonElite : kClearOfElite;
+            const float ux = px - u.x, uy = py - u.y;
+            if (ux * ux + uy * uy < clearance * clearance) return false;
+        }
+        return true;
+    };
     Player* self = ObjectAccessor::FindConnectedPlayer(s.raw().guid);
     // Which filter threw out each bearing, for the "no walkable step" line (Deadmines 2026-10-15 n43: the priest stood 80 s
     // without a sight line to the tank and the log could not say what held it).
@@ -3827,14 +3868,7 @@ bool RaidCastLosStep(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
         const float px = bx + (dx * c - dy * sn) * step;
         const float py = by + (dx * sn + dy * c) * step;
         const float pz = bz + (az - bz) * std::min(1.0f, step / dist);
-        bool clear = true;
-        for (auto const& u : s.raw().combat.nearby_enemies)
-        {
-            if (!RaidEngagedElite(u)) continue;
-            const float ux = px - u.x, uy = py - u.y;
-            if (ux * ux + uy * uy < kClearOfElite * kClearOfElite) { clear = false; break; }
-        }
-        if (!clear) { ++rej_elite; continue; }
+        if (!clear_of_elites(px, py)) { ++rej_elite; continue; }
         if (RaidPointBlocked(s, px, py, pz, kHazardMargin) ||
             RaidPointInUnpulledReach(s, px, py, pz)) { ++rej_hazard; continue; }   // nor into an idle pack's reach
         // Never into a tanked boss's front arc: the cone sidestep would take
@@ -3875,15 +3909,8 @@ bool RaidCastLosStep(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
         G3D::Vector3 pt;
         if (RaidPathStepToward(self, ax, ay, az, step, pt))
         {
-            bool clear = true;
-            for (auto const& u : s.raw().combat.nearby_enemies)
-            {
-                if (!RaidEngagedElite(u)) continue;
-                const float ux = pt.x - u.x, uy = pt.y - u.y;
-                if (ux * ux + uy * uy < kClearOfElite * kClearOfElite) { clear = false; break; }
-            }
             float ad2, afx, afy;
-            if (clear && !RaidPointBlocked(s, pt.x, pt.y, pt.z, kHazardMargin) &&
+            if (clear_of_elites(pt.x, pt.y) && !RaidPointBlocked(s, pt.x, pt.y, pt.z, kHazardMargin) &&
                 !RaidPointInUnpulledReach(s, pt.x, pt.y, pt.z) &&
                 !FrontArcBossAt(s, g, pt.x, pt.y, ad2, afx, afy) &&
                 !DungeonStepRefused(s, ai, pt.x, pt.y, pt.z, now_ms))
@@ -7265,7 +7292,11 @@ bool DungeonConvergeToFight(BotSnapshotView const& s, BotAI& ai,
     // tank a detour) has not joined either: it is pulled back to a valid slot
     // even when in range and LoS (MC 2026-10-06: casters idle on the rocks).
     float off_floor_len = -1.0f;
-    const bool off_floor = Services::Config().behavior_raid_spacing() && raid_ranged && tank_fighting && !s.in_combat() && !s.is_casting() &&
+    // A 5-man healer / caster too (Deadmines deadmines_full 15 Oct, ship deck: the priest stood 9 y below the tank 3 y away on the
+    // map, td <= join range counted it as joined, LINE_OF_SIGHT x17 and the tank died): raid_ranged is false outside a raid, so the
+    // floor test uses the instance predicate and the walk below is the legacy step to the tank's own height.
+    const bool floor_ranged = raid_ranged || InstanceRangedOrHealer(s, ai);
+    const bool off_floor = Services::Config().behavior_raid_spacing() && floor_ranged && tank_fighting && !s.in_combat() && !s.is_casting() &&
                            td <= kJoinRange && RaidBotOffTankFloor(s, *tk, &off_floor_len);
     const bool stuck_out = tank_fighting && !s.in_combat() &&
                            !s.is_casting() && (td > kJoinRange || off_floor);
@@ -7493,8 +7524,11 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                 for (auto const& m : *mems)
                     if (!m.is_bot && m.online && m.map_id == s.map_id())
                     { human_in_instance = true; break; }
+        // Not under an owner Hold / Stay: a bot told to hold its spot does not leave the instance (zg_thekal 2026-10-20: the tank
+        // hearthed from the landing in the tick between the scenario Hold lapsing at the order time and its renewal by the mana wait,
+        // after the trash clearing had killed Hakkar and marked the raid's final encounter done).
         if (s.dungeon_complete() && !s.in_combat() && !s.is_casting() &&
-            !human_in_instance)
+            !human_in_instance && !ai.holding_position(now_ms))
         {
             // Look for a teleporter GO. NearbyObject pre-resolves
             // teleport_dest_map for GAMEOBJECT_TYPE_SPELLCASTER (22)
@@ -7633,11 +7667,24 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                 float hkx, hky, hkz; s.position(hkx, hky, hkz);
                 focus_kill_zone = (hkz < advice.tight_engage_below_z);
             }
-            const uint32 cc = (cc_cohered && !focus_kill_zone)
-                                  ? ClassCC(s.cls(), s.spec()) : 0;
-            if (cc != 0 && s.knows_spell(cc) && s.is_ready(cc))
+            // The hold spell comes from the vanilla tables of MarkCc (Polymorph, Sap, Shackle Undead, Hibernate ...), picked per mob
+            // by creature type. ClassCC's retail table gave a priest Mind Control: zf_antusul and gnomeregan_grubbis 127, the priest
+            // "held" a mob out of range for minutes (API_BEYOND_RANGE x7 per 11 s), this rule claimed every tick, it never drank, and
+            // the tank waited on healer mana until the run stalled.
+            uint32 cc = 0;
+            ObjectGuid pick;
+            auto const hold_spell_for = [&](NearbyUnit const& u) -> uint32
             {
-                ObjectGuid pick;
+                MarkCc::Option const* o = MarkCc::PickOption(s, s.cls(), MarkCc::TypeOf(u), /*ooc*/ !u.unit_in_combat);
+                if (!o || o->self_cast || o->root) return 0u;   // a trap at the feet or a root is no pre-pull hold
+                float ux, uy, uz; s.position(ux, uy, uz);
+                const float ddx = u.x - ux, ddy = u.y - uy, ddz = u.z - uz;
+                if (ddx * ddx + ddy * ddy + ddz * ddz > o->range * o->range || !u.in_los) return 0u;   // in reach from here, no walking in
+                uint32 const sp = MarkCc::SpellFor(s, *o);
+                return s.is_ready(sp) ? sp : 0u;
+            };
+            if (cc_cohered && !focus_kill_zone && MarkCc::IsMarkCcClass(s.cls()))
+            {
                 ObjectGuid const moon = g.raid_mark(/*moon*/ 4);
                 // Prefer moon-marked target if present and visible.
                 if (!moon.IsEmpty())
@@ -7652,7 +7699,8 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                         if (u.is_cc_locked) break;
                         // MarksNeedOrder: the moon on an idle mob is a plan; the sheep on it is the pull.
                         if (!MarkGate::MayEngage(s, ai, &g, moon, &u)) break;
-                        pick = moon;
+                        cc = hold_spell_for(u);
+                        if (cc) pick = moon;
                         break;
                     }
                 }
@@ -7679,6 +7727,7 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                     ObjectGuid const kill_focus = s.raw().pve_order.active ? s.raw().pve_order.kill_focus : ObjectGuid::Empty;
                     std::vector<CcCandidate> cands;
                     std::vector<ObjectGuid> cand_guids;
+                    std::vector<uint32> cand_spells;
                     for (auto const& u : s.raw().combat.nearby_enemies)
                     {
                         if (u.hp <= 0) continue;
@@ -7686,27 +7735,26 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                         c.hits_me = u.victim == s.guid();
                         c.locked = u.is_cc_locked;
                         c.is_skull = !skull.IsEmpty() && u.guid == skull;
-                        // Mechanical deny-guard (2026-06-27). The group's CC spells
-                        // — Polymorph (118), Sap (6770), Freezing Trap (187650) — are
-                        // creature-type restricted and return BAD_TARGETS on
-                        // CREATURE_TYPE_MECHANICAL (9). Skip Mechanical candidates so
-                        // the mage never burns GCDs spamming Polymorph on a Defias
-                        // Reaper/Cannon (the 495K-Polymorph-BAD_TARGETS class the A6
-                        // guard exists to prevent). Deny-list (not allow-list) so a
-                        // valid CC is never silently disabled.
-                        c.wrong_type = u.creature_type == 9 && (cc == 118 || cc == 6770 || cc == 187650);
+                        // No hold of this class takes its creature type (a mechanical Defias Reaper under Polymorph: BAD_TARGETS
+                        // every tick, 2026-06-27), or it stands out of the spell's reach or sight from here.
+                        uint32 const sp = hold_spell_for(u);
+                        c.wrong_type = sp == 0;
                         for (uint32_t e : advice.cc_priority_entries)
                             if (e == u.entry) { c.in_priority_list = true; break; }
                         c.is_kill_focus = !kill_focus.IsEmpty() && u.guid == kill_focus;
                         cands.push_back(c);
                         cand_guids.push_back(u.guid);
+                        cand_spells.push_back(sp);
                     }
                     // The group's kill focus (the most dangerous engaged caster of the list) first, else the first eligible add
                     // (Bot/CcPick.h).
                     if (size_t const at = PickCcTarget(cands); at != kNoCcTarget)
+                    {
                         pick = cand_guids[at];
+                        cc = cand_spells[at];
+                    }
                 }
-                if (!pick.IsEmpty())
+                if (!pick.IsEmpty() && cc != 0)
                 {
                     emit.cast(cc, pick);
                     ai.set_last_rule_fired(moon == pick
@@ -9031,6 +9079,35 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                         { any_member_in_combat_adv = true; break; }
                     }
                 }
+            }
+            // A member's crowd-controlled mob still alive is the fight's last business (HeldMobOfTheGroup): no advance while it
+            // lives; the tank walks back within pull range of it and idle:tank_pull_next takes it as the last of its pack.
+            if (NearbyUnit const* held = !any_member_in_combat_adv && s.is_in_dungeon() && !s.is_in_raid() ? HeldMobOfTheGroup(s, g) : nullptr)
+            {
+                any_member_in_combat_adv = true;
+                float hx, hy, hz;
+                s.position(hx, hy, hz);
+                const float hd = std::sqrt((held->x - hx) * (held->x - hx) + (held->y - hy) * (held->y - hy) + (held->z - hz) * (held->z - hz));
+                if (RaidLogDue(RaidLogKey(s, RaidLogKind::PullHeld) ^ 0x68656c64u, now_ms, 5000u))
+                    TC_LOG_INFO("playerbot.v2", "[tank_advance] {} holds: the crowd-controlled entry {} ({}) {:.0f}y away is still alive, it is killed last",
+                                s.name(), held->entry, held->guid.GetCounter(), hd);
+                if (hd > 25.0f)
+                    if (Player* self_h = ObjectAccessor::FindConnectedPlayer(s.raw().guid))
+                    {
+                        G3D::Vector3 hstep;
+                        bool h_off = false;
+                        if (DungeonTargetReachableAndStep(self_h, held->x, held->y, held->z, kRaidPackLookahead, hstep, &h_off) &&
+                            !DungeonStepAlreadyInFlight(s, hstep.x, hstep.y, hstep.z) &&
+                            !DungeonStepRefused(s, ai, hstep.x, hstep.y, hstep.z, now_ms) &&
+                            emit.move_to(hstep.x, hstep.y, hstep.z, /*run=*/true))
+                        {
+                            if (h_off)
+                                ai.set_dungeon_cross(hstep.x, hstep.y, hstep.z, now_ms + 12000);
+                            ai.note_move_commit(s.map_id(), hstep.x, hstep.y, hstep.z, now_ms);
+                            ai.set_last_rule_fired("idle:dungeon_tank_to_held_mob");
+                            return true;
+                        }
+                    }
             }
             if (any_member_in_combat_adv)
             {
@@ -11241,10 +11318,22 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                 // dungeon pull. The bots never set marks themselves, so every icon on a mob is the owner's call.
                 const bool dungeon_flow_pull = s.is_in_dungeon() && Services::Config().behavior_dungeon_flow();
                 float bx, by, bz; s.position(bx, by, bz);
+                // The sheep is killed last: a member's crowd-controlled mob whose pack is dead (no other mob engaged with the group,
+                // no idle mob within 20 y of it that the pull would wake) is pulled like an idle mob (HeldMobOfTheGroup).
+                NearbyUnit const* held_last = s.is_in_dungeon() && !s.is_in_raid() ? HeldMobOfTheGroup(s, g) : nullptr;
+                if (held_last)
+                    for (auto const& o : s.raw().combat.nearby_enemies)
+                    {
+                        if (o.hp <= 0 || o.is_player || o.untargetable || o.is_pacified || o.guid == held_last->guid) continue;
+                        if (o.unit_in_combat && !o.victim.IsEmpty() && !o.is_cc_locked) { held_last = nullptr; break; }
+                        const float ox = o.x - held_last->x, oy = o.y - held_last->y, oz = o.z - held_last->z;
+                        if (!o.unit_in_combat && !o.no_xp_kill && ox * ox + oy * oy + oz * oz <= 20.0f * 20.0f) { held_last = nullptr; break; }
+                    }
                 for (auto const& u : s.raw().combat.nearby_enemies)
                 {
                     if (u.hp <= 0) continue;
-                    if (!u.victim.IsEmpty()) continue;          // already engaged by someone
+                    const bool last_held = held_last && u.guid == held_last->guid;
+                    if (!u.victim.IsEmpty() && !last_held) continue;          // already engaged by someone
                     if (IsKnownBossUnit(s.map_id(), u)) continue;   // bosses (either boss flag, or the tactics table's) go through engage_boss
                     // Environmental/unkillable mobs (scene props, Mining Powder
                     // entry 48284, training dummies) have no_xp_kill or PACIFIED.
@@ -11288,7 +11377,7 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                     // as later engagement rules. Creature-cast CC
                     // (mob CC'ing mob — rare but exists) falls through
                     // because cc_caster won't be in nearby_friends.
-                    if (u.is_cc_locked && !u.cc_caster.IsEmpty())
+                    if (u.is_cc_locked && !u.cc_caster.IsEmpty() && !last_held)
                     {
                         bool cc_by_ally = (u.cc_caster == s.guid());
                         if (!cc_by_ally)
@@ -11333,6 +11422,9 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                     { bestSq = dsq; best = &u; best_is_priority = true; continue; }
                     if (dsq < bestSq) { bestSq = dsq; best = &u; }
                 }
+                if (best && held_last && best->guid == held_last->guid)
+                    TC_LOG_INFO("playerbot.v2", "[raid_pull] {} pulls the crowd-controlled entry {} ({}): the last of its pack, killed last",
+                                s.name(), best->entry, best->guid.GetCounter());
                 if (best)
                 {
                     // Pull-separately gate (M+ Bolstering, certain raid
@@ -12020,6 +12112,8 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                 if (dpick.item && !s.is_moving())
                 {
                     emit.emit(UseItemByEntryIntent{dpick.item, ObjectGuid::Empty});
+                    if (dpick.drink)
+                        Classic::SayDrinkingIfDue(s, ai, emit, now_ms);
                     ai.set_last_rule_fired("idle:dungeon_healer_drink");
                     if (ai.tank_diag_due(now_ms))
                         TC_LOG_INFO("playerbot.v2", "[healer_drink] {} drinks item {} at mana {}%", s.name(), dpick.item, s.power_pct(POWER_MANA));
@@ -15529,6 +15623,17 @@ void EnsureTravelPlan(BotSnapshotView const& s, BotAI& ai,
                     req.allow_hearth = false;   // hearth would lose travel progress
                     req.skip_trivial = ai.travel_force_graph();
                     Route route = Services::TravelGraph().FindRoute(req);
+                    if (!route.ok && req.from_map == req.to_map)
+                    {
+                        // A far same-map goal with no route falls back to a straight walk that
+                        // cannot find a long way round; say which side had no graph node to
+                        // attach to, or that the search ran dry between them.
+                        TC_LOG_INFO("playerbot.v2",
+                            "[travel_noroute] bot={} map={} from=({:.0f},{:.0f},{:.0f}) to=({:.0f},{:.0f},{:.0f}) dist={:.0f} from_attach={} to_attach={} visited={}",
+                            s.bot_id(), req.from_map, bx, by, bz, tx, ty, tz,
+                            std::sqrt((tx - bx) * (tx - bx) + (ty - by) * (ty - by)),
+                            route.from_attach_count, route.to_attach_count, route.visited_nodes);
+                    }
                     if (route.ok && !route.legs.empty())
                     {
                         auto& g = Services::TravelGraph();
@@ -15749,11 +15854,50 @@ bool DriveTravelPlanTo(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& em
                         if (ride && !s.on_transport())
                         {
                             emit.use_game_object(ride->guid);   // API: board once it stands still at the dock
+                            ::Playerbot::V2::Travel::TransportWaitMemory::Instance().NoteBoarded(lg->payload);
+                            ai.set_transport_wait_since_ms(0);
                             ai.set_last_rule_fired("idle:board_transport");
                             return true;
                         }
                         // Transport not in yet: hold on the dock (no chasing a
                         // moving ship / car — it comes back to this stop).
+                        // A ride that has not come in for TransportWaitMemory::kGiveUpMs is given up: the plan is dropped, and once two
+                        // bots have done so the router leaves the ride out for a while. The Deeprun Tram soak (2026-10-18) had eight bots
+                        // standing on the Stormwind platform for their whole 20 minutes.
+                        {
+                            using ::Playerbot::V2::Travel::TransportWaitMemory;
+                            uint32 const now = s.published_at_ms();
+                            if (ai.transport_wait_since_ms() == 0)
+                                ai.set_transport_wait_since_ms(now);
+                            uint32 const since = ai.transport_wait_since_ms();
+                            if (now - ai.transport_wait_logged_ms() >= 60000u && now - since >= 60000u)
+                            {
+                                ai.set_transport_wait_logged_ms(now);
+                                uint32 seen = 0, serving = 0;
+                                float nearest = -1.f;
+                                for (auto const& go : s.raw().world_objects.nearby_objects)
+                                {
+                                    if (go.go_type != 15 && go.go_type != 11) continue;
+                                    ++seen;
+                                    if (!Services::Portals().ServesSameRoute(lg->payload, go.entry)) continue;
+                                    ++serving;
+                                    float const d = std::sqrt((go.x - bx) * (go.x - bx) + (go.y - by) * (go.y - by) + (go.z - bz) * (go.z - bz));
+                                    if (nearest < 0.f || d < nearest) nearest = d;
+                                }
+                                TC_LOG_INFO("playerbot.v2",
+                                    "[xport_wait] {} waits {} s at the dock ({:.0f},{:.0f},{:.0f}) map {} for route {}: transports in sight {} (this route {}, nearest {:.0f} y; board range {:.0f} y)",
+                                    s.name(), (now - since) / 1000u, bx, by, bz, s.map_id(), lg->payload, seen, serving, nearest, kTransportBoardRange);
+                            }
+                            if (TransportWaitMemory::ShouldGiveUp(since, now))
+                            {
+                                TransportWaitMemory::Instance().NoteGaveUp(lg->payload, now);
+                                TC_LOG_INFO("playerbot.v2", "[xport_wait] {} gave up waiting for route {} after {} s; plan dropped", s.name(), lg->payload,
+                                    (now - since) / 1000u);
+                                ai.clear_travel_plan();   // also clears the wait clock
+                                ai.set_last_rule_fired("idle:transport_wait_giveup");
+                                return true;
+                            }
+                        }
                         ai.set_last_rule_fired("idle:wait_for_transport");
                         return true;
                     }
@@ -17681,7 +17825,7 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
         // all-bot group) must NOT be pulled to a hub by this rule — it would
         // scatter the group. Solo autonomous bots (ungrouped) still relocate.
         if (!_prof_mode && !has_same_map_turnin && !s.objective_is_relocation() &&
-            !s.in_group() &&
+            !s.in_group() && (Services::Config().world_questing() || !s.is_free_world_bot()) &&
             (s.raw().quest_log.quests.empty() || nothing_local))
         {
             // Pick the nearest hub the bot hasn't already tried unproductively
@@ -17735,6 +17879,7 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
             {
                 if (!h) continue;
                 if (ai.hub_recently_tried(h->hubId, hub_now_ms)) continue;
+                if (ai.goal_blacklisted(h->location.GetPositionX(), h->location.GetPositionY(), hub_now_ms)) continue;
                 // T-P0a: emit.move_to is map-implicit — it pathfinds on the
                 // bot's CURRENT map. Feeding it a cross-map hub's coordinates
                 // produces a doomed same-map pathfind toward a point that
@@ -17799,10 +17944,19 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                 chosen = h;
                 break;
             }
+            if (chosen != nullptr && ai.hub_walk_stalled(chosen->hubId, s.raw().position.x, s.raw().position.y, hub_now_ms))
+            {
+                // Walking at this hub for 40 s and not moving: take the next hub (or the wander below) instead of asking again.
+                ai.note_hub_tried(chosen->hubId, hub_now_ms);
+                ai.blacklist_goal(chosen->location.GetPositionX(), chosen->location.GetPositionY(), hub_now_ms);
+                chosen = nullptr;
+            }
             if (chosen != nullptr)
             {
-                emit.move_to(chosen->location.GetPositionX(),
-                             chosen->location.GetPositionY(),
+                float hub_tx = 0.f, hub_ty = 0.f;
+                ::Playerbot::V2::World::HubStandPoint(chosen->location.GetPositionX(), chosen->location.GetPositionY(), chosen->radius,
+                                                      s.guid().GetCounter(), hub_tx, hub_ty);
+                emit.move_to(hub_tx, hub_ty,
                              chosen->location.GetPositionZ(),
                              /*run*/ true);
                 ai.set_last_rule_fired("idle:travel_to_hub");
@@ -19378,7 +19532,7 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                 if (!ai.action_recently_tried(BotAI::ActionKind::BgPort,
                                                mt_key, mt_now_ms))
                 {
-                    emit.cast(s.best_mount_spell());
+                    emit.emit(MountIntent{s.best_mount_spell()});   // stops the bot first: a mount cast is refused while moving
                     ai.note_action_retry(BotAI::ActionKind::BgPort,
                                          mt_key, mt_now_ms);
                     ai.set_last_rule_fired("idle:mount_for_travel");
@@ -19806,7 +19960,7 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                 const RecipeColor c = ResolveRecipeColor(spell_id, cur);
                 if (c == RecipeColor::Gray || c == RecipeColor::Unknown) continue;
                 // A recipe that needs a fire, forge or anvil is only cast beside one: away from it the cast fails with
-                // REQUIRES_SPELL_FOCUS, the bot stands still, and the idle watch counts it stuck (pathing-9 soak: 935 fails).
+                // REQUIRES_SPELL_FOCUS, the bot stands still, and the idle watch counts it stuck (935 fails in one soak run).
                 if (!RecipeFocusNear(s, spell_id)) continue;
                 // Color rank: Orange=1, Yellow=2, Green=3 — lower is better.
                 // Replace if: better color, OR same color but lower skill.

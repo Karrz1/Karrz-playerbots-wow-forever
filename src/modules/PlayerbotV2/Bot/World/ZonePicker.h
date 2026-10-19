@@ -62,4 +62,9 @@ DestinationPick PickVanillaLevelingTown(uint8 level, bool alliance, uint64 seed,
 // the destination stays as it is. Vanilla realm placement only.
 DestinationPick SpreadWithinZone(DestinationPick d, uint8 level, bool alliance, uint64 seed, bool allow_grind = false);
 
+// A place on `map` within `max_yards` of (x, y) where the hostile ordinary mobs average within two levels of `level` (GrindSpot.h). The spot is
+// the bot's own: chosen by a hash of `seed` over the suitable spots in reach, so it does not change as the bot moves and a crowd spreads
+// over the spots. False when none is in reach.
+bool FindGrindSpotNear(bool alliance, uint32 map, float x, float y, uint32 level, uint64 seed, float max_yards, float& ox, float& oy, float& oz);
+
 } // namespace Playerbot::V2::World

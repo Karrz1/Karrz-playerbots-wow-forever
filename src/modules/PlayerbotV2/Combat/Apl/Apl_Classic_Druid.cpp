@@ -372,7 +372,7 @@ void DoTigersFury(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(TIGER
 
 bool ShouldFaerieFireCat(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && InCat(ctx) && VictimIsBossLike(ctx) && Ready(ctx, FAERIE_FIRE_FERAL)
+    return HasLiveTarget(ctx) && InCat(ctx) && VictimIsBossLike(ctx) && (Ready(ctx, FAERIE_FIRE_FERAL) && ctx.bot.victim_in_spell_range(FAERIE_FIRE_FERAL))
         && !FaerieFireUp(ctx);
 }
 void DoFaerieFireFeral(ApPredicateContext const& ctx, BotIntentEmitter& e)
@@ -589,7 +589,7 @@ void DoBearSpreadFaerieFire(ApPredicateContext const& ctx, BotIntentEmitter& e)
 
 bool ShouldFaerieFireBear(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && InBear(ctx) && Ready(ctx, FAERIE_FIRE_FERAL)
+    return HasLiveTarget(ctx) && InBear(ctx) && (Ready(ctx, FAERIE_FIRE_FERAL) && ctx.bot.victim_in_spell_range(FAERIE_FIRE_FERAL))
         && !ctx.bot.has_aura(FAERIE_FIRE_FERAL, ctx.bot.victim());
 }
 
@@ -703,7 +703,7 @@ bool ShouldRejuvenation(ApPredicateContext const& ctx)
 {
     if (!CasterReady(ctx, REJUVENATION)) return false;
     HealTarget const t = LowestFriendOrSelf(ctx);
-    return t.hp_pct <= 85 && !TargetHasMyAura(ctx, REJUVENATION, t.guid) && ClassicHeal::HotAllowed(ctx.bot, ctx.group, t.guid)
+    return t.hp_pct <= 85 && ClassicHeal::CanPayMana(ctx.bot, ctx.bot.resolve_rank(REJUVENATION)) && !TargetHasMyAura(ctx, REJUVENATION, t.guid) && ClassicHeal::HotAllowed(ctx.bot, ctx.group, t.guid)
         && ClassicHeal::HotWorthIt(ctx.bot, ctx.group, t.guid)
         && !ClassicHeal::HotClaimedByOther(ctx.bot, ctx.group, t.guid, REJUVENATION);
 }

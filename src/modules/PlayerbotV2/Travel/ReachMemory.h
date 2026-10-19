@@ -1,7 +1,7 @@
 // ReachMemory - what the path checks have already learned about "from around here, that goal cannot be walked to". A failed path (no path,
 // a goal off the mesh, a partial route that stops short or loops) is remembered per pair of cells (50 y around the start, 25 y around the
 // goal) for every bot, so a second bot standing in the same place does not pay the same Detour call and goal selection can skip a goal
-// before committing to it (Zephras Isle, 2026-10-16: hub after hub, bot after bot, "partial routes toward ..." for a hub on another tier).
+// before committing to it.
 // A complete path forgets the pair. Pure: no game types, tested in tests/game/ClassicReachMemory.cpp.
 
 #pragma once
@@ -118,7 +118,7 @@ private:
 
 // QuestGoalMemory - the same idea for a quest objective: when bots keep giving up on the walk to one quest's goal (the tracker drops the goal
 // after it made no progress), the other bots stop starting that quest for a while instead of each paying the same 90 s wedge
-// (Mcreta, quest 4286, 2026-10-17: walkable ground ends 1,124 y short of the goal). Per quest, not per place: the objective is one point.
+//. Per quest, not per place: the objective is one point.
 class QuestGoalMemory
 {
 public:

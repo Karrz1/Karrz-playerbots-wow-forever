@@ -56,6 +56,32 @@ namespace
         static std::array<std::mutex, kNavExecLockStripes> locks;
         return locks[mapId % kNavExecLockStripes];
     }
+
+    // The nav lock this thread holds, if any. MapUpdater catches a hardware fault (SEH) in Map::Update and skips the tick; that unwind
+    // does not run the destructor of a lock held below the fault (a null read inside the locked A* left the map's stripe held, the
+    // next tick threw on the relock, and the world thread hung until the freeze detector fired). The guard records the lock so the
+    // catch can release it (ReleaseNavLockAfterFault); a normal exit clears the record first, so the lock is never unlocked twice.
+    thread_local std::mutex* t_navLockHeld = nullptr;
+
+    class NavExecGuard
+    {
+    public:
+        explicit NavExecGuard(std::mutex& m) : _m(m) { _m.lock(); t_navLockHeld = &_m; }
+        ~NavExecGuard() { t_navLockHeld = nullptr; _m.unlock(); }
+        NavExecGuard(NavExecGuard const&) = delete;
+        NavExecGuard& operator=(NavExecGuard const&) = delete;
+    private:
+        std::mutex& _m;
+    };
+}
+
+void ReleaseNavLockAfterFault()
+{
+    if (std::mutex* held = t_navLockHeld)
+    {
+        t_navLockHeld = nullptr;
+        held->unlock();
+    }
 }
 
 ////////////////// PathGenerator //////////////////
@@ -144,7 +170,7 @@ bool PathGenerator::CalculatePathImpl(float srcX, float srcY, float srcZ, float 
         // SHARED non-thread-safe dtNavMeshQuery — serialize the node-pool-mutating A*
         // per map (see NavExecLock above). Guards findPath + moveAlongSurface against
         // the cross-thread node-pool corruption that crashed the server 2026-06-27.
-        std::lock_guard<std::mutex> navGuard(NavExecLock(_source->GetMapId()));
+        NavExecGuard navGuard(NavExecLock(_source->GetMapId()));
         BuildPolyPath(start, dest);
     }
 

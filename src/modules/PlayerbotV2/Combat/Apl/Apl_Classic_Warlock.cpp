@@ -26,7 +26,6 @@
 // Skipped: Fear, Fel Domination (Soulstone / Healthstone live in
 // the upkeep rules).
 
-#include "AplPetThrottle.h"
 #include "Bot/SpellFamily.h"
 #include "../ApRegistry.h"
 #include "../ApRotation.h"
@@ -163,7 +162,9 @@ void DoDrainLife(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(DR
 
 bool ShouldLifeTap(ApPredicateContext const& ctx)
 {
-    return ManaPct(ctx) <= 25 && ctx.bot.hp_pct() >= 60 && Ready(ctx, LIFE_TAP);
+    // Taps before the nukes stop (the wand floor is 35 %): tapping at 25 % left the 25-35 % band to the wand, a warlock that shot instead of
+    // converting health into the mana for more bolts (parity t3: 47 s of 180 not casting, 6 mana refills).
+    return ManaPct(ctx) <= std::max<int32>(25, NukeManaFloor(ctx)) && ctx.bot.hp_pct() >= 60 && Ready(ctx, LIFE_TAP);
 }
 void DoLifeTap(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(LIFE_TAP); }
 
@@ -188,17 +189,6 @@ bool ShouldSummonPet(ApPredicateContext const& ctx)
     return ctx.bot.raw().pet.pet_family != Interrupt::SummonPetFamily(want) && ctx.bot.has_reagents(want);
 }
 void DoSummonPet(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(PetSpell(ctx)); }
-
-bool ShouldPetAttack(ApPredicateContext const& ctx)
-{
-    return HasLiveTarget(ctx) && ctx.bot.in_combat() && ctx.bot.has_pet() && ctx.bot.pet_victim() != ctx.bot.victim()
-        && Playerbot::AplPet::PetAttackDue(ctx.bot.guid().GetCounter(), ctx.bot.published_at_ms());
-}
-void DoPetAttack(ApPredicateContext const& ctx, BotIntentEmitter& e)
-{
-    Playerbot::AplPet::NotePetAttack(ctx.bot.guid().GetCounter(), ctx.bot.published_at_ms());
-    e.pet_attack(ctx.bot.victim());
-}
 
 // A raid group: the curse comes from the raid plan and the dots are capped.
 bool InRaid(ApPredicateContext const& ctx)
@@ -245,7 +235,7 @@ bool ShouldRaidCurse(ApPredicateContext const& ctx)
         return false;
     if (po.curse_target == ctx.bot.victim())
     {
-        if (!HasLiveTarget(ctx) || ctx.bot.has_aura(po.curse_spell, ctx.bot.victim()))
+        if (!HasLiveTarget(ctx) || !ctx.bot.victim_in_spell_range(po.curse_spell) || ctx.bot.has_aura(po.curse_spell, ctx.bot.victim()))
             return false;
         return po.curse_spell == CURSE_OF_AGONY || !VictimCurseFromOther(ctx, po.curse_spell);
     }
@@ -329,7 +319,7 @@ void DoShadowBolt(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(S
 // / Searing Pain (the fire filler, Shadow Bolt's mana gate).
 bool ShouldSearingPain(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && ManaPct(ctx) >= NukeManaFloor(ctx) && Ready(ctx, SEARING_PAIN);
+    return HasLiveTarget(ctx) && ManaPct(ctx) >= NukeManaFloor(ctx) && (Ready(ctx, SEARING_PAIN) && ctx.bot.victim_in_spell_range(SEARING_PAIN));
 }
 
 SchoolHint::SchoolChoice const kSchoolChoices[] = {
@@ -347,7 +337,7 @@ void DoSchoolNuke(ApPredicateContext const& ctx, BotIntentEmitter& e) { SchoolHi
 
 bool ShouldWand(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && (Ready(ctx, SHOOT_WAND) && ctx.bot.victim_in_spell_range(SHOOT_WAND)) && ctx.bot.current_cast_spell_id() == 0;
+    return HasLiveTarget(ctx) && ctx.bot.raw().consumables.wand_school_mask != 0 && (Ready(ctx, SHOOT_WAND) && ctx.bot.victim_in_spell_range(SHOOT_WAND)) && ctx.bot.current_cast_spell_id() == 0;
 }
 void DoWand(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(SHOOT_WAND, ctx.bot.victim()); }
 
@@ -373,7 +363,6 @@ ApRule const kWarlockRules[] = {
     { ShouldLifeTap,        DoLifeTap,        "classic_warlock:life_tap" },
     { ShouldArmor,          DoArmor,          "classic_warlock:armor" },
     { ShouldSummonPet,      DoSummonPet,      "classic_warlock:summon_pet" },
-    { ShouldPetAttack,      DoPetAttack,      "classic_warlock:pet_attack" },
     { ShouldRaidCurse,      DoRaidCurse,      "classic_warlock:raid_curse" },
     { ShouldShadowTrance,   DoShadowBolt,     "classic_warlock:shadow_trance" },
     { ShouldSchoolNuke,     DoSchoolNuke,     "classic_warlock:school_nuke" },

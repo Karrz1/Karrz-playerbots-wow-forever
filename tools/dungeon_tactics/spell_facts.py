@@ -130,6 +130,13 @@ f(8282, 'Curse of Blood', 'shadow', 0, 'curse debuff', 'curse', 'u')
 f(15090, 'Dispel Magic', 'holy', 0, 'buff', None, 'u')
 f(12096, 'Fear', 'shadow', 1500, 'fear', 'magic', 'u')
 f(12039, 'Heal', 'holy', 2500, 'heal', None, 'u')
+# Mograine / Whitemane (instance-driven, EventAI 3976 / 3977) and Amnennar (EventAI 7358): schools, cast indexes and effects read from the
+# VMaNGOS spell_template rows (tools/classic_spell_values); the 2 s of Scarlet Resurrection is cast index 5 by recall.
+f(9257, 'Lay on Hands', 'holy', 0, 'heal')                           # Mograine, on himself, once Whitemane has raised him
+f(9256, 'Deep Sleep', 'shadow', 0, 'sleep')                          # Whitemane at 50%: everyone within 100 y stunned 10 s
+f(9232, 'Scarlet Resurrection', 'phys', 2000, 'heal', None, 'u')     # Whitemane on Mograine after the sleep: kick it when awake
+f(12642, 'Summon Frost Spectres', 'phys', 0, 'summon')              # Amnennar at 66% and 33%: three Frost Spectres
+f(13009, "Amnennar's Wrath", 'phys', 0, 'knock')                   # Amnennar every 12 s on the tank: a knockback
 f(11647, 'Power Word: Shield', 'holy', 0, 'shield', 'magic', 'u')
 f(17164, 'Summon Scarlet Hound', 'physical', 0, 'summon', None, 'u')
 f(6742, 'Bloodlust', 'physical', 0, 'buff', None, 'u')

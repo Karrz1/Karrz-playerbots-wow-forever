@@ -6,12 +6,13 @@
 // tank_threat, filled by the snapshot builder). Used to time Fade and Feint.
 
 #include "Bot/BotSnapshotView.h"
+#include "Bot/ThreatLimits.h"
 #include <algorithm>
 
 namespace Playerbot::Combat::ThreatDump {
 
-constexpr int32 kMediumThreatPct = 60;   // VM MediumThreatTrigger
-constexpr int32 kHighThreatPct   = 80;   // VM HighThreatTrigger
+constexpr int32 kMediumThreatPct = kThreatDropPct;   // the numbers live in Bot/ThreatLimits.h
+constexpr int32 kHighThreatPct   = kThreatHighPct;
 
 // Highest share (percent) of the group tank's threat the bot holds on any mob that is fighting and whose victim is not the
 // bot already. 0 when no tank holds threat on a mob or nothing qualifies.

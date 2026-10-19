@@ -30,6 +30,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include "Bot/ResistGear.h"
 
 namespace Playerbot::Classic {
 
@@ -1004,8 +1005,10 @@ bool IsDrinking(BotSnapshotView const& s) { return HasRegenAura(s, true); }
 
 bool RecoverBeforeWalking(BotSnapshotView const& s)
 {
-    if (s.hp_pct() < 50) return true;
     if (IsEating(s) || IsDrinking(s)) return true;
+    // Hurt: stop only for a meal the bot can sit down to; with nothing to eat it keeps going instead of standing about (it never sits
+    // just to regenerate).
+    if (s.hp_pct() < 50 && BestConsumable(s, ConsumableKind::Food) != 0) return true;
     return s.max_power(POWER_MANA) > 0 && s.power_pct(POWER_MANA) < 20 && BestConsumable(s, ConsumableKind::Drink) != 0;
 }
 
@@ -1132,6 +1135,8 @@ bool RaidConsumableBuffUp(BotSnapshotView const& s, RaidConsumable const& c)
     return false;
 }
 
+} // namespace
+
 // The raid role whose kit the bot uses. The group's role wins (a healer-flipped paladin takes the healer kit), then
 // the tank test the blessings use, then the spec.
 RaidConsumableRole RaidConsumableRoleOf(BotSnapshotView const& s, GroupSnapshotView const& g)
@@ -1154,6 +1159,8 @@ RaidConsumableRole RaidConsumableRoleOf(BotSnapshotView const& s, GroupSnapshotV
         role = RaidConsumableRole::Caster;
     return role;
 }
+
+namespace {
 
 bool RaidConsumablesApply(BotSnapshotView const& s)
 {
@@ -1183,9 +1190,18 @@ uint32 PickRaidConsumableStock(BotSnapshotView const& s, GroupSnapshotView const
 {
     if (!RaidConsumablesApply(s))
         return 0;
+    // A resistance potion is stocked only for a school this raid's bosses deal; one for another school counts as handled.
+    uint32 const map_id = s.map_id();
+    auto const school_wanted = [map_id](RaidConsumable const& c)
+    {
+        for (Resist r : { Resist::Fire, Resist::Frost, Resist::Nature, Resist::Shadow })
+            if (c.item == ResistPotionItem(r))
+                return InstanceDealsSchool(map_id, r);
+        return true;
+    };
     RaidConsumable const* next = NextRaidConsumableToStock(RaidConsumableRoleOf(s, g),
         [&](uint32 item) { return s.item_count(item); },
-        [&](RaidConsumable const& c) { return RaidConsumableBuffUp(s, c); });
+        [&](RaidConsumable const& c) { return RaidConsumableBuffUp(s, c) || (c.combat && !school_wanted(c)); });
     return next ? next->item : 0;
 }
 
@@ -1211,7 +1227,7 @@ RecoveryPick PickRecovery(BotSnapshotView const& s, int32 start_hp, int32 start_
             return { food, false };
     if (!drinking && mana_user && mana < start_mana)
         if (uint32 const drink = BestConsumable(s, ConsumableKind::Drink))
-            return { drink, false };
+            return { drink, false, true };
     // A grouped instance DPS (start_mana == kPullReadyDpsManaPct) sits only to 85%: the rest is minutes of waiting for the raid.
     int32 const top_mana = start_mana == kPullReadyDpsManaPct ? 85 : kTopOffPct;
     if ((eating && hp < kTopOffPct) || (drinking && mana < top_mana))
@@ -1353,6 +1369,7 @@ void NoteManaItemRefused(BotSnapshotView const& s)
     if (s.max_power(POWER_MANA) <= 0 || !s.in_combat() || !s.is_in_instance() || s.power_pct(POWER_MANA) > 20 || !LogPaced(s, 0x6D616E61u))
         return;
     uint32 potions = 0, runes = 0, gems = 0, other = 0, rune_items = 0;
+    std::string states;   // each mana item in the bags: what UsableNow reads for it
     for (InventoryItem const& it : s.raw().inventory.bag_items)
     {
         if (it.entry == 12662)
@@ -1360,6 +1377,9 @@ void NoteManaItemRefused(BotSnapshotView const& s)
         if (!IsConsumableClass(it.item_class, it.item_subclass))
             continue;
         ConsumableInfo const& info = Classify(it.entry);
+        if (info.kinds & (KindBit(ConsumableKind::ManaPotion) | KindBit(ConsumableKind::ManaItem)))
+            states += fmt::format(" [{} req {} (bot {}), skill {}/{}, cooldown {} ms]", it.entry, info.req_level, uint32(s.level()),
+                                  info.req_skill ? s.skill_value(uint16(info.req_skill)) : 0u, info.req_skill_rank, s.cd_remaining(info.spell).count());
         if (info.kinds & KindBit(ConsumableKind::ManaPotion))
             potions += it.count;
         else if (info.kinds & KindBit(ConsumableKind::ManaItem))
@@ -1394,9 +1414,9 @@ void NoteManaItemRefused(BotSnapshotView const& s)
         }
     }
     TC_LOG_INFO("playerbot.v2", "[raid_consume] {} mana {}% and no mana item picked: casting {}, consumables allowed {}, a combat consumable used recently {}, "
-                "usable potion {}, in the bags: {} mana potions, {} runes ({} Demonic Runes by entry), {} gems, {} other combat consumables, hp {}%",
+                "usable potion {}, in the bags: {} mana potions, {} runes ({} Demonic Runes by entry), {} gems, {} other combat consumables, hp {}%, items:{}",
                 s.name(), s.power_pct(POWER_MANA), s.is_casting() ? 1 : 0, ConsumablesAllowed(s) ? 1 : 0, CombatConsumableUsedRecently(s) ? 1 : 0,
-                BestConsumable(s, ConsumableKind::ManaPotion), potions, runes, rune_items, gems, other, s.hp_pct());
+                BestConsumable(s, ConsumableKind::ManaPotion), potions, runes, rune_items, gems, other, s.hp_pct(), states);
 }
 
 // ======================= Raid support =======================
@@ -1859,8 +1879,11 @@ uint32 ResistPotionItem(Resist r)
 {
     switch (r)
     {
-        case Resist::Fire: return 13457;   // Greater Fire Protection Potion
-        default:           return 0;
+        case Resist::Fire:   return 13457;   // Greater Fire Protection Potion
+        case Resist::Frost:  return 13456;   // Greater Frost Protection Potion
+        case Resist::Nature: return 13458;   // Greater Nature Protection Potion
+        case Resist::Shadow: return 13459;   // Greater Shadow Protection Potion
+        default:             return 0;
     }
 }
 
@@ -1881,6 +1904,27 @@ uint32 PickResistPotion(BotSnapshotView const& s)
     if (CombatConsumableUsedRecently(s))
         return 0;
     return item;
+}
+
+uint8 PickResistGearSchool(BotSnapshotView const& s)
+{
+    if (!IsVanillaRealm() || !s.in_group() || !s.is_in_raid() || !s.is_alive() || !ResistSwapMap(s.map_id()) || !ConsumablesAllowed(s))
+        return 0;
+    Raid::RaidRules const* rules = Raid::RulesForMap(s.map_id());
+    if (!rules || rules->resistPotion.empty())
+        return 0;
+    for (NearbyUnit const& u : s.nearby_enemies())   // nearest first
+    {
+        if (u.hp <= 0 || u.is_player || !IsBossUnit(u))
+            continue;
+        for (Raid::ResistPotion const& rp : rules->resistPotion)
+            if (rp.enemy == u.entry)
+                for (auto const& [school, spell_school] : { std::pair{ Resist::Fire, uint8(SPELL_SCHOOL_FIRE) }, std::pair{ Resist::Nature, uint8(SPELL_SCHOOL_NATURE) },
+                                                            std::pair{ Resist::Frost, uint8(SPELL_SCHOOL_FROST) }, std::pair{ Resist::Shadow, uint8(SPELL_SCHOOL_SHADOW) } })
+                    if (rp.item == ResistPotionItem(school))
+                        return spell_school;
+    }
+    return 0;
 }
 
 CastPick PickFearWard(BotSnapshotView const& s, GroupSnapshotView const& g)

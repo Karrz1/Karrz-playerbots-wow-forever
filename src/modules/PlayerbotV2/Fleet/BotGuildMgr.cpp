@@ -20,6 +20,7 @@
 #include "BotGuildEventScheduler.h"
 #include "BotGuildNamePool.h"
 #include "DatabaseEnv.h"
+#include "DB2Stores.h"
 #include "Guild.h"
 #include "GuildMgr.h"
 #include "Log.h"
@@ -175,6 +176,24 @@ uint8 BotGuildMgr::CountActiveGuilds(Faction f) const
     return static_cast<uint8>(active_by_faction_[f].size());
 }
 
+namespace {
+// "1,3,4,7": the race ids of one guild faction, for a `c.race IN (...)` filter (race to team is not a database column).
+std::string FactionRaceList(BotGuildMgr::Faction f)
+{
+    std::string races;
+    for (uint8 race = 1; race < 40; ++race)
+    {
+        if (!sChrRacesStore.LookupEntry(race))
+            continue;
+        Team const team = Player::TeamForRace(race);
+        if ((team == ALLIANCE ? BotGuildMgr::FACTION_ALLIANCE : BotGuildMgr::FACTION_HORDE) != f)
+            continue;
+        races += (races.empty() ? "" : ",") + std::to_string(race);
+    }
+    return races;
+}
+}  // namespace
+
 bool BotGuildMgr::EnsureFounderElected(Faction f)
 {
     if (f >= FACTION_COUNT) return false;
@@ -184,14 +203,24 @@ bool BotGuildMgr::EnsureFounderElected(Faction f)
     if (!Enabled()) return false;
 
     // 1. Skip if no open slots for this faction.
-    if (OpenSlotCount(f) == 0) return false;
+    if (OpenSlotCount(f) == 0)
+    {
+        TC_LOG_INFO("playerbot.v2", "[BotGuildMgr] faction={}: no founder elected, {} guild(s) active of target {}",
+                    static_cast<uint32>(f), uint32(CountActiveGuilds(f)), uint32(target_per_faction_));
+        return false;
+    }
 
     // 2. One founder per faction at a time. The charter FSM takes
     //    10-20 in-game min to complete; parallel founders would race
     //    for the same signers + capital NPC.
     {
         std::lock_guard<std::mutex> g(mtx_);
-        if (active_founder_low_[f] != 0) return false;
+        if (active_founder_low_[f] != 0)
+        {
+            TC_LOG_INFO("playerbot.v2", "[BotGuildMgr] faction={}: founder {} is still running its charter ({} s so far)",
+                        static_cast<uint32>(f), active_founder_low_[f], getMSTimeDiff(active_founder_at_ms_[f], getMSTime()) / 1000u);
+            return false;
+        }
     }
 
     if (!g_name_pool)
@@ -213,31 +242,36 @@ bool BotGuildMgr::EnsureFounderElected(Faction f)
     //    `setup_pipeline_state = 0xFF` requires the bot's setup
     //    pipeline is fully complete — gear, talents, mount, capital
     //    placement all done — so the founder is ready to act.
-    const uint32 charter_cost = sWorld->getIntConfig(CONFIG_CHARTER_COST_GUILD);
-    const uint32 min_money    = charter_cost * 12 / 10;       // 1.2× reserve
+    // No charter is bought (the guild is founded directly), so there is no money condition: the 1.2x charter cost filter left Horde
+    // without a founder in 127, whose online bots at level 25+ numbered none.
     const uint8  min_level    = kCharterMinFounderLevel;
 
     // TC's `characters` table has no `guildid` column — guild membership
     // lives in `guild_member.guid -> guildid`. LEFT JOIN + IS NULL is the
     // standard "characters not in any guild" filter. (Prior version queried
     // `c.guildid = 0` which fails with ERROR 1054 "Unknown column".)
+    // The faction is part of the query: drawing 50 random candidates of both factions and filtering afterwards left a faction without a
+    // founder whenever its bots were a small share of the eligible ones (playtest 10-19: no Horde founder among 50, no guild in 30 minutes).
+    std::string const races = FactionRaceList(f);
+    if (races.empty())
+        return false;
     QueryResult result = CharacterDatabase.PQuery(
         "SELECT c.guid, c.race, c.money "
         "FROM characters c "
         "JOIN playerbot_v2_character pv ON c.guid = pv.character_guid_low "
         "LEFT JOIN guild_member gm ON gm.guid = c.guid "
-        "WHERE c.level >= {} AND gm.guid IS NULL AND c.money >= {} "
+        "WHERE c.level >= {} AND gm.guid IS NULL AND c.race IN ({}) "
         "AND pv.setup_pipeline_state = 255 "
         "AND c.online = 1 "                  // must be in-world so TeleportFounderAndSigners can act
         "ORDER BY RAND() LIMIT 50",
-        min_level, min_money);
+        min_level, races);
 
     if (!result)
     {
         TC_LOG_INFO("playerbot.v2",
             "[BotGuildMgr] No eligible founder candidates for faction={} "
-            "(level>={} money>={} setup_complete)",
-            static_cast<uint32>(f), min_level, min_money);
+            "(level>={} setup_complete online)",
+            static_cast<uint32>(f), min_level);
         return false;
     }
 
@@ -266,7 +300,11 @@ bool BotGuildMgr::EnsureFounderElected(Faction f)
     // 4. Reserve a name from the pool.
     const std::string name = g_name_pool->PickAndReserve(
         static_cast<BotGuildNamePool::Faction>(f), chosen_low);
-    if (name.empty()) return false;     // pool exhausted, retry next tick.
+    if (name.empty())
+    {
+        TC_LOG_INFO("playerbot.v2", "[BotGuildMgr] faction={}: no guild name left in the pool for founder {}", static_cast<uint32>(f), chosen_low);
+        return false;     // pool exhausted, retry next tick.
+    }
 
     // 5. Stamp the active founder slot. The idle:guild_charter_drive
     //    rule on the chosen bot's tick will pick this up and start
@@ -292,8 +330,59 @@ bool BotGuildMgr::EnsureFounderElected(Faction f)
     //    every previously-elected founder hit the 30-min budget abort.
     //    Co-locating 5 bots on the plaza also satisfies the signer
     //    branch (CharterSignFire requires founder within 30y of signer).
-    TeleportFounderAndSigners(chosen_low, f);
+    // (The petition walk it was meant to start never got past the first step in play, 2026-10-19: the guild is founded directly.)
+    if (!FoundGuildDirectly(chosen_low, f, name))
+    {
+        OnCharterAborted(f);
+        return false;
+    }
+    return true;
+}
 
+bool BotGuildMgr::FoundGuildDirectly(uint64 founder_low, Faction f, std::string const& name)
+{
+    Player* founder = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(founder_low));
+    if (!founder || !founder->IsInWorld() || founder->GetGuildId() != 0)
+        return false;
+    uint32 const required = std::max<uint32>(1u, sWorld->getIntConfig(CONFIG_MIN_PETITION_SIGNS));
+    QueryResult sigs = CharacterDatabase.PQuery(
+        "SELECT c.guid FROM characters c "
+        "JOIN playerbot_v2_character pv ON c.guid = pv.character_guid_low "
+        "LEFT JOIN guild_member gm ON gm.guid = c.guid "
+        "WHERE gm.guid IS NULL AND pv.setup_pipeline_state = 255 AND c.online = 1 AND c.guid != {} AND c.race IN ({}) "
+        "ORDER BY RAND() LIMIT 20", founder_low, FactionRaceList(f));
+    std::vector<ObjectGuid> members;
+    if (sigs)
+        do
+        {
+            ObjectGuid const g = ObjectGuid::Create<HighGuid::Player>(sigs->Fetch()[0].GetUInt64());
+            Player* m = ObjectAccessor::FindConnectedPlayer(g);
+            if (m && m->IsInWorld() && m->GetGuildId() == 0 && members.size() < required + 1)
+                members.push_back(g);
+        } while (sigs->NextRow());
+    if (members.size() < required)
+    {
+        TC_LOG_INFO("playerbot.v2", "[BotGuildMgr] faction={}: founder {} found only {} of {} online guildless members for '{}'",
+                    static_cast<uint32>(f), founder_low, members.size(), required, name);
+        return false;
+    }
+    Guild* guild = new Guild;
+    if (!guild->Create(founder, name))
+    {
+        delete guild;
+        TC_LOG_INFO("playerbot.v2", "[BotGuildMgr] faction={}: Guild::Create refused '{}' for founder {}", static_cast<uint32>(f), name, founder_low);
+        return false;
+    }
+    sGuildMgr->AddGuild(guild);
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    for (ObjectGuid const& m : members)
+        guild->AddMember(trans, m);
+    CharacterDatabase.CommitTransaction(trans);
+    OnCharterSucceeded(f, founder_low, guild->GetId(), name);
+    OnBotJoinedGuild(guild->GetId(), founder_low);
+    for (ObjectGuid const& m : members)
+        OnBotJoinedGuild(guild->GetId(), m.GetCounter());
+    TC_LOG_INFO("playerbot.v2", "[BotGuildMgr] faction={}: '{}' founded with {} members", static_cast<uint32>(f), name, members.size() + 1);
     return true;
 }
 
@@ -333,8 +422,8 @@ void BotGuildMgr::TeleportFounderAndSigners(uint64 founder_low, Faction f)
         "LEFT JOIN guild_member gm ON gm.guid = c.guid "
         "WHERE gm.guid IS NULL "
         "AND pv.setup_pipeline_state = 255 "
-        "AND c.guid != {} AND c.online = 1 "
-        "ORDER BY RAND() LIMIT 20", founder_low);
+        "AND c.guid != {} AND c.online = 1 AND c.race IN ({}) "
+        "ORDER BY RAND() LIMIT 20", founder_low, FactionRaceList(f));
 
     if (!sigs)
     {
@@ -489,6 +578,83 @@ void BotGuildMgr::OnCharterAborted(Faction f)
         static_cast<uint32>(f), released_founder, released_name);
 }
 
+void BotGuildMgr::ReconcileGuilds()
+{
+    std::vector<uint64> ids;
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        for (auto const& [id, meta] : meta_by_guild_id_)
+            ids.push_back(id);
+    }
+    for (uint64 const id : ids)
+    {
+        if (Guild* guild = sGuildMgr->GetGuildById(id))
+        {
+            last_seen_[id] = { guild->GetName(), uint32(guild->GetMembersCount()) };
+            continue;
+        }
+        auto const seen = last_seen_.find(id);
+        TC_LOG_INFO("playerbot.v2", "[BotGuildMgr] guild {} '{}' is gone from the server (last seen with {} members); its slot is open again",
+                    id, seen != last_seen_.end() ? seen->second.first : std::string("?"), seen != last_seen_.end() ? seen->second.second : 0u);
+        last_seen_.erase(id);
+        std::lock_guard<std::mutex> g(mtx_);
+        meta_by_guild_id_.erase(id);
+        for (auto& v : active_by_faction_)
+            std::erase(v, id);
+    }
+}
+
+void BotGuildMgr::FillGuilds(Faction f)
+{
+    if (f >= FACTION_COUNT || !Enabled()) return;
+    std::vector<std::pair<uint64, uint16>> guilds;   // guild id, member cap
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        for (uint64 const id : active_by_faction_[f])
+            if (auto it = meta_by_guild_id_.find(id); it != meta_by_guild_id_.end())
+                guilds.emplace_back(id, it->second.member_cap ? it->second.member_cap : max_members_per_guild_);
+    }
+    if (guilds.empty()) return;
+    std::string const races = FactionRaceList(f);
+    if (races.empty()) return;
+    constexpr uint32 kPerPass = 30;
+    // World bots only: a player's companions (owner or companion role set) are never put in a guild.
+    QueryResult result = CharacterDatabase.PQuery(
+        "SELECT c.guid FROM characters c "
+        "JOIN playerbot_v2_character pv ON c.guid = pv.character_guid_low "
+        "LEFT JOIN guild_member gm ON gm.guid = c.guid "
+        "WHERE gm.guid IS NULL AND pv.setup_pipeline_state = 255 AND c.online = 1 AND c.race IN ({}) "
+        "AND pv.owner_account_id = 0 AND pv.owner_player_guid = 0 AND pv.companion_role = 0 "
+        "AND c.guid % 10 < 6 "                // a stable six in ten: a real realm keeps many players guildless
+        "ORDER BY RAND() LIMIT {}", races, kPerPass);
+    if (!result) return;
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    std::vector<std::pair<uint64, uint64>> joined;   // guild id, bot
+    do
+    {
+        uint64 const low = result->Fetch()[0].GetUInt64();
+        ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(low);
+        Player* bot = ObjectAccessor::FindConnectedPlayer(guid);
+        if (!bot || !bot->IsInWorld() || bot->GetGuildId() != 0 || bot->GetGroup())
+            continue;
+        Guild* best = nullptr;
+        for (auto const& [id, cap] : guilds)
+        {
+            Guild* guild = sGuildMgr->GetGuildById(id);
+            if (!guild || guild->GetMembersCount() >= cap) continue;
+            if (!best || guild->GetMembersCount() < best->GetMembersCount()) best = guild;
+        }
+        if (!best) break;   // every guild of this faction is full
+        if (best->AddMember(trans, guid))
+            joined.emplace_back(best->GetId(), low);
+    } while (result->NextRow());
+    CharacterDatabase.CommitTransaction(trans);
+    for (auto const& [gid, low] : joined)
+        OnBotJoinedGuild(gid, low);
+    if (!joined.empty())
+        TC_LOG_INFO("playerbot.v2", "[BotGuildMgr] faction={}: {} online bots joined a guild", static_cast<uint32>(f), joined.size());
+}
+
 void BotGuildMgr::Tick(uint32 now_ms)
 {
     // 60s rate limit — the manager doesn't need finer granularity
@@ -496,6 +662,7 @@ void BotGuildMgr::Tick(uint32 now_ms)
     if (last_tick_ms_ != 0 && (now_ms - last_tick_ms_) < 60u * 1000u)
         return;
     last_tick_ms_ = now_ms;
+    ReconcileGuilds();
 
     // Abort founders whose FSM exceeded the 30-min budget — the bot
     // may have logged out or hit an unrecoverable wedge. Phase A.2 of
@@ -518,6 +685,8 @@ void BotGuildMgr::Tick(uint32 now_ms)
     // Elect founders for any faction with open slots and none active.
     for (uint8 fi = 0; fi < FACTION_COUNT; ++fi)
         EnsureFounderElected(static_cast<Faction>(fi));
+    for (uint8 fi = 0; fi < FACTION_COUNT; ++fi)
+        FillGuilds(static_cast<Faction>(fi));
 
     // Phase B: rank ladder hygiene once per real-day.
     constexpr uint32 kRankHygieneIntervalMs = 24u * 60u * 60u * 1000u;

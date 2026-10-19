@@ -1,5 +1,6 @@
 #include "PlayerCraftOrders.h"
 
+#include "../Api/BotTradeShop.h"
 #include "../Bot/BotIntent.h"
 #include "../Bot/BotIntentEmitter.h"
 #include "../Bot/BotRegistry.h"
@@ -35,6 +36,7 @@ constexpr std::uint32_t kMaxListed = 12;
 constexpr std::uint32_t kCastGapMs = 2500;         // between two casts, long enough for a profession cast to finish and report
 constexpr std::uint32_t kOrderDeadlineMs = 10u * 60u * 1000u;
 constexpr std::uint32_t kMailWaitMs = 15000;       // for the mail intent to take the items out of the bags
+constexpr std::uint32_t kMaxDismounts = 3;         // a rule that mounts the bot again is not fought for ever
 constexpr std::uint32_t kExtraCasts = 3;           // casts beyond the plan before the order is given up (a cast can fail and be retried)
 
 enum class Phase : std::uint8_t { Crafting, Mailing };
@@ -43,6 +45,7 @@ struct Job
 {
     std::uint64_t bot = 0;                // guid counter
     std::string requester;
+    ObjectGuid requester_guid;
     std::uint32_t spell = 0;
     std::uint32_t item = 0;
     std::uint32_t yield = 1;
@@ -50,6 +53,7 @@ struct Job
     std::uint32_t baseline = 0;           // the bot's stock of the item when the order was taken
     std::uint32_t casts_planned = 0;
     std::uint32_t casts_pushed = 0;
+    std::uint32_t dismounts = 0;          // times the bot was told to get off its mount (a mounted caster is refused)
     std::uint32_t started_ms = 0;
     std::uint32_t last_cast_ms = 0;
     std::uint32_t mail_ms = 0;
@@ -131,11 +135,26 @@ std::vector<pc::Option> Options(Player const* bot)
             o.item = eff.ItemType;
             o.yield = std::max<std::uint32_t>(1u, std::uint32_t(std::max(eff.CalcValueAsInt(bot), 1)));
             o.name = Lower(t->GetName(sWorld->GetDefaultDbcLocale()));
+            o.rank = std::uint32_t(std::max(t->GetBaseRequiredLevel(), 0)) * 1000u + std::min<std::uint32_t>(t->GetBaseItemLevel(), 999u);
             out.push_back(std::move(o));
             break;
         }
     }
     return out;
+}
+
+// An item that binds when made (conjured mana gems) can never be given to the requester: left out of the list, refused up front.
+bool BindsWhenMade(ItemTemplate const* t)
+{
+    return t && pc::DeliveryFor(false, t->GetBonding() == BIND_ON_ACQUIRE) == pc::Delivery::Bound;
+}
+
+// How the bot's stock of `item` can reach the requester.
+pc::Delivery DeliveryOf(Player const* bot, std::uint32_t item)
+{
+    ItemTemplate const* t = sObjectMgr->GetItemTemplate(item);
+    std::vector<Item*> const held = bot->GetItemListByEntry(item, false);
+    return pc::DeliveryFor(t && t->HasFlag(ITEM_FLAG_CONJURED), !held.empty() && held.front()->IsSoulBound());
 }
 
 void Finish(Job const& j, Player const* bot, std::string const& text)
@@ -161,7 +180,7 @@ bool Order(Player* requester, Player* bot, std::string const& text)
         for (pc::Option const& o : opts)
         {
             SpellInfo const* si = sSpellMgr->GetSpellInfo(o.spell, DIFFICULTY_NONE);
-            if (!si || CastsPossible(bot, si) == 0)
+            if (!si || CastsPossible(bot, si) == 0 || BindsWhenMade(sObjectMgr->GetItemTemplate(o.item)))
                 continue;
             ++total;
             if (listed >= kMaxListed)
@@ -191,6 +210,11 @@ bool Order(Player* requester, Player* bot, std::string const& text)
         Say(bot, to, "I can't make that right now.");
         return true;
     }
+    if (BindsWhenMade(t))
+    {
+        Say(bot, to, fmt::format("{} is soulbound once it is made, I can't give it to you.", ItemLink(t)));
+        return true;
+    }
     for (Job const& j : g_jobs)
         if (j.bot == bot->GetGUID().GetCounter())
         {
@@ -198,9 +222,22 @@ bool Order(Player* requester, Player* bot, std::string const& text)
             return true;
         }
 
-    pc::Plan const plan = pc::PlanOrder({ req.count, o.yield, kMaxItems, CastsPossible(bot, si) });
+    std::uint32_t const carried = bot->GetItemCount(o.item, false);
+    pc::Plan const plan = pc::PlanOrder({ req.count, o.yield, kMaxItems, CastsPossible(bot, si), pc::CarryRoom(t->GetMaxCount(), carried) });
     if (plan.refusal)
     {
+        if (std::string_view(plan.refusal) == "already_carried")
+        {
+            // A unique item (a conjured Mana Jade): a second cast would make nothing, so the one it carries is handed over by trade.
+            if (carried > 0 && pc::DeliveryFor(t->HasFlag(ITEM_FLAG_CONJURED), false) == pc::Delivery::Trade)
+            {
+                TradeShop::StoreDelivery(bot, requester->GetGUID(), o.item);
+                Say(bot, to, fmt::format("I already carry {}, I can only hold one. Open a trade with me and I'll hand it over.", ItemLink(t)));
+            }
+            else
+                Say(bot, to, fmt::format("I already carry {} and can only hold one.", ItemLink(t)));
+            return true;
+        }
         if (std::string_view(plan.refusal) == "no_reagents")
         {
             std::string need;
@@ -218,6 +255,7 @@ bool Order(Player* requester, Player* bot, std::string const& text)
     Job j;
     j.bot = bot->GetGUID().GetCounter();
     j.requester = to;
+    j.requester_guid = requester->GetGUID();
     j.spell = o.spell;
     j.item = o.item;
     j.yield = o.yield;
@@ -226,10 +264,12 @@ bool Order(Player* requester, Player* bot, std::string const& text)
     j.casts_planned = plan.casts;
     j.started_ms = GameTime::GetGameTimeMS();
     g_jobs.push_back(j);
-    Say(bot, to, plan.trimmed
+    Say(bot, to, plan.items > req.count
+        ? fmt::format("One cast makes {}, so I'm making {} x{} and will hand them over when done.", o.yield, ItemLink(t), plan.items)
+        : plan.trimmed
         ? fmt::format("I can make {} of the {} you asked for with my reagents; I'll mail {} to you when done.", plan.items, ItemLink(t), plan.items)
         : fmt::format("Making {} x{}, I'll mail it to you when done.", ItemLink(t), plan.items));
-    TC_LOG_INFO("playerbot.v2", "[craft_order] queued: {} for {} item {} x{} (spell {}, {} casts)", bot->GetName(), to, o.item, plan.items, o.spell, plan.casts);
+    TC_LOG_INFO("playerbot.v2", "[craft_order] queued: {} for {} item {} x{} (spell {}, {} casts, {} per cast)", bot->GetName(), to, o.item, plan.items, o.spell, plan.casts, o.yield);
     return true;
 }
 
@@ -261,7 +301,32 @@ void Tick(std::uint32_t now_ms)
                 {
                     if (crafted == 0)
                     {
-                        Finish(j, bot, "I couldn't make that (no item came out), sorry.");
+                        ItemTemplate const* t = sObjectMgr->GetItemTemplate(j.item);
+                        TC_LOG_INFO("playerbot.v2",
+                            "[craft_order] no item came out: bot {} spell {} known {} casts {} carried {} maxcount {} mounted {} mana {} dismounts {}",
+                            j.bot, j.spell, bot->HasSpell(j.spell), j.casts_pushed, have, t ? t->GetMaxCount() : 0u, bot->IsMounted(),
+                            bot->GetPower(POWER_MANA), j.dismounts);
+                        if (have > 0 && DeliveryOf(bot, j.item) == pc::Delivery::Trade)
+                        {
+                            // The bot already carries one and the data does not call it unique: the cast made nothing, so that one goes over by trade.
+                            TradeShop::StoreDelivery(bot, j.requester_guid, j.item);
+                            Finish(j, bot, fmt::format("I already carry {} and can't make another. Open a trade with me and I'll hand it over.", ItemLink(t)));
+                        }
+                        else
+                            Finish(j, bot, "I couldn't make that (no item came out), sorry.");
+                        done = true;
+                    }
+                    else if (pc::Delivery const how = DeliveryOf(bot, j.item); how != pc::Delivery::Mail)
+                    {
+                        // The mail refuses a conjured item: it stays in the bags and goes over in a trade window.
+                        std::string const link = ItemLink(sObjectMgr->GetItemTemplate(j.item));
+                        if (how == pc::Delivery::Bound)
+                            Finish(j, bot, fmt::format("I made {}, but it is soulbound to me and I cannot give it away.", link));
+                        else
+                        {
+                            TradeShop::StoreDelivery(bot, j.requester_guid, j.item);
+                            Finish(j, bot, fmt::format("I made {}. It cannot go by mail, open a trade with me and I'll hand it over.", link));
+                        }
                         done = true;
                     }
                     else
@@ -286,8 +351,18 @@ void Tick(std::uint32_t now_ms)
                 }
                 else if (!bot->IsNonMeleeSpellCast(false) && !bot->IsInCombat() && bot->IsAlive() && now_ms - j.last_cast_ms >= kCastGapMs)
                 {
-                    Push(bot, CastSpellIntent{ j.spell, ObjectGuid::Empty });
-                    ++j.casts_pushed;
+                    if (bot->IsMounted() && j.dismounts < kMaxDismounts)
+                    {
+                        // The spell code refuses every cast of a mounted caster (NOT_MOUNTED): get off first.
+                        Push(bot, DismountIntent{});
+                        ++j.dismounts;
+                    }
+                    else
+                    {
+                        // exact rank: the recipe asked for, not the highest rank the bot knows (that one makes another item and the order would never see it)
+                        Push(bot, CastSpellIntent{ j.spell, ObjectGuid::Empty, true });
+                        ++j.casts_pushed;
+                    }
                     j.last_cast_ms = now_ms;
                 }
             }
@@ -301,7 +376,8 @@ void Tick(std::uint32_t now_ms)
                 }
                 else if (now_ms - j.mail_ms > kMailWaitMs)
                 {
-                    Finish(j, bot, fmt::format("I made it but the mail failed ({} of {} left my bags); trade me for it.", gone, j.mailing));
+                    TradeShop::StoreDelivery(bot, j.requester_guid, j.item);
+                    Finish(j, bot, fmt::format("I made it but the mail failed ({} of {} left my bags); open a trade with me and I'll hand it over.", gone, j.mailing));
                     done = true;
                 }
             }

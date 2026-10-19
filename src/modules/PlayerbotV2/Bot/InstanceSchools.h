@@ -19,7 +19,8 @@ struct InstanceSchool { std::uint32_t map; Resist school; };
 
 inline constexpr InstanceSchool kInstanceSchools[] = {
     { 409, Resist::Fire },     // Molten Core
-    { 469, Resist::Fire },     // Blackwing Lair
+    { 469, Resist::Fire },     // Blackwing Lair (Firemaw, Vaelastrasz)
+    { 469, Resist::Shadow },   //   Shadow Flame: Ebonroc, Flamegor, Nefarian
     { 249, Resist::Fire },     // Onyxia's Lair
     { 533, Resist::Frost },    // Naxxramas (Sapphiron, Kel'Thuzad)
     { 533, Resist::Shadow },   //   Loatheb, the Four Horsemen

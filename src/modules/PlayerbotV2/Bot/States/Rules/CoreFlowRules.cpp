@@ -93,6 +93,14 @@ bool SoakTravelFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const
             ai.clear_travel_plan();
             return false;
         }
+        // A goal past the graph's own walk reach with no plan cannot be walked in a straight line (the 105 soak
+        // wandered 1000 y off course for the full 1200 s); report it with the attach counts the router logged.
+        if (std::hypot(g.x - bx, g.y - by) > 600.0f)
+        {
+            board.Finish(id, SoakResult::NoRoute, now_ms, s.map_id(), bx, by, bz, legs, leg_index);
+            ai.clear_travel_plan();
+            return false;
+        }
         if (::Playerbot::States::ChunkedWalkToward(s, ai, emit, g.x, g.y, g.z, "idle:soak_walk", now_ms))
             return true;
         return false;
@@ -872,8 +880,8 @@ bool RejoinInstanceFire(BotSnapshotView const& s, BotAI& ai,
         return false;
     }
 
-    // The door refused the bot because the instance holds its most players (a 15-bot raid in a 10-player dungeon, UBRS 2026-10-16): it
-    // stays where it is, safe, instead of walking the open world to an entrance it cannot use (Justor died to the Scarshield Sentries on
+    // The door refused the bot because the instance holds its most players: it
+    // stays where it is, safe, instead of walking the open world to an entrance it cannot use (a bot died to the Scarshield Sentries on
     // that walk, outside the instance where Raul could not raise him), and asks again every kInstanceFullHoldMs for a free slot.
     if (ai.instance_full_map() == anchor->map_id)
     {

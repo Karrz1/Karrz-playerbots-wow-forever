@@ -203,7 +203,7 @@ void DoShieldSelf(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(POWER
 
 bool ShouldWand(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && (Ready(ctx, SHOOT_WAND) && ctx.bot.victim_in_spell_range(SHOOT_WAND)) && ctx.bot.current_cast_spell_id() == 0;
+    return HasLiveTarget(ctx) && ctx.bot.raw().consumables.wand_school_mask != 0 && (Ready(ctx, SHOOT_WAND) && ctx.bot.victim_in_spell_range(SHOOT_WAND)) && ctx.bot.current_cast_spell_id() == 0;
 }
 void DoWand(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(SHOOT_WAND, ctx.bot.victim()); }
 

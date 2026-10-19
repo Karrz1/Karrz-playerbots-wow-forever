@@ -20,6 +20,7 @@
 #include "Log.h"
 #include "Map.h"
 #include "Metric.h"
+#include "PathGenerator.h"
 #include <chrono>
 #include <cstdio>
 #include <stdexcept>
@@ -95,6 +96,8 @@ unsigned int SehSafeMapUpdate(Map* m, uint32 diff, SehFault* fault) noexcept
     // that pointed at session teardown instead of the aura bug.)
     __except (SehFilter(GetExceptionInformation(), fault))
     {
+        // The unwind skips destructors below the fault: a nav lock held by the faulting pathfind would stay locked for good.
+        ReleaseNavLockAfterFault();
         return fault->code;
     }
 }

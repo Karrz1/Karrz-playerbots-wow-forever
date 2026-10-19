@@ -31,6 +31,7 @@ struct CompanionQuestAction
     ObjectGuid giver;
     uint32     quest_id = 0;
     bool       via_order = false;
+    bool       copy_leader = false;   // turn_in only: the bot's copy is still open, but the leader has handed the quest in
 };
 
 // A quest object (chest, goober, gathering node, quest prop) the BOT needs for one of its own open

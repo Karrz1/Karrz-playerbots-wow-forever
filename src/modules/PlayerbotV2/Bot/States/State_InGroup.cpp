@@ -15,6 +15,7 @@
 #include "Bot/BotRegistry.h"
 #include "Bot/MarkGate.h"       // Playerbot.Behavior.MarksNeedOrder
 #include "Services.h"
+#include "GroupControl.h"
 #include "Util/ConfigReader.h"  // full type for Services::Config() (Playerbot.Behavior.Formation)
 #include <algorithm>
 #include "Travel/UnifiedTravelGraph.h"
@@ -81,7 +82,7 @@ static void AnswerReadyCheck(BotAI& ai, BotSnapshotView const& snapshot, GroupSn
             // in party chat; the out-of-combat recovery rules then drink / eat
             // / repair. The check is advisory, nothing else waits on the answer.
             // A bot a little under (just arrived, a buff cast) is ready: the whole raid answering
-            // "not ready" after a call-up read as broken (playtest 2026-10-13).
+            // "not ready" after a call-up read as broken.
             bool ready = true;
             char const* why = nullptr;
             if (!snapshot.is_alive())
@@ -504,6 +505,50 @@ void DispatchInGroup(BotAI& ai,
             }
     }
 
+    // Leash break (a bot in a group with a player, Passive or Aggressive; open world and instance trash, never a boss or a run the dungeon
+    // autopilot drives): a bot whose target is not on anyone in the group
+    // and has drifted beyond the leash from the leader drops it and goes back to follow, so no bot runs off after a mob the group never
+    // pulled (a kited or fleeing mob, a pack past the aggressive radius). A mob on the bot or on a member is never dropped.
+    // Not while the leader has just ordered it (attack / pull window, an engage order, pull back, fallback): his call has no leash.
+    if (snapshot.is_led_by_player() && !snapshot.in_battleground() && !snapshot.victim().IsEmpty() &&
+        (!snapshot.is_in_instance() || (!ai.dungeon_active() && snapshot.victim_info() && !Classic::IsBossUnit(*snapshot.victim_info()))) &&
+        !ai.owner_order_window_open() && !ai.pull_back_active() && !ai.fallback_active() &&
+        !(ai.is_manual_mode(snapshot.published_at_ms()) && ai.owner_command() == BotAI::OwnerCommand::Engage))
+    {
+        auto const stance = ai.owner_stance();
+        bool const aggressive = stance == BotAI::OwnerStance::Aggressive;
+        bool const leashed = aggressive || stance == BotAI::OwnerStance::Passive || stance == BotAI::OwnerStance::Auto;
+        float const reach = aggressive ? Services::Config().behavior_aggressive_radius_yd() : Services::Config().behavior_passive_leash_yd();
+        auto const* grp_members = group.members();
+        NearbyUnit const* tgt = snapshot.victim_info();
+        ObjectGuid const ctl = snapshot.controller_guid();
+        if (leashed && reach > 0.f && grp_members && tgt && !ctl.IsEmpty())
+        {
+            bool on_group = tgt->victim == snapshot.raw().guid;
+            GroupMemberSummary const* ctl_member = nullptr;
+            for (auto const& m : *grp_members)
+            {
+                if (m.guid == tgt->victim || (m.guid != snapshot.raw().guid && m.victim == tgt->guid)) on_group = true;   // on a member, or a member (the leader) is fighting it
+                if (m.guid == ctl && m.online && m.map_id == snapshot.map_id()) ctl_member = &m;
+            }
+            if (!on_group && ctl_member &&
+                std::hypot(tgt->x - ctl_member->x, tgt->y - ctl_member->y) > reach + 10.0f)
+            {
+                emit.stop_attack();
+                if (snapshot.has_pet())
+                    emit.pet_set_command_state(1);   // COMMAND_FOLLOW: the pet comes back with it
+                ai.set_last_rule_fired("ingroup:leash_break");
+                static std::atomic<uint32> s_leash_log_ms{ 0 };
+                uint32 const now_lb = snapshot.published_at_ms();
+                uint32 last_lb = s_leash_log_ms.load(std::memory_order_relaxed);
+                if (now_lb - last_lb >= 500u && s_leash_log_ms.compare_exchange_strong(last_lb, now_lb))
+                    TC_LOG_INFO("playerbot.v2", "[leash] {} drops entry {}: {:.0f} y from {}, not on the group (reach {:.0f} y)",
+                                snapshot.name(), tgt->entry, std::hypot(tgt->x - ctl_member->x, tgt->y - ctl_member->y), ctl_member->name, reach);
+                return;
+            }
+        }
+    }
+
     // Don't override combat-state actions — the primary InCombat dispatch is
     // already running the APL.
     if (ai.state() == BotState::InCombat) return;
@@ -700,14 +745,16 @@ void DispatchInGroup(BotAI& ai,
     // Owner "passive": no assist on the owner's, the skull's or a member's target; only a mob already on a group member is engaged
     // (the defend-member step below). Stance Passive, or Auto in an instance a human leads (BotAI::passive_now); an attack / pull
     // order opens a 15 s window in which it fights.
-    const bool owner_passive = ai.passive_now(snapshot.is_in_instance() && !group.leader_is_bot());
+    // Led by a player (his companion, or a world bot he invited) and no stance picked: Passive, in the open world too.
+    const bool auto_passive = (snapshot.is_in_instance() && !group.leader_is_bot()) || snapshot.is_led_by_player();
+    const bool owner_passive = ai.passive_now(auto_passive);
     // A Passive bot inside an order window (every Attack / Pull / assist order opens 15 s of it) joins the owner's own target and
     // nothing wider: no skull, no kill focus, no other member's victim, no creature outside its scan or far from the owner (the owner,
     // Deadmines 2026-10-15: "the bots were attacking willy-nilly, hitting things that weren't close to me"; with Attack pressed every few
     // seconds the window never closed and the whole assist chain ran, the tank opening on mobs 32-43 y away).
     const bool window_limited = !owner_passive &&
         (ai.owner_stance() == BotAI::OwnerStance::Passive ||
-         (ai.owner_stance() == BotAI::OwnerStance::Auto && snapshot.is_in_instance() && !group.leader_is_bot()));
+         (ai.owner_stance() == BotAI::OwnerStance::Auto && auto_passive));
     // A pet never starts a pull. PetAttack (the bot's own assist) leaves the pet Aggressive for good, and an aggressive pet
     // pulls every mob around it while the group stands still (Deadmines, 2026-10-13). Between fights the pet goes back to
     // Defensive (it fights what attacks its owner or itself), and to Passive when the group is told to stay or is passive.
@@ -890,6 +937,19 @@ void DispatchInGroup(BotAI& ai,
                     for (auto const& m : *members)
                         if (m.guid == u.victim) { attacks_member = true; victim_member = &m; break; }
                 if (!attacks_member) continue;
+                // Leash (open world and instance trash, never a boss): a Passive bot defends a mob on someone else only while it is within PassiveLeashYd of the leader
+                // or of the member it is on (a healer 30 y back is still defended), and that member is itself near the leader. It
+                // never runs off to a pack the group has not pulled. A mob on the bot itself is always fought.
+                if ((owner_passive || window_limited) && snapshot.is_led_by_player() &&
+                    (!snapshot.is_in_instance() || (!ai.dungeon_active() && !Classic::IsBossUnit(u))))
+                {
+                    float const leash = Services::Config().behavior_passive_leash_yd();
+                    float near_d = std::hypot(u.x - leader_member->x, u.y - leader_member->y);
+                    if (victim_member && victim_member->map_id == snapshot.map_id() &&
+                        std::hypot(victim_member->x - leader_member->x, victim_member->y - leader_member->y) <= 2.0f * leash)
+                        near_d = std::min(near_d, std::hypot(u.x - victim_member->x, u.y - victim_member->y));
+                    if (!GroupControl::PassiveMayDefend(u.victim == snapshot.raw().guid, near_d, leash)) continue;
+                }
                 // Passive, tank first (playtest 2026-10-14): a mob on another member is the tank's to pick up; a damage bot joins once the
                 // tank has its opening lead, or at once when the member it is on is under 70 % (a healer waits for nothing here: it heals).
                 if (owner_passive && victim_member && ai.effective_role(snapshot) == Role::Dps && !u.is_player)
@@ -937,7 +997,9 @@ void DispatchInGroup(BotAI& ai,
         if (assist_target.IsEmpty() && ai.owner_stance() == BotAI::OwnerStance::Aggressive && !group.leader_is_bot())
         {
             float best_dsq = std::numeric_limits<float>::max();
-            constexpr float kR2 = BotAI::kAggressiveRadiusYd * BotAI::kAggressiveRadiusYd;
+            // Measured from the leader (not the bot), so a bot never leaves the group to reach a mob.
+            const float kRadius = Services::Config().behavior_aggressive_radius_yd();
+            const float kR2 = kRadius * kRadius;
             for (auto const& u : snapshot.raw().combat.nearby_enemies)
             {
                 if (u.hp <= 0 || !u.in_los || u.no_xp_kill || u.is_pacified || u.untargetable) continue;
@@ -1184,6 +1246,10 @@ void DispatchInGroup(BotAI& ai,
         (ai.pull_back_active() ||
          (ai.is_manual_mode(snapshot.published_at_ms()) && ai.owner_command() == BotAI::OwnerCommand::Engage)) &&
         dist < kDetourMaxRange;
+    // The one answer to "does another layer own this bot's movement right now": the follow, the slot move and the recall all stand
+    // down for it (a rooted bot cannot follow either).
+    bool const movement_owned_elsewhere =
+        in_active_bg || dungeon_run_owns_movement || detour_leased || holding_position || order_owns_movement || snapshot.is_rooted();
     bool const refollow = ai.take_formation_refollow();
     // Owner formation: the bot's goal is its SLOT, recomputed every tick from the owner's live position and facing,
     // not "within the recall slack of the owner" (a slot ring wider than the slack, or any spot inside the ring,
@@ -1191,12 +1257,15 @@ void DispatchInGroup(BotAI& ai,
     // re-issued when the slot has moved more than 2 y from the last one (500 ms apart at most), a bot stops within
     // 1.5 y of the slot and restarts only beyond 2.5 y (no jitter), and a bot that makes no progress for 3 s falls
     // back to the plain follow behind the owner for 8 s.
+    // While the anchor is on the move a follower starts at its follow distance (+1.5 yd), not at the full recall slack; a standing
+    // anchor keeps the wide slack, so nobody shuffles about at a halt.
+    const bool anchor_on_the_move = ai.anchor_moving(anchor->x, anchor->y, snapshot.published_at_ms());
     if (formation_slot_active)
     {
         auto& ft = ai.formation_track();
         constexpr float kArriveYd = 1.5f, kStartYd = 2.5f, kRetargetYd = 2.0f;
         constexpr uint32 kMinReissueMs = 500, kStuckMs = 3000, kFallbackMs = 8000;
-        bool const gated = in_active_bg || dungeon_run_owns_movement || detour_leased || holding_position || order_owns_movement || snapshot.is_rooted();
+        bool const gated = movement_owned_elsewhere;
         float const slot_dist = DistanceXY(bx, by, slot_x, slot_y);
         bool const moving = snapshot.raw().movement.is_moving;
         // 0 = none, 1 = move, 2 = hold, 3 = fallback
@@ -1223,6 +1292,18 @@ void DispatchInGroup(BotAI& ai,
                     ai.set_last_rule_fired("ingroup:formation_fallback");
                     action = 3;
                 }
+                else if (anchor_on_the_move)
+                {
+                    // The owner is walking: the follow generator keeps the bot at its slot's distance and angle and re-aims every update, which
+                    // starts the moment the owner does. Walking to the slot as it stood at the last issue (a point the owner has left by
+                    // the time the bot gets there, re-issued at most every 500 ms and only after the slot moved 2 y) left the circle trailing
+                    // far behind a walking owner (PC 20 Oct, circle, tight, 1 yd). The slot walk settles the bots once the owner halts.
+                    ft.dest_valid = false;
+                    ft.last_progress_ms = formation_now_ms;
+                    emit.follow(anchor->guid, formation_offset.distance, formation_offset.angle_radians);
+                    ai.set_last_rule_fired("ingroup:formation_follow");
+                    action = 1;
+                }
                 else
                 {
                     action = 1;
@@ -1238,13 +1319,36 @@ void DispatchInGroup(BotAI& ai,
                 }
             }
         }
+        // A bot that is told to move and does not, for more than 3 s: where it stands, what is around it, and whether its moves were refused.
+        // Cause of a standstill that no path_fail line explains (a bot standing on a gameobject model is higher than the ground under it).
+        if ((action == 1 || action == 3) && !moving && formation_now_ms - ft.last_progress_ms > kStuckMs &&
+            formation_now_ms - ft.last_stuck_log_ms >= 5000)
+        {
+            ft.last_stuck_log_ms = formation_now_ms;
+            std::string near_objs;
+            for (auto const& o : snapshot.raw().world_objects.nearby_objects)
+            {
+                float const od = DistanceXY(bx, by, o.x, o.y);
+                if (od <= 4.0f)
+                    near_objs += fmt::format("{}{}(type {}) d={:.1f} dz={:.1f}", near_objs.empty() ? "" : "; ", o.entry, o.go_type, od, o.z - bz);
+            }
+            float const gz = snapshot.raw().movement.ground_z;
+            TC_LOG_INFO("playerbot.v2",
+                "[formation_stuck] {} bot=({:.1f},{:.1f},{:.1f}) ground_z={} slot=({:.1f},{:.1f}) slot_dist={:.1f} action={} stuck_ms={} "
+                "path_blocked={} last_blocked_ms_ago={} rooted={} objects_within_4y=[{}]",
+                snapshot.name(), bx, by, bz, gz > -50000.0f ? fmt::format("{:.1f}", gz) : std::string("n/a"), slot_x, slot_y, slot_dist,
+                action == 1 ? "move" : "fallback", formation_now_ms - ft.last_progress_ms, snapshot.path_blocked_count(),
+                snapshot.last_path_blocked_ms() ? formation_now_ms - snapshot.last_path_blocked_ms() : 0u, int(snapshot.is_rooted()), near_objs);
+        }
         if (action != 0 && action != ft.last_action && formation_now_ms - ft.last_log_ms >= 5000)
         {
             TC_LOG_INFO("playerbot.v2",
-                "[formation] {} type={} slot={}/{} slot=({:.1f},{:.1f}) owner=({:.1f},{:.1f}) dist={:.1f} action={}",
+                "[formation] {} type={} slot={}/{} slot=({:.1f},{:.1f}) owner=({:.1f},{:.1f}) dist={:.1f} action={} "
+                "bot=({:.1f},{:.1f},{:.1f}) owner_z={:.1f} owner_dist={:.1f} moving={}",
                 snapshot.name(), FormationTypeName(slot_type), slot_index, slot_count, slot_x, slot_y,
                 leader_member->x, leader_member->y, slot_dist,
-                action == 1 ? "move" : action == 2 ? "hold" : "fallback");
+                action == 1 ? "move" : action == 2 ? "hold" : "fallback",
+                bx, by, bz, leader_member->z, dist, moving ? 1 : 0);
             ft.last_log_ms = formation_now_ms;
             ft.last_action = action;
         }
@@ -1252,9 +1356,9 @@ void DispatchInGroup(BotAI& ai,
     else if (!formation_fallback && ai.formation_track().dest_valid)
         ai.formation_track().dest_valid = false;
 
-    if (!formation_slot_active &&
-        !in_active_bg && !dungeon_run_owns_movement && !detour_leased && !holding_position && !order_owns_movement &&
-        (dist > kRecallSlack || (refollow && dist > 1.5f)) && !snapshot.is_rooted())
+    const float recall_now = anchor_on_the_move ? std::min(kRecallSlack, std::max(kFollowDistance + 1.5f, 5.0f)) : kRecallSlack;
+    if (!formation_slot_active && !movement_owned_elsewhere &&
+        (dist > recall_now || (refollow && dist > 1.5f)))
     {
         // Follow uses MotionMaster MoveFollow, which silently re-emits forever
         // when the leader is unreachable (across a gap / closed door) — and
@@ -1353,7 +1457,7 @@ void DispatchInGroup(BotAI& ai,
         // stale-progress counter so a future real separation starts fresh.
         // Not while an owner formation has the bot outside its slack: the slot walk and the plain-follow fallback alternate (3 s / 8 s),
         // and clearing the counter at every switch kept the stale count under the repath threshold forever, so a bot that could not
-        // reach its slot never got the validated repath or the escape node (Stormwind Trade District ramp, 2026-10-17).
+        // reach its slot never got the validated repath or the escape node (the Stormwind Trade District ramp).
         if (!(formation_slot_active && dist > kRecallSlack))
             ai.reset_follow_progress();
     }
@@ -1367,10 +1471,11 @@ void DispatchInGroup(BotAI& ai,
     // BG maps generally disallow mounts and the InCombat dispatch already
     // dismounts on attack. Letting these fire would spam intents the
     // spell engine rejects.
-    // A companion mounts when its owner does, wherever it is: owner and party ride off together. Others only mount to
-    // close a real gap.
+    // A bot in a group with a player (its owner's companion, or a world bot the player invited) mounts when the leader does, wherever it
+    // is: leader and party ride off together (2026-10-19: a level 59 bot ran after a mounted player on foot). Others only mount to close a
+    // real gap.
     const bool want_mount = !in_active_bg &&
-                            (dist > kMountThreshold || snapshot.is_companion_with_owner()) &&
+                            (dist > kMountThreshold || snapshot.is_led_by_player()) &&
                             leader_member->is_mounted &&
                             !snapshot.is_mounted() &&
                             !snapshot.is_indoors() &&
@@ -1383,7 +1488,7 @@ void DispatchInGroup(BotAI& ai,
     // knows not to wipe a pending dismount deadline.
     const bool want_dismount = !in_active_bg && snapshot.is_mounted() &&
                                !leader_member->is_mounted &&
-                               dist <= kMountThreshold;
+                               (dist <= kMountThreshold || snapshot.is_led_by_player());
     if (want_mount)
     {
         // Edge-triggered: a mount cast takes ~1.5s; without dedup we'd spam
@@ -1408,6 +1513,20 @@ void DispatchInGroup(BotAI& ai,
                 emit.mount_appropriate();
                 ai.set_mount_pending(true);
                 ai.set_last_rule_fired("ingroup:mount");
+            }
+        }
+        else
+        {
+            // Still not mounted a few seconds after the cast was sent: it failed (interrupted by the follow, moving, a stuck cast) and
+            // nothing else clears the flag while the leader stays mounted, so the bot rode nowhere (playtest 10-19: one of three on foot).
+            // Ask again.
+            constexpr uint32 kMountRetryMs = 4000u;
+            const uint32 now_ms = snapshot.published_at_ms();
+            const uint32 sent_at = ai.pending_follow_mount_at_ms();
+            if (sent_at != 0 && now_ms >= sent_at + kMountRetryMs)
+            {
+                ai.set_mount_pending(false);
+                ai.set_pending_follow_mount_at_ms(0);
             }
         }
     }
@@ -1469,7 +1588,7 @@ void DispatchInGroup(BotAI& ai,
     }
 }
 
-// Follow an owner who dropped or jumped to a floor 4+ y below (UBRS stadium 2026-10-17: he went 11 y down into the arena; his bots, which
+// Follow an owner who dropped or jumped to a floor 4+ y below (he went 11 y down into the arena; his bots, which
 // only followed the walking route, went round through the Blackhand packs and died. A warlock then started the ledge walk, a buff cast
 // stopped it, and a combat escape took it along the rim the long way). Runs at the top of every tick, whatever the state. The follow
 // itself is API::move_to follow_drop: when the walking route to him is missing or a long detour it walks to the nearest ledge and
@@ -1496,7 +1615,7 @@ bool HonorFollowDrop(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
     { ai.clear_follow_drop(); return false; }
     float bx, by, bz; s.position(bx, by, bz);
     float const dist = DistanceXY(bx, by, leader->x, leader->y);
-    if (dist < 6.0f || dist > 40.0f || bz - leader->z < 4.0f)
+    if (dist < 6.0f || dist > 50.0f || bz - leader->z < 4.0f)
     { ai.clear_follow_drop(); return false; }
 
     bool const committed = ai.follow_drop_committed(now);

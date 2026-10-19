@@ -10,7 +10,7 @@ namespace Playerbot::Raid {
     {
         r.name = "Temple of Ahn'Qiraj";
 
-        // Kick-first casts (VMaNGOS creature_spells): Qiraji Brainwasher Cause Insanity 26079 (mind control), Princess Yauj's Great
+        // Kick-first casts (vanilla spell ids): Qiraji Brainwasher Cause Insanity 26079 (mind control), Princess Yauj's Great
         // Heal 25807 on the trio (classic_boss_bug_trio.cpp SPELL_YAUJ_HEAL), Skeram's Arcane Explosion 26192 (30 yd, only when more
         // than 4 stand in his melee range, classic_boss_skeram.cpp:94), Mana Burn 26046, Obsidian Nullifier / Destroyer Drain Mana
         // 25671 / 25755, the Anubisath Warder's Silence 26069, Fear 26070 and Entangling Roots 26071 (1.5 s casts), Mind Flay 26143.
@@ -141,6 +141,17 @@ namespace Playerbot::Raid {
         // Frenzy 26051: Tranquilizing Shot is the PvE coordinator's (PlanTranq, any aura the shot removes).
         r.dispel.push_back({ 26053, DispelKind::Poison });
         r.noDispel.push_back(26180);
+        // Her Poison Bolt Volley and Acid Spit are nature: Greater Nature Protection for everyone.
+        r.resistPotion.push_back({ 15509, 13458, Who::Anyone });
+        // Noxious Poison lands on everybody within 6 yd of its target (vanilla data, radius index 18): the ranged and the healers keep 8 apart.
+        r.spread.push_back({ 15509, 8.0f, Who::Ranged });
+        r.spread.push_back({ 15509, 8.0f, Who::Healer });
+        // Poison Bolt Volley 26052 (1,500-2,500 nature on the 15 nearest) is not only a berserk move: vanilla Frenzy 26051, which she
+        // casts every 25-35 s from the pull, carries it as a periodic trigger every 4 s (vmangos spell data, effect 3), and Berserk 26068
+        // every 2 s below 31% or after 5 min. The ranged and the healers stand 20 yards off for the whole fight so the 15 nearest are
+        // the melee and the tanks (123 run: healers at 10-12 y died to the volley at 87% boss health, 4 s apart).
+        r.avoidEnemy.push_back({ 15509, 20.0f, Who::Ranged });
+        r.avoidEnemy.push_back({ 15509, 20.0f, Who::Healer });
 
         // ---------------------------------------------------------------------------------------------------------------
         // TWIN EMPERORS (aq40/classic_boss_twinemperors.cpp): Vek'nilash (15275) is immune to magic, Vek'lor (15276) to physical

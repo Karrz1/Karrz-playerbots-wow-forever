@@ -31,6 +31,8 @@
 #include "TypeContainerVisitor.h"
 #include "PlayerbotAPI.h"
 #include "PlayerbotV2.h"
+#include "LfgBotFill.h"
+#include "StringFormat.h"
 #include "PlayerbotMovement.h"  // BotMovement::SafeTeleport for GM summonall
 #include "RBAC.h"
 #include "SpellHistory.h"
@@ -615,6 +617,7 @@ public:
             { "about",         HandleBotAbout,      rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::Yes },
             { "addon",         HandleBotAddonHello, rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No },
             { "add",           HandleBotAdd,        rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "lfg",           HandleBotLfg,        rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "call",          HandleBotCall,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             // Every player: brings the caller's own bots only (`.bot summon all|saved|<bot name>`).
             { "summon",        HandleBotSummon,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No },
@@ -730,6 +733,28 @@ public:
         return true;
     }
 
+    // .bot lfg [tank|healer|dps]: fill the group's missing tank / healer / damage places now with level-matched companions
+    // (the Group Finder does the same by itself when nobody joins a posted listing in time). The word is your own role.
+    static bool HandleBotLfg(ChatHandler* handler, Optional<std::string> ownRoleArg)
+    {
+        WorldSession* sess = handler->GetSession();
+        Player* me = sess ? sess->GetPlayer() : nullptr;
+        if (!me || !Playerbot::Services::Initialized())
+        { handler->SendSysMessage("`.bot lfg` is in-game only."); return Refuse(handler); }
+        Playerbot::Role own = Playerbot::Role::Unknown;
+        if (ownRoleArg)
+        {
+            bool ok = false;
+            own = ParseRoleWord(*ownRoleArg, ok);
+            if (!ok)
+            { handler->SendSysMessage("Usage: .bot lfg [tank|healer|dps] (your own role)"); return Refuse(handler); }
+        }
+        std::string msg;
+        bool const ok = Playerbot::V2::LfgFillNow(me, own, msg);
+        handler->SendSysMessage(msg.c_str());
+        return ok ? true : Refuse(handler);
+    }
+
     // .bot add <class> [tank|healer|dps] [race] [male|female]
     static bool HandleBotAdd(ChatHandler* handler, std::string const& class_arg, Optional<std::string> arg2,
                              Optional<std::string> arg3, Optional<std::string> arg4)
@@ -782,26 +807,37 @@ public:
             return Refuse(handler);
         }
 
+        std::string outMsg;
+        bool const ok = AddCompanionFor(me, sess, cls, role, race, gender, class_arg, outMsg);
+        handler->SendSysMessage(outMsg.c_str());
+        return ok ? true : Refuse(handler);
+    }
+
+    // Creates one companion of `cls` (race 0 = pick one) for `me` and logs it in; it joins the owner's group through the
+    // normal companion setup. Shared by `.bot add` and the Group Finder bot fill. `outMsg` is what the owner is told.
+    static bool AddCompanionFor(Player* me, WorldSession* sess, uint8 cls, Playerbot::Role role, uint8 race, uint8 gender,
+                                std::string const& className, std::string& outMsg)
+    {
         if (race && !Playerbot::V2::BotComposition::IsLegalRaceClass(race, cls))
-        { handler->PSendSysMessage("That race can't be a %s.", class_arg.c_str()); return Refuse(handler); }
+        { outMsg = "That race can't be a " + className + "."; return false; }
         if (race && Player::TeamForRace(race) != me->GetTeam())
-        { handler->SendSysMessage("That race is from the other faction, so it couldn't join your group."); return Refuse(handler); }
+        { outMsg = "That race is from the other faction, so it couldn't join your group."; return false; }
         if (!race)
             race = PickCompanionRace(me, cls);
         if (!race)
-        { handler->PSendSysMessage("No race of your faction can be a %s.", class_arg.c_str()); return Refuse(handler); }
+        { outMsg = "No race of your faction can be a " + className + "."; return false; }
 
         auto const pick = Playerbot::V2::BotComposition::Roll(race, cls, gender, "");
         if (pick.race == 0 || pick.name.empty())
         {
-            handler->PSendSysMessage("Bot add failed: couldn't roll a %s (race %u, no name or no legal race/class). See Playerbot.log '[BotComposition] Roll exhausted'.",
-                                     class_arg.c_str(), uint32(race));
-            return Refuse(handler);
+            outMsg = Trinity::StringFormat("Bot add failed: couldn't roll a {} (race {}, no name or no legal race/class). See Playerbot.log '[BotComposition] Roll exhausted'.",
+                                           className, uint32(race));
+            return false;
         }
 
         auto const created = Playerbot::V2::BotCharacterFactory::Create(sess, pick.name, race, cls, gender);
         if (!created.ok)
-        { handler->PSendSysMessage("Couldn't create the bot: %s", created.reason.c_str()); return Refuse(handler); }
+        { outMsg = "Couldn't create the bot: " + created.reason; return false; }
 
         Playerbot::BotId const id = created.guid.GetCounter();
         Playerbot::Services::Owners().SetOwner(id, sess->GetAccountId(), me->GetGUID().GetCounter());
@@ -809,11 +845,10 @@ public:
         auto const login = Playerbot::Services::SessionMgr().LoginBot(created.guid);
         if (!login.ok)
         {
-            handler->PSendSysMessage("Created %s but the login was refused (%s). Try `.bot call %s`.",
-                                     pick.name.c_str(), login.reason.c_str(), pick.name.c_str());
-            return Refuse(handler);
+            outMsg = Trinity::StringFormat("Created {} but the login was refused ({}). Try `.bot call {}`.", pick.name, login.reason, pick.name);
+            return false;
         }
-        handler->PSendSysMessage("%s is on the way.", pick.name.c_str());
+        outMsg = pick.name + " is on the way.";
         return true;
     }
 
@@ -5066,6 +5101,12 @@ public:
             Playerbot::BotChatter::OnPlayerKilled(killer, killed);
     }
 };
+
+bool Playerbot::V2::AddCompanionForOwner(Player* owner, uint8 cls, Playerbot::Role role, std::string& msg)
+{
+    return playerbot_v2_commandscript::AddCompanionFor(owner, owner->GetSession(), cls, role, 0,
+                                                      uint8(urand(GENDER_MALE, GENDER_FEMALE)), "bot", msg);
+}
 
 void AddSC_playerbot_v2_commandscript()
 {

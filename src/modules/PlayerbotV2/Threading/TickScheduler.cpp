@@ -1,6 +1,7 @@
 #include "TickScheduler.h"
 #include "AiWorkerPool.h"
 #include "Bot/BotActivityTier.h"
+#include "ReactionWake.h"
 #include "Config.h"
 #include "Timer.h"
 
@@ -65,13 +66,19 @@ void TickScheduler::on_world_tick(Ms now)
     due_buf.reserve(bots_.size());
     for (auto& [id, sched] : bots_)
     {
-        if (sched.next_tick.count() <= now.count())
+        bool const wake_due = sched.wake_at.count() && sched.wake_at.count() <= now.count();
+        if (sched.next_tick.count() <= now.count() || wake_due)
         {
             due_buf.push_back(id);
             // Phase-aligned (see NextPhaseDeadline) with the SAME phase as the
             // snapshot deadline below, so a bot's bot tick still lands on the
             // world tick that just rebuilt its snapshot.
-            sched.next_tick = NextPhaseDeadline(id, now, EffectivePeriod(sched.tier, sched.pvp_floor));
+            Ms const period = EffectivePeriod(sched.tier, sched.pvp_floor);
+            sched.next_tick = NextPhaseDeadline(id, now, period);
+            // A wake-driven tick must not be followed by the regular one a few ms later: that slot is skipped, the phase stays.
+            if (wake_due && sched.next_tick.count() - now.count() < ReactionWake::kMinGainMs)
+                sched.next_tick = Ms{ sched.next_tick.count() + period.count() };
+            sched.wake_at = Ms{0};
         }
     }
     pool_.schedule_ticks(due_buf);
@@ -145,7 +152,8 @@ bool TickScheduler::should_build_snapshot(BotId id, Ms now)
 {
     auto it = bots_.find(id);
     if (it == bots_.end()) return false;
-    if (it->second.next_snapshot.count() > now.count()) return false;
+    bool const wake_due = it->second.wake_at.count() && it->second.wake_at.count() <= now.count();
+    if (it->second.next_snapshot.count() > now.count() && !wake_due) return false;
     // Burst cap for the slow tiers: after a long frame every bot is due at once (295 builds = 370 ms in one tick,
     // which stalls the next frame the same way). Combat/Active always build; Cruise/Idle/Parked bots beyond the cap
     // simply stay due and build on the next frames (deadline untouched).
@@ -176,7 +184,10 @@ bool TickScheduler::should_build_snapshot(BotId id, Ms now)
     // matches bot tick cadence so an bot worker always sees fresh data
     // when its tick fires. Phase-aligned per bot (see NextPhaseDeadline) so
     // bots reset in the same tick do not stay phase-locked.
-    it->second.next_snapshot = NextPhaseDeadline(id, now, EffectivePeriod(it->second.tier, it->second.pvp_floor));
+    Ms const period = EffectivePeriod(it->second.tier, it->second.pvp_floor);
+    it->second.next_snapshot = NextPhaseDeadline(id, now, period);
+    if (wake_due && it->second.next_snapshot.count() - now.count() < ReactionWake::kMinGainMs)
+        it->second.next_snapshot = Ms{ it->second.next_snapshot.count() + period.count() };
     return true;
 }
 
@@ -197,6 +208,28 @@ void TickScheduler::set_pvp_floor(BotId id, Ms floor, Ms now)
         if (sched.next_tick.count() > nt.count())     sched.next_tick = nt;
         if (sched.next_snapshot.count() > nt.count()) sched.next_snapshot = nt;
     }
+}
+
+bool TickScheduler::wake_after_busy(BotId id, int64 busy_ms, Ms now)
+{
+    auto it = bots_.find(id);
+    if (it == bots_.end()) return false;
+    auto& sched = it->second;
+    if (sched.tier != ActivityTier::Combat) return false;
+
+    Ms const period = EffectivePeriod(sched.tier, sched.pvp_floor);
+    ReactionWake::Input in;
+    in.busy_ms = busy_ms;
+    in.period_ms = period.count();
+    in.next_tick_in_ms = sched.next_tick.count() - now.count();
+    in.since_last_wake_ms = sched.last_wake.count() ? now.count() - sched.last_wake.count() : 1000000;
+    int64 const delay = ReactionWake::Delay(in);
+    if (delay < 0) return false;
+
+    sched.wake_at = Ms{ now.count() + delay };
+    sched.last_wake = now;
+    ++n_wakes_;
+    return true;
 }
 
 std::array<uint32, 5> TickScheduler::tier_counts() const

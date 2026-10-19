@@ -516,7 +516,7 @@ void ApplyKeepOut(Plan const& plan, Member const& self, std::vector<Circle> cons
 AvoidFrontal const* FrontRule(RaidRules const& rules, Plan const& plan, Member const& self, Unit const* enemy);
 
 // No raid move walks through the front arc of an enemy with a cone rule (Onyxia's Flame Breath, 120 degrees): a bot back from a fear stands
-// anywhere, and the straight walk to a slot, a post or a target may run through the breath (all eight deaths of the 405 s kill, 2026-10-16,
+// anywhere, and the straight walk to a slot, a post or a target may run through the breath (all eight deaths of a 405 s kill
 // came 3-27 s after a roar). A move whose straight line crosses the widened arc is dropped, and the bot waits on its flank; the ways out of
 // the arc itself (leave cone, leave hazard) and a bot that already stands inside it are not touched. At most one log line a bot every 10 s.
 std::unordered_map<uint64_t, uint32_t> g_lastArcGuardLog;
@@ -798,6 +798,7 @@ bool Clearest(Player* bot, std::vector<Player*> const& others, float wanted, Rai
 struct Sticky { float x, y, z; uint32_t at; char const* reason; };
 std::unordered_map<uint64_t, Sticky> g_sticky;
 std::unordered_map<uint64_t, uint32_t> g_lastSpread;
+std::unordered_map<uint64_t, uint32_t> g_lastSpreadLog;
 std::unordered_map<uint64_t, uint32_t> g_lastTankFace;
 std::unordered_map<uint64_t, uint32_t> g_lastFaceAway;
 std::unordered_map<uint64_t, uint32_t> g_lastRearStep;
@@ -1387,7 +1388,7 @@ bool MagmaAt(Map* map, PhaseShift const& phase, float x, float y, float z, float
     LiquidData ld;
     // All liquids, then the flags of what came back: the vmap filters on the model's raw liquid type, before the area table swaps it for
     // its own (the Majordomo hall's dais is a water-typed model liquid the area turns into lava). A Magma|Slime filter never saw it and the
-    // core, which asks for all liquids, burned bots there for 10% a second (nl100: six deaths at z -119.2, no [raid_lava] line).
+    // core, which asks for all liquids, burned bots there for 10% a second.
     ZLiquidStatus const st = map->GetLiquidStatus(phase, x, y, z, map_liquidHeaderTypeFlags::AllLiquids, &ld);
     if (!(st & MAP_LIQUID_STATUS_IN_CONTACT))
         return false;
@@ -1749,6 +1750,16 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                     if (now - at < 4000)
                         continue;
                     if (Clearest(bot, others, rule.radius, out, "spread", circles, /*urgent*/ false)) { at = now; Remember(bot, out, now); return; }
+                    // No spot: say why, once per bot every 10 s (zg_venoxis 2026-10-20 124: ten casters within 3 y of each other under a
+                    // 12 y spread, Holy Wrath 4-57k through all of them, and nothing in the log said what the spread had tried).
+                    uint32_t& logged = g_lastSpreadLog[bot->GetGUID().GetCounter()];
+                    if (now - logged >= 10000)
+                    {
+                        logged = now;
+                        TC_LOG_INFO("playerbot.v2.raid", "[raid_spread] {} wants {:.0f} y from the raid at {} and has {:.1f}: no spot ({}; "
+                                    "routine probes {}/{})", bot->GetName(), rule.radius, enemy->GetName(), nearest, g_clearestWhy,
+                                    g_pathProbes, kPathProbeRoutine);
+                    }
                 }
 
     // 3b. Face away (Magmadar): the tank that holds the enemy stands on the far side of it from the raid, so the enemy's back is
@@ -1914,7 +1925,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             float const dist = rule.minDist + (float(row) + 0.5f) / float(rows) * depth;
             float const slotAngle = eo + side * angle;
             // A slot is only a slot where nothing would move the bot out again: no hazard circle, no whelp-cave circle (a move that ends in one is
-            // pushed out to its rim, which at her spawn spot put the casters in front of her, live 2026-10-16) and no cone as she faces right now
+            // pushed out to its rim, which at her spawn spot put the casters in front of her) and no cone as she faces right now
             // (the cone step would walk the bot straight out: 180 flank and 140 cone steps in 70 s). The same bearing at another distance inside
             // the band is tried before the bot gives up and stays where it is.
             auto const validAt = [&](float d, float& vx, float& vy)
@@ -2691,8 +2702,8 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
             continue;
         }
         // Majordomo's shields, 10 s on all eight adds every 30 s: Magic Reflection takes the casters off the add, Damage Shield the melee DPS.
-        // The other half keeps attacking, the tanks keep their swings, hunters are hit by neither (until 2026-10-16 either shield stopped
-        // everybody, a third of the fight idle for the whole raid: acmc, n040 and n124 Majordomo 2026-10-15, 3200-4500 raid damage a second).
+        // The other half keeps attacking, the tanks keep their swings, hunters are hit by neither (either shield used to stop
+        // everybody, a third of the fight idle for the whole raid: 3200-4500 raid damage a second).
         if (enemy->HasAura(Shields::kMagicReflection))
             forbiddenCasters.push_back(enemy->GetGUID());
         if (enemy->HasAura(Shields::kDamageShield))
@@ -2886,7 +2897,7 @@ void PublishThreatHolds(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& ord
             fight.last = now;
             // A boss gets the tank's time to arrive and build its lead: mc_geddon 09a8ff07 had Geddon on a mage 6 s in (the tank, 40 y off at the
             // pull, still short of the 900 lead when the 6 s opening wait ran out), loose in the middle of the raid when Inferno came.
-            // Never longer than eight seconds from the tank's first hit in a raid (playtest 2026-10-16: the tank takes a while to run in), the
+            // Never longer than eight seconds from the tank's first hit in a raid, the
             // same wait as the combat state's (kRaidBossOpenWaitMs).
             uint32_t const capMs = boss ? uint32_t(kRaidBossOpenWaitMs) : (tankThreat <= 0.0f ? 1000u : 2000u);
             hold = now - std::min(since, fight.first) < capMs;

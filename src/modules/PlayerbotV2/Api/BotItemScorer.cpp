@@ -572,6 +572,33 @@ bool IsArmorPieceSlotType(uint8 inv)
 
 } // anonymous
 
+int32 ResistPoints(ItemTemplate const* tpl, uint8 school, uint8 level)
+{
+    if (!tpl)
+        return 0;
+    int32 mod;
+    switch (school)
+    {
+        case SPELL_SCHOOL_HOLY:   mod = ITEM_MOD_HOLY_RESISTANCE;   break;
+        case SPELL_SCHOOL_FIRE:   mod = ITEM_MOD_FIRE_RESISTANCE;   break;
+        case SPELL_SCHOOL_NATURE: mod = ITEM_MOD_NATURE_RESISTANCE; break;
+        case SPELL_SCHOOL_FROST:  mod = ITEM_MOD_FROST_RESISTANCE;  break;
+        case SPELL_SCHOOL_SHADOW: mod = ITEM_MOD_SHADOW_RESISTANCE; break;
+        case SPELL_SCHOOL_ARCANE: mod = ITEM_MOD_ARCANE_RESISTANCE; break;
+        default:                  return 0;
+    }
+    uint32 const ilvl = uint32(std::max<int32>(1, EffectiveItemLevelForLevel(tpl, level)));
+    float points = 0.0f;
+    for (uint32 i = 0; i < MAX_ITEM_PROTO_STATS; ++i)
+    {
+        int32 const t = tpl->GetStatModifierBonusStat(i);
+        // Resistance to all schools is the five magic schools (Player::_ApplyItemBonuses), not holy.
+        if (t == mod || (t == ITEM_MOD_CLASSIC_RESISTANCE_ALL_SCHOOLS && school != SPELL_SCHOOL_HOLY))
+            points += RaidStatValue(tpl, i, ilvl);
+    }
+    return int32(points + 0.5f);
+}
+
 int32 ScoreItemRaid(ItemTemplate const* tpl, uint8 cls, uint16 spec, uint8 level, uint8 slot)
 {
     if (!tpl)

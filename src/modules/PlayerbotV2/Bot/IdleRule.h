@@ -74,6 +74,11 @@ struct IdleRule
     // is a companion in its owner's group, which would otherwise wander off on it whenever the owner stands still.
     // Set by finalize() from the rule name.
     bool world_errand = false;
+
+    // Rule that sends a questless bot to a quest giver or hub. Skipped for a bot of the world while Playerbot.World.Questing is 0.
+    // Set by finalize() from the rule name.
+    bool quest_seek = false;
+    bool     fight_exempt = false;   // a world errand that may still run in combat or with a live target (the grind engage itself)
 };
 
 class IdleRuleRegistry

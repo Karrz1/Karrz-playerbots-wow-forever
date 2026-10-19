@@ -83,7 +83,8 @@ public:
     // Charter founding constraints. The actual `Petitions.dbc` row
     // sets the gold cost; we just gate which bots are eligible to
     // attempt founding (no point spawning a charter FSM on an L5).
-    static constexpr uint8 kCharterMinFounderLevel = 25;
+    // Level 10: the online Horde bots in 127 were all below 25 (0 of 57), so no Horde guild past the first was ever founded.
+    static constexpr uint8 kCharterMinFounderLevel = 10;
 
     // Recruitment cooldowns. Per-recruiter to avoid invite spam from a
     // chatty officer; per-target to avoid pestering the same guildless
@@ -166,6 +167,9 @@ public:
     // zone (no nearby petitioner NPC) and the FSM aborts via the
     // 30-min budget every cycle.
     void TeleportFounderAndSigners(uint64 founder_low, Faction f);
+    // Founds the elected founder's guild at once: the guild is created with the founder as leader and online, guildless bots of the same
+    // faction as its first members, with no petition walk. Returns false (the election is released) when it cannot be done.
+    bool FoundGuildDirectly(uint64 founder_low, Faction f, std::string const& name);
 
     // QueueRecruitInvite(): called from idle:guild_recruit_nearby when
     // an officer bot is near a guildless bot AND the officer's guild
@@ -284,7 +288,18 @@ public:
     // GM until they /gquit. Rotation on departure lives in Phase B.2.
     void RunRankHygiene();
 
+    // Forgets the managed guilds the server no longer has (the last member deleted or left, a GM command) and says so, with the
+    // member count it last saw. Without this the slot count kept a vanished guild for good (127: Alliance "6 active of target 6"
+    // with 5 on the table) and no replacement was ever founded.
+    void ReconcileGuilds();
+
+    // Puts online guildless world bots into the managed guilds (the smallest one with room first), a few per pass. Founding gave a
+    // guild 6 members and the in-world recruitment brought almost none: in 127 five guilds held 62 of ~3,180 Alliance bots, so a
+    // player in a capital saw no guild tags at all.
+    void FillGuilds(Faction f);
+
 private:
+    std::unordered_map<uint64, std::pair<std::string, uint32>> last_seen_;   // guild id -> name, member count at the last pass
     mutable std::mutex                                  mtx_;
     uint16                                              target_per_faction_   = kDefaultTargetGuildsPerFaction;
     uint16                                              max_members_per_guild_ = kDefaultMaxMembersPerGuild;

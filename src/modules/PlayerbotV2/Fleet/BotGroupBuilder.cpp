@@ -237,7 +237,7 @@ std::vector<uint64> BotGroupBuilder::PickCandidates(GroupRequest const& req)
     return picked;
 }
 
-uint32 BotGroupBuilder::BuildGroup(GroupRequest const& req)
+uint32 BotGroupBuilder::BuildGroup(GroupRequest const& req, uint64* leader_out)
 {
     std::vector<uint64> cands = PickCandidates(req);
     if (cands.size() < 2)        // can't form a group of one
@@ -284,6 +284,9 @@ uint32 BotGroupBuilder::BuildGroup(GroupRequest const& req)
     TC_LOG_INFO("playerbot.v2",
         "[BotGroupBuilder] Formed group: leader_low={} added={} size={} src=signal {} content_id={}",
         leader_low, added, g->GetMembersCount(), static_cast<uint32>(req.source), req.content_id);
+
+    if (added > 0 && leader_out)
+        *leader_out = leader_low;
 
     // D.4: stamp a pending-finish record so the next DrainPending pass
     // (10s later) fires the content-specific queue / walk.

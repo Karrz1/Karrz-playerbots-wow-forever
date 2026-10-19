@@ -1502,6 +1502,10 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         void AutoSelectAmmo();                              // keeps a usable ammo set, or picks one from the bags
         void TakeAmmo();                                    // one shot
         bool IsAmmoUsableWithRangedWeapon(ItemTemplate const* proto) const;
+        // The display the client draws an arrow or bullet with: 0 when the item has none. The generic 1.60 ammo display (737992 / 737993, from 500000 up)
+        // has no model: the client draws a white box for it, nocked and in flight.
+        static uint32 GetAmmoDisplayId(ItemTemplate const* proto);
+        static bool HasDrawableAmmoDisplay(ItemTemplate const* proto) { uint32 const id = GetAmmoDisplayId(proto); return id && id < 500000; }
         bool NeedsAmmo() const;                             // bow, gun or crossbow equipped
         Item* GetShield(bool useable = false) const;
         Item* GetChildItemByGuid(ObjectGuid guid) const;
@@ -1994,7 +1998,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         bool HasActiveSpell(uint32 spell) const;            // show in spellbook
         uint32 ResolveSupersededRank(uint32 spellId) const; // Classic 1.60: the active higher rank of a known but superseded rank, else spellId
         SpellInfo const* GetCastSpellInfo(SpellInfo const* spellInfo, TriggerCastFlags& triggerFlag, GetCastSpellInfoContext* context) const override;
-        bool IsSpellFitByClassAndRace(uint32 spell_id) const;
+        bool IsSpellFitByClassAndRace(uint32 spell_id, uint32 learnSpellDepth = 0) const;
         bool HandlePassiveSpellLearn(SpellInfo const* spellInfo);
 
         void SendProficiency(ItemClass itemClass, uint32 itemSubclassMask) const;
@@ -2827,6 +2831,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         // Temporarily removed pet cache
         uint32 GetTemporaryUnsummonedPetNumber() const { return m_temporaryUnsummonedPetNumber; }
         void SetTemporaryUnsummonedPetNumber(uint32 petnumber) { m_temporaryUnsummonedPetNumber = petnumber; }
+        void DelayPetResummon(uint32 ms) { m_petResummonDelay = ms; }
         Optional<ReactStates> GetTemporaryPetReactState() const { return m_temporaryPetReactState; }
         void DisablePetControlsOnMount(ReactStates reactState, CommandStates commandState);
         void EnablePetControlsOnDismount();
@@ -3485,6 +3490,8 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
 
         // Temporary removed pet cache
         uint32 m_temporaryUnsummonedPetNumber;
+        uint32 m_botSheathIdleMs = 0;                       // bot only: ms with weapons drawn and no fight
+        uint32 m_petResummonDelay;                          // ms until the pet remembered at login is summoned (0 = none pending)
         Optional<ReactStates> m_temporaryPetReactState;
         uint32 m_oldpetspell;
         ObjectGuid m_temporaryUnsummonedBattlePet;
