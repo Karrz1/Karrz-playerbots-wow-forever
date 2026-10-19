@@ -103,3 +103,12 @@ Key bindings (0.2.2): Esc > Options > Key Bindings > AddOns > "WoW Forever Bots"
 
 Lazy lock key (0.2.4, warlocks): one key that does the right next thing on your target. Each press casts one spell: Demon Armor and your pet when you have none, the curse (Curse of Tongues on mana users, Curse of Agony on the rest), Corruption, Immolate and Siphon Life kept up, Conflagrate, Shadow Bolt as the filler (the free instant bolt on a Shadow Trance proc), Life Tap when mana runs low, Death Coil / Drain Life when your health is low, and your racial on a long fight. The wand takes over when mana is dry. It also sends your pet at the target. Bind it under "Lazy lock" and tap or mash it; it runs the server command `.playerbot lazy`, which you can also type.
 Attack (mouseover) key: hover a mob and press it; the mob becomes your target and the bots attack it. Group pings (the ping wheel, if your client has one): an Attack ping on an enemy sends the bots in, an On my way ping on the ground sends them there. Needs a server with the ping hooks.
+
+## 0.5.1 window
+
+Built on the client's own portrait window (the one its Raid and Looking For Group windows use): centred title, group icon in the portrait slot, dark inner panel, the client's own red buttons, fonts, and square icon tabs down the right edge (Orders, Bots, Form, Marks; hover for the name). Bots tab: class icons, then round role icons (shield, plus, sword) for the roles that class can do; click one to add that bot. A footer shows the group and stance with Call saved and Dismiss all. If the client has no such template the window falls back to a plain dialog frame with the same contents. The only own art is the minimap emblem (`Textures/mono_fb64.tga`); buttons are the Raid Info button template, role icons use the client's LFG art with its check box, switches are client check boxes, mark slots are the client's action-slot frame.
+
+- `/fb scale <0.7-1.5>` sets the window size (default 1.2, saved).
+- `/fb minimap on|off|reset` shows, hides or re-centres the minimap button.
+- `/fb quick` adds a tank, a healer and three damage dealers; `/fb resume` and `/fb flee` send those two orders.
+- When the client blocks an add-on call, one chat line names the add-on and the call.
