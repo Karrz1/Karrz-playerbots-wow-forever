@@ -5,6 +5,7 @@
 #include "SkyborneIsle.h"
 #include "../Util/SlowCall.h"
 #include "../Bot/Gear/BotGearGenerator.h"
+#include "../Bot/Gear/ArmorSwapGate.h"
 #include "../Bot/World/CapitalsTable.h"
 #include "../Bot/World/ZonesByLevel.h"
 #include "../Bot/World/MountsByRace.h"
@@ -409,6 +410,10 @@ bool BotSetupPipeline::DoGrantStarterKit(Player* bot)
 
 bool BotSetupPipeline::DoGenerateGear(Player* bot)
 {
+    // Not while fighting or casting: every piece would be refused (results 61 and 40, seen as equipped=0 in [GearGen]) after being stored
+    // in the bags, and the step would still count as done. Returning false keeps it open for the next pipeline tick.
+    if (!::Playerbot::Gear::CanSwapArmorNow(bot->IsInCombat(), bot->HasUnitState(UNIT_STATE_CASTING) || bot->IsNonMeleeSpellCast(false)))
+        return false;
     RollClassicRole(bot);
     Gear::GearGenerationContext ctx;
     ctx.level  = bot->GetLevel();

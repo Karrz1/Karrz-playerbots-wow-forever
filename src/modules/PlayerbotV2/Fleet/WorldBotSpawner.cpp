@@ -4,6 +4,7 @@
 #include "Api/PlayerbotAPI.h"
 #include "Bot/QuestDoable.h"
 #include "Bot/Gear/WorldGearStart.h"
+#include "Bot/Gear/ArmorSwapGate.h"
 #include "Fleet/WorldLeash.h"
 #include "Fleet/CityLayer.h"
 #include "WorldBotSpawner.h"
@@ -858,7 +859,7 @@ void WorldBotSpawner::ResetStarterGearOnce(Player* bot)
     if (!gear_reset_pending_.contains(guid_low) || gear_reset_tried_.contains(guid_low))
         return;
     // Armor cannot be put on while casting or fighting (result 40, "can't do that right now"): try again on a later tick.
-    if (bot->IsInCombat() || bot->HasUnitState(UNIT_STATE_CASTING) || bot->IsNonMeleeSpellCast(false))
+    if (!::Playerbot::Gear::CanSwapArmorNow(bot->IsInCombat(), bot->HasUnitState(UNIT_STATE_CASTING) || bot->IsNonMeleeSpellCast(false)))
         return;
     gear_reset_tried_.insert(guid_low);   // not marked, or already tried since the server started (a piece that cannot be worn is not retried every tick)
     bool complete = true;
