@@ -196,6 +196,7 @@ Common cause: leftover Buildings/dir_bin/ from a previous run. Delete it and ret
     foreach ($f in Get-ChildItem (Join-Path $OutputPath 'maps') -Filter '*.tilelist' -ErrorAction SilentlyContinue) { if ($f.Name -match '^(\d{4})') { $expect[[int]$Matches[1]] = 1 } }
     foreach ($d in Get-ChildItem (Join-Path $OutputPath 'vmaps') -Directory -ErrorAction SilentlyContinue) { if ($d.Name -match '^\d+$') { $expect[[int]$d.Name] = 1 } }
     $gen = Start-Process (Join-Path (Get-Location).Path 'mmaps_generator.exe') -ArgumentList $mmapArgs -WorkingDirectory (Get-Location).Path -NoNewWindow -PassThru
+    $null = $gen.Handle   # Windows PowerShell 5.1 leaves ExitCode empty unless the process handle is read right after the start
     while (-not $gen.WaitForExit(60000)) {
         $done = @(Get-ChildItem (Join-Path $OutputPath 'mmaps') -Filter '*.mmap' -ErrorAction SilentlyContinue).Count
         Write-Host ("Pathfinding data: {0} of about {1} maps done, still working ({2} minutes so far)..." -f $done, $expect.Count, [math]::Round($clock.Elapsed.TotalMinutes))
