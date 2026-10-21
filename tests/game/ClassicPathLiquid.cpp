@@ -69,3 +69,9 @@ TEST_CASE("PathLiquid: a follower is never refused for water, a town world bot i
     CHECK(DecideLiquid(LiquidPolicy::PreferDry, true, false) == LiquidAction::Go);
     CHECK(DecideLiquid(LiquidPolicy::RequireDry, true, false) == LiquidAction::Refuse);
 }
+
+TEST_CASE("PathLiquid: a ghost on its corpse run ignores magma and deep water", "[pathliquid]")
+{
+    CHECK(LiquidMattersFor(true));
+    CHECK_FALSE(LiquidMattersFor(false));
+}

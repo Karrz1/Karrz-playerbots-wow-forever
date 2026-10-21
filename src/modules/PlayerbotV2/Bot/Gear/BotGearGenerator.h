@@ -68,6 +68,9 @@ struct GearGenerationContext
     // A piece worn for the fight whatever it scores (an item entry; 0 = none): the Onyxia Scale Cloak, whose aura is what the drakes' Shadow
     // Flame checks. It goes on over the pick, the tier piece or the resistance piece in its slot. Ignored for world bots.
     uint32 wear_entry = 0;
+    // Generate even for a world bot under level 10 (WorldGearStart.h). Set only to replace a starter piece the client cannot draw, so
+    // the bot is not left bare; the caller then uses just the slots it needs.
+    bool   replace_unrenderable_starter = false;
     bool   world_bot() const { return ::Playerbot::Pool::UsesWorldGear(role); }
 };
 

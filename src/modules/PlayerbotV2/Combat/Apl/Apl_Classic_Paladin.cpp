@@ -297,9 +297,36 @@ bool ShouldDivineFavor(ApPredicateContext const& ctx)
 }
 void DoDivineFavor(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(DIVINE_FAVOR); }
 
+// Whether the group member `who` is within the friendly range of `spell` (the bot itself always is). Holy Shock reaches 20 y, the heals 40 y: a
+// shock sent at a patient 30 y away fails out of range every tick and, being first in the rotation, starves the heals that would reach.
+bool FriendInSpellRange(ApPredicateContext const& ctx, ObjectGuid who, uint32 spell)
+{
+    if (who.IsEmpty() || who == ctx.bot.guid())
+        return true;
+    SpellInfo const* si = sSpellMgr->GetSpellInfo(ctx.bot.resolve_rank(spell) ? ctx.bot.resolve_rank(spell) : spell, DIFFICULTY_NONE);
+    float const range = si ? si->GetMaxRange(true) : 0.0f;
+    if (range <= 0.0f)
+        return true;
+    auto const* members = ctx.group.members();
+    if (!members)
+        return true;
+    float bx, by, bz;
+    ctx.bot.position(bx, by, bz);
+    for (auto const& m : *members)
+        if (m.guid == who)
+        {
+            float const dx = m.x - bx, dy = m.y - by, dz = m.z - bz;
+            return dx * dx + dy * dy + dz * dz <= range * range;
+        }
+    return true;
+}
+
 bool ShouldHolyShock(ApPredicateContext const& ctx)
 {
-    return Ready(ctx, HOLY_SHOCK) && LowestFriendOrSelf(ctx).hp_pct <= 55;
+    if (!Ready(ctx, HOLY_SHOCK))
+        return false;
+    HealTarget const t = LowestFriendOrSelf(ctx);
+    return t.hp_pct <= 55 && FriendInSpellRange(ctx, t.guid, HOLY_SHOCK);
 }
 void DoHolyShock(ApPredicateContext const& ctx, BotIntentEmitter& e)
 {

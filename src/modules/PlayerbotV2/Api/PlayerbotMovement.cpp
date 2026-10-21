@@ -704,7 +704,7 @@ LiquidVerdict ClassifyDestinationLiquid(Player* p, float x, float y, float z,
     if (outData)
         *outData = liq;
 
-    if (zs == LIQUID_MAP_NO_WATER)
+    if (zs == LIQUID_MAP_NO_WATER || !LiquidMattersFor(p->IsAlive()))
         return LiquidVerdict::Dry;
 
     // Magma / slime is lethal on contact regardless of depth.

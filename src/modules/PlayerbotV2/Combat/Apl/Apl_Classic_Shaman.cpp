@@ -142,7 +142,7 @@ bool ShouldImbue(ApPredicateContext const& ctx)
 void DoImbue(ApPredicateContext const& ctx, BotIntentEmitter& e)
 {
     Classic::CastPick const p = Classic::PickImbue(ctx.bot, true);
-    e.cast_on_item(p.spell, p.target);
+    e.cast_imbue(p.spell, p.target);
 }
 
 // Totems: worth the mana in a group, on elites and multi-mob pulls, or a

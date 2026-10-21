@@ -275,6 +275,10 @@ public:
     // Cast a spell on an Item (disenchant 13262 / prospect 31252 / mill 51005).
     bool cast_on_item(uint32 spell_id, ObjectGuid item_guid)
     { return emit(CastSpellOnItemIntent{spell_id, item_guid}); }
+    // Weapon imbue (Windfury / Flametongue / Rockbiter Weapon) on the bot's own weapon, under the same 30 s retry lockout as the
+    // out-of-combat idle:classic_weapon rule: an imbue the server refuses (or the snapshot does not show yet) is not re-sent every
+    // tick, and the rotation falls through to its other rules while the lockout runs.
+    bool cast_imbue(uint32 spell_id, ObjectGuid item_guid);
 
     // Vehicle controls. enter_vehicle takes a Unit GUID of the vehicle
     // (a Creature or other Unit with a VehicleKit) and an optional seat

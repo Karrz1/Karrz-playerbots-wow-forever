@@ -36,6 +36,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
+#include <unordered_map>
 
 namespace Playerbot {
 
@@ -542,9 +544,40 @@ bool OwnerStayGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     return ManualModeActive(s, ai) && ai.owner_command() == BotAI::OwnerCommand::Stay;
 }
 bool OwnerStayFire(BotSnapshotView const& s, BotAI& ai,
-                   GroupSnapshotView const&, BotIntentEmitter&, uint32)
+                   GroupSnapshotView const& g, BotIntentEmitter&, uint32)
 {
     ai.set_last_rule_fired("idle:owner_stay");
+    // A Stay that holds a bot while its group fights is how a damage dealer stands out of a boss fight: say so (once per 5 s per bot).
+    if (s.is_alive() && !s.in_combat())
+    {
+        if (auto const* members = g.members())
+            for (auto const& m : *members)
+                if (m.in_combat && m.guid != s.guid())
+                {
+                    static std::mutex sStayLogMutex;
+                    static std::unordered_map<uint64, uint32> sStayLog;
+                    uint32 const now = s.published_at_ms();
+                    bool log_now = false;
+                    {
+                        std::lock_guard<std::mutex> lock(sStayLogMutex);
+                        if (sStayLog.size() > 4096) sStayLog.clear();
+                        uint32& last = sStayLog[s.guid().GetCounter()];
+                        if (!last || now - last > 5000u) { last = now; log_now = true; }
+                    }
+                    if (ai.use_stay())
+                    {
+                        // The Stay of an object use ends when the group's fight starts, not only when the bot's own does: Halorio (hunter) stood
+                        // at the altar for 16 s of the Emberseer fight, idle under it, because the boss never turned to him (UBRS 132g 23:38).
+                        ai.clear_use_stay();
+                        ai.exit_manual();
+                        TC_LOG_INFO("playerbot.v2", "[stay_end] {} leaves the object-use Stay: {} is in combat", s.name(), m.name);
+                        return false;   // the lower rules (engage, assist) run on this tick
+                    }
+                    if (log_now)
+                        TC_LOG_INFO("playerbot.v2", "[stay_hold] {} idle under an owner Stay while {} is in combat", s.name(), m.name);
+                    break;
+                }
+    }
     return !s.is_companion_with_owner();   // see OwnerFollowFire; loot runs wait (LootDrainGate)
 }
 

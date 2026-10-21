@@ -425,7 +425,7 @@ public:
     struct Pacing
     {
         uint32 decision_delay_ms     = 600;
-        uint32 pvp_reaction_delay_ms = 700;
+        uint32 pvp_reaction_delay_ms = 630;
     };
     Pacing const& pacing() const { return pacing_; }
 

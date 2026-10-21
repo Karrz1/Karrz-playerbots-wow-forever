@@ -1,4 +1,5 @@
 #include "BotPool.h"
+#include "../Bot/Gear/WorldGearStart.h"
 #include "Creature.h"
 #include "../Util/SlowCall.h"
 #include "BotPopulationManager.h"
@@ -909,6 +910,18 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
                 (!own_character && !Gear::IsBotWearableItemId(it->GetEntry())))
                 bad_slots[bad_count++] = s;
 
+    // A level 1-9 world bot whose unrenderable starter pieces were already taken off (before this fix, or by an earlier pass) is
+    // left with empty body slots: fill them too, so it is dressed on its next pass.
+    std::array<bool, EQUIPMENT_SLOT_END> fill_empty{};
+    if (!own_character && p->GetLevel() < ::Playerbot::Gear::kWorldGearMinLevel &&
+        ::Playerbot::Pool::UsesWorldGear(::Playerbot::Pool::RoleOf(p->GetGUID().GetCounter())))
+        for (uint8 s : { uint8(EQUIPMENT_SLOT_CHEST), uint8(EQUIPMENT_SLOT_LEGS), uint8(EQUIPMENT_SLOT_FEET) })
+            if (!p->GetItemByPos(INVENTORY_SLOT_BAG_0, s) && bad_count < bad_slots.size())
+            {
+                fill_empty[s] = true;
+                bad_slots[bad_count++] = s;
+            }
+
     BotId const id = p->GetGUID().GetCounter();
     if (bad_count == 0)
     {
@@ -945,6 +958,8 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
         ctx.bot_id = id;
         ctx.wearer = p;
         ctx.role = ::Playerbot::Pool::RoleOf(id);
+        // A level 1-9 world bot is not given gear, but when its starter pieces cannot be drawn only a replacement keeps it from going bare.
+        ctx.replace_unrenderable_starter = true;
         // The generator never returns an unrenderable item (index-time gate).
         for (auto const& g : Gear::GenerateGearFor(ctx))
             if (g.slot < EQUIPMENT_SLOT_END)
@@ -956,8 +971,8 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
     {
         uint8 const slot = bad_slots[i];
         Item* cur = p->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
-        if (!cur) continue;     // an earlier swap in this loop already moved it
-        uint32 const bad_entry = cur->GetEntry();
+        if (!cur && !fill_empty[slot]) continue;     // an earlier swap in this loop already moved it
+        uint32 const bad_entry = cur ? cur->GetEntry() : 0;
         char const* outcome = nullptr;
 
         // 1. Swap in the generated piece for this slot. CanEquipNewItem is
@@ -997,6 +1012,9 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
             }
         }
 
+        if (!outcome && !cur)
+            continue;   // an empty slot with no replacement stays empty
+
         // 2. No usable replacement: take it off into the bags, exactly like the
         //    client's auto-store (HandleAutoStoreBagItemOpcode).
         if (!outcome)
@@ -1022,10 +1040,13 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
         if (outcome)
         {
             changed = true;
-            TC_LOG_INFO("playerbot.v2",
-                "[GearHeal] {} L{}: slot {} item {} has no ItemModifiedAppearance "
-                "(client cannot render) - {}",
-                p->GetName(), uint32(p->GetLevel()), uint32(slot), bad_entry, outcome);
+            if (bad_entry)
+                TC_LOG_INFO("playerbot.v2",
+                    "[GearHeal] {} L{}: slot {} item {} has no ItemModifiedAppearance "
+                    "(client cannot render) - {}",
+                    p->GetName(), uint32(p->GetLevel()), uint32(slot), bad_entry, outcome);
+            else
+                TC_LOG_INFO("playerbot.v2", "[GearHeal] {} L{}: empty slot {} - {}", p->GetName(), uint32(p->GetLevel()), uint32(slot), outcome);
         }
         else
         {

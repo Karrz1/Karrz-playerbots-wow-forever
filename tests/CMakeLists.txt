@@ -33,6 +33,7 @@ if(NOT BUILD_PLAYERBOT_V2)
     ClassicGroupControl.cpp
     ClassicGroupOrderText.cpp
     ClassicInstanceFullHold.cpp
+    ClassicBotCustomizationRoll.cpp
     ClassicBotListedGroupPlan.cpp
     ClassicLfgRoleGap.cpp
     ClassicRaidConsumables.cpp

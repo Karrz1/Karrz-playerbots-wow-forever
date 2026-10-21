@@ -34,3 +34,9 @@ TEST_CASE("A player's companion is geared at every level", "[ClassicWorldGearSta
     CHECK(GeneratesGear(false, 9));
     CHECK(GeneratesGear(false, 40));
 }
+
+TEST_CASE("A level 1-9 world bot gets a replacement for a starter piece the client cannot draw", "[ClassicWorldGearStart]")
+{
+    CHECK(GeneratesGear(true, 1, true));
+    CHECK(GeneratesGear(true, 9, true));
+}

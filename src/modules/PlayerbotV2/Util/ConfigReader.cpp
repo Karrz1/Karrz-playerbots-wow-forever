@@ -202,7 +202,8 @@ void ConfigReader::apply_from_loaded_config()
         if (Optional<uint32> id = Trinity::StringTo<uint32>(token))
             lfg_categories_.push_back(*id);
     lfg_activity_maps_.clear();
-    std::string const lfgActivityMaps = c.GetStringDefault("Playerbot.Lfg.ActivityMaps", "214272:229", true);
+    std::string const lfgActivityMaps = c.GetStringDefault("Playerbot.Lfg.ActivityMaps",
+        "203776:43,204032:289,204288:389,204544:36,204800:33,205056:48,205312:34,205568:90,205824:47,206080:189,206336:129,206592:70,206848:209,207104:349,207360:109,207616:230,207872:229,208128:429,208384:429,208640:429,208896:329,211712:189,211968:189,212224:189,214272:229,214016:309,214528:249,214784:409,215040:469,215296:533,215552:509,215808:531", true);
     for (std::string_view token : Trinity::Tokenize(lfgActivityMaps, ',', false))
     {
         size_t const colon = token.find(':');
@@ -282,7 +283,7 @@ void ConfigReader::apply_from_loaded_config()
         cast_pacing_ = p;
         Pacing q;
         q.decision_delay_ms     = pct("Playerbot.Pacing.DecisionDelayMs",     600, 100, 5000);
-        q.pvp_reaction_delay_ms = pct("Playerbot.Pacing.PvpReactionDelayMs", 700, 0, 3000);
+        q.pvp_reaction_delay_ms = pct("Playerbot.Pacing.PvpReactionDelayMs", 630, 0, 3000);
         pacing_ = q;
         BgAutoJoin j;
         j.enabled          = c.GetBoolDefault("Playerbot.Bg.AutoJoin", false, true);

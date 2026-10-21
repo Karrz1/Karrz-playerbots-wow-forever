@@ -9,9 +9,11 @@ namespace Playerbot::Gear {
 
 constexpr std::uint8_t kWorldGearMinLevel = 10;
 
-constexpr bool GeneratesGear(bool world_bot, std::uint8_t level)
+// replace_unrenderable_starter: the caller is swapping out a starter piece the client cannot draw, which is the one case where a
+// level 1-9 world bot still gets a generated piece (otherwise it would be left bare).
+constexpr bool GeneratesGear(bool world_bot, std::uint8_t level, bool replace_unrenderable_starter = false)
 {
-    return !world_bot || level >= kWorldGearMinLevel;
+    return replace_unrenderable_starter || !world_bot || level >= kWorldGearMinLevel;
 }
 
 } // namespace Playerbot::Gear

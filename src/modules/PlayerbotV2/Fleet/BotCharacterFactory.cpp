@@ -2,6 +2,7 @@
 #include "BotAccountMgr.h"
 #include "BotIdentityRegistry.h"
 #include "BotNamePool.h"
+#include "BotCustomizationRoll.h"
 #include "../Services.h"
 #include "../Session/BotSession.h"
 
@@ -160,6 +161,9 @@ std::vector<UF::ChrCustomizationChoice> RollCustomizations(uint8 race, uint8 gen
     }
 
     static thread_local std::mt19937 cust_rng{std::random_device{}()};
+    // Core also requires that a choice whose ChrCustomizationReq lists dependent choices (e.g. a hair
+    // colour that exists only for some hair styles) has one of them selected, so the roll is dependency-aware.
+    std::vector<CustomizationRollOption> rollOptions;
     for (ChrCustomizationOptionEntry const* opt : *options)
     {
         if (!opt)
@@ -179,18 +183,29 @@ std::vector<UF::ChrCustomizationChoice> RollCustomizations(uint8 race, uint8 gen
         if (!choices || choices->empty())
             continue;
 
-        std::vector<ChrCustomizationChoiceEntry const*> candidates;
-        candidates.reserve(choices->size());
+        CustomizationRollOption ro;
+        ro.id = opt->ID;
         for (ChrCustomizationChoiceEntry const* c : *choices)
-            if (c && (seen ? seen->count(c->ID) != 0 : BotCanUseChoice(c, race, cls)))
-                candidates.push_back(c);
-        if (candidates.empty())
-            continue;
-
-        std::uniform_int_distribution<size_t> pick(0, candidates.size() - 1);
+        {
+            if (!c || !(seen ? seen->count(c->ID) != 0 : BotCanUseChoice(c, race, cls)))
+                continue;
+            CustomizationRollChoice rc;
+            rc.id = c->ID;
+            if (ChrCustomizationReqEntry const* req = sChrCustomizationReqStore.LookupEntry(c->ChrCustomizationReqID);
+                req && req->GetFlags().HasFlag(ChrCustomizationReqFlag::HasRequirements))
+                if (auto const* required = sDB2Manager.GetRequiredCustomizationChoices(req->ID))
+                    for (auto const& [optionId, anyOf] : *required)
+                        rc.needsOneOf.push_back(anyOf);
+            ro.choices.push_back(std::move(rc));
+        }
+        if (!ro.choices.empty())
+            rollOptions.push_back(std::move(ro));
+    }
+    for (auto const& [optionId, choiceId] : RollCustomizationChoices(rollOptions, cust_rng))
+    {
         UF::ChrCustomizationChoice entry;
-        entry.ChrCustomizationOptionID = opt->ID;
-        entry.ChrCustomizationChoiceID = candidates[pick(cust_rng)]->ID;
+        entry.ChrCustomizationOptionID = optionId;
+        entry.ChrCustomizationChoiceID = choiceId;
         out.push_back(entry);
     }
     std::ranges::sort(out, {}, &UF::ChrCustomizationChoice::ChrCustomizationOptionID);
@@ -356,6 +371,8 @@ BotCharacterFactory::Result BotCharacterFactory::Create(
     {
         // Player::Create failed AFTER we may have acquired the name from
         // BotNamePool — release it so the slot returns to the pool.
+        TC_LOG_ERROR("playerbot.v2", "[BotCharacterFactory] Player::Create refused {} (race {}, class {}, sex {}, {} customizations)",
+                     normalized, race, charClass, gender, createInfo->Customizations.size());
         Fleet::BotNamePool::Release(normalized);
         return {false, "Player::Create failed (race/class/appearance validation)", {}};
     }

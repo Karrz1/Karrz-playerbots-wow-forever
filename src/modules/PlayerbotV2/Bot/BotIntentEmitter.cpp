@@ -437,6 +437,19 @@ static bool HasCastTime(uint32 spell_id)
     return si && si->CalcCastTime() > 0;
 }
 
+bool BotIntentEmitter::cast_imbue(uint32 spell_id, ObjectGuid item_guid)
+{
+    if (!ai_)
+        return emit(CastSpellOnItemIntent{spell_id, item_guid});
+    uint32 const now_ms = GameTime::GetGameTimeMS();
+    if (ai_->action_recently_tried(BotAI::ActionKind::ClassUpkeep, spell_id, now_ms))
+        return false;
+    bool const pushed = emit(CastSpellOnItemIntent{spell_id, item_guid});
+    if (pushed)
+        ai_->note_action_retry(BotAI::ActionKind::ClassUpkeep, spell_id, now_ms);
+    return pushed;
+}
+
 bool BotIntentEmitter::cast(uint32 spell_id, ObjectGuid target)
 {
     if (ai_ && ai_->mana_break_active(GameTime::GetGameTimeMS()) && HasCastTime(spell_id))

@@ -4,6 +4,7 @@
 
 #include <mutex>
 #include <unordered_map>
+#include "Api/ForeignClassSpell.h"
 #include "PlayerbotAPI.h"
 #include "Bot/QuestLoot.h"
 #include "ClassicBotSkills.h"
@@ -12,6 +13,7 @@
 #include "ClassicTalentBuilds.h"
 #include "ClassicSupplies.h"
 #include "Bot/ClassicUpkeep.h"
+#include "Bot/SpellFamily.h"
 #include "Bot/Raid/ShieldRules.h"
 #include "BotItemScorer.h"
 #include "Player.h"
@@ -1142,6 +1144,24 @@ Result API::cast_spell_on_item(uint32 spell_id, ObjectGuid item_guid)
     if (!item) return Result::InvalidTarget;
 
     SpellCastResult sr = p_->CastSpell(item, spell_id, false);
+    // A weapon imbue or poison rank has a level floor on the weapon (Spell::CheckCast: the item's required level against the spell's
+    // base level, SPELL_FAILED_LOWLEVEL). A bot in a low-level weapon was refused the highest rank for ever; fall back to the highest
+    // lower rank it knows that the weapon takes.
+    if (sr == SPELL_FAILED_LOWLEVEL)
+    {
+        std::vector<uint32> const ranks = SpellFamily::Ranks(spell_id);
+        for (auto it = ranks.rbegin(); it != ranks.rend() && sr == SPELL_FAILED_LOWLEVEL; ++it)
+        {
+            SpellInfo const* ri = sSpellMgr->GetSpellInfo(*it, p_->GetMap()->GetDifficultyID());
+            if (*it == spell_id || !ri || ri->BaseLevel >= info->BaseLevel || !p_->HasSpell(*it))
+                continue;
+            sr = p_->CastSpell(item, *it, false);
+            if (sr == SPELL_CAST_OK)
+                TC_LOG_INFO("playerbot.v2", "[imbue_cast] {} spell {} refused (weapon level), cast lower rank {}", p_->GetName(), spell_id, *it);
+        }
+    }
+    if (sr != SPELL_CAST_OK)
+        TC_LOG_INFO("playerbot.v2", "[imbue_cast] {} spell {} on item {} refused: result {}", p_->GetName(), spell_id, item->GetEntry(), uint32(sr));
     switch (sr)
     {
         case SPELL_CAST_OK:                  return Result::Ok;
@@ -2063,7 +2083,11 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
         // In a capital the layers lie 20 to 40 y apart (Stormwind): a polygon that far from the asked height is another level, not a
         // slope (Hellice, on a roof at z 148.6, was snapped to a polygon 20 to 35 y below it).
         float const max_dz = ::Playerbot::V2::World::IsVanillaCapitalZone(p_->GetZoneId()) ? ::Playerbot::V2::Fleet::kCityDropYards : 60.0f;
-        if (off_end <= 12.0f && std::fabs(dz_end) < max_dz && !::Playerbot::V2::Fleet::PathHasCliff(path.GetPath()))
+        // A polygon in magma or slime is no place to walk to: the liquid gate below refuses it, and the refusal is only the short 3 s
+        // one, so the goal was picked again and again (Burning Steppes, Simer: 53 path_fail Magma for one quest goal in 3 minutes).
+        // Left unsnapped, the goal ends as FarFromPolyEnd, which suppresses it for long and lets goal selection move on.
+        bool const end_in_hazard = BotMovement::ClassifyDestinationLiquid(p_, ae.x, ae.y, ae.z) == BotMovement::LiquidVerdict::Hazard;
+        if (off_end <= 12.0f && std::fabs(dz_end) < max_dz && !end_in_hazard && !::Playerbot::V2::Fleet::PathHasCliff(path.GetPath()))
         {
             if (SehSafeCalculatePath(path, ae.x, ae.y, ae.z) && !(path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_FARFROMPOLY_END)))
             {
@@ -9441,7 +9465,7 @@ uint32 API::purge_foreign_class_spells()
     for (auto const& [spellId, state] : p_->GetSpellMap())
     {
         auto it = taughtBy.find(spellId);
-        if (it != taughtBy.end() && !(it->second & mine))
+        if (it != taughtBy.end() && ::Playerbot::Api::IsForeignClassSpell(it->second, mine))
             doomed.push_back(spellId);
     }
     for (uint32 spellId : doomed)

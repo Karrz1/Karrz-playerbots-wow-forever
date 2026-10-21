@@ -424,7 +424,7 @@ Playerbot.Cast.MaxPct = 140
 #                        ghost bots and bots under 35% HP bypass it (healing, defensives, ress).
 #                        Replaces the old Playerbot.Reaction.* StartAttack holds, now removed.
 Playerbot.Pacing.DecisionDelayMs = 600
-Playerbot.Pacing.PvpReactionDelayMs = 700
+Playerbot.Pacing.PvpReactionDelayMs = 630
 
 # Reaction speed. A bot in combat whose global cooldown or cast ends between two of its regular tick slots (Combat 100 ms) is woken on
 # the world tick it ends in, instead of waiting out the rest of the slot (about 50 ms on average). Only bots in the Combat tier, at

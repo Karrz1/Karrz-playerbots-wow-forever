@@ -53,6 +53,15 @@ bool PathTouchesLiquid(std::vector<PathPoint> const& pts, WetFn wet, float step 
     return false;
 }
 
+// Magma, slime and deep water only hurt the living: Player::EnvironmentalDamage returns at once for a dead player
+// (IsImmuneToEnvironmentalDamage = !isTargetableForAttack), and the breath timer is disabled for a ghost. A ghost running to
+// its corpse therefore walks over liquid; refusing a corpse run because the corpse lies in lava left the ghost standing at the
+// graveyard (live 132g, Burning Steppes: path_fail Magma for the same corpse every 8 s, [move_abandon] ghost=true).
+constexpr bool LiquidMattersFor(bool alive)
+{
+    return alive;
+}
+
 enum class LiquidAction : unsigned char { Go, UseDryRoute, Refuse };
 
 // path_wet: the first route touches liquid; dry_found: a route that avoids it exists.

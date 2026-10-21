@@ -750,7 +750,7 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
     std::vector<GearItem> out;
     if (!g_initialized || ctx.cls < 1 || ctx.cls >= MAX_CLASSES) return out;
     // A world bot below level 10 keeps its starting outfit (WorldGearStart.h).
-    if (!::Playerbot::Gear::GeneratesGear(ctx.world_bot(), ctx.level)) return out;
+    if (!::Playerbot::Gear::GeneratesGear(ctx.world_bot(), ctx.level, ctx.replace_unrenderable_starter)) return out;
 
     uint16 const target_ilvl = TargetIlvlForLevel(ctx.level);
     auto const& pool = g_pools[ctx.cls];

@@ -116,6 +116,8 @@ private:
         std::unordered_map<uint64, int64> mob_hp;
         uint64 dmg_total = 0;
         uint32 dmg_last_ms = 0;
+        // Mana % of each member when the pull started, for the [raid_dps] line.
+        std::unordered_map<uint64, int32> start_mana;
     };
 
     // Raid tank -> mob assignment for one (group, map) bucket, the generic

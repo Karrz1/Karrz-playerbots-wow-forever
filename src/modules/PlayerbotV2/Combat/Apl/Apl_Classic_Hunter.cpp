@@ -204,6 +204,7 @@ void DoBackOffDeadZone(ApPredicateContext const& ctx, BotIntentEmitter& e)
         len = 1.0f;
     }
     float const stand = s.spell_min_range(ARCANE_SHOT, *v) + 4.0f;
+    TC_LOG_INFO("playerbot.v2", "[hunter_backoff] {} steps back from {} ({:.1f} y, shooting spot {:.1f} y)", s.name(), v->entry, DistToVictim(ctx), stand);
     e.move_to(v->x + dx / len * stand, v->y + dy / len * stand, me.z, /*run*/ true);
 }
 

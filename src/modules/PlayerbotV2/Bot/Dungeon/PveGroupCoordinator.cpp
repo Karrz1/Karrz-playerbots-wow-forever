@@ -2597,8 +2597,12 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
         fl.mob_hp.clear();
         fl.dmg_total = 0;
         fl.dmg_last_ms = 0;
+        fl.start_mana.clear();
         for (auto const& e : mem)
+        {
             TakeDamageDone(e.guid_low, true);
+            if (e.src && e.src->max_mana > 0) fl.start_mana[e.guid_low] = Pct(e.src->mana, e.src->max_mana);
+        }
         uint32 alive = 0, tanks = 0, healers = 0;
         for (auto const& e : mem)
         {
@@ -2764,8 +2768,12 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
         {
             uint64 const d = TakeDamageDone(e.guid_low, true);
             if (e.tank || e.healer || !e.is_bot || !d) continue;
+            std::string mana;
+            auto const sm = fl.start_mana.find(e.guid_low);
+            if (sm != fl.start_mana.end() && e.src->max_mana > 0)
+                mana = ", mana " + std::to_string(sm->second) + ">" + std::to_string(Pct(e.src->mana, e.src->max_mana)) + "%";
             rows.emplace_back(d, std::string(e.src->name) + "(" + ShortClass(e.cls) + ") " + std::to_string(d) + " (" +
-                                     std::to_string(d / dur) + "/s)");
+                                     std::to_string(d / dur) + "/s" + mana + ")");
         }
         std::sort(rows.begin(), rows.end(), [](auto const& a, auto const& b) { return a.first > b.first; });
         std::string txt;
