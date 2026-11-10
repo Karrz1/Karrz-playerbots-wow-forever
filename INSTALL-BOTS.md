@@ -19,9 +19,19 @@ The bots are part of the server program, so you need a `worldserver.exe` that wa
 
 ## B. Building from source
 
-1. Build as for the plain Forever server, adding one option:
-   `cmake -S . -B build -DSERVERS=1 -DSCRIPTS=static -DBUILD_PLAYERBOT_V2=1`
-   then `cmake --build build --config RelWithDebInfo --target worldserver`. Needs the usual
+Build from the `forever-bots` branch of https://github.com/Karrz1/TrinityCore. It already has the bot module, the
+module loader and the core wiring in it; nothing needs to be copied over it. (Copying the files of
+Karrz-playerbots-wow-forever over advocaite's `forever` does not work: that repository only holds an older, partial copy.)
+All paths below are inside that checkout.
+
+1. Get the source and build it as for the plain Forever server, adding one option:
+   ```
+   git clone -b forever-bots https://github.com/Karrz1/TrinityCore.git ForeverCore-bots
+   cd ForeverCore-bots
+   cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DSERVERS=1 -DSCRIPTS=static -DBUILD_PLAYERBOT_V2=1
+   ```
+   When the option is picked up, CMake prints `Playerbot V2 module enabled` and `Modules: AddSC_playerbot_v2`.
+   Then `cmake --build build --config RelWithDebInfo --target worldserver`. Needs the usual
    TrinityCore requirements (Visual Studio 2022 or newer on Windows, Boost, OpenSSL, MySQL
    8 client). Without `-DBUILD_PLAYERBOT_V2=1` you get the unchanged server and no bots.
 2. The build puts `playerbot.conf.dist` into `worldserver.conf.d`. Run `cmake --install` or copy
@@ -31,8 +41,8 @@ The bots are part of the server program, so you need a `worldserver.exe` that wa
 
 ## Steps for everyone
 
-Optional first: the vanilla (1.12) numbers. They are not in the repository; you build them from the VMaNGOS database dump you download yourself
-(`tools/classic_spell_values/README.md`, one command). Without them the bots and the server use the client's own values.
+Optional first: the vanilla (1.12) numbers. They are not in the repository; they are built from the VMaNGOS database dump you download yourself,
+with the builder in `tools/classic_spell_values/` of the Karrz-playerbots-wow-forever repository (one command, see its README). Without them the bots and the server use the client's own values.
 
 3. **Create the shared bot database (once).** In a command prompt, from this folder
    (use your own MySQL user; `mysql.exe` is in your MySQL `bin` folder):
@@ -43,21 +53,19 @@ Optional first: the vanilla (1.12) numbers. They are not in the repository; you 
    Your database user needs rights on the new `playerbot` database
    (`GRANT ALL ON playerbot.* TO '<your db user>'@'%';`). The server reads and writes it with the
    same login as your other databases. The files do not drop anything.
-4. **Settings.** In `worldserver.conf.d`, rename `playerbot.conf.dist` to `playerbot.conf`. The build has already put
-   `zz-0-playerbot-defaults.conf` there: it turns the auction house bot **on** (one neutral house, vanilla items), with nothing to copy.
-   Do not edit it (a build replaces it); put your own changes in a later file such as `zz-9-local.conf`, and
-   set `AuctionHouseBot.Seller.Enabled = 0` and `AuctionHouseBot.Buyer.Enabled = 0` there to turn it off. Optionally also copy
-   `examples\zz-forever-bots.conf` into the same folder. That file is optional and turns on
-   extras that are **not** Blizzlike: solo raid entry and saving on entry (`Instance.IgnoreRaid`, `Instance.BindOnEntry`), killed raid trash staying dead (`Instance.PersistRaidTrash`),
-   no Molten Core runes, no attunements, open Ahn'Qiraj gates (see `doc/OptionalServerOptions.md`), the
-   auction house bot (all three houses buying), faster raid casting, and world bots (stage A, 300 bots, `Playerbot.World.*`).
+4. **Settings.** The build puts `zz-forever-bots.conf` into `worldserver.conf.d` (an existing copy is never overwritten).
+   It turns on the world bots (up to 220 awake, about 160 around each player, from a roster of 3000), the auction house bot, bot raid tactics and bot logging, so they work
+   without further setup. The raid and instance shortcuts that are not Blizzlike (solo raid entry, no attunements, no Molten Core runes,
+   open Ahn'Qiraj gates; see `doc/OptionalServerOptions.md`) are in that file but commented out; remove the `#` to use them.
+   Optionally rename `playerbot.conf.dist` to `playerbot.conf` to change other bot settings (every key is documented there).
+   `examples\zz-forever-bots.conf` in the Karrz-playerbots-wow-forever repository is the older optional version (shortcuts switched on, faster raid casting, 300 bots); copy it over to use that.
    Change a value and restart to tune; set `Playerbot.World.Enable = 0` for no roaming bots,
-   `AuctionHouseBot.Seller.Enabled = 0` for no auction bot. Weak PC: set `Playerbot.World.MaxBots = 100`
-   and `Playerbot.World.GlobalFill = 0`. Expect 4-6 GB of extra RAM at 300 bots.
+   `AuctionHouseBot.Seller.Enabled = 0` for no auction bot. Weak PC: set `Playerbot.World.MaxBots = 100`,
+   `BotsPerPlayer = 40`, `CityBots = 40` and `ZoneBots = 20`. Expect about 2.9 GB of RAM for the server plus about 4 MB per awake bot (about 3.8 GB at 220 bots).
 5. **Start the server** (bnetserver, then worldserver). The first start takes longer while the bot
    tables are created. Bot log lines go to `Playerbot.log` in your logs folder.
 6. **Install the addon.** Copy the folder `src\modules\PlayerbotV2\Addon\ForeverBots` into
-   `<your WoW folder>\_classic_beta_\Interface\AddOns\` (so you have `...\AddOns\ForeverBots\ForeverBots.toc`).
+   `<your WoW folder>\_forever_\Interface\AddOns\` (so you have `...\AddOns\ForeverBots\ForeverBots.toc`).
    On the character screen open AddOns and tick "Load out of date AddOns" if it is greyed out.
 
 ## Using the bots in game
