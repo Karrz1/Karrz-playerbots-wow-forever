@@ -1,5 +1,9 @@
 # Playerbot V2 — Build & CMake Wiring
 
+> **Note:** this is an early design note, not build instructions. To build the server with the bots, use the
+> `forever-bots` branch of https://github.com/Karrz1/TrinityCore and follow `INSTALL-BOTS.md` (section B).
+> The `configure_*.bat` scripts named below were never published, and the files in this repository alone do not build.
+
 The module is built via the single CMake option `BUILD_PLAYERBOT_V2`. (The
 legacy V1 module and its `BUILD_PLAYERBOT` flag have been removed; this is the
 only Playerbot build flag.)
@@ -16,8 +20,7 @@ Default OFF. Opt-in.
 
 ## 2. Configuration scripts
 
-The `configure_*.bat` scripts at the repository root pass `-DBUILD_PLAYERBOT_V2=1`.
-A minimal manual configure:
+A minimal manual configure (`configure_*.bat` helper scripts were planned but never published):
 
 ```bat
 cmake -S . -B build -A x64 ^

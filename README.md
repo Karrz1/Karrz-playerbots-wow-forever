@@ -44,12 +44,12 @@ What the buttons and chat orders do: [`src/modules/PlayerbotV2/BOT_COMMANDS.md`]
 
 ## Server owners
 
-This repository contains the bot module, the SQL, the settings, and the files of advocaite's TrinityCore `forever` branch that the
-bots change. To use it:
+Build from the `forever-bots` branch of https://github.com/Karrz1/TrinityCore. It is the full server source with the bots in it,
+and it is what the repack is built from. The files in this repository are an older, partial copy: copying them over
+advocaite's `forever` does **not** give a working bot build (the module loader and core wiring are missing), so do not use that way.
 
-1. Check out advocaite's `forever` at commit `440d365e` (https://github.com/advocaite/TrinityCore).
-2. Copy the contents of this repository over that checkout (same folder layout, overwrite existing files).
-3. Build with `-DBUILD_PLAYERBOT_V2=1` (off by default; without it the server is unchanged), create the shared database from
+1. `git clone -b forever-bots https://github.com/Karrz1/TrinityCore.git ForeverCore-bots`
+2. Build with `-DBUILD_PLAYERBOT_V2=1` (off by default; without it the server is unchanged), create the shared database from
    `sql/playerbot_shared/`, rename `playerbot.conf.dist` to `playerbot.conf`, start worldserver (it applies `sql/playerbot_v2`).
 
 Short guide: [`BOTS.md`](BOTS.md). Step by step: [`INSTALL-BOTS.md`](INSTALL-BOTS.md).
@@ -63,7 +63,7 @@ from the VMaNGOS database dump that you download yourself; without them the serv
 
 ## What you need, and where to get it
 
-- **The server code**: this repository holds our changes on top of advocaite's `forever` branch (https://github.com/advocaite/TrinityCore/tree/forever, commit `440d365e`, based on TrinityCore). Follow "Server owners" above.
+- **The server code**: the `forever-bots` branch of https://github.com/Karrz1/TrinityCore (advocaite's Forever core, based on TrinityCore, plus the bots). Follow "Server owners" above.
 - **The game client**: the WoW Forever (Classic beta) client, build **70450**, and advocaite's launcher that applies the server key: https://github.com/advocaite/foreverlauncher. Both come from advocaite's Forever project; we do not distribute client files.
 - **Vanilla (1.12) data**: the VMaNGOS project (https://github.com/vmangos/core) and its public database dump `world_full_14_june_2021` (https://github.com/brotalnia/database). You download it yourself; `tools/classic_spell_values/build_vanilla_data.py` turns it into the SQL files the server uses. Nothing from the dump is in this repository.
 - **Maps**: extracted from your own client with the tools in this repository (`tools/extract_client_data.sh` or `.ps1`).
@@ -74,10 +74,10 @@ from the VMaNGOS database dump that you download yourself; without them the serv
 
 Anyone can build the server Karrz plays on. These are the steps in order; the realm's own PC scripts, logins and certificates are not part of this repository.
 
-1. **Build.** `cmake -S . -B build -DSERVERS=1 -DTOOLS=1 -DSCRIPTS=static -DBUILD_PLAYERBOT_V2=1`, then build `worldserver`, `bnetserver` and the tools. Details: [`INSTALL-BOTS.md`](INSTALL-BOTS.md).
-2. **Vanilla data.** Download the VMaNGOS world dump (`world_full_14_june_2021`) yourself and run `python3 tools/classic_spell_values/build_vanilla_data.py --dump <file>`. It writes the vanilla (1.12) spell, creature and boss numbers as SQL files that the server applies at start. See [`tools/classic_spell_values/README.md`](tools/classic_spell_values/README.md).
+1. **Build.** Clone `forever-bots` (see "Server owners"), then in that folder `cmake -S . -B build -DSERVERS=1 -DTOOLS=1 -DSCRIPTS=static -DBUILD_PLAYERBOT_V2=1`, then build `worldserver`, `bnetserver` and the tools. Details: [`INSTALL-BOTS.md`](INSTALL-BOTS.md).
+2. **Vanilla data.** Download the VMaNGOS world dump (`world_full_14_june_2021`) yourself and run `python3 tools/classic_spell_values/build_vanilla_data.py --dump <file>` (that tool is in this repository). It writes the vanilla (1.12) spell, creature and boss numbers as SQL files that the server applies at start. See [`tools/classic_spell_values/README.md`](tools/classic_spell_values/README.md).
 3. **Maps.** Extract the maps, vmaps and mmaps from your own client with the tools built in step 1: `tools/extract_client_data.sh` (Linux) or `tools/extract_client_data.ps1` (Windows) runs `mapextractor`, `vmap4extractor`, `vmap4assembler` and `mmaps_generator` in order. Put the result in `DataDir`. No map files are included, and the map format is the stock TrinityCore one. The mmaps (pathfinding data) are REQUIRED for the bots: without them they cannot walk, and the server logs "Could not load MMAP ... result: 2". The full run takes about 10 to 20 minutes on a modern PC and about 45 GB of free disk while it works (about 2 GB are left); the Windows script can be started again after an interruption with `-Resume`. Never copy someone else's mmaps: they are made from your own client.
-4. **Config.** Create the bot database (`INSTALL-BOTS.md`, step 3), rename `playerbot.conf.dist` to `playerbot.conf` in `worldserver.conf.d`, and copy [`examples/karrz-realm.conf`](examples/karrz-realm.conf) into the same folder. It holds the realm's world bots and 50/50 faction balance, the battleground rules, the raid switches (solo raid entry, saved on entry, trash stays dead, no Molten Core runes, no attunements, open Ahn'Qiraj gates), the auction house bot and the logging. Lower the bot numbers in it on a smaller machine. The first start creates a few thousand roster characters, which takes about two hours.
+4. **Config.** Create the bot database (`INSTALL-BOTS.md`, step 3), rename `playerbot.conf.dist` to `playerbot.conf` in `worldserver.conf.d`, and copy [`examples/karrz-realm.conf`](examples/karrz-realm.conf) from this repository into the same folder. It holds the realm's world bots and 50/50 faction balance, the battleground rules, the raid switches (solo raid entry, saved on entry, trash stays dead, no Molten Core runes, no attunements, open Ahn'Qiraj gates), the auction house bot and the logging. Lower the bot numbers in it on a smaller machine. The first start creates a few thousand roster characters, which takes about two hours.
 5. **Add-on.** Copy `src/modules/PlayerbotV2/Addon/ForeverBots` into `<WoW folder>/_classic_beta_/Interface/AddOns/` (the public repository also has it ready as `ForeverBots-addon.zip`). Type `/fb` in game.
 
 ## Credits and licenses
