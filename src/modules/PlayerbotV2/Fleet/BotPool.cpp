@@ -32,6 +32,12 @@ bool IsScenarioBot(uint64 bot_id)
     return g_scenario_bots.count(bot_id) != 0;
 }
 
+std::vector<uint64> ScenarioBots()
+{
+    std::lock_guard<std::mutex> lock(g_scenario_mu);
+    return { g_scenario_bots.begin(), g_scenario_bots.end() };
+}
+
 BotRole RoleOf(uint64 bot_id)
 {
     if (!Services::Initialized() || !Services::Lifecycle().is_bot(bot_id))

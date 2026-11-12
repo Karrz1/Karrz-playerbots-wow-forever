@@ -1,0 +1,26 @@
+# Baseline: dps_scorecard_raid group 12 on build 220 (raid total 14040 dps); only the label and dps columns are read.
+# dps_scorecard_raid 2026-10-23 15:16:00 UTC: 23 bots on one level 63 dummy (armor 3731, no resistances, 2000000000 health), Tier 3, 120 s measured after 75 s of buffing
+run	label	dps
+2026-10-23 15:16:00	Dsctank	331
+2026-10-23 15:16:00	Dscpriest	122
+2026-10-23 15:16:00	Dscpaladin	0
+2026-10-23 15:16:00	Dscdruid	111
+2026-10-23 15:16:00	Dscarms	727
+2026-10-23 15:16:00	Dscfury	1067
+2026-10-23 15:16:00	Dscret	664
+2026-10-23 15:16:00	Dscbm	547
+2026-10-23 15:16:00	Dscmm	498
+2026-10-23 15:16:00	Dscsurv	392
+2026-10-23 15:16:00	Dsccombat	868
+2026-10-23 15:16:00	Dscassn	761
+2026-10-23 15:16:00	Dscshadow	687
+2026-10-23 15:16:00	Dscele	632
+2026-10-23 15:16:00	Dscenh	617
+2026-10-23 15:16:00	Dscfire	834
+2026-10-23 15:16:00	Dscfrost	564
+2026-10-23 15:16:00	Dscarcane	634
+2026-10-23 15:16:00	Dscaff	812
+2026-10-23 15:16:00	Dscdemo	746
+2026-10-23 15:16:00	Dscdest	776
+2026-10-23 15:16:00	Dscbalance	676
+2026-10-23 15:16:00	Dscferal	974

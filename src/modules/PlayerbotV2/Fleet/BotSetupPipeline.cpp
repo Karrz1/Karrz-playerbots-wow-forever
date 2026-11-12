@@ -740,7 +740,9 @@ bool BotSetupPipeline::DoAcquireMount(Player* bot)
     // Call Pet (883) and pet-dependent abilities all silently fail. Spawn a
     // race-themed starter pet so the bot has one — same creature template
     // each race's racial questline would have given them.
-    if (bot->GetClass() == CLASS_HUNTER && bot->GetPetGUID().IsEmpty())
+    // Classic hunters tame their first beast at level 10 (Discord 2026-11-09: hunter bots under 10 had a pet); a younger bot gets
+    // none here, and the pet rules give it one when it reaches 10.
+    if (bot->GetClass() == CLASS_HUNTER && bot->GetLevel() >= 10 && bot->GetPetGUID().IsEmpty())
     {
         uint32 pet_entry = World::HunterPetEntryForRace(bot->GetRace());
         // A hunter nobody owns (world / pool bot) gets its own beast, stable per bot, instead of its race's one.
@@ -1022,8 +1024,21 @@ bool BotSetupPipeline::RunFor(Player* bot, uint8 target_level, StateRef* known)
         if (fn(bot)) state |= bit;
         else
         {
-            TC_LOG_WARN("playerbot.v2", "[BotSetupPipeline] step {} failed for char {} L{}",
-                        name, bot->GetName(), uint32(bot->GetLevel()));
+            // At most one line a minute per bot and step, with the number of failures since the last line: a step that waits
+            // (gear waits for the fight to end) is retried every pipeline tick.
+            static std::unordered_map<uint64, std::pair<uint32, uint32>> sFailLog;   // (char << 8 | bit) -> (last line ms, failures since)
+            uint32 const nowMs = GameTime::GetGameTimeMS();
+            if (sFailLog.size() > 8192)
+                sFailLog.clear();
+            auto& [lastMs, since] = sFailLog[(char_guid << 8) | bit];
+            ++since;
+            if (!lastMs || nowMs - lastMs >= 60000u)
+            {
+                TC_LOG_WARN("playerbot.v2", "[BotSetupPipeline] step {} failed for char {} L{} ({} failures in the last minute, in combat {})",
+                            name, bot->GetName(), uint32(bot->GetLevel()), since, int(bot->IsInCombat()));
+                lastMs = nowMs;
+                since = 0;
+            }
             // Per-bot diagnostic ring. Surfaces the same failure to /diag so
             // the GM can see which step is misbehaving without scraping
             // Server.log. No early exit — pipeline continues so other steps
@@ -1057,6 +1072,17 @@ bool BotSetupPipeline::RunFor(Player* bot, uint8 target_level, StateRef* known)
             persist(state, target_level);
             return false;
         }
+    }
+    // A bot being set up is not out in the world yet: a fight it has from its start spot (a mob of the start zone engaged before it
+    // was levelled and placed) is ended here. Placement teleports it far across the same continent, and the fight would follow:
+    // it chased a Young Thistle Boar 16 km away for good, never left combat, and the gear step waited on the fight every tick.
+    // A fight with a victim beside it is kept.
+    if (bot->IsInCombat() && (!bot->GetVictim() || !bot->IsWithinDistInMap(bot->GetVictim(), 100.0f)))
+    {
+        Unit const* victim = bot->GetVictim();
+        TC_LOG_INFO("playerbot.v2", "[BotSetupPipeline] {} L{}: setup ends a fight with {} at {:.0f} y", bot->GetName(), uint32(bot->GetLevel()),
+                    victim ? victim->GetName() : std::string("no victim"), victim ? bot->GetExactDist(victim) : -1.0f);
+        bot->CombatStopWithPets(true);
     }
     step(SetupBit::StarterKit,       [&](Player* p){ return DoGrantStarterKit(p); }, "StarterKit");
     step(SetupBit::GenerateGear,     [&](Player* p){ return DoGenerateGear(p); },   "GenerateGear");

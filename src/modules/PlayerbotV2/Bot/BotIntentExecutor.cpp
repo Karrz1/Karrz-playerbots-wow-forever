@@ -10,6 +10,7 @@
 #include "../Util/ConfigReader.h"
 #include "../Fleet/BotGuildCharter.h"
 #include "../Fleet/BotGuildMgr.h"
+#include "GuildWhisperInvite.h"
 #include "../Fleet/BotPopulationManager.h"   // SwapResistGear
 #include "../Fleet/CraftOrderBoard.h"
 #include "../Fleet/JunkQuestResolver.h"
@@ -21,6 +22,7 @@
 #include "../Combat/Apl/HealClaimStore.h"
 #include "CombatManager.h"
 #include "TemporarySummon.h"
+#include "Api/BotLanguage.h"
 #include "PlayerbotAPI.h"
 #include "SpellAuras.h"
 #include "SpellInfo.h"
@@ -28,6 +30,7 @@
 #include <unordered_map>
 #include "Channel.h"
 #include "ChannelMgr.h"
+#include "DB2Stores.h"
 #include "Creature.h"
 #include "Guild.h"
 #include "GuildMgr.h"
@@ -70,12 +73,28 @@ Result SayInZoneChannel(Player* bot, uint8 channel_id, std::string const& text)
         bot->UpdateLocalChannels(bot->GetZoneId());
         ch = find(channel_id);
     }
+    // LookingForGroup is not an auto-join channel: the bot joins it the way a player types /join, on its first line there.
+    if (!ch)
+        if (ChatChannelsEntry const* entry = sChatChannelsStore.LookupEntry(channel_id))
+            if (entry->GetFlags().HasFlag(ChatChannelFlags::LookingForGroup))
+                if (ChannelMgr* mgr = ChannelMgr::ForTeam(bot->GetTeam()))
+                {
+                    AreaTableEntry const* zone = sAreaTableStore.LookupEntry(bot->GetZoneId());
+                    Channel* lfg = entry->GetFlags().HasFlag(ChatChannelFlags::ZoneBased) ? (zone ? mgr->GetSystemChannel(channel_id, zone) : nullptr)
+                                                                                         : mgr->GetSystemChannel(channel_id);
+                    if (lfg)
+                    {
+                        lfg->JoinChannel(bot);
+                        ch = find(channel_id);
+                    }
+                }
     // Trade exists only in cities; ike3 posted the line to General instead.
     if (!ch && channel_id != 1)
         ch = find(1);
     if (!ch)
         return Result::Other;
-    ch->Say(bot->GetGUID(), text, LANG_UNIVERSAL);
+    // Each member reads the line in their own language (a Russian client reads the bots' chatter in Russian).
+    BotLanguage::ChannelSay(bot, ch, text);
     return Result::Ok;
 }
 
@@ -300,6 +319,7 @@ struct IntentVisitor
     // VendorBuyByEntry / VendorBuy / VendorSell / VendorSellTrash / RepairAll /
     // VendorBuyByCategory bundled into VendorIntent.
     Result operator()(TogglePvpIntent const&)              { return api.toggle_pvp(); }
+    Result operator()(SetPvpIntent const& i)               { return api.set_pvp(i.on); }
     Result operator()(AddFriendIntent const& i)            { return api.add_friend(i.name, i.note); }
     Result operator()(RemoveFriendIntent const& i)         { return api.remove_friend(i.friend_guid); }
     Result operator()(AddIgnoreIntent const& i)            { return api.add_ignore(i.name); }
@@ -466,6 +486,7 @@ struct IntentVisitor
             else if constexpr (std::is_same_v<T, LfgProposalRespondIntent>)   return api.lfg_proposal_respond(op.proposal_id, op.accept);
             else if constexpr (std::is_same_v<T, LfgRoleCheckIntent>)         return api.lfg_role_check(op.roles);
             else if constexpr (std::is_same_v<T, EnterAreaTriggerIntent>)     return api.enter_area_trigger(op.area_trigger_id);
+            else if constexpr (std::is_same_v<T, AlwaysBuffIntent>)           return api.always_buffs(op.set, op.mask);
             else                                                              return Result::Other;
         }, qi.op);
     }
@@ -533,7 +554,11 @@ struct IntentVisitor
                 return claimed.id != 0 ? Result::Ok : Result::ServerRefused;
             }
             else if constexpr (std::is_same_v<T, EconomyOp::RestockClassSupplies>)
+            {
+                // The supplies rule reaches every bot now and then: a petless world hunter gets its beast here (BotPopulationManager::EnsureBotHunterPet).
+                V2::Fleet::BotPopulationManager::EnsureBotHunterPet(api.player());
                 return api.restock_class_supplies();
+            }
             else if constexpr (std::is_same_v<T, EconomyOp::StockRaidConsumable>)
                 return api.stock_raid_consumable(op.item);
             else if constexpr (std::is_same_v<T, EconomyOp::ResistGear>)
@@ -541,6 +566,13 @@ struct IntentVisitor
                 Player* bot = api.player();
                 if (!bot || !Services::Config().raid_resist_gear()) return Result::ServerRefused;
                 Services::Population().SwapResistGear(bot, op.school);
+                return Result::Ok;
+            }
+            else if constexpr (std::is_same_v<T, EconomyOp::FightCloak>)
+            {
+                Player* bot = api.player();
+                if (!bot || (op.on && !Services::Config().raid_onyxia_cloak())) return Result::ServerRefused;
+                Services::Population().SwapFightCloak(bot, op.on);
                 return Result::Ok;
             }
             else                                                      return Result::Other;
@@ -612,6 +644,8 @@ struct IntentVisitor
                 if (!target) return Result::InvalidTarget;
                 uint64 gid = 0;
                 const auto r = V2::BotRecruitToGuild(bot, target, gid);
+                if (r == V2::RecruitResult::Invited)
+                    return Result::Ok;                  // a real player: invite sent, he is not a member yet
                 if (r != V2::RecruitResult::Ok)
                     return Result::ServerRefused;
                 // Stamp join-date for hygiene.
@@ -636,6 +670,8 @@ struct IntentVisitor
                     "<{}> recruiting all levels, friendly social guild — /w {} for invite",
                     g->GetName(), bot->GetName());
                 ch->Say(bot->GetGUID(), msg, /*lang*/ 0 /*LANG_UNIVERSAL — channel system overrides per-channel*/);
+                // "/w <name> for invite": a whispered "inv" / "invite pls" to this bot now gets the guild invite.
+                V2::GuildWhisperInvite::NoteOffer(bot->GetGUID().GetCounter(), 0);
                 return Result::Ok;
             }
             else
@@ -919,7 +955,7 @@ size_t V2::Module::DrainIntents()
                     if (BotAI* botai = reg.ai(id))
                     {
                         if (r == Result::OutOfRange)
-                            botai->note_cast_out_of_range();
+                            botai->note_cast_out_of_range(GameTime::GetGameTimeMS());
                         else if (r == Result::Ok)
                             botai->reset_cast_oor();
                     }

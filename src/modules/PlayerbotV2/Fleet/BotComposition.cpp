@@ -104,26 +104,28 @@ constexpr std::array<ClassWeight, 13> kClassWeights = { {
     { CLASS_EVOKER,         1 },     // Dracthyr only — gets renormalized hard
 } };
 
-// Classic 1.60 (Forever): the 1.12 race/class table. The Forever world DB is
-// built on retail TDB data, so playercreateinfo (GetPlayerInfo) still answers
-// for Blood Elves, Death Knights, Tauren Paladins and the Skyborne races; a
-// vanilla realm's ambient bots are the 8 original races in their 1.12 class
-// combinations only.
+// Classic 1.60 (Forever): the 1.12 race/class table plus the combinations
+// Forever adds (Human Hunter, Dwarf Shaman, Gnome Priest, Orc Mage, Undead
+// Paladin, Troll Warlock; CharBaseInfo and the official race/class list). The
+// Forever world DB is built on retail TDB data, so playercreateinfo
+// (GetPlayerInfo) still answers for Blood Elves, Death Knights, Tauren
+// Paladins and the like; a vanilla realm's ambient bots are the 8 original
+// races and the Skyborne in these combinations only.
 bool IsVanillaCombo(uint8 race, uint8 cls)
 {
     auto bit = [](uint8 c) { return 1u << c; };
     uint32 mask = 0;
     switch (race)
     {
-        case RACE_HUMAN:    mask = bit(CLASS_WARRIOR) | bit(CLASS_PALADIN) | bit(CLASS_ROGUE) | bit(CLASS_PRIEST) | bit(CLASS_MAGE) | bit(CLASS_WARLOCK); break;
-        case RACE_DWARF:    mask = bit(CLASS_WARRIOR) | bit(CLASS_PALADIN) | bit(CLASS_HUNTER) | bit(CLASS_ROGUE) | bit(CLASS_PRIEST); break;
+        case RACE_HUMAN:    mask = bit(CLASS_WARRIOR) | bit(CLASS_PALADIN) | bit(CLASS_HUNTER) | bit(CLASS_ROGUE) | bit(CLASS_PRIEST) | bit(CLASS_MAGE) | bit(CLASS_WARLOCK); break;
+        case RACE_DWARF:    mask = bit(CLASS_WARRIOR) | bit(CLASS_PALADIN) | bit(CLASS_HUNTER) | bit(CLASS_ROGUE) | bit(CLASS_PRIEST) | bit(CLASS_SHAMAN); break;
         case RACE_NIGHTELF: mask = bit(CLASS_WARRIOR) | bit(CLASS_HUNTER) | bit(CLASS_ROGUE) | bit(CLASS_PRIEST) | bit(CLASS_DRUID); break;
-        case RACE_GNOME:    mask = bit(CLASS_WARRIOR) | bit(CLASS_ROGUE) | bit(CLASS_MAGE) | bit(CLASS_WARLOCK); break;
-        case RACE_ORC:      mask = bit(CLASS_WARRIOR) | bit(CLASS_HUNTER) | bit(CLASS_ROGUE) | bit(CLASS_SHAMAN) | bit(CLASS_WARLOCK); break;
+        case RACE_GNOME:    mask = bit(CLASS_WARRIOR) | bit(CLASS_ROGUE) | bit(CLASS_PRIEST) | bit(CLASS_MAGE) | bit(CLASS_WARLOCK); break;
+        case RACE_ORC:      mask = bit(CLASS_WARRIOR) | bit(CLASS_HUNTER) | bit(CLASS_ROGUE) | bit(CLASS_SHAMAN) | bit(CLASS_MAGE) | bit(CLASS_WARLOCK); break;
         // Undead Paladin is a Classic 1.60 combination (CharBaseInfo; sql/custom/world/2026_09_30_00_world_classic_undead_paladin.sql).
         case RACE_UNDEAD_PLAYER: mask = bit(CLASS_WARRIOR) | bit(CLASS_PALADIN) | bit(CLASS_ROGUE) | bit(CLASS_PRIEST) | bit(CLASS_MAGE) | bit(CLASS_WARLOCK); break;
         case RACE_TAUREN:   mask = bit(CLASS_WARRIOR) | bit(CLASS_HUNTER) | bit(CLASS_SHAMAN) | bit(CLASS_DRUID); break;
-        case RACE_TROLL:    mask = bit(CLASS_WARRIOR) | bit(CLASS_HUNTER) | bit(CLASS_ROGUE) | bit(CLASS_PRIEST) | bit(CLASS_SHAMAN) | bit(CLASS_MAGE); break;
+        case RACE_TROLL:    mask = bit(CLASS_WARRIOR) | bit(CLASS_HUNTER) | bit(CLASS_ROGUE) | bit(CLASS_PRIEST) | bit(CLASS_SHAMAN) | bit(CLASS_MAGE) | bit(CLASS_WARLOCK); break;
         // Classic 1.60 Skyborne: the combinations of CharBaseInfo.db2, from Fleet/SkyborneIsle.h
         case RACE_SKYBORNE_ALLIANCE:
         case RACE_SKYBORNE_HORDE:

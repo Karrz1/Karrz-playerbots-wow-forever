@@ -37,7 +37,13 @@ inline uint32 InstanceGroupCapFor(Player const* owner, std::string* map_name = n
     if (!map || !map->IsDungeon())
         return std::min<uint32>(Playerbot::Services::Config().behavior_open_world_group_cap(), MAX_RAID_SIZE);
     if (map_name)
+    {
+        // Never empty in an instance: callers tell an instance from the open world by this name, and a map whose name is
+        // blank in the client data was read as the open world (Molten Core: 17 in the raid, "40 of 40 ... open world").
         *map_name = map->GetMapName() ? map->GetMapName() : "";
+        if (map_name->empty())
+            *map_name = "This instance";
+    }
     InstanceMap const* im = map->ToInstanceMap();
     uint32 cap = im ? im->GetMaxPlayers() : 0;
     // A raid is as big as the map says: the difficulty row can name a smaller flex size than the 40-player classic raid
@@ -74,16 +80,23 @@ inline bool InstanceGroupFull(Player const* owner, std::string& msg)
     return true;
 }
 
-// The owner's companions (bots owned by the account) that are online right now, `except` left out. Invited world bots are
+// The owner's companions (bots owned by the account) that are online right now and in the owner's group, `except` left out. Invited world bots are
 // not owned, so they never count. O(registry): keep it out of per-tick paths.
 inline uint32 CompanionsOut(Player const* owner, Playerbot::BotId except = 0, std::vector<Playerbot::BotId>* ids = nullptr)
 {
     uint32 n = 0;
     if (!owner || !owner->GetSession())
         return 0;
+    Group const* group = owner->GetGroup();
     for (Playerbot::BotId id : Playerbot::Services::Owners().BotsOwnedBy(owner->GetSession()->GetAccountId()))
     {
-        if (id == except || !ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id)))
+        ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(id);
+        if (id == except || !ObjectAccessor::FindConnectedPlayer(guid))
+            continue;
+        // Only companions with the owner count. A bot that is online but not in the owner's live group (a level 1 left behind by
+        // a login whose setup never ran) is not "out" with them and must not use up the cap (17 in the raid, 22 such strays:
+        // "40 of 40", playtest 2026-10-22).
+        if (!group || !group->IsMember(guid))
             continue;
         ++n;
         if (ids)
@@ -102,8 +115,9 @@ inline bool CompanionSpawnFull(Player const* owner, Playerbot::BotId except, std
     uint32 const cap = InstanceGroupCapFor(owner, &name);
     if (!cap)
         return false;
-    if (!name.empty() && InstanceGroupFull(owner, msg))
-        return true;
+    // An instance holds what the map holds: only the group size counts there, not companions that are elsewhere.
+    if (!name.empty())
+        return InstanceGroupFull(owner, msg);
     uint32 const out = CompanionsOut(owner, except);
     if (out < cap)
         return false;

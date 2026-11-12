@@ -6,7 +6,7 @@
 // 1 and resolve to the highest known rank in the snapshot view and
 // API::cast_spell.
 //
-// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
+// Priorities follow Karrz's ike3 vanilla strategies (Karrz1/wow-1.12
 // raid10-revamp, playerbot/strategy/shaman/*Strategy.cpp, MANGOSBOT_ZERO).
 // Totems and weapon imbues come from Bot/ClassicUpkeep.cpp (one totem per
 // element by spec and party, Tremor / cleansing totems when the party needs
@@ -48,6 +48,8 @@ constexpr uint32 FLAME_SHOCK         = 8050;
 constexpr uint32 FROST_SHOCK         = 8056;    // raid school rule only (frost preferred)
 constexpr uint32 STORMSTRIKE         = 17364;   // Enhancement talent
 constexpr uint32 ELEMENTAL_MASTERY   = 16166;   // Elemental talent
+constexpr uint32 LAVA_BURST         = 408490;  // Forever spell, 1238299 / 1238300 are its trainer ranks; always crits a Flame Shocked target
+constexpr uint32 FIRE_NOVA         = 408341;  // Forever replaced Fire Nova Totem (1535) with this spell, ranks 408341-408345; needs a live fire totem
 
 constexpr uint8 POWER_MANA = 0;
 
@@ -331,6 +333,34 @@ bool ShouldFlameShock(ApPredicateContext const& ctx)
 }
 void DoFlameShock(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(FLAME_SHOCK, ctx.bot.victim()); }
 
+// Lava Burst on a Flame Shocked target is a guaranteed critical strike: cast on cooldown behind the Flame Shock.
+bool ShouldLavaBurst(ApPredicateContext const& ctx)
+{
+    return HasLiveTarget(ctx) && ManaPct(ctx) >= 20 && Ready(ctx, LAVA_BURST) && ctx.bot.victim_in_spell_range(LAVA_BURST)
+        && ctx.bot.has_aura(FLAME_SHOCK, ctx.bot.victim());
+}
+void DoLavaBurst(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(LAVA_BURST, ctx.bot.victim()); }
+
+// Fire Nova hits everything within 10 yd of the fire totem. At rank 1 it costs 95 mana for 50 damage per target, a poor trade against a
+// Lightning Bolt below three targets, so it is cast only with three or more attackers standing at the totem.
+bool ShouldFireNova(ApPredicateContext const& ctx)
+{
+    if (!ctx.bot.in_combat() || ManaPct(ctx) < 30 || !Ready(ctx, FIRE_NOVA))
+        return false;
+    TotemUpkeep const& fire = ctx.bot.classic_upkeep().totems[0];     // summon slot SUMMON_SLOT_TOTEM: fire
+    if (fire.created_by_spell == 0)
+        return false;
+    int n = 0;
+    for (auto const& a : ctx.bot.raw().combat.attackers)
+    {
+        if (a.hp <= 0 || a.untargetable || a.is_pacified) continue;
+        float const dx = a.x - fire.x, dy = a.y - fire.y, dz = a.z - fire.z;
+        if (dx * dx + dy * dy + dz * dz <= 100.0f) ++n;
+    }
+    return n >= 3;
+}
+void DoFireNova(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(FIRE_NOVA); }
+
 bool ShouldChainLightning(ApPredicateContext const& ctx)
 {
     return HasLiveTarget(ctx) && ManaPct(ctx) >= 15 && ctx.bot.enemies_within(30.0f) >= 2 && (Ready(ctx, CHAIN_LIGHTNING) && ctx.bot.victim_in_spell_range(CHAIN_LIGHTNING))
@@ -373,7 +403,9 @@ ApRule const kElementalRules[] = {
     { ShouldTotem,               DoTotem,             "classic_sham_ele:totem" },
     { Interrupt::Purge::Should,  Interrupt::Purge::Cast, "classic_sham_ele:purge" },
     { ShouldCure,                DoCure,              "classic_sham_ele:cure" },
+    { ShouldFireNova,            DoFireNova,          "classic_sham_ele:fire_nova" },
     { ShouldEleSchoolNuke,       DoEleSchoolNuke,     "classic_sham_ele:school_nuke" },
+    { ShouldLavaBurst,           DoLavaBurst,         "classic_sham_ele:lava_burst" },
     { ShouldFlameShock,          DoFlameShock,        "classic_sham_ele:flame_shock" },
     { ShouldChainLightning,      DoChainLightning,    "classic_sham_ele:chain_lightning_aoe" },
     { ShouldChainLightningSingle, DoChainLightning,   "classic_sham_ele:chain_lightning" },

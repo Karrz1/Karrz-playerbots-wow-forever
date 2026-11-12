@@ -68,6 +68,28 @@ RaidRules const* RulesForMap(uint32_t mapId)
     return it == registry.end() ? nullptr : it->second.get();
 }
 
+std::vector<uint32_t> RuleMaps()
+{
+    std::vector<uint32_t> out;
+    for (auto const& [mapId, rules] : Registry())
+        out.push_back(mapId);
+    return out;
+}
+
+bool RulesPlaceTank(uint32_t mapId, uint32_t boss)
+{
+    RaidRules const* rules = RulesForMap(mapId);
+    if (!rules)
+        return false;
+    for (TankSpot const& rule : rules->tankSpot)
+        if (InTankSpot(rule, boss))
+            return true;
+    for (Stand const& rule : rules->stand)
+        if (rule.enemy == boss && (rule.who == Who::Tank || rule.who == Who::MainTank || rule.who == Who::OffTank))
+            return true;
+    return false;
+}
+
 bool OwnsAura(uint32_t mapId, uint32_t aura)
 {
     RaidRules const* rules = RulesForMap(mapId);
@@ -80,6 +102,12 @@ bool OwnsAura(uint32_t mapId, uint32_t aura)
         if (rule.aura == aura)
             return true;
     return std::find(rules->noDispel.begin(), rules->noDispel.end(), aura) != rules->noDispel.end();
+}
+
+bool KeepsAura(uint32_t mapId, uint32_t aura)
+{
+    RaidRules const* rules = RulesForMap(mapId);
+    return rules && std::find(rules->noDispel.begin(), rules->noDispel.end(), aura) != rules->noDispel.end();
 }
 
 bool InterruptFirst(uint32_t mapId, uint32_t spell)

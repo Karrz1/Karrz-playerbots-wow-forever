@@ -32,13 +32,16 @@ inline bool IsStartZone(std::uint32_t zone)
     return zone == 12 || zone == 14 || zone == 1 || zone == 141 || zone == 85 || zone == 215;
 }
 
-// May a bot of `race` and `level` be put in `zone`? Anywhere but a start zone, and anyone above the start levels; in a start zone at the
-// start levels only the races that begin there. A race without a start zone of its own is not limited.
+// May a bot of `race` and `level` be put in `zone`? Anywhere but a start zone. A start zone takes only bots at the start levels, and of
+// those only the races that begin there (a race without a start zone of its own is not limited). Higher levels kill the valley's few
+// mobs in one hit each: on the PC (26 Oct) 39 Alliance bots of level 11-60 cleared Deathknell beside 42 undead residents.
 inline bool RaceFitsStartZone(std::uint8_t race, std::uint32_t level, std::uint32_t zone)
 {
-    if (!IsStartZone(zone) || level > kStartZoneMaxLevel || StartZoneOfRace(race) == 0)
+    if (!IsStartZone(zone))
         return true;
-    return StartZoneOfRace(race) == zone;
+    if (level > kStartZoneMaxLevel)
+        return false;
+    return StartZoneOfRace(race) == 0 || StartZoneOfRace(race) == zone;
 }
 
 // One of the races that start in `zone`, by `seed` (two races share Dun Morogh and Durotar). 0 when `zone` is not a start zone.

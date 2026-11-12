@@ -27,7 +27,10 @@
 #include <string>
 
 #include "AreaCap.h"
+#include "BotSize.h"
 #include "GateDuels.h"
+#include "Gathering.h"
+#include "MovingBubble.h"
 #include "StrandedWatch.h"
 #include "WorldLoadFacts.h"
 #include "WorldFactionMix.h"
@@ -58,6 +61,15 @@ public:
     // A bot this spawner placed (or is placing) in the world. The battleground filler never drafts these.
     bool IsPlaced(uint64 guid_low) const { return placed_.contains(guid_low) || pending_.contains(guid_low); }
 
+    // The world bot choice of the ForeverBots panel (Fleet/BotSize.h PopLevel), set by a GM in game (.bot population, add-on POP_REQ).
+    // It applies on the next world tick, is saved in the characters database and read back at the next start. nullopt = the files
+    // decide (Bots.* lines, Playerbot.World.Enable).
+    void SetPopulation(std::optional<PopLevel> level);
+    std::optional<PopLevel> Population() const { return pop_level_; }
+    // One plain line for the panel and the command: the choice, what it gives, and whether bots are still logging out.
+    std::string PopulationLine() const;
+    bool PopulationDraining() const { return drain_until_ms_ != 0; }
+
 private:
     struct Config
     {
@@ -66,7 +78,7 @@ private:
         uint32 bots_per_player  = 25;      // target per real player (within ActivityRadius)
         uint32 city_bots        = 0;       // target when the player is in a capital/town (0 = BotsPerPlayer)
         uint32 zone_bots        = 0;       // target when the player is in a leveling zone (0 = BotsPerPlayer)
-        uint32 start_zone_bots  = 50;      // the same in a start zone (Mulgore, Durotar, ...), where a real realm has a few new characters (0 = ZoneBots)
+        uint32 start_zone_bots  = 25;      // the same in a start zone (Mulgore, Durotar, ...), where a real realm has a few new characters (0 = ZoneBots)
         float  activity_radius  = 300.0f;  // a bot this close to an anchor counts toward it
         float  despawn_radius   = 450.0f;  // a bot farther than this from every anchor is logged out
         float  ring_min         = 60.0f;   // spawn ring (placement distance from the anchor)
@@ -90,7 +102,10 @@ private:
         bool   seed_roster      = false;   // build the sleeping roster up to PoolMax without waiting for a player to arrive
         uint32 seed_in_flight   = 8;       // seeded bots set up at the same time
         uint32 pool_max         = 400;     // ambient characters allowed to exist (online or not)
-        bool   natural_moves    = true;    // bots arrive on foot from out of sight and leave toward an inn before they log out
+        bool   natural_moves    = true;    // bots arrive on foot from out of sight and leave out of sight (the city gate in a capital) before they log out
+        bool   idle_swap        = true;    // a bot the idle watch keeps finding standing, out of every player's sight, is placed again and walks in
+        uint32 idle_swap_strikes = 2;      // idle-watch strikes before the swap
+        uint32 idle_swap_cd_ms  = 180000;  // a bot is swapped at most this often
         bool   day_rhythm       = true;    // scale the bubble target by the hour of the day (Fleet/DayRhythm.h)
         uint32 jump_grace_ms    = 20000;   // bots around the place a player jumped away from are kept this long (an instance trip: ZoneGraceSec)
         uint32 area_cap_outdoors = 14;     // most world bots within area_radius of one another outdoors (0 = no cap; Fleet/AreaCap.h)
@@ -103,6 +118,19 @@ private:
         bool   travel_soak      = false;   // send a few world bots between places of the travel graph and log how each leg ends (Travel/SoakBoard.h)
         uint32 travel_soak_bots = 8;       // bots on a soak leg at the same time
         uint32 travel_soak_leg_s = 1200;   // seconds a leg may take before it counts as stuck
+        bool   moving_enable    = true;    // a riding player's bubble follows his heading (Fleet/MovingBubble.h)
+        MovingRule moving;
+        uint32 moving_spawn_factor = 2;    // x spawn rate while he moves
+        float  moving_despawn_behind = 450.0f;   // bots this far behind a moving player log out (out of sight); 0 = only DespawnRadius
+        // Plain bot numbers (Bots.* lines, Fleet/BotSize.h). plain = at least one Bots.* line is set: max_bots, pool_max, city_bots,
+        // zone_bots (= zone_hi) and bots_per_player then come from them, each zone rolls its number in [zone_lo, zone_hi], the cap
+        // is shared evenly over the occupied places, and a place nobody is in for leave_zone_ms loses its bots fast. day_rhythm is off
+        // unless Bots.DayRhythm = 1 (the numbers are flat).
+        bool   plain            = false;
+        uint32 zone_lo          = 0;
+        uint32 zone_hi          = 0;
+        uint32 leave_zone_ms    = 20000;   // Bots.LeaveZoneSec: a zone without a player for this long logs its bots out (0 = old rule only)
+        std::string plain_summary;         // for the start line
     };
 
     struct Anchor
@@ -113,6 +141,7 @@ private:
         uint32 zone = 0;
         uint8  level = 1;
         bool   alliance = true;
+        Motion motion;                     // smoothed velocity; a ghost has none
     };
 
     // A bot we have asked to log in (or created) and have not placed yet.
@@ -132,7 +161,9 @@ private:
     };
 
     void LoadConfig();
+    void PublishStrangers();
     void CollectAnchors(std::vector<Anchor>& out);
+    void PublishParties(uint32 now_ms);
     void DrivePending(uint32 now_ms, std::vector<Anchor> const& anchors);
     void DriveDespawn(uint32 now_ms, std::vector<Anchor> const& anchors);
     void DriveSpawn(uint32 now_ms, std::vector<Anchor> const& anchors);
@@ -149,6 +180,7 @@ private:
     void DriveGraduation(uint32 now_ms);
     // Residents standing in lava or on ground with no way out are placed again (Fleet/StrandedWatch.h).
     void DriveStranded(uint32 now_ms, std::vector<Anchor> const& anchors);
+    void DriveIdleSwap(uint32 now_ms, std::vector<Anchor> const& anchors);   // out-of-sight bots that stand around: placed again, walk in
     void DriveStuckLedger(uint32 now_ms);   // bots the idle watch keeps finding standing: why they cannot move, and back onto the mesh if off it
     // A bot the spawner no longer wants: out of every player's sight it logs out at once; in sight it first walks to the nearest inn
     // (or away from the player) and logs out once it is out of view or after a minute. True when the bot was dealt with (logged out
@@ -158,6 +190,9 @@ private:
     // A crowd over the area cap sends its extras to other spots next to the nearest player (Fleet/AreaCap.h).
     void DriveCrowd(uint32 now_ms, std::vector<Anchor> const& anchors);
     void DriveGateDuels(uint32 now_ms, std::vector<Anchor> const& anchors);   // pairs of bots duelling outside a capital gate (GateDuels.h)
+    void DriveGatherings(uint32 now_ms, std::vector<Anchor> const& anchors);  // bots at a campfire and in a group outside the gate, talking (Gathering.h)
+    void FormStreetChats(uint32 now_ms, std::vector<Anchor> const& anchors);  // and small chats inside the cities where a player walks
+    bool GatherFree(BotId id, Player* p, uint32 now_ms) const;                // a world bot free to join a gathering or a chat now
     // Level range of the bots around this anchor: its zone's, lifted to MinLevel, except on Zephras Isle (Fleet/SkyborneIsle.h).
     void WindowFor(Anchor const& a, uint8& lo, uint8& hi) const;
     bool PlaceNear(Player* bot, Player* anchor);
@@ -167,10 +202,32 @@ private:
     std::unordered_map<uint32, uint32> AwakeByZone(Anchor const& a) const;
     uint32 SpawnRateFor(Anchor const& a) const;
     uint32 TargetFor(Anchor const& a) const;   // bubble size for this anchor: city_bots / zone_bots / bots_per_player
+    // Plain bot numbers: each occupied place's number for this tick (rolled zone number, even share of the cap) and how many
+    // players are in it; a place's roll and when it last had a player.
+    void PlanPlaces(uint32 now_ms, std::vector<Anchor> const& anchors, std::vector<Anchor> const& keep_anchors);
+    uint32 PlaceWantFor(Anchor const& a);
+    std::unordered_map<uint64, uint32> place_target_, place_players_, zone_roll_, place_seen_ms_;
+    std::string plain_logged_;
+    std::optional<PopLevel> pop_level_;       // the panel's choice (SetPopulation); loaded once from the database
+    bool   pop_loaded_ = false;
+    bool   pop_changed_ = false;              // SetPopulation since the last LoadConfig: the config is read again at once
+    bool   drain_requested_ = false;          // SetPopulation stepped down: the next tick starts the drain
+    uint32 drain_until_ms_ = 0;               // a step down / Off: every world bot not busy logs out until then (or none is left)
+    uint32 drain_started_ms_ = 0;
+    void LoadPopulationOnce();
+    void DriveDrain(uint32 now_ms, std::vector<Anchor> const& anchors);
 
     struct Ghost { Anchor a; uint32 until_ms; };   // where a player was before an instance / far jump: keeps its bots for a grace
     std::vector<Ghost> ghosts_;
     std::unordered_map<uint64, Anchor> prev_anchor_;
+    // Per player: last position seen by the motion tracker and his smoothed velocity (Playerbot.World.Moving.*).
+    struct MotionTrack { uint32 map = 0; float x = 0.0f, y = 0.0f; uint32 ms = 0; Motion m; };
+    std::unordered_map<uint64, MotionTrack> motion_;
+    void TrackMotion(uint32 now_ms, std::vector<Anchor>& anchors);
+    bool InBubbleOf(Anchor const& a, float x, float y) const;   // counts toward a's target (corridor while he moves)
+    uint64 n_moving_placed_ = 0;       // bots put ahead of a moving player
+    uint64 n_moving_woken_ = 0;        // sleepers woken ahead of a moving player
+    uint64 n_left_behind_ = 0;         // bots logged out far behind a moving player
     struct PlaceDest { float x = 0.0f, y = 0.0f; uint32 until_ms = 0; };
     std::unordered_map<uint64, PlaceDest> place_dest_;   // where a bot sent by PlaceNear is walking to, for a while: the crowd count uses it, not its position on the way
     // World bots under level 10 made before they stopped being given a generated set (migration 0031): each is stripped to its starter outfit once, on login.
@@ -221,9 +278,10 @@ private:
     uint64 n_placed_ = 0;
     uint64 n_despawned_ = 0;
     uint64 n_abandoned_ = 0;
-    // Why PlaceNear's candidate spots were refused (index: 0 no ground, 1 water, 2 no navmesh point, 3 lava, 4 no complete path, 5 area full) and
+    // Why PlaceNear's candidate spots were refused (index: 0 no ground, 1 water, 2 no navmesh point, 3 lava, 4 no complete path, 5 area full, 6 a town of
+    // the other side) and
     // how many calls found none at all; reported in the [world] line so a placement that never succeeds names its cause.
-    uint64 n_place_reject_[6] = {};
+    uint64 n_place_reject_[7] = {};
     uint64 n_place_none_ = 0;
     uint64 n_place_calls_ = 0;
     uint32 last_have_ = 0, last_target_ = 0;   // the last anchor a spawn pass found at its bubble target: how many it has and what it may have ([world] line)
@@ -249,13 +307,47 @@ private:
     std::unordered_map<uint64, uint32> gate_rest_;
     uint32 gate_why_ms_[6] = {};   // last "why no duels" line per city (kCityCount)
     uint32 last_gate_ms_ = 0;
+    // Gatherings outside the gates (Gathering.h): the rings in progress, the bots resting after one, the Basic Campfire's object entry
+    // (learnt from the first fire a bot lights: 0 = not yet, UINT32_MAX = the spell gave none).
+    struct GatherRing
+    {
+        uint32 city = 0, ring = 0, since_ms = 0, until_ms = 0;   // ring: 0 campfire, 1 standing, Gathering::kStreetRing+ a street chat
+        bool   sit = false;
+        std::string place;            // a street chat: where it stands ("the bank")
+        float  cx = 0, cy = 0, cz = 0;
+        std::vector<uint64> members;
+        ObjectGuid fire;
+        uint32 fire_try_ms = 0;
+        // The talk: a script (script >= 0) or the chat model (model), the bots taking part, when the next line is due.
+        int32  script = -1;
+        uint32 line = 0, next_line_ms = 0, turns_left = 0, topic = 0, asked_ms = 0;
+        bool   model = false, waiting = false;
+        std::vector<uint64> talkers;
+        std::string chat;
+        uint64 key = 0;
+        std::vector<uint32> recent;   // scripts said lately in this ring
+    };
+    std::vector<GatherRing> gather_rings_;
+    std::unordered_map<uint64, uint32> gather_rest_;
+    uint32 last_gather_ms_ = 0;
+    uint32 gather_form_ms_[6] = {};
+    uint32 gather_why_ms_[6] = {};
+    uint32 street_form_ms_[6] = {};
+    uint32 street_seq_ = 0;
+    uint32 campfire_entry_ = 0;
+    uint64 gather_seq_ = 0;
     std::unordered_map<uint64, uint32> leaving_;   // bot guid low -> module ms when it was sent walking away
     uint64 n_arrived_walking_ = 0;
     uint64 n_left_walking_ = 0;
+    uint64 n_idle_swaps_ = 0;
+    uint32 last_swap_pass_ms_ = 0;
+    std::unordered_map<uint64, uint32> swap_ms_;   // per bot: when it was last swapped
     uint32 swap_burst_until_ms_ = 0;   // module ms until which a jump (teleport / hearth) swaps the bubble at a higher rate
     uint32 owned_online_ = 0;          // companions and a player's own bots in the world (outside the world cap)
     uint32 tied_online_ = 0;           // ambient bots in a group, instance or battleground (outside the world cap)
     uint64 n_evicted_ = 0;             // bots recycled early, inside DespawnRadius, to make room at the world cap
+    uint32 parties_formed_ = 0;        // small parties of world bots formed / ended (Fleet/BotParties.h)
+    uint32 parties_ended_ = 0;
     uint64 n_crowd_moved_ = 0;
     uint64 n_stranded_moved_ = 0;      // residents found in lava or with no way out and placed again
     std::unordered_map<uint64, StrandedState> stranded_;

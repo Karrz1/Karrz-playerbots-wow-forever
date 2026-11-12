@@ -67,6 +67,12 @@ TC_GAME_API SupplyFamily const* FindSupplyFamily(std::string_view name);
 // Highest rank of `family` usable at `level` that the server knows; 0 when none.
 TC_GAME_API uint32 BestSupplyRank(SupplyFamily const& family, uint8 level);
 
+// Infinite food and water (Api/VirtualSupply.h): the Food (`water` false) / Water rank a bot of `cls` and `level` eats or drinks when
+// none is in its bags; 0 when the family is not the class's (water for a class without mana).
+TC_GAME_API uint32 VirtualRecoveryRank(bool water, uint8 cls, uint8 level);
+// `item` is a rank of the Food / Water family a bot of `cls` and `level` may use without the item; its kind in `water`.
+TC_GAME_API bool IsVirtualRecoveryItem(uint32 item, uint8 cls, uint8 level, bool& water);
+
 // ---- Group buff spells ----
 // The party versions of the class buffs (Prayer of Fortitude, Prayer of Shadow Protection, Arcane Brilliance, Gift of the Wild) and
 // their higher ranks: a vanilla player trains them at 48-60, but the Forever trainers do not list them (MC mc_garr 2026-10-12: "spell
@@ -81,7 +87,7 @@ TC_GAME_API bool LearnableGroupBuff(uint32 spell, uint8 level);
 // The restock tops the bags up to AMMO_TARGET (several stacks) once the stock is under
 // AMMO_LOW_PERCENT of it.
 constexpr uint32 AMMO_TARGET = 1000;
-constexpr uint32 AMMO_LOW_PERCENT = 30;
+constexpr uint32 AMMO_LOW_PERCENT = 60;
 constexpr uint32 AmmoLowBelow() { return AMMO_TARGET * AMMO_LOW_PERCENT / 100; }
 
 // Best projectile of `kind` a bot of `level` can use (required level <= level, highest

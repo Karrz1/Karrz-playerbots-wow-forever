@@ -2,19 +2,27 @@
 // First real-bodies pass: cast_spell / move_to / hearth wired to TrinityCore.
 // Remaining commands listed in v2/API.md fill in incrementally.
 
+#include <functional>
+#include <atomic>
 #include <mutex>
+#include <set>
+#include <optional>
 #include <unordered_map>
 #include "Api/ForeignClassSpell.h"
 #include "PlayerbotAPI.h"
+#include "BotLanguage.h"
 #include "Bot/QuestLoot.h"
+#include "Bot/BotBridge.h"
 #include "ClassicBotSkills.h"
 #include "Travel/ReachMemory.h"
 #include "ClassicSpec.h"
 #include "ClassicTalentBuilds.h"
 #include "ClassicSupplies.h"
 #include "Bot/ClassicUpkeep.h"
+#include "Bot/AlwaysBuffs.h"
 #include "Bot/SpellFamily.h"
 #include "Bot/Raid/ShieldRules.h"
+#include "Diagnostics/DamageParity.h"
 #include "BotItemScorer.h"
 #include "Player.h"
 #include "Corpse.h"
@@ -31,6 +39,7 @@
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "DB2Structure.h"
+#include "Util/ChestLock.h"
 #include "Creature.h"
 #include "UnitDefines.h"
 #include "Loot.h"
@@ -47,14 +56,20 @@
 #include "DetourNavMeshQuery.h"
 #include "PlayerbotV2.h"     // path-outcome telemetry, bot-leader battleground queue
 #include "PlayerbotMovement.h"  // unified bot-movement helpers
+#include "BotSwim.h"
 #include "FollowDrop.h"          // follow_drop: ledge plan toward an owner who dropped or jumped down
 #include "Fleet/CityLayer.h"      // same-level moves across a drop, NoPath storm
+#include "Fleet/BotPool.h"        // Pool::IsScenarioBot: a test character trades with nobody
 #include "Bot/World/ZonePicker.h" // IsVanillaCapitalZone
 #include "Fleet/InstanceEntry.h"  // PrepareInstanceEntry: a stale raid lock must not keep a companion out of its owner's instance
 #include "PartialRouteStall.h"
 #include "NoMotionGuard.h"
 #include "TradeFlow.h"
 #include "JunkDrop.h"
+#include "VirtualSupply.h"
+#include "Services.h"
+#include "Fleet/BotAccountMgr.h"   // is_pool_account: a player's own alt gets no free gold or repair
+#include "Util/ConfigReader.h"
 #include "BotTrade.h"
 #include "BotTradeShop.h"
 #include "SocialMgr.h"  // SOCIAL_FLAG_FRIEND/IGNORED for friend ops
@@ -89,6 +104,8 @@
 #include "SmartEnum.h"    // CastFailName: SpellCastResult constant names
 #include "DuelPackets.h"
 #include "AreaTriggerPackets.h"
+#include "AreaTrigger.h"          // ExitPortalOnPath: the static teleport triggers of an instance
+#include "AreaTriggerTemplate.h"
 #include "WorldSession.h"
 #include "TradeData.h"
 #include "TradePackets.h"
@@ -334,9 +351,31 @@ namespace {
     // apart. WaypointMovementGenerator sent each one as its own spline, and a hop shorter than three seconds is only sent when the one
     // before has ended, so a bot walking a city street stopped and started at every point (two bots on one route showed it in
     // Ironforge, 132). Those routes go out as one spline through all points instead.
+    //
+    // A living bot off a transport gets those navmesh points straight as a spline launched at once from where it stands, not through a
+    // WaypointMovementGenerator: that generator starts every new path with StopMoving() and a 1000 ms wait (DoInitialize), and a bot
+    // on a far walk asks for a new path every one to two seconds (ChunkedWalkToward aims each step 35 y ahead of where it stands, so
+    // the goal is new each time and the same-goal skip in move_to never holds). The bot ran for half a second, stood for a second and
+    // ran again, the whole way (Discord bug reports 6 and 8 Nov, "random bots move for half a second, stop, then repeat in a loop").
+    // A new spline replaces a running one without a stop. The motion type stays WAYPOINT, so the same-goal skip and the stall breaker
+    // treat it as before. A navmesh path starts at the bot, so this never turns it back. Authored road routes keep the generator: their
+    // first node can lie behind the bot, and sent at once that turned city bots back and forth (0.1.31, Stormwind, undone in 76287b12).
+    void LaunchRouteSpline(Player* p, std::vector<G3D::Vector3>&& pts, bool run)
+    {
+        p->GetMotionMaster()->LaunchMoveSpline([pts = std::move(pts), run](Movement::MoveSplineInit& init)
+        {
+            init.MovebyPath(pts);
+            init.SetWalk(!run);
+        }, 0, MOTION_PRIORITY_NORMAL, WAYPOINT_MOTION_TYPE);
+    }
+
     void MoveAlongRoute(Player* p, WaypointPath const& route, bool run, bool navmesh_points = false)
     {
-        constexpr size_t kMaxSplinePoints = 60;   // the path generator's own cap is 74; a longer route keeps the per-point walk
+        // The path generator's own cap is 74 points. A longer navmesh route is cut to its first 60 points and goes out as one spline all
+        // the same: the per-point walk stopped at every point, and in Ironforge, whose ring streets turn a 200 y errand into a 250-300 y
+        // route, nearly every town walk was over 60 points (bots ran, stopped and turned all the way, live 275). The rule re-sends the
+        // move when the bot reaches the cut, and the route is computed again from there.
+        constexpr size_t kMaxSplinePoints = 60;
         if (p->IsAlive() && navmesh_points)
         {
             std::vector<WaypointNode> nodes;
@@ -351,7 +390,20 @@ namespace {
                 nodes.emplace_back(nid++, n.X, n.Y, n.Z);
                 px = n.X; py = n.Y; pz = n.Z;
             }
-            if (!nodes.empty() && nodes.size() <= kMaxSplinePoints)
+            if (nodes.size() > kMaxSplinePoints)
+                nodes.erase(nodes.begin() + kMaxSplinePoints, nodes.end());
+            if (!nodes.empty() && !p->GetTransport())
+            {
+                // MoveSplineInit puts the bot's own place over point 0, so the bot's place goes first and every route point is kept.
+                std::vector<G3D::Vector3> pts;
+                pts.reserve(nodes.size() + 1);
+                pts.emplace_back(p->GetPositionX(), p->GetPositionY(), p->GetPositionZ());
+                for (WaypointNode const& n : nodes)
+                    pts.emplace_back(n.X, n.Y, n.Z);
+                LaunchRouteSpline(p, std::move(pts), run);
+                return;
+            }
+            if (!nodes.empty())
             {
                 WaypointPath exact(0, std::move(nodes), run ? WaypointMoveType::Run : WaypointMoveType::Walk);
                 exact.BuildSegments();
@@ -375,24 +427,27 @@ namespace {
             pts.emplace_back(n.X, n.Y, n.Z);
         if (pts.size() < 2)
             return;
-        p->GetMotionMaster()->LaunchMoveSpline([pts = std::move(pts), run](Movement::MoveSplineInit& init)
-        {
-            init.MovebyPath(pts);
-            init.SetWalk(!run);
-        }, 0, MOTION_PRIORITY_NORMAL, WAYPOINT_MOTION_TYPE);
+        LaunchRouteSpline(p, std::move(pts), run);
     }
 
-    inline uint64 PathDestKey(uint32 map_id, float x, float y)
+    inline uint64 PathDestKey(uint32 map_id, float x, float y, float z)
     {
         // 5y buckets Ã¢Â€Â” angle jitter within ~5y still re-tries; persistent
         // same-spot pushes hit the same bucket. map_id mixed into the high
         // bits so cross-map (x,y) collisions (e.g. (0,0) on every map)
         // don't false-block. 16 bits each for qx/qy is plenty given world
         // bounds (Ã‚Â±17000y / 5 = Ã‚Â±3400, fits in i16).
+        // The height is bucketed too: a floor above or below the failed goal is another place. Keyed on x and y alone, a
+        // goal one level down (off the mesh, FarFromPolyEnd) blocked every move to the floor above it for the 60 s long window
+        // (Gnomeregan 2026-10-30, 0.1.27 set A: the tank on the -154.7 level refused its route step at (-434,44) for 60 s
+        // after a waypoint at z -173 failed, and the group stood). move_to keys on the caller's asked z, so its ground snaps
+        // never move a goal from one bucket to another.
         constexpr float kBucket = 5.0f;
         int32 qx = static_cast<int32>(std::floor(x / kBucket));
         int32 qy = static_cast<int32>(std::floor(y / kBucket));
-        return (uint64(map_id & 0xFFFFu) << 32)
+        int32 qz = static_cast<int32>(std::floor(z / kBucket));
+        return (uint64(uint16(int16(qz))) << 48)
+             | (uint64(map_id & 0xFFFFu) << 32)
              | (uint64(uint16(int16(qx))) << 16)
              | uint64(uint16(int16(qy)));
     }
@@ -498,6 +553,39 @@ namespace {
             it = ((now_ms - it->second) >= kEquipFailTtlMs) ? m.erase(it) : std::next(it);
         m[key] = now_ms;
     }
+
+    // A town bot that must keep dry and has no dry way out of where it stands. The Stormwind canal tunnel at the Mage Quarter
+    // (-8940,800, z 91) lies under a bridge, beside the water: every route out of it touches the canal, so an ungrouped bot down
+    // there was refused each move and stood in the tunnel until something else moved it (Discord 2026-11-09: ten bots at a time,
+    // each for a minute or two). A bot refused this way again and again without leaving the spot may take the wet route for a while.
+    struct WetRefusals { float x = 0.0f, y = 0.0f; uint32 first_ms = 0, n = 0, open_until = 0; };
+    constexpr uint32 kWetRefusalsToOpen = 3;        // refusals from one spot
+    constexpr uint32 kWetRefusalWindowMs = 180000;  // within three minutes
+    constexpr float  kWetRefusalSpotYards = 8.0f;   // a bot that walked off in between is not stuck
+    constexpr uint32 kWetWayOutMs = 30000;          // how long the wet route is allowed then
+
+    bool NoDryWayOut(Player const* p)
+    {
+        static std::unordered_map<uint64, WetRefusals> s_wet;
+        uint32 const now = GameTime::GetGameTimeMS();
+        WetRefusals& w = s_wet[p->GetGUID().GetCounter()];
+        if (w.open_until && int32(w.open_until - now) > 0)
+            return true;
+        w.open_until = 0;
+        float const px = p->GetPositionX(), py = p->GetPositionY();
+        if (w.first_ms == 0 || now - w.first_ms > kWetRefusalWindowMs
+            || std::hypot(px - w.x, py - w.y) > kWetRefusalSpotYards)
+        {
+            w = WetRefusals{ px, py, now ? now : 1u, 0, 0 };
+        }
+        if (++w.n < kWetRefusalsToOpen)
+            return false;
+        w = WetRefusals{};
+        w.open_until = (now + kWetWayOutMs) ? now + kWetWayOutMs : 1u;
+        TC_LOG_INFO("playerbot.v2", "[wet_way_out] {} has no dry way out of ({:.1f},{:.1f},{:.1f}); it may cross the water for {} s",
+                    p->GetName(), px, py, p->GetPositionZ(), kWetWayOutMs / 1000u);
+        return true;
+    }
 } // anonymous
 
 API::API(Player* p) : p_(p) {}
@@ -587,6 +675,56 @@ void API::set_cast_speed_multiplier(float mult)
 
 // ---- Commands (real bodies) ----------------------------------------------
 
+// The static area trigger of a dungeon that teleports to another map (its exit portal) one of the walk segments runs into, or
+// null. A player steps into the portal to leave; a bot that walks across it while backing off or spacing out is thrown out of
+// the instance (Hall of Thanes 2026-10-29: the portal stands 13 y behind the entrance landing, a priest and a hunter landed in
+// Old Ironforge one second into the run, and no entrance trigger leads back in). Only inside a dungeon: outside, walking into
+// an instance's entrance portal is how a bot gets back to its group.
+static AreaTrigger const* ExitPortalOnPath(Player const* p, Position const* pts, size_t n)
+{
+    Map const* map = p ? p->GetMap() : nullptr;
+    if (!map || !map->IsDungeon() || n < 2)
+        return nullptr;
+    for (auto const& [spawnId, at] : map->GetAreaTriggerBySpawnIdStore())
+    {
+        AreaTriggerTemplate const* tmpl = at ? at->GetTemplate() : nullptr;
+        if (!tmpl)
+            continue;
+        bool exit = false;
+        for (AreaTriggerAction const& action : tmpl->Actions)
+            if (action.ActionType == AREATRIGGER_ACTION_TELEPORT)
+                if (WorldSafeLocsEntry const* loc = sObjectMgr->GetWorldSafeLoc(action.Param))
+                    exit = exit || loc->Loc.GetMapId() != map->GetId();
+        if (!exit)
+            continue;
+        float const r = at->GetMaxSearchRadius() + 0.6f;    // the trigger's bounds + a player's own radius
+        float const ax = at->GetPositionX(), ay = at->GetPositionY(), az = at->GetPositionZ();
+        for (size_t i = 0; i + 1 < n; ++i)
+        {
+            float const sx = pts[i].GetPositionX(), sy = pts[i].GetPositionY(), sz = pts[i].GetPositionZ();
+            float const dx = pts[i + 1].GetPositionX() - sx, dy = pts[i + 1].GetPositionY() - sy, dz = pts[i + 1].GetPositionZ() - sz;
+            float const len2 = dx * dx + dy * dy;
+            float const t = len2 > 0.0001f ? std::clamp(((ax - sx) * dx + (ay - sy) * dy) / len2, 0.0f, 1.0f) : 0.0f;
+            float const cx = sx + dx * t - ax, cy = sy + dy * t - ay, cz = sz + dz * t - az;
+            float const d2 = cx * cx + cy * cy;
+            float const s2 = (sx - ax) * (sx - ax) + (sy - ay) * (sy - ay);
+            // Only a segment that closes in on it: a bot standing just outside the portal still walks away from it.
+            if (d2 <= r * r && d2 < s2 - 0.01f && std::fabs(cz) <= r + 2.5f)
+                return at;
+        }
+    }
+    return nullptr;
+}
+
+static AreaTrigger const* ExitPortalOnPath(Player const* p, Movement::PointsArray const& path)
+{
+    std::vector<Position> pts;
+    pts.reserve(path.size());
+    for (G3D::Vector3 const& v : path)
+        pts.emplace_back(v.x, v.y, v.z);
+    return ExitPortalOnPath(p, pts.data(), pts.size());
+}
+
 // Classic 1.60 rank chains: rotations name a spell by any rank (usually
 // rank 1); cast the highest rank the bot actually knows. Lower ranks stay
 // in the spellbook (HasSpell) after a higher one is learned.
@@ -620,7 +758,7 @@ static uint32 HighestKnownRank(Player const* p, uint32 spell_id)
         if (name && *name)
             for (auto const& [id, ps] : p->GetSpellMap())
             {
-                if (!ps.active || ps.disabled || id == spell_id) continue;
+                if (ps.state == PLAYERSPELL_REMOVED || !ps.active || ps.disabled || id == spell_id) continue;
                 SpellInfo const* si = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE);
                 if (!si || !si->SpellName || si->SpellFamilyName != base->SpellFamilyName || si->GetEffects().empty() ||
                     si->GetEffect(EFFECT_0).Effect != base->GetEffect(EFFECT_0).Effect || si->IsPassive() != base->IsPassive())
@@ -756,6 +894,11 @@ char const* API::CastFailName(uint32 code)
         case CastRejectStunned:         return "API_STUNNED";
         case CastRejectSilenced:        return "API_SILENCED";
         case CastRejectBeyondRange:     return "API_BEYOND_RANGE";
+        case CastRejectTargetImmune:    return "API_TARGET_IMMUNE";
+        case CastRejectTargetAirborne:  return "API_TARGET_AIRBORNE";
+        case CastRejectInCombat:        return "API_PEACE_ONLY_IN_COMBAT";
+        case CastRejectNoEquippedItem:  return "API_NO_EQUIPPED_ITEM";
+        case CastRejectItemAtLimit:     return "API_ITEM_AT_LIMIT";
         default: break;
     }
     if (code < EnumUtils::Count<SpellCastResult>())
@@ -769,11 +912,127 @@ char const* API::CastFailName(uint32 code)
     return "UNKNOWN";
 }
 
+namespace
+{
+// Every effect of the spell only does damage (direct, weapon, periodic or leech), so a damage immunity stops all of it.
+bool SpellOnlyDamages(SpellInfo const* info)
+{
+    bool any = false;
+    for (SpellEffectInfo const& eff : info->GetEffects())
+    {
+        if (!eff.IsEffect())
+            continue;
+        switch (eff.Effect)
+        {
+            case SPELL_EFFECT_SCHOOL_DAMAGE:
+            case SPELL_EFFECT_WEAPON_DAMAGE:
+            case SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL:
+            case SPELL_EFFECT_NORMALIZED_WEAPON_DMG:
+            case SPELL_EFFECT_WEAPON_PERCENT_DAMAGE:
+            case SPELL_EFFECT_HEALTH_LEECH:
+                any = true;
+                continue;
+            case SPELL_EFFECT_APPLY_AURA:
+                if (eff.ApplyAuraName == SPELL_AURA_PERIODIC_DAMAGE || eff.ApplyAuraName == SPELL_AURA_PERIODIC_LEECH
+                    || eff.ApplyAuraName == SPELL_AURA_PERIODIC_DAMAGE_PERCENT)
+                {
+                    any = true;
+                    continue;
+                }
+                return false;
+            default:
+                return false;
+        }
+    }
+    return any;
+}
+
+// The target takes nothing from the spell: immune to every effect (or the spell / its mechanic), or immune to its damage
+// when damage is all the spell does.
+bool TargetShrugsOff(Player const* caster, Unit const* target, SpellInfo const* info)
+{
+    uint32 mask = 0;
+    for (SpellEffectInfo const& eff : info->GetEffects())
+        if (eff.IsEffect())
+            mask |= 1u << eff.EffectIndex;
+    if (!mask)
+        return false;
+    if (target->IsImmunedToSpell(info, mask, caster))
+        return true;
+    return SpellOnlyDamages(info) && target->IsImmunedToDamage(caster, info);
+}
+
+bool IsChargeSpell(SpellInfo const* info)
+{
+    return info->HasEffect(SPELL_EFFECT_CHARGE) || info->HasEffect(SPELL_EFFECT_CHARGE_DEST);
+}
+
+// Clear of the ground under it: more than 6 yd up, or flying (gravity off) more than 2.5 yd up. A floating mob that hovers at
+// head height (wisps, elementals with gravity off) and a mob under water are not airborne.
+bool TargetAirborne(Unit const* target)
+{
+    if (target->IsInWater())
+        return false;
+    float const floor = target->GetFloorZ();
+    if (floor <= INVALID_HEIGHT)
+        return false;
+    float const height = target->GetPositionZ() - floor;
+    return height > 6.0f || (target->IsFlying() && height > 2.5f);
+}
+
+// A CastReject code for a spell the bot's own state forbids (0 when the spell may go out). Mirrors Spell::CheckCast /
+// CheckItems for a plain cast from the spellbook.
+uint32 CastBlockedByOwnState(Player* p, SpellInfo const* info)
+{
+    if (p->IsInCombat() && !info->CanBeUsedInCombat(p))
+        return API::CastRejectInCombat;
+    if (info->EquippedItemClass >= 0 && !p->HasItemFitToSpellRequirements(info))
+        return API::CastRejectNoEquippedItem;
+    for (SpellEffectInfo const& eff : info->GetEffects())
+    {
+        if (eff.Effect != SPELL_EFFECT_CREATE_ITEM || !eff.ItemType)
+            continue;
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(eff.ItemType);
+        if (!proto)
+            continue;
+        uint32 const count = std::clamp<uint32>(eff.CalcValueAsInt(), 1u, proto->GetMaxStackSize());
+        ItemPosCountVec dest;
+        if (InventoryResult const r = p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, eff.ItemType, count); r != EQUIP_ERR_OK)
+        {
+            // Which limit it is (bags full, the item's own count, its limit category): API_ITEM_AT_LIMIT alone did not say why a
+            // mage with no water could not conjure any (Gun, 2026-11-08).
+            TC_LOG_INFO("playerbot.v2", "[cast_block] {} spell {}: item {} x{} does not fit, InventoryResult {} (limit category {}, max "
+                        "count {}, free slots {})", p->GetName(), info->Id, eff.ItemType, count, uint32(r), proto->GetItemLimitCategory(),
+                        proto->GetMaxCount(), p->GetFreeInventorySlotCount());
+            return API::CastRejectItemAtLimit;
+        }
+    }
+    return 0;
+}
+}
+
 Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
 {
     if (!p_) return Result::Other;
     last_cast_fail_ = CastRejectNotKnown;
     if (!spell_id) return Result::NotKnown;
+
+    // Reincarnation: 20608 is the passive that grants it and has nothing to cast. The resurrection is 21169, which the core offers a dead
+    // shaman through SelfResSpells when the passive is known and 21169 is off cooldown; a client casts it with CMSG_SELF_RES
+    // (WorldSession::HandleSelfResOpcode). The bot's cast of 20608 while dead takes the same path.
+    if (spell_id == 20608 && !p_->IsAlive())
+    {
+        constexpr int32 reincarnation_res = 21169;
+        if (p_->m_activePlayerData->SelfResSpells.FindIndex(reincarnation_res) < 0)
+            return Result::NotReady;
+        if (p_->HasAuraType(SPELL_AURA_PREVENT_RESURRECTION))
+            return Result::Locked;
+        SpellCastResult const res = p_->CastSpell(p_, uint32(reincarnation_res), false);
+        if (res != SPELL_CAST_OK)
+            return Result::ServerRefused;
+        p_->RemoveSelfResSpell(reincarnation_res);
+        return Result::Ok;
+    }
 
     uint32 const requested_id = spell_id;
     if (!exact_rank || !p_->HasSpell(spell_id))
@@ -923,6 +1182,25 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
         return last_cast_fail_ = CastRejectTargetReflects, Result::InvalidTarget;
     }
 
+    // A hostile target that would shrug the spell off entirely (school or damage immunity, an immunity to every effect, a
+    // taunt-immune boss for Taunt) is not cast at: the cast itself succeeds and only the hit reads "Immune", so nothing else
+    // stops the rotation from spending every GCD and its mana on it. InvalidTarget arms the executor's per-spell back-off, so
+    // the rotation moves to its next spell (another school, melee) and tries this one again in 10 s.
+    if (tu != p_ && !info->IsPositive() && !info->HasAttribute(SPELL_ATTR0_NO_IMMUNITIES) && p_->IsValidAttackTarget(tu, info)
+        && TargetShrugsOff(p_, tu, info))
+    {
+        TC_LOG_DEBUG("playerbot.api", "[API::cast_spell] spell {} target {} rejected: target is immune", spell_id, target.ToString());
+        return last_cast_fail_ = CastRejectTargetImmune, Result::InvalidTarget;
+    }
+
+    // Charge-type spells (Charge, Intercept, Feral Charge) at a target in the air (a boss in its flying phase) can never land:
+    // the core either refuses the path or the bot leaps under the boss and loses its GCD. Refused like an immune target.
+    if (tu != p_ && IsChargeSpell(info) && TargetAirborne(tu))
+    {
+        TC_LOG_DEBUG("playerbot.api", "[API::cast_spell] spell {} target {} rejected: target is airborne", spell_id, target.ToString());
+        return last_cast_fail_ = CastRejectTargetAirborne, Result::InvalidTarget;
+    }
+
     // Stun gate. Stuns block EVERY cast (physical + spell). The
     // snapshot exposes is_stunned() but APL predicates don't gate
     // consistently. Reject early so a stunned bot doesn't spam
@@ -953,6 +1231,16 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
             "[API::cast_spell] spell {} rejected: silenced",
             spell_id);
         return last_cast_fail_ = CastRejectSilenced, Result::Locked;
+    }
+
+    // Spells the core would refuse for the bot's own state, checked the way Spell::CheckCast does so the cast is never tried:
+    // a peace-only spell (Stealth, Prowl, conjuring, eating) in combat, a spell that needs an item the bot has not equipped
+    // (Shoot without a wand, Shield Bash without a shield) and a conjure whose item is already at its carry limit. ServerRefused
+    // arms the same 10 s back-off the core's own refusal would have, without building the spell first.
+    if (uint32 const own = CastBlockedByOwnState(p_, info))
+    {
+        TC_LOG_DEBUG("playerbot.api", "[API::cast_spell] spell {} rejected: {}", spell_id, CastFailName(own));
+        return last_cast_fail_ = own, Result::ServerRefused;
     }
 
     // Defensive range gate. Belt-and-suspenders for any rule whose target
@@ -1038,8 +1326,14 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
     ClearStaleMoveFlags(p_);
     SpellCastResult sr = p_->CastSpell(tu, spell_id, false);
     last_cast_fail_ = sr == SPELL_CAST_OK ? 0u : uint32(sr);
+    // Playerbot.Bridge: a spell the server keeps refusing (not the timing races: cooldown, another cast still going).
+    if (sr != SPELL_CAST_OK && sr != SPELL_FAILED_NOT_READY && sr != SPELL_FAILED_SPELL_IN_PROGRESS && ::Playerbot::BotBridge::Enabled())
+        ::Playerbot::BotBridge::NoteCastFail(p_->GetGUID().GetCounter(), spell_id, uint32(sr));
     if (sr == SPELL_CAST_OK)
+    {
         LogCastWhileMoving(p_, "casts", spell_id);
+        Diagnostics::Parity::NoteCast(p_, spell_id);
+    }
     if (sr != SPELL_CAST_OK)
     {
         // Throttled diagnostic: log the first failure per (spell, reason) combo
@@ -1182,6 +1476,9 @@ Result API::cast_spell_at_position(uint32 spell_id, float x, float y, float z)
     if (!p_) return Result::Other;
     if (!spell_id) return Result::NotKnown;
 
+    // The highest rank the bot knows, as cast() does: the rotations name rank 1 (Hurricane 16914, Blizzard 10), and a bot that knows
+    // every rank went out at rank 1's damage.
+    spell_id = HighestKnownRank(p_, spell_id);
     SpellInfo const* info = sSpellMgr->GetSpellInfo(spell_id, p_->GetMap()->GetDifficultyID());
     if (!info) return Result::NotKnown;
     if (!p_->HasSpell(spell_id) && !info->HasAttribute(SPELL_ATTR0_PASSIVE))
@@ -1424,6 +1721,13 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
         }
     }
 
+    // In the air after a battleground ledge drop (below) or a follow leap: no other move re-aims the bot until it lands. A pathed move
+    // issued mid-flight replaced the jump spline and left the bot hanging short of the landing, then walking back up to the ledge and
+    // dropping again (WSG soak on 247: Jacelia's drop off (1055,1397,339) ended at (1066,1396,331), hover_settle, a second drop 3 s later).
+    if (!drop)
+        if (auto it = s_followDropAir.find(p_->GetGUID().GetCounter()); it != s_followDropAir.end() && GameTime::GetGameTimeMS() < it->second)
+            return Result::Ok;
+
     // Already there. A rule holding a spot (raid/dungeon positioning, hold,
     // stand-at-NPC) keeps re-emitting the same destination after arrival; the
     // emitter dedup lets one through every ~1.5s and MovePoint then launches
@@ -1472,6 +1776,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
         float const speed = dist3 / fall_s;
         uint32 const flight_ms = uint32(fall_s * 1000.0f) + 250u;
         s_dropUntil[dgl] = dnow + flight_ms + 500u;
+        s_followDropAir[dgl] = dnow + flight_ms;
         Position dest = p_->GetPosition();
         dest.Relocate(x, y, z);
         p_->SetFacingTo(std::atan2(y - sy, x - sx));
@@ -1497,6 +1802,13 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
         const float ddz = z - p_->GetPositionZ();
         if (ddx*ddx + ddy*ddy + ddz*ddz > 60.0f * 60.0f)
             return Result::Locked;
+        Position const seg[2] = { p_->GetPosition(), Position(x, y, z) };
+        if (AreaTrigger const* portal = ExitPortalOnPath(p_, seg, 2))
+        {
+            TC_LOG_INFO("playerbot.v2", "[exit_portal] {} will not walk into the exit portal (area trigger {}) at ({:.1f},{:.1f},{:.1f}) on a move to ({:.1f},{:.1f},{:.1f})",
+                p_->GetName(), portal->GetEntry(), portal->GetPositionX(), portal->GetPositionY(), portal->GetPositionZ(), x, y, z);
+            return Result::Locked;
+        }
         p_->GetMotionMaster()->MovePoint(0, x, y, z, /*generatePath*/ false);
         return Result::Ok;
     }
@@ -1514,15 +1826,29 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
     // owner's / mob's / anchor's Z next to a rock or ledge higher than the hint
     // would resolve to the terrain under the collision mesh (bot embedded).
     float const z_ask = z;
-    z = BotMovement::GroundZ(p_, x, y, z, "move_to");
+    // A goal on the navmesh at the asked height is walkable as asked: the mover walks the navmesh, so the ground probe below must
+    // not lift it onto another surface. The vmap probe searches from 3 y above the hint and takes the first face it meets, which
+    // beside a ramp is the ledge over it (Gnomeregan 0.1.27 test2: the route step at (-533.9,319.7,-219.2) on the ramp's edge
+    // became z -216.9, the goal went onto the 2 y strip above the ramp, and from the strip the only way on was back over its
+    // off-mesh link to (-532.8,299.9): the tank walked that loop for the last 10 minutes of the run while the group stood).
+    Position goal_on_mesh;
+    bool const asked_on_mesh = BotMovement::NearestNavPoint(p_, x, y, z_ask, 1.0f, 1.0f, goal_on_mesh) &&
+        std::fabs(goal_on_mesh.GetPositionZ() - z_ask) <= 1.0f && goal_on_mesh.GetExactDist2d(x, y) <= 1.0f;
+    z = asked_on_mesh ? goal_on_mesh.GetPositionZ() : BotMovement::GroundZ(p_, x, y, z, "move_to");
     // A world bot in a capital asking for its own level (the chunked walks and the wanderers pass the bot's z) whose destination has its
     // ground 20+ y lower: the capital stands on layers (Stormwind: the city floor at z 94 to 100, others at z 75 and z 59 under it,
     // joined only by steep faces). The ground probe would put the goal on the lower layer and the path would take the bot down the
     // face, where the town's hubs cannot be reached. The ask is
     // refused like a blocked path, so the rule picks another bearing.
-    if (!p_->GetGroup() && !p_->IsInFlight() && !p_->GetTransport() && p_->GetMap() && !p_->GetMap()->IsDungeon()
-        && !p_->GetMap()->IsBattlegroundOrArena() && ::Playerbot::V2::World::IsVanillaCapitalZone(p_->GetZoneId())
-        && ::Playerbot::V2::Fleet::AcrossDrop(p_->GetPositionZ(), z_ask, z)
+    // Not for a bot in the water: its own z is the canal surface and the ground under its goal the canal floor (Stormwind 86 over 59.5),
+    // so every step it asked for read as a drop and was refused; idle:leave_water never moved it and the canals filled up (live 244).
+    // A pit of liquid under a same-level ask (Fleet::IntoLiquidPit: the Great Forge's lava) is refused or kept at the asked level the
+    // same way, for a grouped bot too: no group follows its leader into the lava.
+    bool const city_ground = !p_->IsInWater() && !p_->IsInFlight() && !p_->GetTransport() && p_->GetMap() && !p_->GetMap()->IsDungeon()
+        && !p_->GetMap()->IsBattlegroundOrArena() && ::Playerbot::V2::World::IsVanillaCapitalZone(p_->GetZoneId());
+    bool const liquid_pit = city_ground && ::Playerbot::V2::Fleet::IntoLiquidPit(p_->GetPositionZ(), z_ask, z,
+        p_->GetMap()->GetLiquidStatus(p_->GetPhaseShift(), x, y, z + 0.05f, map_liquidHeaderTypeFlags::AllLiquids, nullptr) != LIQUID_MAP_NO_WATER);
+    if (city_ground && (liquid_pit || (!p_->GetGroup() && ::Playerbot::V2::Fleet::AcrossDrop(p_->GetPositionZ(), z_ask, z)))
         && !([&]
         {
             // The ground probe sees terrain and static models, the mover walks the navmesh. Where the mesh has a walkable surface at the
@@ -1540,13 +1866,27 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
         if (gat == 0 || gnow - gat >= 10000u)
         {
             gat = gnow ? gnow : 1u;
-            TC_LOG_INFO("playerbot.v2", "[level_guard] {} refused a same-level move across a drop: z={:.1f} dst=({:.1f},{:.1f}) ground={:.1f}",
-                        p_->GetName(), z_ask, x, y, z);
+            TC_LOG_INFO("playerbot.v2", "[level_guard] {} refused a same-level move {}: z={:.1f} dst=({:.1f},{:.1f}) ground={:.1f}",
+                        p_->GetName(), liquid_pit ? "into a liquid pit" : "across a drop", z_ask, x, y, z);
         }
-        NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS());
+        NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask), GameTime::GetGameTimeMS());
         return Result::Locked;
     }
-    BotMovement::SnapToGround(p_, x, y, z);
+    // The swimmer's step at its own level stays on the surface, where the navmesh has its water polygons, not on the canal floor.
+    if (p_->IsInWater() && ::Playerbot::V2::Fleet::AcrossDrop(p_->GetPositionZ(), z_ask, z))
+        z = z_ask;
+    if (!asked_on_mesh)
+        BotMovement::SnapToGround(p_, x, y, z);
+    // A goal in deep water is swum to, at the swim z (Api/BotSwim.h): the ground probe above put it on the lake bed (the bot walked
+    // down and stood under the water until idle:surface_to_breathe lifted it, then the next step took it down again) and a surface
+    // ask kept it on top of the water. A dive the caller asked for, to something on the floor, keeps its depth.
+    if (p_->IsAlive() && !p_->IsFlying() && !p_->IsInFlight() && !p_->GetTransport())
+    {
+        float swim_z = 0.f;
+        if (BotMovement::SwimLevel(p_, x, y, z_ask, swim_z) &&
+            !BotMovement::Swim::IsPurposefulDive(z_ask, p_->GetPositionZ(), swim_z))
+            z = swim_z;
+    }
 
     // Battleground start room (STATUS_WAIT_JOIN): the gates are shut and the bots only mill about their start area, so a
     // destination whose ground is far above or below the bot is off the platform (a gate-wait spot spread over the edge of
@@ -1605,7 +1945,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
     // generator type + goal-key (not the movement flag) lets the spline run to
     // completion. This also strictly improves the original winding-route fix
     // (Grimfang Valley-exit oscillation) Ã¢Â€Â” same intent, without the isMoving hole.
-    uint64 const move_goal_key = PathDestKey(p_->GetMapId(), x, y);
+    uint64 const move_goal_key = PathDestKey(p_->GetMapId(), x, y, z_ask);
     // Ã¢Â”Â€Ã¢Â”Â€ TEMP Gap-1 crossing diagnostic (Deadmines map 36 foundry bridge) Ã¢Â”Â€Ã¢Â”Â€
     // Logs every branch move_to takes while a bot sits in the Gap-1 box, so the
     // off-mesh crossing is debuggable from the log alone. Remove after the fix.
@@ -1662,19 +2002,29 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
                     p_->GetPositionY(), (pr.key == move_goal_key) ? 1 : 0,
                     std::sqrt(pdx*pdx + pdy*pdy),
                     (uint32)(now_probe - pr.ms), (int)mtype);
-            if (pr.key != move_goal_key)
+            // A route spline (MoveAlongRoute) keeps the speed it was launched with. A bot that mounts or dismounts on the way would keep
+            // the old speed while the same goal is asked for, so a speed change sends the route again (at once, without a stop).
+            bool speed_changed = false;
+            if (mtype == WAYPOINT_MOTION_TYPE && p_->movespline->Initialized() && !p_->movespline->Finalized() &&
+                !p_->IsInWater() && !p_->IsFlying() && !p_->GetTransport())
+            {
+                float const want = p_->GetSpeed(run ? MOVE_RUN : MOVE_WALK);
+                float const have = p_->movespline->Velocity();
+                speed_changed = want > 0.1f && std::fabs(have - want) > 0.15f * want;
+            }
+            if (!speed_changed && pr.key != move_goal_key)
             {
                 // New goal for the probe Ã¢Â€Â” start the progress clock here.
                 pr = { move_goal_key, p_->GetPositionX(), p_->GetPositionY(), now_probe };
                 return Result::Ok;
             }
-            if (pdx * pdx + pdy * pdy >= 4.0f * 4.0f)
+            if (!speed_changed && pdx * pdx + pdy * pdy >= 4.0f * 4.0f)
             {
                 // Advanced >=4y since the mark Ã¢Â€Â” progressing, refresh + keep running.
                 pr.x = p_->GetPositionX(); pr.y = p_->GetPositionY(); pr.ms = now_probe;
                 return Result::Ok;
             }
-            if (now_probe - pr.ms < 3000u)
+            if (!speed_changed && now_probe - pr.ms < 3000u)
                 return Result::Ok;   // within grace Ã¢Â€Â” let the spline keep trying
             // Stalled >3s within 4y: reset the clock and FALL THROUGH to re-issue.
             pr.x = p_->GetPositionX(); pr.y = p_->GetPositionY(); pr.ms = now_probe;
@@ -1707,11 +2057,16 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
                 "spline_set={} spline_done={} spline_t={}/{} ms flags=0x{:x} falling={})",
                 p_->GetName(), x, y, z, p_->GetPositionX(), p_->GetPositionY(), p_->GetPositionZ(), int(p_->GetMotionMaster()->GetCurrentMovementGeneratorType()),
                 p_->HasUnitState(UNIT_STATE_CASTING), p_->GetStandState() != UNIT_STAND_STATE_STAND, p_->HasUnitState(UNIT_STATE_ROOT),
-                p_->HasUnitState(UNIT_STATE_STUNNED), p_->IsInCombat(), PathFailedRecently(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS()),
+                p_->HasUnitState(UNIT_STATE_STUNNED), p_->IsInCombat(), PathFailedRecently(p_, PathDestKey(p_->GetMapId(), x, y, z_ask), GameTime::GetGameTimeMS()),
                 p_->HasAuraType(SPELL_AURA_GHOST), p_->IsBeingTeleported(),
                 p_->movespline->Initialized(), p_->movespline->Finalized(), p_->movespline->timePassed(), p_->movespline->Duration(),
                 uint32(p_->GetUnitMovementFlags()), p_->IsFalling());
-            NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS(), kPathFailTtlLongMs);
+            NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask), GameTime::GetGameTimeMS(), kPathFailTtlLongMs);
+            if (::Playerbot::BotBridge::Enabled())
+                ::Playerbot::BotBridge::ReportStuck(p_->GetGUID().GetCounter(), fmt::format(
+                    "tried to go to ({:.0f},{:.0f},{:.0f}) for over 30 s without moving; goal dropped (combat={} rooted={} path_fail_recent={})",
+                    x, y, z, p_->IsInCombat(), p_->HasUnitState(UNIT_STATE_ROOT),
+                    PathFailedRecently(p_, PathDestKey(p_->GetMapId(), x, y, z_ask), GameTime::GetGameTimeMS())));
             return Result::Locked;
         }
     }
@@ -1724,7 +2079,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
     // so legitimate retries proceed.
     {
         uint32 const move_now_ms = GameTime::GetGameTimeMS();
-        uint64 const dest_key = PathDestKey(p_->GetMapId(), x, y);
+        uint64 const dest_key = PathDestKey(p_->GetMapId(), x, y, z_ask);
         if (PathFailedRecently(p_, dest_key, move_now_ms))
         {
             // Named refusal (see [move_lock] above): a poisoned destination
@@ -1888,6 +2243,100 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
             TC_LOG_INFO("playerbot.v2", "[path_fail_ep] {}{}", p_->GetName(), ep_diag);
     };
 
+    // A path across a dungeon's exit portal throws the bot out of the instance (ExitPortalOnPath). Checked again on the path the
+    // liquid gate below sees, since the retries in between can compute a new one.
+    auto refuse_exit_portal = [&]() -> bool
+    {
+        if (!path_ok || (pt & PATHFIND_NOPATH))
+            return false;
+        AreaTrigger const* portal = ExitPortalOnPath(p_, path.GetPath());
+        if (!portal)
+            return false;
+        static std::unordered_map<uint64, uint32> s_portalLog;
+        uint32 const pnow = GameTime::GetGameTimeMS();
+        uint32& plast = s_portalLog[p_->GetGUID().GetCounter()];
+        if (!plast || pnow - plast >= 5000u)
+        {
+            plast = pnow ? pnow : 1u;
+            TC_LOG_INFO("playerbot.v2", "[exit_portal] {} will not walk into the exit portal (area trigger {}) at ({:.1f},{:.1f},{:.1f}) on a move to ({:.1f},{:.1f},{:.1f})",
+                p_->GetName(), portal->GetEntry(), portal->GetPositionX(), portal->GetPositionY(), portal->GetPositionZ(), x, y, z);
+        }
+        NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask), pnow);
+        return true;
+    };
+    if (refuse_exit_portal())
+        return Result::Locked;
+
+    // A floor with no navmesh: the top of a zeppelin tower is collision a player walks on, but the navmesh has only the ground 25-30 y
+    // under it. Every path from up there ends on that ground, so a bot beside its player on the tower walked off it to the ground below
+    // (11-08: Orgrimmar, a formation slot at z 48 went to "mesh at z 20.8"; Undercity, two bots brought beside him ran 40 y off).
+    // A short step across that same floor is walked straight: the bot stands off the mesh, the spot is real ground within 2.5 y of the
+    // ask on the bot's own level, the mesh lies far below both, and nothing is in the way. Anything else goes the usual way.
+    if (!direct && !asked_on_mesh && p_->IsAlive() && !p_->IsInWater() && !p_->IsFlying() && !p_->GetTransport() && !p_->GetVehicle() &&
+        p_->GetMap() && !p_->GetMap()->IsBattlegroundOrArena())
+    {
+        constexpr float kDeckWalkYards = 20.0f;
+        float const bx = p_->GetPositionX(), by = p_->GetPositionY(), bz = p_->GetPositionZ();
+        float const step = std::hypot(x - bx, y - by);
+        if (step > 0.5f && step <= kDeckWalkYards && std::fabs(z_ask - bz) <= 4.0f)
+        {
+            bool mesh_far_below = true;   // no path at all: the mesh is nowhere near
+            if (path_ok && !(pt & PATHFIND_NOPATH))
+            {
+                G3D::Vector3 const ae = path.GetActualEndPosition();
+                mesh_far_below = ae.z < z_ask - 8.0f && ae.z < bz - 8.0f;
+            }
+            Position bot_on_mesh;
+            float floor_z = 0.f;
+            if (mesh_far_below && !BotMovement::NearestNavPoint(p_, bx, by, bz, 3.0f, 4.0f, bot_on_mesh) &&
+                BotMovement::ProbeGround(p_, x, y, z_ask, floor_z) && std::fabs(floor_z - z_ask) <= 2.5f && std::fabs(floor_z - bz) <= 4.0f &&
+                BotMovement::LineIsClear(p_, bx, by, bz + 1.5f, x, y, floor_z + 1.5f))
+            {
+                p_->GetMotionMaster()->MovePoint(0, x, y, floor_z, /*generatePath*/ false);
+                static std::unordered_map<uint64, uint32> s_deckAt;
+                uint32 const dnow = GameTime::GetGameTimeMS();
+                uint32& dat = s_deckAt[p_->GetGUID().GetCounter()];
+                if (dat == 0 || dnow - dat >= 10000u)
+                {
+                    dat = dnow ? dnow : 1u;
+                    TC_LOG_INFO("playerbot.v2", "[deck_walk] {} walks {:.1f} y straight across a floor with no navmesh: ({:.1f},{:.1f},{:.1f}) -> ({:.1f},{:.1f},{:.1f}) map {}",
+                                p_->GetName(), step, bx, by, bz, x, y, floor_z, p_->GetMapId());
+                }
+                return Result::Ok;
+            }
+        }
+    }
+
+    // A goal moved far UP onto a model: the bot asked for a spot at its own level (a wander step, a chunk of a long walk), and a height
+    // probe from high above or the polygon nearest the goal lies 8+ y higher on something that is not the terrain: a tree's roots or
+    // branches, a roof. Shadowglen 0.1.34: wander goals at the bot's level under Aldrassil were moved onto the tree (far_end_snap 1358.1
+    // -> 1397.3, the NoPath retry from 50 y above landing 18 to 29 y up on the trunks), and the bots ran at the trees, stopped and picked
+    // again, round and round. A hill is terrain, so the terrain height there is close to the surface found and the goal still moves up.
+    // Open world only: in a dungeon, a battleground or a capital the floors are models and have their own guards.
+    bool const open_world_level_ask = std::fabs(z_ask - p_->GetPositionZ()) < ::Playerbot::V2::Fleet::kSameLevelYards
+        && p_->GetMap() && !p_->GetMap()->IsDungeon() && !p_->GetMap()->IsBattlegroundOrArena()
+        && !::Playerbot::V2::World::IsVanillaCapitalZone(p_->GetZoneId()) && !p_->GetTransport() && !p_->IsInWater();
+    auto rise_onto_model = [&](float sx, float sy, float sz) -> bool
+    {
+        constexpr float kModelRise = 8.0f;
+        if (!open_world_level_ask || sz <= std::max(z_ask, p_->GetPositionZ()) + kModelRise)
+            return false;
+        float const terrain = p_->GetMap()->GetGridHeight(p_->GetPhaseShift(), sx, sy);
+        bool const on_model = terrain <= INVALID_HEIGHT || sz - terrain > 4.0f;
+        if (on_model)
+        {
+            static std::unordered_map<uint64, uint32> s_modelAt;
+            uint32 const mnow = GameTime::GetGameTimeMS();
+            uint32& mat = s_modelAt[p_->GetGUID().GetCounter()];
+            if (mat == 0 || mnow - mat >= 10000u)
+            {
+                mat = mnow ? mnow : 1u;
+                TC_LOG_INFO("playerbot.v2", "[goal_on_model] {} asked ({:.1f},{:.1f},{:.1f}) at its own level, not moved up to {:.1f} at ({:.1f},{:.1f}): terrain {:.1f}",
+                            p_->GetName(), x, y, z_ask, sz, sx, sy, terrain);
+            }
+        }
+        return on_model;
+    };
     if (!path_ok || (pt & PATHFIND_NOPATH))
     {
         // Dest-Z mesh-snap RETRY. Stepped/projected waypoints carry the
@@ -1918,7 +2367,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
                     break;
                 gz = below;
             }
-            if (gz > INVALID_HEIGHT && std::fabs(gz - z) > 8.0f)
+            if (gz > INVALID_HEIGHT && std::fabs(gz - z) > 8.0f && !rise_onto_model(x, y, gz))
             {
                 // Re-run on the SAME PathGenerator (repeated CalculatePath
                 // calls overwrite internal state by design).
@@ -1948,7 +2397,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
                                               true, 160.0f);
                     if (mz <= INVALID_HEIGHT)
                         mz = (p_->GetPositionZ() + z) * 0.5f;
-                    if (SehSafeCalculatePath(path, mx, my, mz) &&
+                    if (!rise_onto_model(mx, my, mz) && SehSafeCalculatePath(path, mx, my, mz) &&
                         !(path.GetPathType() & PATHFIND_NOPATH))
                     {
                         pt = path.GetPathType();
@@ -1993,6 +2442,8 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
         // stands on the canal BOTTOM with no liquid above its own z). The bot is
         // plainly in the canal but those two report false, which is why the exit
         // recovery never engaged on the first attempts.
+        if (TrySwimLeg(x, y, z, run))
+            return Result::Ok;
         Map* const wmap = p_->GetMap();
         const bool src_in_liquid = wmap && wmap->GetLiquidStatus(
             p_->GetPhaseShift(), p_->GetPositionX(), p_->GetPositionY(),
@@ -2062,10 +2513,21 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
         Playerbot::V2::Module::instance().OnPathOutcome(1 /*NoPath*/);
         log_path_fail("NoPath");
         BotMovement::NoteNoPath(p_);
-        NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS(),
+        NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask), GameTime::GetGameTimeMS(),
                      kPathFailTtlLongMs);
         NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
         NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
+        return Result::Locked;
+    }
+    // A wet route is refused here as well as at the liquid gate below: the partial and far-end branches in between drive the route they
+    // got without reaching that gate.
+    if (BotMovement::g_LiquidPathPolicy && path.IsWetRoute()
+        && BotMovement::DecideLiquid(BotMovement::g_LiquidPathPolicy(p_), /*path_wet*/ true, /*dry_found*/ false) == BotMovement::LiquidAction::Refuse
+        && !NoDryWayOut(p_))
+    {
+        Playerbot::V2::Module::instance().OnPathOutcome(3 /*FarFromPolyEnd*/);
+        log_path_fail("Liquid");
+        NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask), GameTime::GetGameTimeMS());
         return Result::Locked;
     }
     // Retry at the polygon found, for a destination that lies just off the mesh. A chunk step is aimed at a point on the bot's own level a
@@ -2082,12 +2544,18 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
         float const dz_end = ae.z - z;
         // In a capital the layers lie 20 to 40 y apart (Stormwind): a polygon that far from the asked height is another level, not a
         // slope (Hellice, on a roof at z 148.6, was snapped to a polygon 20 to 35 y below it).
-        float const max_dz = ::Playerbot::V2::World::IsVanillaCapitalZone(p_->GetZoneId()) ? ::Playerbot::V2::Fleet::kCityDropYards : 60.0f;
+        bool const in_capital = ::Playerbot::V2::World::IsVanillaCapitalZone(p_->GetZoneId());
+        float const max_dz = in_capital ? ::Playerbot::V2::Fleet::kCityDropYards : 60.0f;
+        // Nor is a polygon well below the ask in a capital: a bridge's deck snapped down to the walkway under it (Stormwind, the
+        // canal tunnel at the Mage Quarter: asked z 100.5 on the bridge, snapped to the tunnel floor at z 90.9, and the bots that
+        // went down there found no dry way back up).
+        bool const snaps_under = in_capital && dz_end < -::Playerbot::V2::Fleet::kLiquidDropYards;
         // A polygon in magma or slime is no place to walk to: the liquid gate below refuses it, and the refusal is only the short 3 s
         // one, so the goal was picked again and again (Burning Steppes, Simer: 53 path_fail Magma for one quest goal in 3 minutes).
         // Left unsnapped, the goal ends as FarFromPolyEnd, which suppresses it for long and lets goal selection move on.
         bool const end_in_hazard = BotMovement::ClassifyDestinationLiquid(p_, ae.x, ae.y, ae.z) == BotMovement::LiquidVerdict::Hazard;
-        if (off_end <= 12.0f && std::fabs(dz_end) < max_dz && !end_in_hazard && !::Playerbot::V2::Fleet::PathHasCliff(path.GetPath()))
+        if (off_end <= 12.0f && std::fabs(dz_end) < max_dz && !snaps_under && !end_in_hazard && !::Playerbot::V2::Fleet::PathHasCliff(path.GetPath())
+            && !rise_onto_model(ae.x, ae.y, ae.z))
         {
             if (SehSafeCalculatePath(path, ae.x, ae.y, ae.z) && !(path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_FARFROMPOLY_END)))
             {
@@ -2114,7 +2582,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
                 p_->GetPositionY(), x, y, z);
         if ((p_->InBattleground() && z < p_->GetPositionZ() - 3.0f &&
              TryBgDescentCrawl(x, y, z, run)) ||
-            TryTerrainWalkFallback(x, y, z, run))
+            TryTerrainWalkFallback(x, y, z, run) || TrySwimLeg(x, y, z, run))
             return Result::Ok;
         Playerbot::V2::Module::instance().OnPathOutcome(3 /*FarFromPolyEnd*/);
         log_path_fail("FarFromPolyEnd");
@@ -2122,7 +2590,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
         // Off-mesh destination (above terrain / inside geometry / a phantom POI
         // Z). Permanently unreachable until the data changes Ã¢Â€Â” suppress long so
         // the bot stops oscillating toward it and goal-selection moves on.
-        NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS(),
+        NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask), GameTime::GetGameTimeMS(),
                      kPathFailTtlLongMs);
         NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
         return Result::Locked;
@@ -2168,7 +2636,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
                     p_->GetPositionX(), p_->GetPositionY(), p_->GetPositionZ(),
                     near_poly.x, near_poly.y, near_poly.z);
                 Playerbot::V2::Module::instance().OnPathOutcome(2 /*FarFromPolyStart*/);
-                NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
+                NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask),
                              GameTime::GetGameTimeMS());
                 return Result::Locked;
             }
@@ -2189,7 +2657,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
             // for THIS target's pathfind. Different XY destinations may
             // still resolve from the same source, so the LRU's per-bucket
             // expiry lets the rule explore other directions.
-            NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
+            NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask),
                          GameTime::GetGameTimeMS());
             return Result::Locked;
         }
@@ -2308,6 +2776,10 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
             // Gated on the bot being in liquid, so it can NOT re-introduce the
             // rolled-back crawl-on-Incomplete that stranded bots on elevator
             // platforms (elevators are never in water).
+            // A target under water with the bot in the same water (Blackfathom pool: the mage at the surface, the tank and the corpse on
+            // the bed 9 y below; the path stopped at the surface above them, and the mage stood there 45 s while the group moved on).
+            if (TrySwimLeg(x, y, z, run))
+                return Result::Ok;
             {
                 Map* const nwmap = p_->GetMap();
                 const bool ns_in_liquid = nwmap && nwmap->GetLiquidStatus(
@@ -2374,8 +2846,10 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
             // Ã¢ÂˆÂ’47y partial to (-4986,-954) unlocks a +372y advancing path from
             // there). Strictly gated so it can NOT re-introduce the rolled-back
             // crawl's elevator/ramp stranding or thrash a true dead-end:
-            //   * far goal mid-haul (cur_to_dst > 100y) Ã¢Â€Â” not a local disconnected
-            //     target (those keep the long-TTL refuse below);
+            //   * far goal mid-haul (cur_to_dst > 100y), or a near goal whose partial
+            //     ends well FARTHER than the bot stands (a route cut by the cap, not a
+            //     goal off the mesh: PartialIsTruncatedRoute) Ã¢Â€Â” not a local
+            //     disconnected target (those keep the long-TTL refuse below);
             //   * a real escape leg (endpoint >= 15y away) Ã¢Â€Â” not sub-step jitter;
             //   * NOT climbing (endpoint z <= pose z + 8y) Ã¢Â€Â” a downward/level
             //     escape can't strand the bot riding a lift UP (the documented
@@ -2392,14 +2866,14 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
                 const float esc_leg = dist3d(path_end.x, path_end.y, path_end.z,
                                              p_->GetPositionX(), p_->GetPositionY(),
                                              p_->GetPositionZ());
-                if (cur_to_dst > 100.0f && esc_pts.size() >= 2 &&
+                if (Playerbot::BotMovement::PartialIsTruncatedRoute(cur_to_dst, end_to_dst) && esc_pts.size() >= 2 &&
                     esc_leg >= kMinEscapeLegYards &&
                     path_end.z <= p_->GetPositionZ() + kMaxEscapeClimbYards)
                 {
                     Playerbot::BotMovement::PartialRouteStall& ec = g_route_stall[p_->GetGUID().GetCounter()];
                     // A new goal, or a bot that has genuinely closed in since the last
                     // partial (a pocket was escaped), refills the budget; a loop never does.
-                    if (Playerbot::BotMovement::AllowPartialRoute(ec, PathDestKey(p_->GetMapId(), x, y), cur_to_dst))
+                    if (Playerbot::BotMovement::AllowPartialRoute(ec, PathDestKey(p_->GetMapId(), x, y, z_ask), cur_to_dst))
                     {
                         std::vector<WaypointNode> esc_nodes;
                         esc_nodes.reserve(esc_pts.size());
@@ -2440,7 +2914,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
                 return Result::Ok;
             const uint32 nonadv_ttl =
                 (cur_to_dst > 100.0f) ? kPathFailTtlMs : kPathFailTtlLongMs;
-            NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
+            NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask),
                          GameTime::GetGameTimeMS(), nonadv_ttl);
             if (nonadv_ttl == kPathFailTtlLongMs)
                 NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
@@ -2475,7 +2949,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
             // mechanism the road-centerline branch above already uses successfully.
             auto const& pts = path.GetPath();
             if (!Playerbot::BotMovement::AllowPartialRoute(g_route_stall[p_->GetGUID().GetCounter()],
-                                                           PathDestKey(p_->GetMapId(), x, y), cur_to_dst))
+                                                           PathDestKey(p_->GetMapId(), x, y, z_ask), cur_to_dst))
             {
                 // Walked kStallMaxPartials partials toward this goal without getting closer: the partials
                 // lead between two local minima. Refuse like a non-advancing partial so the destination
@@ -2486,7 +2960,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
                     Playerbot::BotMovement::kStallMaxPartials, x, y, z, cur_to_dst);
                 // The long window: a loop is geometry (Francoise, a goal in the Keep, 632 y and not one yard closer for an hour), and three
                 // seconds had the rule ask for the same goal again every ten.
-                NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
+                NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask),
                              GameTime::GetGameTimeMS(), kPathFailTtlLongMs);
                 NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
                 return Result::Locked;
@@ -2597,6 +3071,8 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
     // return PATHFIND_NORMAL. This point gate is the only thing that stops it;
     // the mmap read is cheap and only fires on otherwise-valid paths.
     {
+        if (refuse_exit_portal())
+            return Result::Locked;
         BotMovement::LiquidVerdict const lv =
             BotMovement::ClassifyDestinationLiquid(p_, x, y, z);
 
@@ -2611,7 +3087,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
             // plenty for wander to rotate through.
             Playerbot::V2::Module::instance().OnPathOutcome(3 /*FarFromPolyEnd*/);
             log_path_fail("Magma");
-            NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
+            NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask),
                          GameTime::GetGameTimeMS());
             return Result::Locked;
         }
@@ -2620,11 +3096,12 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
         // one when that exists (for this move_to and for follow/chase alike); a route that is still wet means there is none:
         // town life of an ungrouped bot then does not move (the rule picks another goal), a follower goes on through the water.
         if (BotMovement::g_LiquidPathPolicy && path_ok && !(pt & PATHFIND_NOPATH) && path.IsWetRoute()
-            && BotMovement::DecideLiquid(BotMovement::g_LiquidPathPolicy(p_), /*path_wet*/ true, /*dry_found*/ false) == BotMovement::LiquidAction::Refuse)
+            && BotMovement::DecideLiquid(BotMovement::g_LiquidPathPolicy(p_), /*path_wet*/ true, /*dry_found*/ false) == BotMovement::LiquidAction::Refuse
+            && !NoDryWayOut(p_))
         {
             Playerbot::V2::Module::instance().OnPathOutcome(3 /*FarFromPolyEnd*/);
             log_path_fail("Liquid");
-            NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS());
+            NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask), GameTime::GetGameTimeMS());
             return Result::Locked;
         }
 
@@ -2683,7 +3160,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
                 // before. Stamp the LRU so wander doesn't re-probe every tick.
                 Playerbot::V2::Module::instance().OnPathOutcome(3 /*FarFromPolyEnd*/);
                 log_path_fail("Submerged");
-                NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
+                NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask),
                              GameTime::GetGameTimeMS());
                 return Result::Locked;
             }
@@ -2921,6 +3398,7 @@ bool API::TryTerrainWalkFallback(float x, float y, float z, bool run)
     const float tgtY  = sy + (dy / dist) * reach;
 
     int const steps = std::max(2, int(reach / kSampleStep));
+    float prevX = sx, prevY = sy;
     float prevZ = sz;
     float endZ  = sz;
     for (int i = 1; i <= steps; ++i)
@@ -2955,12 +3433,30 @@ bool API::TryTerrainWalkFallback(float x, float y, float z, bool run)
         // shared helper. A skim sample that lands in magma/slime or in water
         // deep enough to submerge the bot is refused (hazard / drown); wading
         // depth is fine.
-        if (BotMovement::IsLiquidImpassableForWalk(
-                BotMovement::ClassifyDestinationLiquid(p_, px, py, g)))
+        BotMovement::LiquidVerdict const tw_lv = BotMovement::ClassifyDestinationLiquid(p_, px, py, g);
+        if (BotMovement::IsLiquidImpassableForWalk(tw_lv))
         {
             tw_log("refuse:hazard", px, py, g);            // hazard / drown
             return false;
         }
+        // A bot that keeps out of liquid (a capital's town bots, see g_LiquidPathPolicy) does not skim into wading water either: the
+        // skim ignores the navmesh, so it would walk them off a quay into a canal.
+        if (tw_lv != BotMovement::LiquidVerdict::Dry && BotMovement::g_LiquidPathPolicy
+            && BotMovement::g_LiquidPathPolicy(p_) != BotMovement::LiquidPolicy::None)
+        {
+            tw_log("refuse:water", px, py, g);
+            return false;
+        }
+        // Nothing stands across the step: the height probe alone passes a wall whose top is near the bot's level. The Hall of Thanes
+        // mage skimmed 16 y from the floor (z 500) onto geometry at z 501.6 that a probe from 3 y above did not find, and was below the
+        // hall at z 7 two seconds later.
+        if (!BotMovement::LineIsClear(p_, prevX, prevY, prevZ + 1.5f, px, py, g + 1.5f))
+        {
+            tw_log("refuse:blocked", px, py, g);
+            return false;
+        }
+        prevX = px;
+        prevY = py;
         prevZ = g;
         if (i == steps) endZ = g;                          // validated ground at the segment end
     }
@@ -2972,6 +3468,70 @@ bool API::TryTerrainWalkFallback(float x, float y, float z, bool run)
         p_->SetWalk(!run);
     p_->GetMotionMaster()->MovePoint(0, tgtX, tgtY, endZ, /*generatePath*/ false);
     tw_log("skim", tgtX, tgtY, endZ);
+    return true;
+}
+
+bool API::TrySwimLeg(float x, float y, float z, bool run)
+{
+    Map* mm = p_->GetMap();
+    if (!mm)
+        return false;
+    // A bot that keeps out of liquid (a capital's town bots) never swims on purpose.
+    if (BotMovement::g_LiquidPathPolicy && BotMovement::g_LiquidPathPolicy(p_) != BotMovement::LiquidPolicy::None)
+        return false;
+
+    // Longer than a pool or a flooded hall: that is a trip for the router, not one straight swim.
+    constexpr float kMaxLeg = 40.0f;
+    constexpr float kSampleStep = 2.0f;
+    float const sx = p_->GetPositionX(), sy = p_->GetPositionY(), sz = p_->GetPositionZ();
+    float const dx = x - sx, dy = y - sy, dz = z - sz;
+    float const len = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 1.0f || len > kMaxLeg)
+        return false;
+
+    // In water at a point: water or ocean only (magma and slime are never swum), below the surface or on it. A bot that crossed the
+    // water on the navmesh stands on the surface polygons, at the liquid's level or a little above it (the Blackfathom mage at z -57.4,
+    // the surface polygon at -57.9), so a yard above the level still counts; a bridge over the water does not.
+    float const collisionHeight = std::max(p_->GetCollisionHeight(), DEFAULT_COLLISION_HEIGHT);
+    auto in_water = [&](float px, float py, float pz) -> bool
+    {
+        LiquidData liq{};
+        ZLiquidStatus const zs = mm->GetLiquidStatus(p_->GetPhaseShift(), px, py, pz,
+            map_liquidHeaderTypeFlags::Water | map_liquidHeaderTypeFlags::Ocean, &liq, collisionHeight);
+        return zs != LIQUID_MAP_NO_WATER && pz <= liq.level + 1.0f;
+    };
+    if (!in_water(sx, sy, sz) || !in_water(x, y, z))
+        return false;
+
+    // Every point of the line is in the water and not under the floor, and no wall, rock or door stands across it.
+    int const steps = std::max(2, int(len / kSampleStep));
+    for (int i = 1; i < steps; ++i)
+    {
+        float const t = float(i) / float(steps);
+        float const px = sx + dx * t, py = sy + dy * t, pz = sz + dz * t;
+        if (!in_water(px, py, pz))
+            return false;
+        float const g = mm->GetHeight(p_->GetPhaseShift(), px, py, pz + 1.0f, /*vmap*/ true, 10.0f);
+        if (g > INVALID_HEIGHT && g > pz + 0.5f)
+            return false;
+    }
+    float const mid = collisionHeight * 0.5f;
+    if (!BotMovement::LineIsClear(p_, sx, sy, sz + mid, x, y, z + mid))
+        return false;
+
+    if (p_->IsWalking() == run)
+        p_->SetWalk(!run);
+    p_->GetMotionMaster()->MovePoint(0, x, y, z, /*generatePath*/ false);
+
+    static std::unordered_map<uint64, uint32> s_swimLogAt;
+    uint32 const now = GameTime::GetGameTimeMS();
+    uint32& at = s_swimLogAt[p_->GetGUID().GetCounter()];
+    if (at == 0 || now - at >= 5000u)
+    {
+        at = now ? now : 1u;
+        TC_LOG_INFO("playerbot.v2", "[swim_leg] {} swims ({:.1f},{:.1f},{:.1f}) -> ({:.1f},{:.1f},{:.1f}), {:.1f} y, no route through the water",
+                    p_->GetName(), sx, sy, sz, x, y, z, len);
+    }
     return true;
 }
 
@@ -3047,6 +3607,10 @@ bool API::TryBgDescentCrawl(float x, float y, float z, bool run)
 Result API::stop_movement(bool clear_generators)
 {
     if (!p_) return Result::Other;
+    // Not in the air after a ledge drop or leap: a stop there halts the jump spline and leaves the bot hanging short of the landing
+    // (WSG soak on 247: the battleground mount rule stops a moving bot, and Jacelia's drop ended in hover_settle 2 s later, twice).
+    if (auto it = s_followDropAir.find(p_->GetGUID().GetCounter()); it != s_followDropAir.end() && GameTime::GetGameTimeMS() < it->second)
+        return Result::Ok;
     if (!clear_generators)
     {
         p_->StopMoving();
@@ -3099,6 +3663,19 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
         return Result::InvalidTarget;
     }
 
+    // A target beyond sight is never attacked, as a player cannot click it. A fight carried over a teleport on the same continent
+    // left hunters chasing a Young Thistle Boar 16 km away for good, still in combat (bots-on test 2026-10-27). Drop it like the
+    // friendly target above.
+    if (!p_->IsWithinDistInMap(tu, p_->GetMap()->GetVisibilityRange()))
+    {
+        if (p_->GetVictim() == tu)
+        {
+            p_->AttackStop();
+            p_->SetSelection(ObjectGuid::Empty);
+        }
+        return Result::InvalidTarget;
+    }
+
     // A mounted player cannot attack (Unit::Attack returns false), so a bot riding past an enemy emitted start_attack every
     // tick and nothing happened: bots ran past each other mounted in WSG (playtest, 2026-10-08). Like a real player who clicks
     // an enemy, the bot gets off its mount first.
@@ -3137,6 +3714,17 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
             p_->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
     };
 
+    // Auto Shot's minimum and maximum against this mob, from the same function the core's range check uses (Spell::CalcMinMaxRange): the caster's
+    // and the mob's combat reach, the range entry and the ranged weapon's range modifier. Estimating them here left a hunter standing 9-11 y from a
+    // mob, shot refused OUT_OF_RANGE on every try, and not knowing it was inside the zone (PC 20 Oct, Halorio on Blackhand trash).
+    auto autoShotRange = [&](Unit const* target) -> std::optional<SpellRange>
+    {
+        SpellInfo const* shot = sSpellMgr->GetSpellInfo(75, DIFFICULTY_NONE);
+        if (!shot || !shot->RangeEntry)
+            return std::nullopt;
+        return Spell::CalcMinMaxRange(p_, target, false, shot, true);
+    };
+
     auto ensureAutoShot = [&](Unit* victim)
     {
         constexpr uint32 AUTO_SHOT = 75;
@@ -3157,9 +3745,9 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
                 // Inside Auto Shot's minimum range the hunter fights in melee (hunter_dead_zone below), and the repeat is held there by
                 // design: only a hold outside that range is worth a line.
                 bool in_min_range = false;
-                if (check == SPELL_FAILED_OUT_OF_RANGE)
-                    if (SpellInfo const* shot = sSpellMgr->GetSpellInfo(75, DIFFICULTY_NONE); shot && shot->RangeEntry)
-                        in_min_range = p_->GetExactDist(victim) < shot->GetMinRange(false) + (shot->RangeEntry->Flags & SPELL_RANGE_RANGED ? p_->GetMeleeRange(victim) : 0.0f) + 1.0f;
+                std::optional<SpellRange> const shot_range = autoShotRange(victim);
+                if (check == SPELL_FAILED_OUT_OF_RANGE && shot_range)
+                    in_min_range = p_->GetExactDist(victim) < shot_range->Min + 1.0f;
                 if (check != SPELL_CAST_OK && check != SPELL_FAILED_DONT_REPORT && !in_min_range)
                 {
                     static std::mutex sHeldLogMutex;
@@ -3178,8 +3766,8 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
                         }
                     }
                     if (log_now)
-                        TC_LOG_INFO("playerbot.v2", "[autoshot_held] {} on {}: check {} dist {:.1f} moving {} in_front {} los {} ammo {} count {}", p_->GetName(), victim->GetName(),
-                            uint32(check), p_->GetExactDist(victim), int(p_->isMoving()), int(p_->HasInArc(static_cast<float>(M_PI), victim)),
+                        TC_LOG_INFO("playerbot.v2", "[autoshot_held] {} on {}: check {} dist {:.1f} min {:.1f} max {:.1f} moving {} in_front {} los {} ammo {} count {}", p_->GetName(), victim->GetName(),
+                            uint32(check), p_->GetExactDist(victim), shot_range ? shot_range->Min : -1.0f, shot_range ? shot_range->Max : -1.0f, int(p_->isMoving()), int(p_->HasInArc(static_cast<float>(M_PI), victim)),
                             int(p_->IsWithinLOSInMap(victim)), p_->GetAmmoId(), p_->GetAmmoId() ? p_->GetItemCount(p_->GetAmmoId()) : 0u);
                     // Facing is the one cause the bot can mend here: it never turns between shots, a client's player does.
                     if (check == SPELL_FAILED_UNIT_NOT_INFRONT)
@@ -3218,8 +3806,11 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
                 }
             }
             if (log_now)
-                TC_LOG_INFO("playerbot.v2", "[autoshot_fail] {} on {}: result {} dist {:.1f} ammo {} count {}", p_->GetName(), victim->GetName(), uint32(shot),
-                    p_->GetExactDist(victim), p_->GetAmmoId(), p_->GetAmmoId() ? p_->GetItemCount(p_->GetAmmoId()) : 0u);
+            {
+                std::optional<SpellRange> const shot_range = autoShotRange(victim);
+                TC_LOG_INFO("playerbot.v2", "[autoshot_fail] {} on {}: result {} dist {:.1f} min {:.1f} max {:.1f} ammo {} count {}", p_->GetName(), victim->GetName(), uint32(shot),
+                    p_->GetExactDist(victim), shot_range ? shot_range->Min : -1.0f, shot_range ? shot_range->Max : -1.0f, p_->GetAmmoId(), p_->GetAmmoId() ? p_->GetItemCount(p_->GetAmmoId()) : 0u);
+            }
         }
     };
 
@@ -3264,21 +3855,66 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
     // hunter that neither shoots nor swings stands and lets it kill the group. Inside it the hunter fights in melee, like a player closing in.
     bool hunter_dead_zone = false;
     if (p_->GetClass() == CLASS_HUNTER)
-        if (SpellInfo const* shot = sSpellMgr->GetSpellInfo(75, DIFFICULTY_NONE); shot && shot->RangeEntry)
-        {
-            float shot_min = shot->GetMinRange(false);
-            if (shot->RangeEntry->Flags & SPELL_RANGE_RANGED)
-                shot_min += p_->GetMeleeRange(tu);
-            hunter_dead_zone = p_->GetExactDist(tu) < shot_min + 1.0f;
-        }
+        if (std::optional<SpellRange> const shot_range = autoShotRange(tu))
+            hunter_dead_zone = p_->GetExactDist(tu) < shot_range->Min + 1.0f;
     const bool ranged_hunter_engage =
         p_->GetClass() == CLASS_HUNTER &&
         !hunter_dead_zone &&
-        ::Playerbot::Classic::EffectiveSpecId(p_) != uint32(ChrSpecialization::HunterSurvival) &&
+        // Vanilla Survival shoots like the other two specs; only the retail table makes it the melee one.
+        (::Playerbot::IsVanillaRealm() || ::Playerbot::Classic::EffectiveSpecId(p_) != uint32(ChrSpecialization::HunterSurvival)) &&
         p_->GetWeaponForAttack(RANGED_ATTACK, true) != nullptr &&
         // With nothing to shoot the hunter fights in melee, like a player without arrows: Auto Shot would be refused every time.
         (!p_->NeedsAmmo() || (p_->AutoSelectAmmo(), p_->GetAmmoId() != 0 && p_->HasItemCount(p_->GetAmmoId())));
     const bool melee_swing = !ranged_hunter_engage && !physical_avoided;
+    // Every chase a hunter is given, with the distance and the shooting state it was given at (159: hunters put back at 24 y were 3.5 y from the dummy
+    // by the next check, and nothing in the log said who sent them in). One line a bot per 2 s.
+    auto logHunterChase = [&](char const* site)
+    {
+        if (p_->GetClass() != CLASS_HUNTER)
+            return;
+        static std::mutex sChaseLogMutex;
+        static std::unordered_map<uint64, uint32> sChaseLog;
+        uint32 const now = getMSTime();
+        {
+            std::lock_guard<std::mutex> lock(sChaseLogMutex);
+            if (sChaseLog.size() > 4096)
+                sChaseLog.clear();
+            uint32& last = sChaseLog[p_->GetGUID().GetCounter()];
+            if (last && now - last < 2000u)
+                return;
+            last = now;
+        }
+        TC_LOG_INFO("playerbot.v2", "[hunter_chase] {} on {}: {} dist {:.1f} dead_zone {} ranged_engage {} melee_swing {}", p_->GetName(), tu->GetName(), site, p_->GetExactDist(tu), int(hunter_dead_zone), int(ranged_hunter_engage), int(melee_swing));
+    };
+    if (p_->GetClass() == CLASS_HUNTER && !ranged_hunter_engage)
+    {
+        // Why a hunter engages in melee (157: Raptor Strike and white swings against the dummy while the harness had it 15 y away): every
+        // condition of the ranged engage, once per 5 s per hunter.
+        static std::mutex sMeleeLogMutex;
+        static std::unordered_map<uint64, uint32> sMeleeLog;
+        uint32 const now = getMSTime();
+        bool log_now = false;
+        {
+            std::lock_guard<std::mutex> lock(sMeleeLogMutex);
+            if (sMeleeLog.size() > 4096)
+                sMeleeLog.clear();
+            uint32& last = sMeleeLog[p_->GetGUID().GetCounter()];
+            if (!last || now - last > 5000u)
+            {
+                last = now;
+                log_now = true;
+            }
+        }
+        if (log_now)
+        {
+            Item const* ranged = p_->GetWeaponForAttack(RANGED_ATTACK, true);
+            Item const* equipped = p_->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+            TC_LOG_INFO("playerbot.v2", "[hunter_melee_engage] {} on {}: dist {:.1f} dead_zone {} spec {} usable_ranged_weapon {} equipped_ranged {} needs_ammo {} ammo_id {} ammo_count {} physical_avoided {} los {}",
+                p_->GetName(), tu->GetName(), p_->GetExactDist(tu), int(hunter_dead_zone), ::Playerbot::Classic::EffectiveSpecId(p_), ranged ? ranged->GetEntry() : 0u,
+                equipped ? equipped->GetEntry() : 0u, int(p_->NeedsAmmo()), p_->GetAmmoId(), p_->GetAmmoId() ? p_->GetItemCount(p_->GetAmmoId()) : 0u,
+                int(physical_avoided), int(p_->IsWithinLOSInMap(tu)));
+        }
+    }
 
     if (p_->GetVictim() == tu)
     {
@@ -3298,14 +3934,14 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
         // fight turns to melee, but this path never chased again: the hunter stood a few yards off, unable to shoot or swing (Isane, 2026-10-20).
         // Close in once it stands still; a hunter already walking keeps its chase.
         if (p_->GetClass() == CLASS_HUNTER && hunter_dead_zone && melee_swing && p_->movespline->Finalized() && !p_->IsWithinMeleeRange(tu))
-            p_->GetMotionMaster()->MoveChase(tu);
+            { p_->GetMotionMaster()->MoveChase(tu); logHunterChase("dead_zone_close_in"); }
         // The opening engage chases once; another layer's move (formation slot, follow) replaces that chase and this path never issued it
         // again, so a hunter ordered at a mob beyond its shooting range stood in the aim pose for good (PC 20 Oct, whelp ~30+ y away).
         // Take the chase up again whenever the bot is not chasing and the mob is out of its 28 y shooting spot.
         else if (p_->GetClass() == CLASS_HUNTER && ranged_hunter_engage && p_->GetExactDist(tu) > 28.0f &&
                  !(tu->IsCreature() && !tu->IsInCombat() && !tu->GetVictim() && p_->GetGroup() && p_->GetMap()->Instanceable()) &&   // an idle mob in an instance: see below
                  p_->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
-            p_->GetMotionMaster()->MoveChase(tu, ChaseRange(0.0f, 28.0f));
+            { p_->GetMotionMaster()->MoveChase(tu, ChaseRange(0.0f, 28.0f)); logHunterChase("ranged_28"); }
         return Result::Ok;
     }
 
@@ -3365,7 +4001,7 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
             // check instead of class check; pre-L10 (spec None) hunters
             // default to ranged, which matches their Steady Shot kit.
             is_pure_caster =
-                ::Playerbot::Classic::EffectiveSpecId(p_) != uint32(ChrSpecialization::HunterSurvival) && ranged_hunter_engage;   // melee fallback: close in
+                (::Playerbot::IsVanillaRealm() || ::Playerbot::Classic::EffectiveSpecId(p_) != uint32(ChrSpecialization::HunterSurvival)) && ranged_hunter_engage;   // melee fallback: close in
             break;
         case CLASS_EVOKER:
             // Evoker is pure-caster like Mage/Hunter (no melee spec Ã¢Â€Â”
@@ -3434,11 +4070,21 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
         // MaxRange=28 still keeps the bot inside Frostbolt / Shadow Bolt /
         // Steady Shot's 30y range with a small safety margin; Evoker
         // (25y range baseline) gets a tighter 23y to stay in range.
-        const float max_chase = is_short_range_caster ? 23.0f : 28.0f;
+        // 28 stopped the 167 warlock at 29.2 y: the chase range is edge to edge (the combat reaches come on top), so the bot stood at the edge of
+        // the 30 y cast range, where a step of the dummy or a wobble put it out of range. 25 puts it at about 26-27 y.
+        // Mind Flay and Earth Shock reach 20 y, not 30: the shadow priest and the elemental shaman stood at 27.5 y (190: 25 plus the combat reaches),
+        // so their rotation's channel and shock were never in range (no Mind Flay in the t1 and buffed legs) and only the 30 y spells fired.
+        ChrSpecialization const caster_spec = ChrSpecialization(::Playerbot::Classic::EffectiveSpecId(p_));
+        bool const twenty_yard_rotation = caster_spec == ChrSpecialization::PriestShadow || caster_spec == ChrSpecialization::ShamanElemental;
+        const float max_chase = is_short_range_caster ? 21.0f : twenty_yard_rotation ? (caster_spec == ChrSpecialization::ShamanElemental ? 13.0f : 16.0f) : 25.0f;   // the elemental also keeps the victim inside Searing Totem's 18 y
         p_->GetMotionMaster()->MoveChase(tu, ChaseRange(0.0f, max_chase));
+        logHunterChase("opening_ranged");
     }
     else
+    {
         p_->GetMotionMaster()->MoveChase(tu);
+        logHunterChase("opening_melee");
+    }
     return Result::Ok;
 }
 
@@ -3585,6 +4231,9 @@ Result API::mount(uint32 mount_id)
     if (p_->IsInCombat()) return Result::Locked;
     if (p_->IsMounted())  return Result::Ok;
     if (p_->IsInWater() || p_->IsFlying()) return Result::Locked;
+    // In the air after a ledge drop or leap: the stop below would halt the jump spline mid-flight.
+    if (auto it = s_followDropAir.find(p_->GetGUID().GetCounter()); it != s_followDropAir.end() && GameTime::GetGameTimeMS() < it->second)
+        return Result::Locked;
     // The mount cast is refused while the bot moves (SPELL_FAILED_MOVING): a bot that walks or follows stands still for it.
     if (p_->isMoving())
         p_->StopMoving();
@@ -3620,7 +4269,7 @@ Result API::mount(uint32 mount_id)
         int32 best_speed = -1;
         for (auto const& [sid, ps] : p_->GetSpellMap())
         {
-            if (!ps.active || ps.disabled) continue;
+            if (ps.state == PLAYERSPELL_REMOVED || !ps.active || ps.disabled) continue;
             SpellInfo const* si = sSpellMgr->GetSpellInfo(sid, p_->GetMap()->GetDifficultyID());
             if (!si) continue;
             bool is_mount = false;
@@ -3733,9 +4382,8 @@ Result API::party_chat(std::string const& text)
     if (og) group = og;
     ChatMsg type = group->IsLeader(p_->GetGUID()) ? CHAT_MSG_PARTY_LEADER : CHAT_MSG_PARTY;
 
-    WorldPackets::Chat::Chat packet;
-    packet.Initialize(type, LANG_UNIVERSAL, p_, nullptr, text);
-    group->BroadcastPacket(packet.Write(), false, group->GetMemberGroup(p_->GetGUID()));
+    // Each member reads the line in their own language (BotLanguage.h).
+    BotLanguage::GroupChat(p_, group, type, text, group->GetMemberGroup(p_->GetGUID()));
     return Result::Ok;
 }
 
@@ -3778,6 +4426,71 @@ Result API::near_teleport_to(float x, float y, float z, float o, bool navmesh_po
     return Result::Ok;
 }
 
+Result API::always_buffs(uint8 set, uint8 mask)
+{
+    if (!p_ || set >= kBuffSetCount) return Result::Other;
+    std::string changed;
+    bool const horde = p_->GetTeam() == HORDE;
+    // One row: put on when its kind is on here, taken off when it is off here.
+    auto const row = [&](AlwaysAura const& a)
+    {
+        bool const on = (mask & (a.world ? kAlwaysMaskWorldBuffs : kAlwaysMaskConsumables)) != 0 && (!a.horde_only || horde);
+        for (uint32 id : AlwaysAuraEffects(a))
+        {
+            if (a.kind == AlwaysKind::Stone)
+            {
+                // The temporary enchantment on the main hand (a stone lasts an hour; two here, so it is not renewed every tick).
+                Item* mh = p_->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+                if (!mh) continue;
+                uint32 const now = mh->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+                if (on ? now != 0 : now != id) continue;   // already on / another oil or stone is on / ours is not there to take off
+                p_->ApplyEnchantment(mh, TEMP_ENCHANTMENT_SLOT, false);
+                mh->SetEnchantment(TEMP_ENCHANTMENT_SLOT, on ? id : 0, on ? 2u * 60u * 60u * 1000u : 0u, 0);
+                p_->ApplyEnchantment(mh, TEMP_ENCHANTMENT_SLOT, true);
+                changed += (on ? " +enchant " : " -enchant ") + std::to_string(id);
+            }
+            else if (on)
+            {
+                if (!p_->HasAura(id) && p_->AddAura(id, p_))
+                    changed += " +" + std::to_string(id);
+            }
+            else if (p_->HasAura(id))
+            {
+                p_->RemoveAurasDueToSpell(id);
+                changed += " -" + std::to_string(id);
+            }
+        }
+    };
+    for (AlwaysAura const& a : kWorldBuffs) row(a);
+    for (uint8 b = 0; b < kBuffSetCount; ++b)
+        if (b == set || !(mask & (kAlwaysMaskConsumables | kAlwaysMaskWorldBuffs)))   // the other roles' rows only to strip them
+            for (AlwaysAura const& a : AlwaysBuffRoleRows(BuffSet(b))) row(a);
+    // A real player's own character summoned as a bot (an alt on their account) gets no free gold or repair: each summon put the
+    // alt up to 200 gold for nothing (Discord report 2026-11-08). The server's bots live on the bot pool accounts.
+    bool const players_own = p_->GetSession() && !Services::Accounts().is_pool_account(p_->GetSession()->GetAccountId());
+    if ((mask & kAlwaysMaskRepair) && !players_own)
+    {
+        // Gear never wears out and the bot is never broke: a full repair at no cost, and the gold back up to the floor.
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            if (Item* it = p_->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (*it->m_itemData->MaxDurability && *it->m_itemData->Durability < *it->m_itemData->MaxDurability)
+                {
+                    p_->DurabilityRepairAll(/*takeCost*/ false, 0.0f, /*guildBank*/ false);
+                    changed += " +repair";
+                    break;
+                }
+        uint64 const floor = uint64(kAlwaysGoldFloor) * 10000ull;   // copper per gold
+        if (p_->GetMoney() < floor)
+        {
+            p_->SetMoney(floor);
+            changed += " +gold";
+        }
+    }
+    if (!changed.empty())
+        TC_LOG_INFO("playerbot.v2", "[always_buff] {} mask {}{}", p_->GetName(), uint32(mask), changed);
+    return changed.empty() ? Result::NotKnown : Result::Ok;
+}
+
 Result API::cancel_aura(uint32 spell_id)
 {
     if (!p_) return Result::Other;
@@ -3791,7 +4504,7 @@ Result API::guild_chat(std::string const& text)
     if (!p_ || text.empty()) return Result::Other;
     Guild* guild = p_->GetGuild();
     if (!guild) return Result::Locked;
-    guild->BroadcastToGuild(p_->GetSession(), /*officerOnly*/ false, text, LANG_UNIVERSAL);
+    BotLanguage::GuildSay(p_, guild, /*officer*/ false, text);   // each member reads it in their language
     return Result::Ok;
 }
 
@@ -3800,7 +4513,7 @@ Result API::officer_chat(std::string const& text)
     if (!p_ || text.empty()) return Result::Other;
     Guild* guild = p_->GetGuild();
     if (!guild) return Result::Locked;
-    guild->BroadcastToGuild(p_->GetSession(), /*officerOnly*/ true, text, LANG_UNIVERSAL);
+    BotLanguage::GuildSay(p_, guild, /*officer*/ true, text);   // each member reads it in their language
     return Result::Ok;
 }
 
@@ -3810,6 +4523,26 @@ Result API::toggle_pvp()
     // re-evaluates the actual flag state (zone overrides, sanctuary, etc).
     if (!p_) return Result::Other;
     p_->UpdatePvP(!p_->IsPvP());
+    return Result::Ok;
+}
+
+Result API::set_pvp(bool on)
+{
+    if (!p_) return Result::Other;
+    if (on)
+    {
+        p_->SetPlayerFlag(PLAYER_FLAGS_IN_PVP);
+        p_->RemovePlayerFlag(PLAYER_FLAGS_PVP_TIMER);
+        if (!p_->IsPvP() || p_->pvpInfo.EndTimer)
+            p_->UpdatePvP(true, true);
+    }
+    else if (p_->HasPlayerFlag(PLAYER_FLAGS_IN_PVP))
+    {
+        p_->RemovePlayerFlag(PLAYER_FLAGS_IN_PVP);
+        p_->SetPlayerFlag(PLAYER_FLAGS_PVP_TIMER);
+        if (!p_->pvpInfo.IsHostile && p_->IsPvP())
+            p_->pvpInfo.EndTimer = GameTime::GetGameTime();   // start toggle-off
+    }
     return Result::Ok;
 }
 
@@ -4042,11 +4775,61 @@ Result API::face_target(ObjectGuid target, bool combat)
         ClearStaleMoveFlags(p_);
         if (p_->isMoving() || !p_->movespline->Finalized() || p_->HasUnitState(UNIT_STATE_LOST_CONTROL | UNIT_STATE_STUNNED) ||
             p_->GetCurrentSpell(CURRENT_CHANNELED_SPELL) || p_->HasUnitState(UNIT_STATE_CASTING))
+        {
+            // The caller logs "refaced" for every request it sends, so a bot the core never turns (damage_parity 166: a priest 90 degrees
+            // off its dummy for 3 minutes, 84 "refaced" lines, 5 s of casting) is told apart from a turned one by this line.
+            static std::mutex sLockedLogMutex;
+            static std::unordered_map<uint64, uint32> sLockedLog;
+            uint32 const now = getMSTime();
+            bool log_now = false;
+            {
+                std::lock_guard<std::mutex> lock(sLockedLogMutex);
+                if (sLockedLog.size() > 4096)
+                    sLockedLog.clear();
+                uint32& last = sLockedLog[p_->GetGUID().GetCounter()];
+                if (!last || now - last > 5000u)
+                {
+                    last = now;
+                    log_now = true;
+                }
+            }
+            if (log_now)
+                TC_LOG_INFO("playerbot.v2", "[face_locked] {} cannot be turned to {}: moving {} flags 0x{:X} spline_finalized {} spline_left {} ms generator {} lost_control {} stunned {} channeling {} casting_state {}",
+                            p_->GetName(), u->GetName(), int(p_->isMoving()), uint32(p_->GetUnitMovementFlags()), int(p_->movespline->Finalized()), p_->movespline->timeRemaining(),
+                            int(p_->GetMotionMaster()->GetCurrentMovementGeneratorType()), int(p_->HasUnitState(UNIT_STATE_LOST_CONTROL)), int(p_->HasUnitState(UNIT_STATE_STUNNED)),
+                            int(p_->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr), int(p_->HasUnitState(UNIT_STATE_CASTING)));
             return Result::Locked;
+        }
         float const off = Position::NormalizeOrientation(p_->GetOrientation() - p_->GetAbsoluteAngle(u));
         if (off < 0.1f || off > 2.0f * float(M_PI) - 0.1f)
             return Result::Ok;
+        float const before = p_->GetOrientation();
         p_->SetFacingToPoint(u->GetPosition(), /*force*/ true);
+        // A turn the core accepted but did not apply (damage_parity 189: a priest 90 degrees off its dummy for a whole leg, no refusal logged)
+        // leaves this line behind: the orientation before and after, the bearing wanted and the states that stop a unit turning.
+        float const after_off = Position::NormalizeOrientation(p_->GetOrientation() - p_->GetAbsoluteAngle(u));
+        if (after_off > 0.1f && after_off < 2.0f * float(M_PI) - 0.1f)
+        {
+            static std::mutex sTurnLogMutex;
+            static std::unordered_map<uint64, uint32> sTurnLog;
+            uint32 const now = getMSTime();
+            bool log_now = false;
+            {
+                std::lock_guard<std::mutex> lock(sTurnLogMutex);
+                if (sTurnLog.size() > 4096)
+                    sTurnLog.clear();
+                uint32& last = sTurnLog[p_->GetGUID().GetCounter()];
+                if (!last || now - last > 5000u)
+                {
+                    last = now;
+                    log_now = true;
+                }
+            }
+            if (log_now)
+                TC_LOG_INFO("playerbot.v2", "[face_not_applied] {} asked to face {}: orientation {:.2f} -> {:.2f}, wanted {:.2f}, spline_finalized {} cannot_turn {} root {} on_transport {}",
+                            p_->GetName(), u->GetName(), before, p_->GetOrientation(), p_->GetAbsoluteAngle(u), int(p_->movespline->Finalized()), int(p_->HasUnitState(UNIT_STATE_CANNOT_TURN)), int(p_->HasUnitState(UNIT_STATE_ROOT)),
+                            int(p_->GetTransport() != nullptr));
+        }
         return Result::Ok;
     }
     // Already facing it (within ~0.1 rad) and standing still: nothing to do.
@@ -4098,9 +4881,7 @@ Result API::raid_warning(std::string const& text)
     {
         return Result::Locked;
     }
-    WorldPackets::Chat::Chat packet;
-    packet.Initialize(CHAT_MSG_RAID_WARNING, LANG_UNIVERSAL, p_, nullptr, text);
-    group->BroadcastPacket(packet.Write(), false);
+    BotLanguage::GroupChat(p_, group, CHAT_MSG_RAID_WARNING, text, -1);
     return Result::Ok;
 }
 
@@ -4112,9 +4893,7 @@ Result API::raid_chat(std::string const& text)
     Group* og = p_->GetOriginalGroup();
     if (og) group = og;
     ChatMsg type = group->IsLeader(p_->GetGUID()) ? CHAT_MSG_RAID_LEADER : CHAT_MSG_RAID;
-    WorldPackets::Chat::Chat packet;
-    packet.Initialize(type, LANG_UNIVERSAL, p_, nullptr, text);
-    group->BroadcastPacket(packet.Write(), false);
+    BotLanguage::GroupChat(p_, group, type, text, -1);
     return Result::Ok;
 }
 
@@ -4139,14 +4918,15 @@ inline Language RacialSpokenLanguage(Player const* p)
 Result API::say(std::string const& text)
 {
     if (!p_ || text.empty()) return Result::Other;
-    p_->Say(text, RacialSpokenLanguage(p_));
+    // Player::Say with each listener reading the line in their own language (BotLanguage.h).
+    BotLanguage::SayInRange(p_, CHAT_MSG_SAY, RacialSpokenLanguage(p_), text, sWorld->getFloatConfig(CONFIG_LISTEN_RANGE_SAY));
     return Result::Ok;
 }
 
 Result API::yell(std::string const& text)
 {
     if (!p_ || text.empty()) return Result::Other;
-    p_->Yell(text, RacialSpokenLanguage(p_));
+    BotLanguage::SayInRange(p_, CHAT_MSG_YELL, RacialSpokenLanguage(p_), text, sWorld->getFloatConfig(CONFIG_LISTEN_RANGE_YELL));
     return Result::Ok;
 }
 
@@ -4162,7 +4942,7 @@ Result API::whisper(std::string const& target_name, std::string const& text)
     if (!p_ || target_name.empty() || text.empty()) return Result::Other;
     Player* recipient = ObjectAccessor::FindConnectedPlayerByName(target_name);
     if (!recipient) return Result::InvalidTarget;
-    p_->Whisper(text, LANG_UNIVERSAL, recipient);
+    BotLanguage::Whisper(p_, recipient, text);   // in the recipient's language
     return Result::Ok;
 }
 
@@ -4603,7 +5383,8 @@ Result API::trade_with(ObjectGuid owner, bool gift_ok)
     }
     Player* trader = mine->GetTrader();
     TradeData* his = trader ? trader->GetTradeData() : nullptr;
-    if (!trader || !his || trader->GetGUID() != owner)
+    // A scenario test character's test gear never changes hands (BotAI declines its trades; this is the last gate).
+    if (!trader || !his || trader->GetGUID() != owner || ::Playerbot::Pool::IsScenarioBot(me))
     {
         s_trade_seen.erase(me);
         p_->TradeCancel(true);
@@ -4972,15 +5753,27 @@ Result API::pet_attack(ObjectGuid target)
     }
     Unit* victim = ObjectAccessor::GetUnit(*p_, target);
     if (!victim || !victim->IsAlive()) return Result::InvalidTarget;
-    // PET_ACTION_ATTACK semantics: enable attack mode + start attacking the
-    // selected target. Mirrors what the client emits for the pet bar attack
-    // button.
-    pet->SetReactState(REACT_AGGRESSIVE);
-    pet->GetCharmInfo()->SetIsCommandAttack(true);
-    pet->GetCharmInfo()->SetIsAtStay(false);
-    pet->GetCharmInfo()->SetIsFollowing(false);
-    pet->GetCharmInfo()->SetIsReturning(false);
-    pet->ToCreature()->AI()->AttackStart(victim);
+    // COMMAND_ATTACK semantics, as the pet bar Attack button (PetHandler):
+    // the react state is left alone, so a Passive pet attacks this target
+    // only and goes back to its owner when it dies instead of pulling
+    // whatever is near. A pet on another live target is stopped first, since
+    // PetAI::AttackStart will not switch off a live victim.
+    CharmInfo* ci = pet->GetCharmInfo();
+    if (!ci) return Result::Other;
+    if (pet->GetVictim() != victim || !ci->IsCommandAttack())
+    {
+        if (pet->GetVictim())
+            pet->AttackStop();
+        ci->SetIsCommandAttack(true);
+        ci->SetIsAtStay(false);
+        ci->SetIsFollowing(false);
+        ci->SetIsCommandFollow(false);
+        ci->SetIsReturning(false);
+        if (PetAI* petAI = dynamic_cast<PetAI*>(pet->AI()))
+            petAI->_AttackStart(victim);
+        else
+            pet->AI()->AttackStart(victim);
+    }
     return Result::Ok;
 }
 
@@ -5706,6 +6499,20 @@ bool MakeBagRoom(Player* bot, uint32 min_free)
     return cleared >= want;
 }
 
+uint32 CountBagRot(Player* bot)
+{
+    if (!bot) return 0;
+    bool const bags_tight = CountFreeBagSlots(bot) <= 3;   // sell_trash's kTightBagThreshold
+    uint32 n = 0;
+    bot->ForEachItem(ItemSearchLocation::Inventory, [bot, bags_tight, &n](Item* it)
+    {
+        if (IsBagRot(bot, it, it ? it->GetTemplate() : nullptr, bags_tight))
+            ++n;
+        return ItemSearchCallbackResult::Continue;
+    });
+    return n;
+}
+
 Result API::make_room(uint32 min_free)
 {
     if (!p_) return Result::Other;
@@ -5873,11 +6680,65 @@ static Result UseItemImpl(Player* p, Item* item, ObjectGuid target)
     return Result::Ok;
 }
 
+// Infinite food and water (Api/VirtualSupply.h): the bot has none of the Food / Water rank its recovery rules picked (bags full of
+// gear and quest items), so it eats / drinks without the item: the item's on-use spell, cast like the item would, nothing consumed.
+static Result UseVirtualSupply(Player* p, uint32 item_entry)
+{
+    bool water = false;
+    if (!Classic::UseVirtually(false, Services::Config().classic_class_supplies(),
+                               Classic::IsVirtualRecoveryItem(item_entry, p->GetClass(), uint8(p->GetLevel()), water)))
+        return Result::InvalidTarget;
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item_entry);
+    if (!proto)
+        return Result::InvalidTarget;
+    uint32 spellId = 0;
+    for (ItemEffectEntry const* eff : proto->Effects)
+        if (eff->TriggerType == ITEM_SPELLTRIGGER_ON_USE && eff->SpellID > 0)
+        {
+            spellId = uint32(eff->SpellID);
+            break;
+        }
+    if (!spellId || !sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE))
+        return Result::Other;
+    // A bottle or a loaf has no lockout of its own: a player who is stood up drinks again at once. The food / drink spell cast without
+    // the item kept a cooldown of about a minute, so a drink broken by a step or a pull left the bot unable to drink again for that long
+    // (Violet Hold 2026-11-08: Askara said "need to drink", then failed with NOT_READY every 10 s at 30 % mana and stood about).
+    SpellCastResult const res = p->CastSpell(p, spellId, CastSpellExtraArgs(TRIGGERED_IGNORE_SPELL_AND_CATEGORY_CD));
+    if (res != SPELL_CAST_OK)
+    {
+        // Why a drink without the item did not start (Thorium Point 2026-10-29: two mages logged a drink every 10 s for a minute and
+        // only spirit regen showed in their mana). One line per bot per 10 s.
+        static std::unordered_map<uint64, uint32> s_fail_log;
+        uint32 const now_ms = GameTime::GetGameTimeMS();
+        uint32& last = s_fail_log[p->GetGUID().GetCounter()];
+        if (!last || now_ms - last >= 10000u)
+        {
+            last = now_ms ? now_ms : 1u;
+            TC_LOG_INFO("playerbot.v2", "[supplies] {} cannot {} without the item {}: spell {} cast result {} (stand {} moving {} casting {})",
+                        p->GetName(), water ? "drink" : "eat", item_entry, spellId, uint32(res), uint32(p->GetStandState()),
+                        p->isMoving() ? 1 : 0, p->IsNonMeleeSpellCast(false) ? 1 : 0);
+        }
+        return Result::Locked;
+    }
+    TC_LOG_INFO("playerbot.v2", "[supplies] {} {} without the item: {} ({}), none in the bags ({} free slots)", p->GetName(),
+                water ? "drinks" : "eats", item_entry, proto->GetName(sWorld->GetDefaultDbcLocale()), p->GetFreeInventorySlotCount());
+    return Result::Ok;
+}
+
 Result API::use_item_by_entry(uint32 item_entry, ObjectGuid target)
 {
     if (!p_) return Result::Other;
     if (!p_->IsAlive()) return Result::Locked;
-    return UseItemImpl(p_, p_->GetItemByEntry(item_entry), target);
+    Item* item = p_->GetItemByEntry(item_entry);
+    if (!item && (target.IsEmpty() || target == p_->GetGUID()))
+        return UseVirtualSupply(p_, item_entry);
+    // An item that starts a quest: a player right-clicks it and accepts the quest page that opens. Most of these items have
+    // no on-use spell, so casting one did nothing and the bot never got the quest; take the quest from the item instead.
+    if (item)
+        if (uint32 const startQuest = item->GetTemplate()->GetStartQuest())
+            if (p_->GetQuestStatus(startQuest) == QUEST_STATUS_NONE)
+                return accept_quest(item->GetGUID(), startQuest);
+    return UseItemImpl(p_, item, target);
 }
 
 Result API::use_item_by_slot(uint8 bag, uint8 slot, ObjectGuid target)
@@ -6383,6 +7244,16 @@ Result API::use_game_object(ObjectGuid go_guid)
                     }
         return Result::InvalidTarget;
     }
+    // A chest a player could not click either: despawned, or a quest object (mushroom, flower, crate) for a quest the bot does not
+    // have. A bot opening one took nothing from it, but the object stayed opened with loot made for the bot, and the player who
+    // needed it found it empty (Discord 2026-10-27).
+    if (obj->GetGoType() == GAMEOBJECT_TYPE_CHEST && (!obj->isSpawned() || !obj->ActivateToQuest(p_)))
+        return Result::InvalidTarget;
+    // An herb, ore vein or locked box is a chest whose lock needs a skill: a player casts Herb Gathering, Mining or Pick Lock on it,
+    // and Use() skips that lock. Bots walking past emptied every herb and ore node in the open world with no skill at all, so players
+    // found none (Discord 2026-11-09). A bot never opens one of these by a plain click.
+    if (obj->GetGoType() == GAMEOBJECT_TYPE_CHEST && Playerbot::ChestNeedsSkill(obj->GetGOInfo()))
+        return Result::InvalidTarget;
     // Mounted-restriction check from HandleGameObjectUseOpcode: most GOs
     // refuse interaction while mounted unless flagged UsableMounted.
     if (p_->IsMounted() && !obj->GetGOInfo()->IsUsableMounted())
@@ -6390,7 +7261,10 @@ Result API::use_game_object(ObjectGuid go_guid)
 
     // A battleground flag or banner is not used in a shapeshift form (a bear-form druid stood at the Lumber Mill banner doing nothing,
     // the owner AB 2026-10-11): leave the form first, the next click (the rule re-emits) goes through as a caster.
-    if (p_->InBattleground() && p_->GetShapeshiftForm() != FORM_NONE &&
+    // Only a real shapeshift (druid animal forms, Ghost Wolf) blocks the click; a warrior stance or Stealth does not (SpellInfo::CheckShapeshift).
+    // The log showed warriors (form 17, 18) and rogues (form 30) dropping their stance or stealth for every flag click.
+    SpellShapeshiftFormEntry const* const formInfo = p_->GetShapeshiftForm() != FORM_NONE ? sSpellShapeshiftFormStore.LookupEntry(p_->GetShapeshiftForm()) : nullptr;
+    if (p_->InBattleground() && formInfo && !formInfo->GetFlags().HasFlag(SpellShapeshiftFormFlags::Stance) &&
         (obj->GetGoType() == GAMEOBJECT_TYPE_BUTTON || obj->GetGoType() == GAMEOBJECT_TYPE_GOOBER || obj->GetGoType() == GAMEOBJECT_TYPE_FLAGSTAND ||
          obj->GetGoType() == GAMEOBJECT_TYPE_FLAGDROP || obj->GetGoType() == GAMEOBJECT_TYPE_NEW_FLAG || obj->GetGoType() == GAMEOBJECT_TYPE_NEW_FLAG_DROP ||
          obj->GetGoType() == GAMEOBJECT_TYPE_CAPTURE_POINT))
@@ -6410,6 +7284,9 @@ Result API::use_game_object(ObjectGuid go_guid)
     {
         struct BannerCapture { ObjectGuid go; Position goPos; uint32 startMs = 0; Position pos; uint32 health = 0; uint32 lastDoneMs = 0; };
         static std::unordered_map<ObjectGuid, BannerCapture> s_bannerCapture;
+        // Bots in different battlegrounds run on different map threads.
+        static std::mutex s_bannerCaptureMutex;
+        std::lock_guard<std::mutex> bannerLock(s_bannerCaptureMutex);
         BannerCapture& cap = s_bannerCapture[p_->GetGUID()];
         uint32 const nowMs = GameTime::GetGameTimeMS();
         // A cast already running (the capture spell the object's Use() starts) must never be restarted by a second click: a
@@ -6443,6 +7320,28 @@ Result API::use_game_object(ObjectGuid go_guid)
         bool const sameGo = cap.startMs != 0 && (cap.go == go_guid || cap.goPos.GetExactDist2d(obj) < 3.0f);
         bool const moved = sameGo && p_->GetExactDist2d(cap.pos) > 3.0f;
         bool const hurt = sameGo && p_->GetHealth() < cap.health;
+        // One capper per banner: a team mate already channeling this banner (started under 6 s ago, alive, at the pole) keeps it,
+        // and this bot stays next to it as its guard instead of starting a second channel (soak on 246: three Alliance bots started
+        // the Stables together and broke each other off). The idle rule holds a bot whose click was refused here at the banner.
+        if (!sameGo)
+            for (auto const& [otherGuid, other] : s_bannerCapture)
+            {
+                if (otherGuid == p_->GetGUID() || other.startMs == 0 || nowMs - other.startMs >= 6000u ||
+                    other.goPos.GetExactDist2d(obj) >= 3.0f)
+                    continue;
+                Player const* capper = ObjectAccessor::GetPlayer(*p_, otherGuid);
+                if (!capper || !capper->IsAlive() || capper->GetBGTeam() != p_->GetBGTeam() || capper->GetExactDist2d(obj) > 6.0f)
+                    continue;
+                thread_local std::unordered_map<uint64, uint32> s_guardLogMs;
+                uint32& last = s_guardLogMs[p_->GetGUID().GetCounter()];
+                if (last == 0 || nowMs - last >= 10000u)
+                {
+                    last = nowMs;
+                    TC_LOG_INFO("playerbot.v2", "[bg_capture] {} guards entry={} while {} captures it", p_->GetName(), obj->GetEntry(),
+                                capper->GetName());
+                }
+                return Result::Locked;
+            }
         if (!sameGo || moved || hurt)
         {
             if (sameGo)
@@ -6504,8 +7403,15 @@ Result API::use_game_object(ObjectGuid go_guid)
                 p_->ModifyMoney(loot->gold);
                 loot->gold = 0;
             }
-            p_->SendLootRelease(go_guid);
         }
+        // The real release, as API::loot_corpse does: SendLootRelease alone is only a packet, so a looted chest or quest object
+        // stayed opened (GO_ACTIVATED) and never despawned or respawned; every player who clicked it later got an empty window
+        // (Discord 2026-10-27).
+        WorldSession* sess = p_->GetSession();
+        if (sess && p_->GetLootGUID() == go_guid)
+            sess->DoLootRelease(loot);
+        else
+            p_->SendLootRelease(go_guid);
     }
     return Result::Ok;
 }
@@ -7701,6 +8607,23 @@ Result API::apply_starter_talents()
     return ranks > 0 ? Result::Ok : Result::Locked;
 }
 
+// The trait edges that end at a node, indexed once. sTraitEdgeStore is a sparse array of about 1.4 million slots, and the talent walk below asks for the
+// parents of a node for every refused pick, again after every rank it places and in each recursion: a scan of the whole store each time held the
+// world thread for 60 s when a group of bots logged in together (168 freeze, the hot loop was this scan).
+static std::vector<TraitEdgeEntry const*> const& TraitEdgesInto(int32 nodeId)
+{
+    static std::unordered_map<int32, std::vector<TraitEdgeEntry const*>> byRight;
+    static std::once_flag once;
+    static std::vector<TraitEdgeEntry const*> const none;
+    std::call_once(once, []
+    {
+        for (TraitEdgeEntry const* edge : sTraitEdgeStore)
+            byRight[edge->RightTraitNodeID].push_back(edge);
+    });
+    auto itr = byRight.find(nodeId);
+    return itr != byRight.end() ? itr->second : none;
+}
+
 Result API::apply_classic_talents()
 {
     if (!p_) return Result::Other;
@@ -7712,6 +8635,73 @@ Result API::apply_classic_talents()
     uint32 const spec = ::Playerbot::Classic::EffectiveSpecId(p_);
     auto const build = ::Playerbot::Classic::GetTalentBuild(p_->GetClass(), spec);
     if (build.empty()) return Result::NotKnown;
+
+    // The walk below validates the whole trait config once per rank and per refused pick (TraitMgr::FillOwnedCurrenciesMap and
+    // MeetsTraitCondition each time), which is seconds of world thread for one bot. Companions ask for it on every upkeep and a group of
+    // them logs in together (169 freeze: 60 s), so a bot whose level, specialization and purchased ranks are what its last walk left
+    // is not walked again, and walks that are still needed are spaced by a duty cycle (the caller is told Locked and asks again later).
+    struct TalentWalkState { uint8 level; uint32 spec; uint32 ranks; };
+    static std::mutex s_walkLock;
+    static std::unordered_map<uint64, TalentWalkState> s_walked;
+    static std::atomic<uint32> s_nextWalkMs{ 0 };
+    uint64 const walkKey = p_->GetGUID().GetCounter();
+    {
+        std::lock_guard<std::mutex> lock(s_walkLock);
+        auto const walked = s_walked.find(walkKey);
+        if (walked != s_walked.end() && walked->second.level == uint8(p_->GetLevel()) && walked->second.spec == spec
+            && walked->second.ranks == CountActiveTraitRanks(p_))
+            return Result::Ok;
+    }
+    // Playerbot.ClassicTalents.ApplyOnLogin = 0 (default): a bot that already holds all the points of its level on the build its talents
+    // say it has (171 froze with 17 walks in one second at login) is not walked again; one that changed spec or still has points to place is.
+    static bool const applyOnLogin = sConfigMgr->GetBoolDefault("Playerbot.ClassicTalents.ApplyOnLogin", false, true);
+    if (!applyOnLogin)
+    {
+        uint32 const held = CountActiveTraitRanks(p_);
+        int32 const points = std::max<int32>(0, int32(p_->GetLevel()) - 9);
+        // The bot must hold the build as it is defined now: every pick, in the build's order, up to the points of its level, at the ranks the
+        // build lists. A build definition that changed (talent names corrected to Forever's nodes) or a spec pinned by a scenario fails this
+        // and the bot is walked once; a pick the class trees have no node for cannot be held and does not count against the bot.
+        bool holdsBuild = held > 0 && int32(held) >= points;
+        if (holdsBuild)
+        {
+            UF::TraitConfig const* activeCfg = p_->GetTraitConfig(p_->m_activePlayerData->ActiveCombatTraitConfigID);
+            int32 placed = 0;
+            for (::Playerbot::Classic::TalentPick const& pick : build)
+            {
+                if (placed >= points)
+                    break;
+                if (pick.filler)
+                    continue;
+                placed += pick.ranks;
+                ::Playerbot::Classic::TalentNode const* node = ::Playerbot::Classic::FindTalent(p_, pick.name);
+                if (!node)
+                    continue;
+                int32 rank = 0;
+                for (UF::TraitEntry const& e : activeCfg->Entries)
+                    if (e.TraitNodeID == node->TraitNodeID && e.TraitNodeEntryID == node->TraitNodeEntryID)
+                        rank = e.Rank + e.GrantedRanks;
+                if (rank < std::min<int32>(pick.ranks, node->MaxRanks))
+                {
+                    holdsBuild = false;
+                    break;
+                }
+            }
+        }
+        if (holdsBuild)
+        {
+            std::lock_guard<std::mutex> lock(s_walkLock);
+            s_walked[walkKey] = { uint8(p_->GetLevel()), spec, held };
+            return Result::Ok;
+        }
+    }
+    // At most one walk per world update, whatever the duty cycle says.
+    static std::atomic<uint32> s_lastWalkLoop{ 0 };
+    uint32 const loopNow = World::m_worldLoopCounter.load();
+    if (loopNow == s_lastWalkLoop.load() || int32(getMSTime() - s_nextWalkMs.load()) < 0)
+        return Result::Locked;
+    s_lastWalkLoop.store(loopNow);
+    uint32 const walkStartMs = getMSTime();
 
     // Start from the free (granted) ranks only and buy the build rank by
     // rank. ValidateConfig enforces tier gates and the points the bot's
@@ -7739,18 +8729,126 @@ Result API::apply_classic_talents()
     std::vector<TreeKey> buildTrees;   // the trees the build spends in, in the order it first names them
 
     std::string unresolved;   // build talents the class trees have no node for, by name
-    for (::Playerbot::Classic::TalentPick const& pick : build)
+    std::map<std::string, int32> rankOf;      // pick name -> ranks held when its last visit ended
+    std::map<std::string, int32> refusedBy;   // pick name -> the last LearnResult that stopped its ranks (the reason a talent is missing)
+
+    // ValidateConfig answers from the config and the player alone, and the player does not change during the walk, so a rank it refused stays refused
+    // until another rank is bought. `cfgVersion` counts the ranks bought; a node or pick refused at the current version is not validated again.
+    // Without it fillParents filled every ancestor once per path to it (a node under two parents that share a parent: that one twice, and so on
+    // five levels up), and every refused pick, with its parents, was validated again after each leftover rank. On the 70532 client data (234,
+    // 2026-10-23) the walk held the world thread past the 60 s freeze detector, inside ValidateConfig, when Karrz targeted or cast.
+    uint32 cfgVersion = 0;
+    std::map<int32, uint32> parentsTriedAt;      // node id -> cfgVersion when its parents were last filled
+    std::map<std::string, uint32> pickTriedAt;   // pick name -> cfgVersion when its ranks were last refused
+
+    // Whatever the data, one walk may not hold the world thread longer than this: a walk cut short keeps the ranks it validated, says so once per
+    // class and spec, and the bot is not walked again until its level, spec or ranks change.
+    static uint32 const walkBudgetMs = sConfigMgr->GetIntDefault("Playerbot.ClassicTalents.WalkBudgetMs", 250, true);
+    uint32 validations = 0;
+    bool cutShort = false;
+    auto const overBudget = [&]
+    {
+        if (!cutShort && getMSTimeDiff(walkStartMs, getMSTime()) > walkBudgetMs)
+            cutShort = true;
+        return cutShort;
+    };
+    auto const validate = [&]
+    {
+        ++validations;
+        return TraitMgr::ValidateConfig(cfg, p_);
+    };
+
+    // A talent below another is refused until a parent node is filled to its maximum (ValidateConfig), and a build that takes a
+    // parent only partway (3 of 5) loses everything under it. Buys the parents of a node, and theirs, up to their maximum ranks as
+    // far as ValidateConfig allows; true when at least one rank was bought.
+    // The class trees have edges both ways between two nodes (70532: ten pairs, 104708 <-> 104709 among them). Following one
+    // back to a node still being filled (`path`) found that node's entry before it held a rank and erased it, under the
+    // indexes the callers hold: the walk then wrote ranks past the end of the vector and erased from beyond it, which corrupted
+    // the heap and spun the world thread in memmove until the freeze detector ended it (234, crashes 00:49 and 00:55).
+    std::vector<int32> path;
+    std::vector<TraitMgr::NodeEntryInfo> const configNodes = TraitMgr::GetNodeEntriesForConfig(cfg);
+    std::function<bool(int32, int32)> fillParents = [&](int32 nodeId, int32 depth) -> bool
+    {
+        bool bought = false;
+        if (depth > 4 || overBudget() || std::ranges::find(path, nodeId) != path.end())
+            return false;
+        // Filled already with the config as it stands: the same ranks would be refused again.
+        if (auto [tried, first] = parentsTriedAt.try_emplace(nodeId, cfgVersion); !first)
+        {
+            if (tried->second == cfgVersion)
+                return false;
+            tried->second = cfgVersion;
+        }
+        path.push_back(nodeId);
+        for (TraitEdgeEntry const* edge : TraitEdgesInto(nodeId))
+        {
+            if (overBudget())
+                break;
+            if (std::ranges::find(path, int32(edge->LeftTraitNodeID)) != path.end())
+                continue;
+            auto info = std::ranges::find(configNodes, edge->LeftTraitNodeID, &TraitMgr::NodeEntryInfo::TraitNodeID);
+            if (info == configNodes.end())
+                continue;
+
+            auto itr = std::ranges::find_if(cfg.Entries, [&](WorldPackets::Traits::TraitEntry const& e)
+            {
+                return e.TraitNodeID == info->TraitNodeID && e.TraitNodeEntryID == info->TraitNodeEntryID;
+            });
+            bool const added = itr == cfg.Entries.end();
+            if (added)
+            {
+                WorldPackets::Traits::TraitEntry& entry = cfg.Entries.emplace_back();
+                entry.TraitNodeID = info->TraitNodeID;
+                entry.TraitNodeEntryID = info->TraitNodeEntryID;
+                itr = std::prev(cfg.Entries.end());
+            }
+            size_t const index = size_t(std::distance(cfg.Entries.begin(), itr));
+
+            // the parent's own parents first, or its ranks are refused as well
+            if (cfg.Entries[index].Rank + cfg.Entries[index].GrantedRanks < info->MaxRanks && fillParents(info->TraitNodeID, depth + 1))
+                bought = true;
+            // that call can add entries, but only after this one
+            while (cfg.Entries[index].Rank + cfg.Entries[index].GrantedRanks < info->MaxRanks && !overBudget())
+            {
+                ++cfg.Entries[index].Rank;
+                if (validate() != TraitMgr::LearnResult::Ok)
+                {
+                    --cfg.Entries[index].Rank;
+                    break;
+                }
+                ++cfgVersion;
+                bought = true;
+            }
+            // only the entry this call added: one that was there before belongs to a caller
+            if (added && !cfg.Entries[index].Rank && !cfg.Entries[index].GrantedRanks)
+                cfg.Entries.erase(cfg.Entries.begin() + index);
+        }
+        path.pop_back();
+        return bought;
+    };
+
+    // Buys the pick's ranks as far as ValidateConfig allows; true when at least one rank was bought. `firstVisit` records
+    // the pick's name and tree once (the walk below passes over every pick more than once).
+    auto buyPick = [&](::Playerbot::Classic::TalentPick const& pick, bool firstVisit) -> bool
     {
         ::Playerbot::Classic::TalentNode const* node = ::Playerbot::Classic::FindTalent(p_, pick.name);
         if (!node)
         {
-            if (!unresolved.empty())
-                unresolved += ", ";
-            unresolved += pick.name;
-            continue;
+            if (firstVisit)
+            {
+                if (!unresolved.empty())
+                    unresolved += ", ";
+                unresolved += pick.name;
+            }
+            return false;
         }
-        if (std::ranges::find(buildTrees, treeOf(node->TraitNodeID)) == buildTrees.end())
+        if (firstVisit && std::ranges::find(buildTrees, treeOf(node->TraitNodeID)) == buildTrees.end())
             buildTrees.push_back(treeOf(node->TraitNodeID));
+        if (overBudget())
+            return false;
+        // refused with the config as it stands (its parents tried as well): nothing has been bought since that would let a rank through
+        if (auto tried = pickTriedAt.find(pick.name); tried != pickTriedAt.end() && tried->second == cfgVersion)
+            return false;
 
         auto entryItr = std::ranges::find_if(cfg.Entries, [&](WorldPackets::Traits::TraitEntry const& e)
         {
@@ -7765,18 +8863,48 @@ Result API::apply_classic_talents()
         }
         size_t const entryIndex = size_t(std::distance(cfg.Entries.begin(), entryItr));
 
+        int32 const before = cfg.Entries[entryIndex].Rank;
         int32 const target = std::min<int32>(pick.ranks, node->MaxRanks - cfg.Entries[entryIndex].GrantedRanks);
-        while (cfg.Entries[entryIndex].Rank < target)
+        for (bool parentsTried = false; ; parentsTried = true)
         {
-            ++cfg.Entries[entryIndex].Rank;
-            if (TraitMgr::ValidateConfig(cfg, p_) != TraitMgr::LearnResult::Ok)
+            while (cfg.Entries[entryIndex].Rank < target && !overBudget())
             {
-                --cfg.Entries[entryIndex].Rank;
-                break;
+                ++cfg.Entries[entryIndex].Rank;
+                if (TraitMgr::LearnResult const result = validate(); result != TraitMgr::LearnResult::Ok)
+                {
+                    --cfg.Entries[entryIndex].Rank;
+                    refusedBy[pick.name] = int32(AsUnderlyingType(result));
+                    break;
+                }
+                ++cfgVersion;
+                refusedBy.erase(pick.name);
             }
+            // refused: fill the parent nodes to their maximum once and try the remaining ranks again
+            if (parentsTried || cfg.Entries[entryIndex].Rank >= target || !fillParents(node->TraitNodeID, 0))
+                break;
         }
+        bool const bought = cfg.Entries[entryIndex].Rank > before;
+        if (cfg.Entries[entryIndex].Rank < target)
+            pickTriedAt[pick.name] = cfgVersion;
+        rankOf[pick.name] = cfg.Entries[entryIndex].Rank;
         if (!cfg.Entries[entryIndex].Rank && !cfg.Entries[entryIndex].GrantedRanks)
             cfg.Entries.erase(cfg.Entries.begin() + entryIndex);
+        return bought;
+    };
+
+    // A talent in a deeper tier is refused until the tab holds enough points (ValidateConfig's tier gates), and the build lists
+    // talents in levelling order, so a single walk lost every talent whose tier the earlier picks had not opened yet (the arms
+    // bot ended with no Deep Wounds, Two-Handed Weapon Specialization, Impale or Sweeping Strikes: damage_parity 2026-10-21).
+    // Walk the build again until a pass buys nothing; the fillers come last, with the points left.
+    for (bool filler : { false, true })
+    {
+        for (bool progress = true, firstVisit = true; progress; firstVisit = false)
+        {
+            progress = false;
+            for (::Playerbot::Classic::TalentPick const& pick : build)
+                if (pick.filler == filler && buyPick(pick, firstVisit))
+                    progress = true;
+        }
     }
     // Points the build couldn't place (a name Forever's trees spell differently, a prerequisite it doesn't list) were
     // left unspent: a level 60 paladin sat on 13 of 51 (Celestera, 2026-10-05). Spend the rest down the trees, the one
@@ -7807,11 +8935,23 @@ Result API::apply_classic_talents()
         });
         // One rank per talent per pass, repeated until a pass places nothing: the first tree takes every point it can
         // (its deeper tiers open as it fills) before a point goes to the next one.
-        for (bool placed = true; placed; )
+        // A level L bot has L - 9 points to spend (51 at 60). Every point bought ends the walk below, and the pass that finds nothing
+        // left to place validates every talent of the class once more, so a bot whose points are all spent does not go through it.
+        int32 const pointsForLevel = std::max<int32>(0, int32(p_->GetLevel()) - 9);
+        auto const ranksBought = [&cfg]
+        {
+            int32 total = 0;
+            for (WorldPackets::Traits::TraitEntry const& e : cfg.Entries)
+                total += std::max<int32>(0, e.Rank);
+            return total;
+        };
+        for (bool placed = true; placed && ranksBought() < pointsForLevel && !overBudget(); )
         {
             placed = false;
             for (TraitMgr::NodeEntryInfo const& info : nodes)
             {
+                if (overBudget())
+                    break;
                 auto entryItr = std::ranges::find_if(cfg.Entries, [&](WorldPackets::Traits::TraitEntry const& e)
                 {
                     return e.TraitNodeID == info.TraitNodeID && e.TraitNodeEntryID == info.TraitNodeEntryID;
@@ -7827,9 +8967,19 @@ Result API::apply_classic_talents()
                 if (entryItr->Rank + entryItr->GrantedRanks < info.MaxRanks)
                 {
                     ++entryItr->Rank;
-                    if (TraitMgr::ValidateConfig(cfg, p_) == TraitMgr::LearnResult::Ok)
+                    if (validate() == TraitMgr::LearnResult::Ok)
                     {
+                        ++cfgVersion;
                         placed = true;
+                        // A build talent refused for want of points in its tab (Vengeance, 147) is tried again as each rank lands: the
+                        // leftover points would otherwise take all of what it needs by the time its tier opens.
+                        std::vector<std::string> retry;
+                        for (auto const& [name, result] : refusedBy)
+                            retry.push_back(name);
+                        for (std::string const& name : retry)
+                            for (::Playerbot::Classic::TalentPick const& pick : build)
+                                if (name == pick.name)
+                                    buyPick(pick, false);
                         break;   // restart from the top: the preferred tree's next rank may have just opened
                     }
                     --entryItr->Rank;
@@ -7854,8 +9004,7 @@ Result API::apply_classic_talents()
     for (UF::TraitEntry const& e : active->Entries)
         if (e.Rank > 0)
             current[{ e.TraitNodeID, e.TraitNodeEntryID }] = e.Rank;
-    if (ranksOf(cfg.Entries) == current)
-        return Result::Ok;   // already on the build for this level
+    bool const already = ranksOf(cfg.Entries) == current;   // already on the build for this level
 
     // Ranks per tree, the build's trees first: shows whether the tabs were told apart.
     std::map<TreeKey, int32> perTree;
@@ -7869,9 +9018,119 @@ Result API::apply_classic_talents()
         if (std::ranges::find(buildTrees, tree) == buildTrees.end())
             split += (split.empty() ? "" : "/") + std::to_string(ranks);
 
-    p_->UpdateTraitConfig(std::move(cfg), 0, /*withCastTime*/ false);
-    TC_LOG_INFO("playerbot.api", "[API::talents] {} classic build for spec {} committed: {} ranks, per tree {} (build talents not found: {})",
-        p_->GetName(), spec, CountActiveTraitRanks(p_), split, unresolved.empty() ? "none" : unresolved);
+    // Every talent the walk left ranks in, by name (read before UpdateTraitConfig moves the config): the build's picks and the points the leftover pass
+    // spent. Parity 200 (fire mage 575 against 743) had the same auras up as 184 and nothing to say which ranks differed.
+    std::string heldRanks;
+    if (!already && p_->GetLevel() >= 60)
+        for (std::string const& n : ::Playerbot::Classic::ListTalentNames(p_))
+            if (::Playerbot::Classic::TalentNode const* node = ::Playerbot::Classic::FindTalent(p_, n))
+                for (WorldPackets::Traits::TraitEntry const& e : cfg.Entries)
+                    if (e.Rank > 0 && e.TraitNodeID == node->TraitNodeID && e.TraitNodeEntryID == node->TraitNodeEntryID)
+                        heldRanks += fmt::format("{}{}={}/{}", heldRanks.empty() ? "" : ", ", n, e.Rank, node->MaxRanks);
+
+    if (!already)
+        p_->UpdateTraitConfig(std::move(cfg), 0, /*withCastTime*/ false);
+    if (!unresolved.empty() && p_->GetLevel() >= 60)
+    {
+        // once per class and process: the names the client data gives this class's talents, to correct the build's
+        static std::mutex s_namesLock;
+        static std::set<uint8> s_namesLogged;
+        std::lock_guard lock(s_namesLock);
+        if (s_namesLogged.insert(p_->GetClass()).second)
+        {
+            std::string all;
+            // with each node's row, the ranks this bot holds and the nodes it hangs under, so a build can be mapped onto the tab
+            for (std::string const& n : ::Playerbot::Classic::ListTalentNames(p_))
+            {
+                std::string info;
+                if (::Playerbot::Classic::TalentNode const* node = ::Playerbot::Classic::FindTalent(p_, n))
+                {
+                    TraitNodeEntry const* tn = sTraitNodeStore.LookupEntry(node->TraitNodeID);
+                    int32 held = 0;
+                    for (WorldPackets::Traits::TraitEntry const& e : cfg.Entries)
+                        if (e.TraitNodeID == node->TraitNodeID && e.TraitNodeEntryID == node->TraitNodeEntryID)
+                            held = e.Rank;
+                    std::string parents;
+                    for (TraitEdgeEntry const* edge : TraitEdgesInto(node->TraitNodeID))
+                        parents += (parents.empty() ? "" : "+") + std::to_string(edge->LeftTraitNodeID) + "t" + std::to_string(edge->Type);
+                    info = fmt::format("[{} y{} {}/{}{}{}]", node->TraitNodeID, tn ? tn->PosY : -1, held, node->MaxRanks, parents.empty() ? "" : " under ", parents);
+                }
+                all += (all.empty() ? "" : ", ") + n + info;
+            }
+            TC_LOG_INFO("playerbot.api", "[API::talents] class {} talent names in the client data: {}", uint32(p_->GetClass()), all);
+        }
+    }
+    std::string refused;   // build talents left short of their ranks, with ValidateConfig's LearnResult
+    for (auto const& [name, result] : refusedBy)
+        refused += (refused.empty() ? "" : ", ") + name + "=" + std::to_string(result) + " (holds " + std::to_string(rankOf.contains(name) ? rankOf[name] : 0) + ")";
+    // The detail walks the edge store per refused talent: once per class and spec, and only for a bot with every point (a levelling bot's
+    // refusals are its level; build 171 hung the world thread for 60 s with the lines written for every bot of the roster).
+    static std::mutex s_detailLock;
+    static std::set<uint32> s_detailLogged;
+    bool logDetail = false;
+    if (!refusedBy.empty() && p_->GetLevel() >= 60)
+    {
+        std::lock_guard lock(s_detailLock);
+        logDetail = s_detailLogged.insert(uint32(p_->GetClass()) << 16 | spec).second;
+    }
+    if (logDetail)
+    {
+        // Where each build pick sits and what it holds, to see which tab's points the refused one is waiting for: node id, the currencies
+        // its tab spends (Forever's three tabs share one tree and differ by currency), the posY row, and the ranks held.
+        std::string detail;
+        for (::Playerbot::Classic::TalentPick const& pick : build)
+            if (::Playerbot::Classic::TalentNode const* node = ::Playerbot::Classic::FindTalent(p_, pick.name))
+            {
+                std::string currencies;
+                for (int32 c : std::get<2>(treeOf(node->TraitNodeID)))
+                    currencies += (currencies.empty() ? "" : "+") + std::to_string(c);
+                TraitNodeEntry const* tn = sTraitNodeStore.LookupEntry(node->TraitNodeID);
+                int32 held = 0;
+                for (WorldPackets::Traits::TraitEntry const& e : cfg.Entries)
+                    if (e.TraitNodeID == node->TraitNodeID && e.TraitNodeEntryID == node->TraitNodeEntryID)
+                        held = e.Rank;
+                detail += fmt::format("{}{}[node {} cur {} y {} {}/{}]", detail.empty() ? "" : ", ", pick.name, node->TraitNodeID, currencies, tn ? tn->PosY : -1, held, node->MaxRanks);
+            }
+        TC_LOG_INFO("playerbot.api", "[API::talents] refused detail: {}", detail);
+        // The nodes a refused pick hangs under: ValidateConfig refuses it (LearnResult 2) until a RequiredForAvailability parent is full.
+        for (auto const& [name, result] : refusedBy)
+            if (::Playerbot::Classic::TalentNode const* node = ::Playerbot::Classic::FindTalent(p_, name))
+            {
+                std::string parents;
+                for (TraitEdgeEntry const* edge : TraitEdgesInto(node->TraitNodeID))
+                {
+                    auto info = std::ranges::find(configNodes, edge->LeftTraitNodeID, &TraitMgr::NodeEntryInfo::TraitNodeID);
+                    int32 held = 0;
+                    for (WorldPackets::Traits::TraitEntry const& e : cfg.Entries)
+                        if (info != configNodes.end() && e.TraitNodeID == info->TraitNodeID && e.TraitNodeEntryID == info->TraitNodeEntryID)
+                            held = e.Rank + e.GrantedRanks;
+                    parents += fmt::format("{}node {} edge type {} {}/{}", parents.empty() ? "" : ", ", edge->LeftTraitNodeID, edge->Type, held,
+                                           info != configNodes.end() ? info->MaxRanks : -1);
+                }
+                TC_LOG_INFO("playerbot.api", "[API::talents] refused {} (node {}) has parents: {}", name, node->TraitNodeID, parents.empty() ? "none" : parents);
+            }
+    }
+    TC_LOG_INFO("playerbot.api", "[API::talents] {} classic build for spec {} {}: {} ranks, per tree {} (build talents not found: {}; refused: {})",
+        p_->GetName(), spec, already ? "already in place" : "committed", CountActiveTraitRanks(p_), split, unresolved.empty() ? "none" : unresolved, refused.empty() ? "none" : refused);
+    if (!heldRanks.empty())
+        TC_LOG_INFO("playerbot.api", "[API::talents] {} spec {} holds: {}", p_->GetName(), spec, heldRanks);
+    {
+        static std::mutex s_cutLock;
+        static std::set<uint32> s_cutLogged;
+        std::lock_guard lock(s_cutLock);
+        if (cutShort && s_cutLogged.insert(uint32(p_->GetClass()) << 16 | spec).second)
+            TC_LOG_ERROR("playerbot.api", "[API::talents] {} classic build for spec {} cut short after {} ms and {} validations ({} ranks placed, budget "
+                "Playerbot.ClassicTalents.WalkBudgetMs = {}): the class trees make the walk too long", p_->GetName(), spec,
+                getMSTimeDiff(walkStartMs, getMSTime()), validations, CountActiveTraitRanks(p_), walkBudgetMs);
+    }
+    {
+        uint32 const now = getMSTime();
+        s_nextWalkMs.store(now + 3 * getMSTimeDiff(walkStartMs, now));
+        std::lock_guard<std::mutex> lock(s_walkLock);
+        if (s_walked.size() > 8192)
+            s_walked.clear();
+        s_walked[walkKey] = { uint8(p_->GetLevel()), spec, CountActiveTraitRanks(p_) };
+    }
     return CountActiveTraitRanks(p_) > 0 ? Result::Ok : Result::Locked;
 }
 
@@ -7906,8 +9165,56 @@ Result API::restock_class_supplies()
         if (s_supplyReasonLogged.insert(key).second)
             TC_LOG_INFO("playerbot.v2", "[supplies] {} gets no {} (item {}): {} ({})", p_->GetName(), f.name, item, why, detail);
     };
-    for (Classic::SupplyFamily const& f : Classic::GetSupplyFamilies())
+    // Food and drink first, and room made for them (JunkDrop.h PickRoomForSupply): bots have endless supplies, and the families were
+    // stocked in table order, so reagents and potions took the last free slots and a healer with full bags got no water at all
+    // (deadmines_full on 0.1.23: "Scnpriest gets no Water: no room in the bags", then healer_no_rest and healer_oom).
+    auto const essential = [](Classic::SupplyFamily const& f)
+    { return std::string_view(f.name) == "Food" || std::string_view(f.name) == "Water"; };
+    // Spare: the shared consumables (potions, Demonic Runes, bandages), never a class tool or reagent (totems, shards, poisons).
+    auto const spare_supply = [&](uint32 entry)
     {
+        for (Classic::SupplyFamily const& f : Classic::GetSupplyFamilies())
+            if (!essential(f) && f.cls == 0)
+                for (Classic::SupplyRank const& r : f.ranks)
+                    if (r.item == entry)
+                        return true;
+        return false;
+    };
+    // Destroys one grey, else one spare supply stack, to make room; false when nothing may go.
+    auto const make_room = [&](Classic::SupplyFamily const& f, uint32 entry)
+    {
+        std::vector<JunkCandidate> cands;
+        std::vector<Item*> cand_items;
+        p_->ForEachItem(ItemSearchLocation::Inventory, [&](Item* bi)
+        {
+            ItemTemplate const* bt = bi ? bi->GetTemplate() : nullptr;
+            if (bt && !bi->IsBag() && bi->GetEntry() != entry)
+            {
+                cands.push_back({ uint64(bt->GetSellPrice()) * bi->GetCount(), bt->GetQuality() == ITEM_QUALITY_POOR,
+                    bt->GetClass() == ITEM_CLASS_QUEST, spare_supply(bi->GetEntry()) });
+                cand_items.push_back(bi);
+            }
+            return ItemSearchCallbackResult::Continue;
+        });
+        std::size_t const v = PickRoomForSupply(cands);
+        if (v == kNoJunk)
+            return false;
+        Item* victim = cand_items[v];
+        TC_LOG_INFO("playerbot.v2", "[supplies] {} destroys item {} x{} ({}) to make room for {} (item {})", p_->GetName(), victim->GetEntry(),
+            victim->GetCount(), cands[v].poor ? "grey" : "spare supply", f.name, entry);
+        p_->DestroyItem(victim->GetBagSlot(), victim->GetSlot(), true);
+        return true;
+    };
+    std::vector<Classic::SupplyFamily const*> families;
+    for (Classic::SupplyFamily const& f : Classic::GetSupplyFamilies())
+        if (essential(f))
+            families.push_back(&f);
+    for (Classic::SupplyFamily const& f : Classic::GetSupplyFamilies())
+        if (!essential(f))
+            families.push_back(&f);
+    for (Classic::SupplyFamily const* fp : families)
+    {
+        Classic::SupplyFamily const& f = *fp;
         if (!Classic::SupplyFamilyForClass(f, p_->GetClass())) continue;
         if (Classic::MageConjuresFamily(p_->GetClass(), f.name, [this](uint32 id) { return p_->HasSpell(id); })) continue;
         uint32 const entry = Classic::BestSupplyRank(f, level);
@@ -7951,19 +9258,35 @@ Result API::restock_class_supplies()
         uint32 const target = Classic::SupplyTarget(f, level);
         if (have >= target) continue;
         ItemPosCountVec dest;
-        if (InventoryResult const stored = p_->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, target - have); stored != EQUIP_ERR_OK)
+        uint32 count = target - have;
+        uint32 no_space = 0;
+        InventoryResult stored = p_->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, count, &no_space);
+        // Food and drink: make room (a few slots at most), then take what fits.
+        for (int freed = 0; stored != EQUIP_ERR_OK && essential(f) && freed < 4 && make_room(f, entry); ++freed)
+        {
+            dest.clear();
+            no_space = 0;
+            stored = p_->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, count, &no_space);
+        }
+        if (stored != EQUIP_ERR_OK && no_space > 0 && no_space < count)
+        {
+            count -= no_space;   // part of the stack fits
+            dest.clear();
+            stored = p_->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, count);
+        }
+        if (stored != EQUIP_ERR_OK)
         {
             full = true;
             skipped(f, entry, "no room in the bags", uint32(stored));
             continue;
         }
         if (p_->StoreNewItem(dest, entry, true))
-            added += target - have;
+            added += count;
         else
             skipped(f, entry, "StoreNewItem refused", 0);
     }
     // Ammo for the equipped bow / crossbow / gun (thrown needs none): the best arrows or
-    // bullets the level allows, topped up in whole stacks to AMMO_TARGET once under 30%.
+    // bullets the level allows, topped up in whole stacks to AMMO_TARGET once under 60%.
     // Hunter pet food is the plain "Food" family above and is not touched here.
     if (p_->NeedsAmmo())
     {
@@ -7983,7 +9306,7 @@ Result API::restock_class_supplies()
                     have += item->GetCount();
                 return ItemSearchCallbackResult::Continue;
             });
-            if (have < Classic::AmmoLowBelow())
+            if (have < Classic::AMMO_TARGET)   // whenever the restock runs: to the full stack
             {
                 uint32 given = 0;
                 uint32 const stack = std::max<uint32>(1u, ammoProto->GetMaxStackSize());
@@ -8236,6 +9559,22 @@ Result API::lfg_role_check(uint8 roles)
     // and Group::SetLfgRoles is the same call LFG itself uses on a
     // successful role-check round. Group::SetLfgRoles skips the party update
     // when the slot already carries these roles.
+    // A role that changes (setrole, a spec swap) is also announced with SMSG_ROLE_CHANGED_INFORM, as the client's own Set Role
+    // does (WorldSession::HandleSetRoleOpcode): the party update alone left the party frame on the old icon, so a bot turned
+    // from tank to damage still showed a shield (Tornn, 2026-10-29). Not on the first role after joining (old role 0): the
+    // roster update draws that one, and the inform would print "<bot> is now ..." for every bot that joins.
+    uint8 const oldRole = g->GetLfgRoles(p_->GetGUID()) & ~uint8(1);   // without the leader bit
+    uint8 const newRole = roles & ~uint8(1);
+    if (oldRole && oldRole != newRole)
+    {
+        WorldPackets::Party::RoleChangedInform roleChangedInform;
+        roleChangedInform.PartyIndex = g->GetGroupCategory();
+        roleChangedInform.From = p_->GetGUID();
+        roleChangedInform.ChangedUnit = p_->GetGUID();
+        roleChangedInform.OldRole = oldRole;
+        roleChangedInform.NewRole = newRole;
+        g->BroadcastPacket(roleChangedInform.Write(), false);
+    }
     g->SetLfgRoles(p_->GetGUID(), roles);
     return Result::Ok;
 }
@@ -8333,8 +9672,7 @@ Result API::bg_port(uint16 bg_type_id, bool accept)
     PVPDifficultyEntry const* bracket = DB2Manager::GetBattlegroundBracketByLevel(
         bg_tmpl->MapIDs.front(), p_->GetLevel());
 
-    Battleground* bg = sBattlegroundMgr->GetBattleground(ginfo.IsInvitedToBGInstanceGUID,
-        bgTypeId == BATTLEGROUND_AA ? BATTLEGROUND_TYPE_NONE : bgTypeId);
+    Battleground* bg = sBattlegroundMgr->GetBattleground(ginfo.IsInvitedToBGInstanceGUID, qid);
 
     if (accept)
     {
@@ -8346,6 +9684,14 @@ Result API::bg_port(uint16 bg_type_id, bool accept)
         if (p_->GetLevel() > bg->GetMaxLevel()) return Result::Locked;
         if (p_->HasAura(/*Freeze*/ 9454)) return Result::Locked;
         if (!p_->IsInvitedForBattlegroundQueueType(qid)) return Result::Locked;
+        // TeleportTo refuses while another teleport is pending, and SendToBattleground does not say so: the bot kept the battleground
+        // id set below while it stayed in the world (WSG 2026-10-24: a fresh JIT bot whose setup teleport was still running ported, stayed
+        // in Redridge and held an Alliance place and an order slot all match). It stays invited, so the port is fired again later.
+        if (p_->IsBeingTeleported())
+        {
+            TC_LOG_INFO("playerbot.v2", "[bg_port] {} teleport still pending; deferring", p_->GetName());
+            return Result::NotReady;
+        }
 
         if (!p_->InBattleground())
             p_->SetBattlegroundEntryPoint();
@@ -8361,6 +9707,16 @@ Result API::bg_port(uint16 bg_type_id, bool accept)
         p_->SetBattlegroundId(bg->GetInstanceID(), bg->GetTypeID(), qid);
         p_->SetBGTeam(ginfo.Team);
         BattlegroundMgr::SendToBattleground(p_, bg);
+        // A far teleport leaves the old map at once (or waits as a delayed world port); still in the world on another map with no teleport
+        // pending means it was refused. Undo the battleground id the way the world-port handler does on a non-battleground map.
+        if (p_->IsInWorld() && !p_->IsBeingTeleported() && p_->GetMapId() != bg->GetMapId())
+        {
+            TC_LOG_INFO("playerbot.v2", "[bg_port] {} port to bg_inst={} refused (still on map {}); battleground id cleared",
+                        p_->GetName(), bg->GetInstanceID(), p_->GetMapId());
+            p_->SetBattlegroundId(0, BATTLEGROUND_TYPE_NONE, BATTLEGROUND_QUEUE_NONE);
+            p_->SetBGTeam(TEAM_OTHER);
+            return Result::ServerRefused;
+        }
 
         // Seething Shore (BG_SS = 894) post-port fix. SS uses a transport
         // (airship) for initial player placement. Bots porting via this
@@ -9204,6 +10560,11 @@ Result API::guild_bank_deposit_money(ObjectGuid banker, uint64 amount)
     Guild* guild = p_->GetGuild();
     if (!guild) return Result::InvalidTarget;
     if (!p_->HasEnoughMoney(amount)) return Result::NotEnoughResource;
+    // Gold under the always-repair floor is handed out for free (SetMoney back up to kAlwaysGoldFloor), so it never goes
+    // into a guild bank: an owner's "gbank deposit" or the idle rule would otherwise turn the top-up into endless bank gold.
+    uint64 const free_floor = uint64(kAlwaysGoldFloor) * 10000ull;   // copper per gold
+    if (p_->GetMoney() <= free_floor) return Result::NotEnoughResource;
+    amount = std::min<uint64>(amount, p_->GetMoney() - free_floor);
 
     // HandleMemberDepositMoney is void Ã¢Â€Â” it logs and broadcasts but doesn't
     // signal failure. Sample bot gold before/after to detect rank-permission
@@ -9382,6 +10743,89 @@ Result API::trainer_buy_all_available(ObjectGuid trainer_npc,
     return Result::Ok;
 }
 
+// The top vanilla ranks (Shadow Bolt 25307, Greater Heal 25314, ...) are Ahn'Qiraj book ranks: no trainer sells them, so the trainer pass never
+// teaches them. A rank is another spell of the same name, class family, kind and first effect as one the bot knows (the match HighestKnownRank
+// uses, because the spell data chains few class spells) with a spell level the bot has reached, listed under the class's skill lines.
+// Vanilla-era ids only: the Forever spells above 100000 come with talents and runes, not as ranks.
+static uint32 LearnHigherRanksOfKnownSpells(Player* p)
+{
+    ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(p->GetClass());
+    if (!classEntry)
+        return 0;
+    LocaleConstant const loc = sWorld->GetDefaultDbcLocale();
+    auto const keyOf = [loc](SpellInfo const* si) -> std::string
+    {
+        char const* name = si->SpellName ? (*si->SpellName)[loc] : nullptr;
+        if (!name || !*name || si->GetEffects().empty())
+            return {};
+        return fmt::format("{}|{}|{}|{}", name, uint32(si->SpellFamilyName), uint32(si->GetEffect(EFFECT_0).Effect), si->IsPassive());
+    };
+    std::unordered_set<std::string> knownNames;
+    std::unordered_map<std::string, std::pair<int32, uint32>> known;   // key -> (spell level, id) of the highest rank the bot has: the level, then the id, orders ranks
+    for (auto const& [id, ps] : p->GetSpellMap())
+    {
+        if (ps.state == PLAYERSPELL_REMOVED || ps.disabled)
+            continue;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE);
+        if (!si || si->SpellFamilyName != classEntry->SpellClassSet)
+            continue;
+        if (std::string key = keyOf(si); !key.empty())
+        {
+            auto const rank = std::make_pair(int32(si->SpellLevel), si->Id);
+            auto [it, inserted] = known.try_emplace(key, rank);
+            if (!inserted && rank > it->second)
+                it->second = rank;
+            knownNames.insert(key.substr(0, key.find('|')));
+        }
+    }
+    std::vector<uint32> toLearn;
+    std::unordered_set<uint32> seen;
+    static std::atomic<uint32> rejectLog{ 0 };
+    for (SkillLineAbilityEntry const* entry : sSkillLineAbilityStore)
+    {
+        if (!entry || entry->Spell >= 100000 || !seen.insert(entry->Spell).second || p->HasSpell(entry->Spell))
+            continue;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(entry->Spell, DIFFICULTY_NONE);
+        if (!si || si->IsPassive() || si->SpellLevel == 0 || si->SpellLevel > p->GetLevel() || si->SpellFamilyName != classEntry->SpellClassSet)
+            continue;
+        std::string const key = keyOf(si);
+        auto const itr = key.empty() ? known.end() : known.find(key);
+        if (itr == known.end())
+        {
+            if (!key.empty() && knownNames.count(key.substr(0, key.find('|'))) && rejectLog.fetch_add(1) < 400)
+                TC_LOG_INFO("playerbot.v2", "[BookRanks] {} {}: candidate {} \"{}\" level {} skipped: a spell of that name is known, but family, first effect or kind differs", p->GetName(),
+                    uint32(p->GetClass()), si->Id, key, si->SpellLevel);
+            continue;
+        }
+        // Vanilla ranks of one spell can share a spell level (the last two ranks of many spells are both level 60): the level, then the id, orders them.
+        auto const reject = [&](char const* why)
+        {
+            if (rejectLog.fetch_add(1) < 400)
+                TC_LOG_INFO("playerbot.v2", "[BookRanks] {} {}: candidate {} \"{}\" level {} rejected: {} (best known {} at level {})", p->GetName(), uint32(p->GetClass()),
+                    si->Id, key, si->SpellLevel, why, itr->second.second, itr->second.first);
+        };
+        if (std::make_pair(int32(si->SpellLevel), si->Id) <= itr->second)
+        {
+            reject("not above the best known rank");
+            continue;
+        }
+        if (!p->IsSpellFitByClassAndRace(si->Id))
+        {
+            reject("IsSpellFitByClassAndRace");
+            continue;
+        }
+        if (!SpellMgr::IsSpellValid(si, p, false))
+        {
+            reject("IsSpellValid");
+            continue;
+        }
+        toLearn.push_back(si->Id);
+    }
+    for (uint32 id : toLearn)
+        p->LearnSpell(id, false);
+    return uint32(toLearn.size());
+}
+
 uint32 API::learn_trainer_spells_free()
 {
     if (!p_) return 0;
@@ -9404,6 +10848,10 @@ uint32 API::learn_trainer_spells_free()
         if (!learned)
             break;
     }
+    uint32 const higher_ranks = LearnHigherRanksOfKnownSpells(p_);
+    if (higher_ranks)
+        TC_LOG_INFO("playerbot.v2", "[BotSetupPipeline] {} learned {} higher ranks no trainer sells (book ranks)", p_->GetName(), higher_ranks);
+    total += higher_ranks;
     if (!total)
     {
         // Nothing learned: say which trainers were in reach, so a data problem shows in the log.
@@ -9473,6 +10921,46 @@ uint32 API::purge_foreign_class_spells()
         TC_LOG_DEBUG("playerbot.api", "[levelup] {} loses foreign class spell {}", p_->GetName(), spellId);
         p_->RemoveSpell(spellId, false, false);
     }
+    return uint32(doomed.size());
+}
+
+uint32 API::unlearn_spells_above_level()
+{
+    if (!p_) return 0;
+    ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(p_->GetClass());
+    if (!classEntry)
+        return 0;
+    // spell -> the lowest level any trainer of the bot's class sells it at
+    uint32 const mine = p_->GetClassMask();
+    std::unordered_map<uint32, uint32> trainerLevel;
+    for (auto const& [id, trainer] : sObjectMgr->GetTrainers())
+    {
+        if (trainer.GetType() == Trainer::Type::Tradeskill || trainer.GetType() == Trainer::Type::Pet || !(trainer.GetClassMask() & mine))
+            continue;
+        for (Trainer::Spell const& spell : trainer.GetSpells())
+        {
+            uint32 const req = std::max<uint32>(spell.ReqLevel, 1);
+            auto [it, inserted] = trainerLevel.try_emplace(spell.SpellId, req);
+            if (!inserted)
+                it->second = std::min(it->second, req);
+        }
+    }
+    uint32 const level = p_->GetLevel();
+    std::vector<uint32> doomed;
+    for (auto const& [spellId, state] : p_->GetSpellMap())
+    {
+        if (state.state == PLAYERSPELL_REMOVED)
+            continue;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
+        // The class's own active spells only: talents, racials and professions are not levelled ranks.
+        if (!si || si->IsPassive() || si->SpellFamilyName != classEntry->SpellClassSet)
+            continue;
+        auto const it = trainerLevel.find(spellId);
+        if (::Playerbot::Api::IsSpellAboveLevel(it != trainerLevel.end() ? it->second : 0, si->SpellLevel, level))
+            doomed.push_back(spellId);
+    }
+    for (uint32 spellId : doomed)
+        p_->RemoveSpell(spellId, false, false);
     return uint32(doomed.size());
 }
 
@@ -9650,7 +11138,92 @@ uint32 API::learn_class_quest_spells_free()
     for (uint32 spellId : kHunterPetSpells)
         learn(spellId, nullptr);
 
+    // Tranquilizing Shot 19801 is a book (a Molten Core drop) that no trainer and no quest teaches, and every raiding hunter of the
+    // tier has read it: without it a bot hunter cannot shoot off a boss's Frenzy (Chromaggus, Magmadar, Flamegor; bwl_chromaggus on
+    // d90ef3de69 logged 0 shots). A bot hunter gets it at 60 as it gets its trainer spells.
+    constexpr uint32 kTranquilizingShot = 19801;
+    if (level >= 60 && !p_->HasSpell(kTranquilizingShot) && sSpellMgr->GetSpellInfo(kTranquilizingShot, DIFFICULTY_NONE))
+    {
+        p_->LearnSpell(kTranquilizingShot, false);
+        if (p_->HasSpell(kTranquilizingShot))
+        {
+            ++learned;
+            TC_LOG_INFO("playerbot.api", "[API::class_quest_spells] {} (L{}) reads the Tranquilizing Shot book (19801)", p_->GetName(),
+                uint32(level));
+        }
+    }
+
     return learned;
+}
+
+namespace
+{
+// A granted pet is one the hunter has raised: a fresh tame is Rebellious (no training points, so no Bite or Claw), Unhappy (x0.75 damage, Pet::GetHappinessDamageMod)
+// and loses loyalty until it runs away. The grant makes it a Best Friend, fed, and teaches the highest rank of each damage ability of its family that its level and
+// training points allow (cost per chain from classic_pet_spell_training_points), with autocast on, as a player's pet is trained at 60.
+void RaiseGrantedHunterPet(Pet* pet, Player const* owner)
+{
+    pet->InitLoyalty(Pet::BEST_FRIEND, Pet::GetLoyaltyStartPoints(Pet::BEST_FRIEND));
+    pet->SetPower(POWER_HAPPINESS, Pet::HAPPINESS_MAX);
+
+    CreatureTemplate const* tpl = pet->GetCreatureTemplate();
+    CreatureFamilyEntry const* family = tpl && tpl->family ? sCreatureFamilyStore.LookupEntry(tpl->family) : nullptr;
+    if (!family)
+        return;
+
+    uint32 budget = pet->GetTrainingPointsTotal();
+    std::vector<uint32> learned;
+    std::set<uint32> chains;
+    for (uint8 line = 0; line < 2; ++line)
+    {
+        if (!family->SkillLine[line])
+            continue;
+        std::vector<SkillLineAbilityEntry const*> const* abilities = sDB2Manager.GetSkillLineAbilitiesBySkill(family->SkillLine[line]);
+        if (!abilities)
+            continue;
+        for (SkillLineAbilityEntry const* ability : *abilities)
+        {
+            uint32 const first = sSpellMgr->GetFirstSpellInChain(ability->Spell);
+            if (!Pet::GetSpellTrainingPoints(ability->Spell) || !chains.insert(first).second)
+                continue;
+            // The highest rank of the chain the pet's level reaches and the points pay for.
+            uint32 best = 0;
+            for (uint32 id = first; id; id = sSpellMgr->GetNextSpellInChain(id))
+            {
+                SpellInfo const* info = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE);
+                if (!info || info->SpellLevel > pet->GetLevel() || Pet::GetSpellTrainingPoints(id) > budget)
+                    break;
+                best = id;
+            }
+            SpellInfo const* info = best ? sSpellMgr->GetSpellInfo(best, DIFFICULTY_NONE) : nullptr;
+            if (!info || info->IsPositive() || !info->IsAutocastable())
+                continue;
+            bool damaging = false;
+            for (SpellEffectInfo const& eff : info->GetEffects())
+                damaging = damaging || eff.IsEffect(SPELL_EFFECT_SCHOOL_DAMAGE) || eff.IsEffect(SPELL_EFFECT_WEAPON_DAMAGE)
+                        || eff.IsEffect(SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL) || eff.IsEffect(SPELL_EFFECT_NORMALIZED_WEAPON_DMG)
+                        || eff.IsEffect(SPELL_EFFECT_WEAPON_PERCENT_DAMAGE);
+            if (!damaging)
+                continue;
+            budget -= Pet::GetSpellTrainingPoints(best);
+            learned.push_back(best);
+        }
+    }
+
+    for (uint32 spellId : learned)
+    {
+        pet->learnSpell(spellId);
+        if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE))
+        {
+            pet->ToggleAutocast(info, true);
+            if (CharmInfo* ci = pet->GetCharmInfo())
+                ci->SetSpellAutocast(info, true);
+        }
+    }
+    pet->UpdateTrainingPoints();
+    TC_LOG_INFO("playerbot.api", "[API::starter_pet] {} pet {} (family {}) raised: Best Friend, happy, {} damage abilities trained ({} of {} points left)",
+        owner->GetName(), pet->GetEntry(), tpl->family, learned.size(), budget, pet->GetTrainingPointsTotal());
+}
 }
 
 API::StarterPetResult API::grant_starter_hunter_pet(uint32 entry)
@@ -9690,6 +11263,7 @@ API::StarterPetResult API::grant_starter_hunter_pet(uint32 entry)
     }
     pet->GetMap()->AddToMap(pet->ToCreature());
     p_->SetMinion(pet, true);
+    RaiseGrantedHunterPet(pet, p_);
     pet->SavePetToDB(PET_SAVE_AS_CURRENT);
     p_->PetSpellInitialize();
     // characters.summonedPetNumber now, as BotSetupPipeline::DoAcquireMount does: a teleport before the next

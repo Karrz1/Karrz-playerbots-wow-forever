@@ -1,7 +1,7 @@
 #pragma once
 // Pure positioning decision for the melee-behind step.
 //
-// Idea from Karrz's VMaNGOS bots (the ike3-based playerbot code, playerbot/values/StanceReposition.cpp, Stances.cpp), rewritten against our
+// Idea from Karrz's VMaNGOS bots (Karrz1/wow-1.12, playerbot/values/StanceReposition.cpp, Stances.cpp), rewritten against our
 // snapshot (no code copied): the melee "behind" step fires only for a mob a tank holds, inside a 135 degree front arc, never on
 // the mob's own victim, never on Onyxia.
 // State_Idle.cpp calls it; keeping it here keeps that file's diff small.

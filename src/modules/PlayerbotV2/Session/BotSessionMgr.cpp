@@ -76,6 +76,16 @@ bool BotSessionMgr::IsHeadless(ObjectGuid playerGuid) const
     return sessions_.count(playerGuid) != 0;
 }
 
+size_t BotSessionMgr::HeadlessCountOnAccount(uint32 accountId) const
+{
+    std::lock_guard lk(mtx_);
+    size_t n = 0;
+    for (auto const& [guid, session] : sessions_)
+        if (session && session->GetAccountId() == accountId)
+            ++n;
+    return n;
+}
+
 bool BotSessionMgr::LogoutBot(ObjectGuid playerGuid)
 {
     std::shared_ptr<BotSession> sess;

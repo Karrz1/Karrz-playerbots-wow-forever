@@ -46,8 +46,8 @@ constexpr float kIdleMaxHubYards = 2500.0f;
 constexpr std::size_t kIdleHubChoices = 6;           // the nearest few; strikes and the bot id pick among them
 
 // Call every tick. `exempt` = a good reason to stand (fighting, casting, resting at low health, grouped, owned, in an instance,
-// riding). Returns true once when the bot has stood still for kIdleStuckMs without a reason.
-inline bool IdleStuck(IdleWatch& w, float x, float y, std::uint32_t now_ms, bool exempt)
+// riding). Returns true once when the bot has stood still for `stuck_ms` (kIdleStuckMs; shorter in a capital) without a reason.
+inline bool IdleStuck(IdleWatch& w, float x, float y, std::uint32_t now_ms, bool exempt, std::uint32_t stuck_ms = kIdleStuckMs)
 {
     float const dx = x - w.x, dy = y - w.y;
     float const moved2 = dx * dx + dy * dy;
@@ -57,10 +57,44 @@ inline bool IdleStuck(IdleWatch& w, float x, float y, std::uint32_t now_ms, bool
         w.x = x; w.y = y; w.since_ms = now_ms ? now_ms : 1u;
         return false;
     }
-    if (now_ms - w.since_ms >= kIdleStuckMs)
+    if (now_ms - w.since_ms >= stuck_ms)
     {
         w.since_ms = now_ms;
         ++w.strikes;
+        return true;
+    }
+    return false;
+}
+
+// A walk toward a far goal that keeps moving but never gets closer: the bot runs back and forth (a party in Ironforge's Military Ward
+// chunk-walked for half an hour toward a Searing Gorge objective that has no walking route out of the room, live 275). The idle watch
+// does not see it, the bot is never still. `key` names the goal; the best distance resets whenever the goal changes.
+struct GoalProgress
+{
+    std::uint64_t key = 0;
+    float best = 0.f;
+    std::uint32_t since_ms = 0;   // when `best` last improved by kGoalProgressYards
+    std::uint32_t last_ms = 0;    // the last call: a walk broken off (a fight, a meal, another rule) starts the clock again
+};
+
+constexpr float kGoalProgressYards = 30.0f;
+constexpr std::uint32_t kGoalProgressMs = 180000u;   // a walking bot covers 1200 y in that time: any real route gains 30 y
+constexpr std::uint32_t kGoalProgressGapMs = 20000u;
+
+// Call each time the bot walks toward the goal. True once it has gone kGoalProgressMs without getting kGoalProgressYards closer.
+inline bool GoalStalled(GoalProgress& g, std::uint64_t key, float dist, std::uint32_t now_ms)
+{
+    bool const broken_off = g.last_ms != 0 && now_ms - g.last_ms > kGoalProgressGapMs;
+    g.last_ms = now_ms ? now_ms : 1u;
+    if (g.key != key || g.since_ms == 0 || broken_off || dist <= g.best - kGoalProgressYards)
+    {
+        g.key = key; g.best = dist; g.since_ms = now_ms ? now_ms : 1u;
+        return false;
+    }
+    if (now_ms - g.since_ms >= kGoalProgressMs)
+    {
+        g.since_ms = now_ms ? now_ms : 1u;
+        g.best = dist;
         return true;
     }
     return false;

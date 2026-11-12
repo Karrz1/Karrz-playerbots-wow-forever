@@ -20,6 +20,7 @@ class Player;
 class Unit;
 class Aura;
 class Group;
+class Channel;
 struct Position;
 
 namespace Playerbot { class SnapshotBuildPool; struct GroupSnapshot; }
@@ -44,6 +45,7 @@ public:
     // their use cases (see PlayerbotV2.cpp comments for rationale).
     void OnPlayerLogin(Player* p);
     void OnPlayerLogout(Player* p);
+    void OnPlayerDeleted(uint64 guid_low);
     void OnLevelUp(Player* p, uint8 new_level);
     void OnDeath(Unit* victim, Unit* killer);
     void OnResurrect(Player* p);
@@ -54,13 +56,15 @@ public:
     void NoteDamageSpell(uint32 spell_id);
     void OnHitOutcome(Unit* attacker, Unit* victim, uint32 spell_id, uint8 outcome, uint32 damage);
     void OnEnergize(Unit* target, uint32 spell_id, int32 gained, uint8 power);
+    void OnHealOutcome(Unit* healer, Unit* target, uint32 spell_id, uint32 raw, uint32 effective);
     void OnHealReceived(Unit* healer, Unit* target, int32 amount, uint32 spell_id);
     void OnAuraApplied(Unit* target, Aura* aura);
     void OnAuraRemoved(Unit* target, Aura* aura);
     void OnGroupMemberJoined(Group* g, Player* p);
     void OnGroupMemberLeft(Group* g, Player* p);
     void OnWhisperReceived(Player* sender, Player* receiver, std::string const& msg);
-    void OnPartyChat(Player* sender, Group* group, std::string const& msg);
+    // raid_chat: the line was said in raid chat (a chat-model answer goes back to raid chat; party chat stays in the subgroup).
+    void OnPartyChat(Player* sender, Group* group, std::string const& msg, bool raid_chat = false);
     // A bot order sent by the ForeverBots panel as an addon message (fixed prefix, party/raid): same parser as party chat.
     void OnAddonOrder(Player* sender, Group* group, std::string const& prefix, std::string const& text);
     void OnAddonWhisper(Player* sender, Player* receiver, std::string const& prefix, std::string const& text);
@@ -68,6 +72,8 @@ public:
     // ground is a fall back to that point.
     void OnGroupPingUnit(Player* sender, Group* group, Unit* target, uint8 type);
     void OnGroupPingPoint(Player* sender, Group* group, Position const& point, uint8 type);
+    // A player put a world marker on the ground: a waiting "Place at cursor" order takes the spot.
+    void OnWorldMarkerPlaced(Player* sender, Position const& point);
     // One line with the add-on's download link for a player whose client has not said hello (Playerbot.AddonHint.*).
     void SendDueAddonHints();
     // The ForeverBots add-on greeted the server (self-whisper or the silent `.bot addon` command): no download hint for this player.
@@ -77,6 +83,9 @@ public:
     // sender's first bot in the group as the messenger. answer_unknown: an unrecognised order whispers back instead of
     // vanishing (the ';' form only; a bare line could be chatter).
     void DispatchSquadLine(Player* sender, Group* group, std::string const& body, bool answer_unknown);
+    // A squad line the parser does not know ("all go to the bank and wait", "Lentha dance with me"): to the bot bridge's program
+    // as an order for the bots it names ("all" / no name: every bot of the sender's in the group). False: not sent.
+    static bool AskModelSquadOrder(Player* sender, Group* group, std::string const& body);
     static bool GroupHasBotNamed(Group const* group, std::string_view name);
     // Phase C.3: route guild chat messages to BotChatReactor::ReactGuild.
     void OnGuildChat(Player* sender, uint64 guild_id, std::string const& msg);
@@ -84,6 +93,8 @@ public:
     // SC-P1a: /say and /yell social reactions. Route to BotChatReactor's
     // range-gated say/yell paths so a single nearby bot can answer.
     void OnSayChat(Player* sender, std::string const& msg);
+    // A real player wrote in General, Trade or LookingForGroup: world bots may answer (Bot/ChannelChat.h).
+    void OnChannelChat(Player* sender, Channel* channel, std::string const& msg);
     void OnYellChat(Player* sender, std::string const& msg);
     // SC-P2c: reciprocate a nearby player's text emote (/wave, /salute, ...).
     void OnTextEmote(Player* sender, uint32 emote_id, uint32 text_emote_id, ObjectGuid target);

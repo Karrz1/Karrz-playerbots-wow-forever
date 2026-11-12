@@ -16,6 +16,7 @@
 #include <functional>
 #include <string_view>
 #include "InstanceSchools.h"
+#include "AlwaysBuffs.h"
 #include "ClassicSupplies.h"   // RaidConsumableRole
 #include "BotTypes.h"
 #include "ObjectGuid.h"
@@ -100,10 +101,18 @@ uint32 ResistPotionItem(Resist r);
 // in the bags, off cooldown and its protection is not already up. 0 = none.
 uint32 PickResistPotion(BotSnapshotView const& s);
 
+// In an instance fight: the item that cures an aura the bot carries (RaidRules::cureItem, Hourglass Sand on Brood Affliction: Bronze), when the
+// bot can act, has it in the bags and it is off cooldown. 0 = none. A carrier with no item is logged ([raid_cure], once per 10 s).
+uint32 PickCureItem(BotSnapshotView const& s);
+
 // Raid resistance gear (Playerbot.Raid.ResistGear): the school (SpellSchools value) of the boss a grouped bot stands before: the nearest living
 // boss within the bot's 40 yd scan whose RaidRules::resistPotion row names a Greater Protection Potion, on a map the swap runs on
 // (Bot/ResistGear.h). 0 = none: the bot wears its own gear.
 uint8 PickResistGearSchool(BotSnapshotView const& s);
+
+// Blackwing Lair's Onyxia Scale Cloak (Playerbot.Raid.OnyxiaCloak, Bot/ResistGear.h): true while a grouped level 60 bot is in the instance,
+// so it wears the cloak there; false elsewhere, so its own cloak goes back on.
+bool WantsFightCloak(BotSnapshotView const& s);
 
 // Dwarf priest: Fear Ward (6346) on the tank the raid plan gave it
 // (PveOrder::fear_ward_target) while that tank is in range. spell 0 = nothing.
@@ -121,6 +130,10 @@ CastPick PickFearWard(BotSnapshotView const& s, GroupSnapshotView const& g);
 // change the plan. Out of combat only; nothing while this bot is in a form
 // (DruidFormToLeave takes it out first).
 CastPick PickClassBuff(BotSnapshotView const& s, GroupSnapshotView const& g, PickSkip skip = {});
+// A world bot's buff for a passing real player (Playerbot.World.Kindness): Fortitude (priest), Intellect (mage, a mana user only)
+// or Mark of the Wild (druid), the spell the bot would cast on its own group. `held` = the Strangers::BuffBit the player has.
+// `bit_out` = the buff picked. Nothing in combat, mounted or in a druid form.
+uint32 PickStrangerBuff(BotSnapshotView const& s, uint8 held, bool target_has_mana, uint8& bit_out);
 // A cast PickClassBuff returned with a kind 6 key (caster-centred buff): tracks whether it reached anyone, and backs the buff off when not.
 void NoteAreaBuffCast(ObjectGuid caster, uint64 key, uint32 needy, uint32 now_ms);
 
@@ -153,6 +166,12 @@ uint32 PickPaladinAura(BotSnapshotView const& s, GroupSnapshotView const& g);
 // conditions. `skip` paces a job by its key (member, debuff type): a skipped
 // job stays this bot's and it moves on to its next one.
 CastPick PickDispel(BotSnapshotView const& s, GroupSnapshotView const& g, PickSkip skip = {});
+
+// The same plan, only the jobs where the debuff takes a member out of the fight (Hex, Polymorph, a magic Fear, Sleep or stun, by
+// the aura's mechanic). Those jobs come first in PickDispel too, so both agree on who takes each one. The healer rotations run it
+// before their heals: a hexed tank holds no threat, and in zf_antusul (RC10) the priest kept healing through two Hexes on the tank
+// while the mobs ate the casters.
+CastPick PickControlDispel(BotSnapshotView const& s, GroupSnapshotView const& g, PickSkip skip = {});
 
 // Mana below which a bot takes no dispel job (and is left out of the plan).
 constexpr int32 kDispelMinManaPct = 15;
@@ -267,6 +286,11 @@ void ShortClassSupplies(BotSnapshotView const& s, std::vector<uint32>& out);
 // PickRaidConsumableStock: the kit item the bags are short of whose buff is missing, to stock (0 = none).
 // Playerbot.Consumables.PvE / .PvP for the bot's current map (battlegrounds and arenas are PvP, everything else PvE).
 bool ConsumablesAllowed(BotSnapshotView const& s);
+// Playerbot.AlwaysBuffs.<Switch>.<Place>: where the bot stands (a battleground or arena map, else a raid or dungeon instance, else the world)
+// and whether a switch is on there. A bot in a raid-type group counts as in a raid wherever it stands (the dps scorecard fights in the
+// open world with a 22-bot raid and its flasks and world buffs were stripped there).
+AlwaysPlace AlwaysPlaceOf(BotSnapshotView const& s, GroupSnapshotView const* g = nullptr);
+bool AlwaysOn(BotSnapshotView const& s, AlwaysSwitch what, GroupSnapshotView const* g = nullptr);
 uint32 PickRaidConsumable(BotSnapshotView const& s, GroupSnapshotView const& g);
 uint32 PickRaidConsumableStock(BotSnapshotView const& s, GroupSnapshotView const& g);
 // The role whose kit (ClassicSupplies RaidConsumablesFor) the bot drinks: the group's role first, then the tank test, then the spec.
@@ -295,12 +319,18 @@ enum class ConsumableKind : uint8
 // first on a tie. With `conjured_only` only conjured items count. 0 = none.
 uint32 BestConsumable(BotSnapshotView const& s, ConsumableKind kind, bool conjured_only = false);
 
+// Food / Drink to recover with: BestConsumable, else (PlayerbotV2.Classic.ClassSupplies: infinite supplies) the Food / Water rank of
+// the bot's level, which the API eats / drinks without the item (Api/VirtualSupply.h). A healer is never left with nothing to drink.
+uint32 RecoveryConsumable(BotSnapshotView const& s, ConsumableKind kind);
+
 // Mage Conjure Water / Conjure Food: the best rank the mage knows (found in the spell data, like
 // the healthstones) when fewer than `want_below` conjured items of that kind (Drink / Food) are
 // in the bags, else 0.
 uint32 MageConjureSpell(BotSnapshotView const& s, ConsumableKind kind, uint32 want_below);
 // Best Conjure Water (Drink) / Conjure Food (Food) rank `knows` accepts, 0 = none.
 uint32 BestMageConjure(ConsumableKind kind, std::function<bool(uint32)> const& knows);
+// `spell` is a Conjure Water (Drink) / Conjure Food (Food) rank: its kind in `kind`. Found by the spell data, so any locale.
+bool   IsMageConjure(uint32 spell, ConsumableKind& kind);
 // A mage that can conjure the item of supply family `family` ("Water", "Food") makes its own: the restock skips it.
 bool   MageConjuresFamily(uint8 cls, std::string_view family, std::function<bool(uint32)> const& knows);
 
@@ -315,6 +345,9 @@ bool HealIncoming(BotSnapshotView const& s, GroupSnapshotView const& g);
 // A food / drink regeneration aura is up (any rank, any item).
 bool IsEating(BotSnapshotView const& s);
 bool IsDrinking(BotSnapshotView const& s);
+// Milliseconds left on the longest food / drink aura (-1: none). A rest whose aura still had time left when it went was broken off
+// (the bot moved, cast or was stood up); one that ran out ended on its own (BotAI::note_resting).
+int32 RegenAuraLeftMs(BotSnapshotView const& s);
 
 // The quest / travel walkers (idle priority 697-700) stand down while the bot should recover first: under half health, a
 // food / drink aura is up (standing up mid-meal wastes the item), or a caster with water in the bags is under a fifth mana.
@@ -336,7 +369,8 @@ struct RecoveryPick
     bool   hold = false; // already eating / drinking: stay seated
     bool   drink = false; // `item` is a drink (it may be announced in party chat, Bot/DrinkSay.h)
 };
-RecoveryPick PickRecovery(BotSnapshotView const& s, int32 start_hp, int32 start_mana);
+// `to_full`: a drink runs to 95 % whatever the start mark (a player's bots rest until full, Classic::LedMaySitDown).
+RecoveryPick PickRecovery(BotSnapshotView const& s, int32 start_hp, int32 start_mana, bool to_full = false);
 
 // Healer mana a grouped instance tank waits for before it pulls (State_Idle
 // dungeon group-ready gate). The drink rules start a grouped healer's drink
@@ -424,6 +458,12 @@ bool IsBossUnit(NearbyUnit const& u);
 // big. In the open world the previous test stands: the bot's victim is a boss
 // or has 100k+ health (elites, world bosses).
 bool BossFight(BotSnapshotView const& s);
+
+// Lone Wolf (hunter talent 415370, Marksmanship row 3): +20% damage with every attack while no pet is out. A hunter that took it plays
+// without its pet in a raid (a raid group, or a raid map), as a player with the talent does: the pet's own damage is far below the 20%.
+// Outside a raid (levelling, dungeons, battlegrounds) the pet stays with it. The hunter APL dismisses the pet and every summon path
+// (Call Pet, Revive Pet, the idle pet upkeep) holds back while this is true.
+bool LoneWolfKeepsPetAway(BotSnapshotView const& s);
 
 // [raid_cd] log line for a major cooldown the bot uses inside an instance
 // (one per bot and spell per 10 s, so a retried cast logs once).

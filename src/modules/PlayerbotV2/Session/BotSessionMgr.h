@@ -66,6 +66,10 @@ public:
     // 2026-06-11).
     bool IsHeadless(ObjectGuid playerGuid) const;
 
+    // Characters of `accountId` itself (the player's own alts, `.playerbot summon`) driven by a headless session right now.
+    // Companions live on the bot pool accounts and are not counted.
+    size_t HeadlessCountOnAccount(uint32 accountId) const;
+
 private:
     mutable std::mutex                                     mtx_;
     std::unordered_map<ObjectGuid, std::shared_ptr<BotSession>> sessions_;

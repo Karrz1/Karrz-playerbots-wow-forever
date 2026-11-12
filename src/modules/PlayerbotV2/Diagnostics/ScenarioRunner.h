@@ -36,6 +36,14 @@ bool Abort();
 
 bool Running();
 
+// Marks every catalogue character that exists (Pool::MarkScenarioBot), so the test squads stay out of the world pool, the battleground
+// and Group Finder fills and trades after a restart too. Called once from the first Tick.
+void MarkTestCharacters();
+
+// Logs out every test character that is online and not held by a running scenario (`.playerbot scenario cleanup`; Tick does it every
+// 30 s while nothing runs). Returns how many; `names` gets them, comma separated.
+std::uint32_t LogoutIdleTestBots(std::string* names = nullptr);
+
 // One world tick. Cheap when nothing runs.
 void Tick(std::uint32_t diff_ms);
 

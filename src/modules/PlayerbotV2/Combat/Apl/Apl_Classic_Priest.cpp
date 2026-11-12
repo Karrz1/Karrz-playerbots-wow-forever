@@ -6,7 +6,7 @@
 // DPS list. Spell ids are vanilla rank 1 and resolve to the highest known
 // rank in the snapshot view and API::cast_spell.
 //
-// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
+// Priorities follow Karrz's ike3 vanilla strategies (Karrz1/wow-1.12
 // raid10-revamp, playerbot/strategy/priest/*Strategy.cpp, MANGOSBOT_ZERO):
 // shield + Flash Heal on critical, Greater Heal on low, Renew on topping,
 // Prayer of Healing on group damage, dispels (the raid dispel plan), Power
@@ -56,6 +56,7 @@ constexpr uint32 SMITE              = 585;
 constexpr uint32 HOLY_FIRE          = 14914;
 constexpr uint32 SHADOW_WORD_PAIN   = 589;
 constexpr uint32 MIND_BLAST         = 8092;
+constexpr uint32 STARSHARDS         = 10797;   // Night Elf racial, arcane damage over time
 constexpr uint32 MIND_FLAY          = 15407;   // Shadow talent
 constexpr uint32 SHADOWFORM         = 15473;   // Shadow talent
 constexpr uint32 VAMPIRIC_EMBRACE   = 15286;   // Shadow talent
@@ -206,6 +207,13 @@ bool ShouldWand(ApPredicateContext const& ctx)
     return HasLiveTarget(ctx) && ctx.bot.raw().consumables.wand_school_mask != 0 && (Ready(ctx, SHOOT_WAND) && ctx.bot.victim_in_spell_range(SHOOT_WAND)) && ctx.bot.current_cast_spell_id() == 0;
 }
 void DoWand(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(SHOOT_WAND, ctx.bot.victim()); }
+
+// A shadow priest wands only when the nukes have stopped (below the 15 % floor of Mind Blast / Mind Flay): in the global cooldown after an
+// instant those are not ready, and with no mana test the wand started there and the repeat held the rotation (166: 175 of 180 s not casting).
+bool ShouldShadowWand(ApPredicateContext const& ctx)
+{
+    return ShouldWand(ctx) && ManaPct(ctx) < 15;
+}
 
 // ======================= Healer =======================
 
@@ -460,6 +468,7 @@ void DoHealerSchoolNuke(ApPredicateContext const& ctx, BotIntentEmitter& e) { Sc
 ApRule const kHealerRules[] = {
     { ShouldDesperatePrayer,   DoDesperatePrayer,  "classic_heal:desperate_prayer" },
     { ShouldShieldCritical,    DoShieldCritical,   "classic_heal:shield_critical" },
+    { ClassicHeal::ShouldControlDispel, ClassicHeal::DoControlDispel, "classic_heal:dispel_control" },   // a hexed tank holds no threat
     { ShouldShieldTank,        DoShieldTank,       "classic_heal:shield_tank" },
     { ShouldRenewTank,         DoRenewTank,        "classic_heal:renew_tank" },
     { ShouldInnerFocus,        DoInnerFocus,       "classic_heal:inner_focus" },
@@ -508,6 +517,16 @@ bool ShouldShadowPain(ApPredicateContext const& ctx)
     return HasLiveTarget(ctx) && ManaPct(ctx) >= 10 && (Ready(ctx, SHADOW_WORD_PAIN) && ctx.bot.victim_in_spell_range(SHADOW_WORD_PAIN))
         && !ctx.bot.has_aura(SHADOW_WORD_PAIN, ctx.bot.victim());
 }
+
+// Starshards (Night Elf): 156 x 6 ticks for 350 mana at rank 7 against Mind Flay's 142 x 3 for 205 (SpellAudit 19305 / 18807 and the
+// classic_spell_value rows): 2.7 damage per mana against 2.1, no cast time, and it ticks while Mind Blast and Mind Flay are cast.
+// Kept up whenever the victim does not carry it.
+bool ShouldStarshards(ApPredicateContext const& ctx)
+{
+    return HasLiveTarget(ctx) && ManaPct(ctx) >= 15 && (Ready(ctx, STARSHARDS) && ctx.bot.victim_in_spell_range(STARSHARDS))
+        && !ctx.bot.has_aura(STARSHARDS, ctx.bot.victim());
+}
+void DoStarshards(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(STARSHARDS, ctx.bot.victim()); }
 
 bool ShouldMindBlast(ApPredicateContext const& ctx)
 {
@@ -579,10 +598,11 @@ ApRule const kShadowRules[] = {
     { ShouldVampiricEmbrace,  DoVampiricEmbrace,  "classic_shadow:vampiric_embrace" },
     { ShouldShadowSchoolNuke, DoShadowSchoolNuke, "classic_shadow:school_nuke" },
     { ShouldShadowPain,       DoPain,             "classic_shadow:shadow_word_pain" },
+    { ShouldStarshards,       DoStarshards,       "classic_shadow:starshards" },
     { ShouldMindBlast,        DoMindBlast,        "classic_shadow:mind_blast" },
     { ShouldMindFlay,         DoMindFlay,         "classic_shadow:mind_flay" },
     { ShouldShadowSmite,      DoSmite,            "classic_shadow:smite" },
-    { ShouldWand,             DoWand,             "classic_shadow:wand" },
+    { ShouldShadowWand,       DoWand,             "classic_shadow:wand" },
     { HasLiveTarget,          DoAutoAttack,       "classic_shadow:auto_attack" },
 };
 

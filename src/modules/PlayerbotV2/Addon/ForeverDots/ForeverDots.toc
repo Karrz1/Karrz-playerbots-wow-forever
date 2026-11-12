@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: ForeverDots
+## Notes: Countdown bars for your damage-over-time spells beside your character, grouped per enemy. /dots for options.
+## Author: Karrz
+## Version: 1.2.1
+## SavedVariables: ForeverDotsDB
+
+ForeverDots.lua

@@ -313,9 +313,13 @@ void Init()
     // is the deploy dir (e.g. M:\PlayerbotServer) and may differ from the
     // config dir on systems that pass `-c` with an absolute path.
     {
+        // INSTALL.md step 4 puts it in worldserver.conf.d instead: ConfigMgr::LoadAdditionalDir has
+        // already loaded that file, so it is not loaded again and no "missing" warning is logged.
+        // Neither file: every Playerbot.* key keeps its compiled-in default.
         std::filesystem::path const wsConf{sConfigMgr->GetFilename()};
         std::filesystem::path const playerbotConf = wsConf.parent_path() / "playerbot.conf";
-        h->config->load(playerbotConf.generic_string());
+        std::error_code ec;
+        h->config->load(std::filesystem::exists(playerbotConf, ec) ? playerbotConf.generic_string() : std::string());
     }
     h->perf      = std::make_unique<PerfCounters>();
     h->snapshots = std::make_unique<SnapshotPublisher>();

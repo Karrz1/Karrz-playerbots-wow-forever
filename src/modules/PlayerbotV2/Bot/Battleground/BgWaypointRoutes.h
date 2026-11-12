@@ -29,7 +29,7 @@ struct RoutePath { char const* name; std::vector<RoutePoint> pts; };
 #include "BgWaypointData.inc"
 
 // A path that may only be walked first point to last: a jump / roof drop, and the start-room, cave and graveyard exits that the
-// original bots never walk backwards (vPaths_NoReverseAllowed, the ike3-based playerbot code BattleBotWaypoints.cpp).
+// original bots never walk backwards (vPaths_NoReverseAllowed, Karrz1/wow-1.12 raid10-revamp bcc8b9f BattleBotWaypoints.cpp).
 // Horde_Cave_to_Tower_Point_Crossroad is in their list but is NOT one-way here: our router also uses it backwards, it is the only
 // link by which a bot from the Alliance half reaches the Horde base (the test below fails when it is made one-way).
 inline bool IsOneWayPath(std::string_view nm)
@@ -52,10 +52,12 @@ inline bool IsOneWayPath(std::string_view nm)
 class Graph
 {
 public:
+    struct AvoidArea { float x, y, r; };   // see kAvoidSets below
+
     // junction_xy: recordings of one place that lie within this many yards (and 4 y in height) are the same place. AV needs 3.5: the
     // Frostwolf graveyard flag was recorded twice 3.15 y apart ((-1081.3,-348.2) and (-1079.6,-345.5)), which cut the whole Horde half
     // of the map (129 nodes) off from the valley, so no Horde bot had a route to any Alliance objective (av-stuck-2, 2026-10-11).
-    Graph(RoutePath const* paths, size_t count, float junction_xy = 2.5f)
+    Graph(RoutePath const* paths, size_t count, float junction_xy = 2.5f, std::vector<AvoidArea> avoid = {}) : avoid_(std::move(avoid))
     {
         for (size_t pi = 0; pi < count; ++pi)
         {
@@ -114,14 +116,76 @@ public:
         return best;
     }
 
+    // The node a bot at (x,y,z) starts its route to `target` from: of the nodes within `slack` yards of as near as the nearest node
+    // (`nearest`, `nearest_dist` away), the one with the shortest walk to it plus route on to `target`; -1 when none reaches it. A node
+    // counts only when the recorded paths link it to `nearest` within a short way (either direction), or when it is within kCross yards of
+    // as near as `nearest`: the recordings are walked ground, a straight line to an unlinked node further off can cross a wall.
+    // Always starting at the nearest node turned bots round on the spot (bot-only AV 254 / 253 [bg_route] back-and-forths):
+    //  * 2,739 for the Horde at (-418.6,-342.5,18.7) / (-398.0,-372.6,31.4) on the way to Stonehearth: ike3 recorded the second node
+    //    14 y above the ground the bots walk on (they stand at (-399,-371,17)), so from under it Nearest picked the first one again;
+    //  * 417 on the Alliance cave slope near (488,-427): a bot a few yards past its nearest node was sent back to it by the lookahead;
+    //  * 256 at the Frostwolf graveyard (-1055,-373): the nearest node lies on the one-way path into the graveyard, away from the goal.
+    // Picking any node within a radius instead (AV 255) sent Horde bots on the Iceblood graveyard path at (-567,-391) straight at the
+    // tower-crossroad path's first node (-536.6,-373.8) 35 y away, which no walk connects ([wedge] cat=Navmesh): 900 lines stuck.
+    // 25 y: the AV river road has two recordings 10-15 y apart, and at 15 y a bot between them could take neither and turned round
+    // (walk sim: stuck runs AV 145 -> 41); the Iceblood graveyard shortcut above is 35 y.
+    static constexpr float kCross = 25.0f;
+    int StartToward(float x, float y, float z, int nearest, float nearest_dist, float slack, int target, int variant = 0) const
+    {
+        if (nearest < 0) return -1;
+        float const reach = nearest_dist + slack;
+        // Recorded-path distance from `nearest` to every node near it, along the paths in either direction (bounded Dijkstra).
+        size_t const n = nodes_.size();
+        float const limit = 2.0f * reach + 20.0f;
+        std::vector<float> local(n, std::numeric_limits<float>::max());
+        using QE = std::pair<float, int>;
+        std::priority_queue<QE, std::vector<QE>, std::greater<QE>> q;
+        local[size_t(nearest)] = 0.0f;
+        q.emplace(0.0f, nearest);
+        while (!q.empty())
+        {
+            auto [d, u] = q.top();
+            q.pop();
+            if (d > local[size_t(u)]) continue;
+            for (auto const* edges : { &nodes_[size_t(u)].out, &nodes_[size_t(u)].in })
+                for (auto const& [v, w] : *edges)
+                    if (d + w <= limit && d + w < local[size_t(v)])
+                    {
+                        local[size_t(v)] = d + w;
+                        q.emplace(d + w, v);
+                    }
+        }
+        int best = -1;
+        float best_cost = std::numeric_limits<float>::max();
+        for (size_t i = 0; i < n; ++i)
+        {
+            RoutePoint const& p = nodes_[i].p;
+            float const dx = p.x - x, dy = p.y - y, dz = (p.z - z) * 3.0f;
+            float const d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (d > reach) continue;
+            // Linked to the nearest node by the recorded paths nearby, or about as near as it: the same stretch of ground.
+            if (local[i] == std::numeric_limits<float>::max() && d > nearest_dist + kCross) continue;
+            float const route = DistanceTo(int(i), target, variant);
+            if (route == std::numeric_limits<float>::max()) continue;
+            if (d + route < best_cost) { best_cost = d + route; best = int(i); }
+        }
+        return best;
+    }
+
     // Next node to step to from `from` on the shortest path to `target`, or -1 when `target` is unreachable.
     // variant 0 = the plain shortest path; 1..kVariants-1 scale every recorded path's length by a per-variant factor (0.75 .. 1.6) so
     // different bots / different runs prefer different tunnels, graveyard jumps and roofs instead of all walking one lane.
     static constexpr int kVariants = 8;
+    // Avoid sets: a route `variant` of kVariants * k + v is variant v that keeps clear of avoid area k (1-based, the graph's `avoid` list,
+    // AV only): every recorded edge with an end inside the area costs kAvoidFactor times its length, so the route goes round when there
+    // is a way round and still goes through when there is none.
+    static constexpr int kAvoidSets = 3;
+    static constexpr float kAvoidFactor = 20.0f;
+    static constexpr int kRouteKeys = kVariants * kAvoidSets;
     int NextToward(int from, int target, int variant = 0) const
     {
         if (from == target) return -1;
-        Table const& t = HopsTo(target, variant % kVariants);
+        Table const& t = HopsTo(target, variant % kRouteKeys);
         return t.hop[size_t(from)];
     }
 
@@ -129,7 +193,7 @@ public:
     float DistanceTo(int from, int target, int variant = 0) const
     {
         if (from == target) return 0.0f;
-        return HopsTo(target, variant % kVariants).dist[size_t(from)];
+        return HopsTo(target, variant % kRouteKeys).dist[size_t(from)];
     }
 
     // The first / last node of the recorded path called `name`, or -1.
@@ -166,7 +230,7 @@ private:
     Table const& HopsTo(int target, int variant) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        int const key = target * kVariants + variant;
+        int const key = target * kRouteKeys + variant;
         auto it = cache_.find(key);
         if (it != cache_.end()) return it->second;
         size_t const n = nodes_.size();
@@ -176,13 +240,22 @@ private:
         std::priority_queue<QItem, std::vector<QItem>, std::greater<QItem>> pq;
         dist[size_t(target)] = 0.0f;
         pq.emplace(0.0f, target);
+        int const avoid = variant / kVariants;
+        AvoidArea const* area = avoid > 0 && size_t(avoid) <= avoid_.size() ? &avoid_[size_t(avoid - 1)] : nullptr;
+        auto inside = [&](int i)
+        {
+            if (!area) return false;
+            float const dx = nodes_[size_t(i)].p.x - area->x, dy = nodes_[size_t(i)].p.y - area->y;
+            return dx * dx + dy * dy <= area->r * area->r;
+        };
         while (!pq.empty())
         {
             auto [d, v] = pq.top();
             pq.pop();
             if (d > dist[size_t(v)]) continue;
             for (auto const& [u, w] : nodes_[size_t(v)].in)       // u -> v exists
-                if (float const w2 = w * Factor(nodes_[size_t(u)].path, variant); d + w2 < dist[size_t(u)])
+                if (float const w2 = w * Factor(nodes_[size_t(u)].path, variant % kVariants) * (inside(u) || inside(v) ? kAvoidFactor : 1.0f);
+                    d + w2 < dist[size_t(u)])
                 {
                     dist[size_t(u)] = d + w2;
                     hop[size_t(u)] = v;
@@ -204,13 +277,24 @@ private:
     mutable std::mutex mutex_;
     mutable std::unordered_map<int, Table> cache_;
     std::vector<char const*> names_;
+    std::vector<AvoidArea> avoid_;
 };
+
+// AV route avoid sets (Graph::kAvoidSets) and the radius round the captain they keep clear of: his garrison (Galvangar's Frostwolf
+// Warriors and lieutenants stand 10-40 yd from him) and the road through it (Iceblood Garrison (-492,-187) is 57 yd, (-532,-231) 67 yd).
+constexpr int kAvoidGalvangar = 1;
+constexpr int kAvoidBalinda = 2;
+constexpr float kCaptainAvoidRadius = 70.0f;
 
 inline Graph const* GraphFor(uint16_t bg_type)
 {
     static Graph const wsg(kPathsWsg, sizeof(kPathsWsg) / sizeof(kPathsWsg[0]));
     static Graph const ab(kPathsAb, sizeof(kPathsAb) / sizeof(kPathsAb[0]));
-    static Graph const av(kPathsAv, sizeof(kPathsAv) / sizeof(kPathsAv[0]), 3.5f);
+    // AV avoid areas (Graph::kAvoidSets): 1 = Iceblood Garrison around Galvangar, 2 = Stonehearth Outpost around Balinda. A team that
+    // left the enemy captain alive (BgAvPlan::CaptainGivenUp) walks its general push round his garrison: in bot-only AV 263 the
+    // Alliance push from Snowfall took the road through Iceblood Garrison past the living Galvangar and died there.
+    static Graph const av(kPathsAv, sizeof(kPathsAv) / sizeof(kPathsAv[0]), 3.5f,
+                          { { -545.2f, -165.4f, kCaptainAvoidRadius }, { -57.8f, -286.6f, kCaptainAvoidRadius } });
     switch (bg_type)
     {
         case 1: return &av;
@@ -218,6 +302,37 @@ inline Graph const* GraphFor(uint16_t bg_type)
         case 3: return &ab;
         default: return nullptr;
     }
+}
+
+// A recorded node on the route from (hx,hy,hz) to (tx,ty,tz), the first one walking back from the target end that is at least `back`
+// yards from the target (x/y): a spot on the near side of the target, on the way in. False when the graph has no such route; when the
+// whole route is nearer than `back`, its first node.
+inline bool ApproachPoint(uint16_t bg_type, float hx, float hy, float hz, float tx, float ty, float tz, float back,
+                          float& rx, float& ry, float& rz)
+{
+    Graph const* g = GraphFor(bg_type);
+    if (!g || g->size() == 0) return false;
+    float dh = 0.f, dt = 0.f;
+    int const from = g->Nearest(hx, hy, hz, dh);
+    int const to = g->Nearest(tx, ty, tz, dt);
+    if (from < 0 || to < 0) return false;
+    std::vector<int> path{ from };
+    for (int cur = from; cur != to;)
+    {
+        cur = g->NextToward(cur, to);
+        if (cur < 0 || path.size() > g->size()) return false;
+        path.push_back(cur);
+    }
+    for (auto it = path.rbegin(); it != path.rend(); ++it)
+    {
+        RoutePoint const& p = g->Point(*it);
+        if ((p.x - tx) * (p.x - tx) + (p.y - ty) * (p.y - ty) >= back * back || std::next(it) == path.rend())
+        {
+            rx = p.x; ry = p.y; rz = p.z;
+            return true;
+        }
+    }
+    return false;
 }
 
 // The waypoint to walk to next on the way from (bx,by,bz) to (tx,ty,tz): the first node on the recorded route that is at least
@@ -247,7 +362,26 @@ inline bool NextWaypoint(uint16_t bg_type, float bx, float by, float bz, float t
         nx = f.x; ny = f.y; nz = f.z;
         return true;
     }
-    int cur = from;
+    int const cur_start = g->StartToward(bx, by, bz, from, db, std::max(lookahead, 20.0f), to, variant);
+    int cur = cur_start >= 0 ? cur_start : from;
+    // No recorded way from here to the goal: no waypoint (the bot moves on the navmesh). Returning the start node anyway sent a bot
+    // 20-28 yd from it back to it and the plain move away again, for good (AV, Snowfall to the node nearest a goal on a one-way path).
+    if (cur != to && g->NextToward(cur, to, variant) < 0)
+        return false;
+    // A start node the bot has already walked past (its next node on the route is nearer the bot than the start node is) is not walked
+    // back to (AV, the Horde's river road to its captain waiting spot: a bot at (-334,-284) started at (-360.3,-299.9) 31 yd behind it,
+    // past the lookahead, and turned round between that node and (-294.7,-283.6) for good).
+    for (int k = 0; k < 4 && cur != to; ++k)
+    {
+        int const next = g->NextToward(cur, to, variant);
+        if (next < 0) break;
+        RoutePoint const& a = g->Point(cur);
+        RoutePoint const& b = g->Point(next);
+        auto d2 = [](float x, float y, float z, RoutePoint const& q)
+        { float const dx = q.x - x, dy = q.y - y, dz = (q.z - z) * 3.0f; return dx * dx + dy * dy + dz * dz; };
+        if (d2(bx, by, bz, b) >= d2(a.x, a.y, a.z, b)) break;
+        cur = next;
+    }
     int steps = 0;
     while (steps++ < 64)
     {
@@ -386,7 +520,12 @@ inline bool FollowLaneWaypoints(uint16_t bg_type, std::vector<LanePoint> const& 
         if (w[next].drop)
         {
             float const ax = w[next].x - bx, ay = w[next].y - by;
-            if (ax * ax + ay * ay < kLedgeR * kLedgeR && std::fabs(w[next].z - bz) < 4.0f)
+            // Landed short: down from the ledge, at the landing's level but not on the landing point. The drop is over; the old test
+            // (within 3.5 y of the landing) kept such a bot "in the air" and gave it the landing as a drop target, a drop the move API
+            // refuses below a 4 y fall, so it stood there (WSG soak on 247: Jacelia came down the Horde-side slope at (1066,1396,325),
+            // 10 y short of the landing (1077,1396,324), every move refused for 154 s).
+            bool const landed_short = bz < w[bi].z - 3.0f && std::fabs(w[next].z - bz) < 4.0f && ax * ax + ay * ay < 20.0f * 20.0f;
+            if ((ax * ax + ay * ay < kLedgeR * kLedgeR && std::fabs(w[next].z - bz) < 4.0f) || landed_short)
             {
                 if (next + 1 >= n) return false;          // landed at the chain's end: on to the goal
                 ++next;                                    // landed: the leg after the landing

@@ -1,5 +1,5 @@
 // ThreatDiscipline.h - shared group threat rules for non-tank damage, AoE and
-// healing (port of Karrz's ike3-based bots GroupPveRestraint / MCRaidHoldDamage,
+// healing (port of Karrz's wow-1.12 GroupPveRestraint / MCRaidHoldDamage,
 // generalised to any group with a tank).
 //
 // Pure functions of the bot's snapshot (NearbyUnit my_threat / tank_threat /
@@ -58,12 +58,14 @@ enum class RaidLogKind : uint8
     ThreatHold = 1, AoeHold = 2, PullHeld = 4, PullSkip = 5,
     OpenerHold = 6,                            // [raid_pull] non-tank opener on an unpulled mob (PrologueRules)
     PullBackOpener = 7,                        // [pull_back] no ranged opener for this tank (PrologueRules)
+    SightPull = 8,                             // [sight_pull] a bot's gather / wait at the line-of-sight pull spot (State_InCombat)
     Escape = 16, CancelHeal = 17, Rez = 18,   // [raid_escape], overheal cancel, rez spread
     Interrupt = 32, Tranq = 33, FearHold = 34, // [raid_interrupt], [raid_tranq], [raid_threat] fear hold
     Hazard = 48, Los = 49, Cone = 50,          // [raid_hazard], [raid_los], [raid_cone] (State_Idle)
     TankHazard = 51,                           // [raid_hazard] tank variant (State_Idle)
     TankSpread = 64, TankAoeHold = 65,         // [raid_tank] (Combat/Apl/ApTankThreat.h)
     TankDance = 66,                            // [raid_tank] warrior Battle Stance dance (Apl_Classic_Warrior)
+    DemoSkip = 67,                             // [raid_tank] Demoralizing Shout / Roar not cast on a boss (ApTankThreat.h)
 };
 
 inline uint64 RaidLogKey(BotSnapshotView const& s, RaidLogKind k)
@@ -72,13 +74,13 @@ inline uint64 RaidLogKey(BotSnapshotView const& s, RaidLogKind k)
 }
 
 // Threat discipline applies here: enabled, not a battleground, inside an
-// instance (or the open world when configured), and the group has a tank.
+// instance or in a raid group (or the open world when configured), and the group has a tank.
 inline bool ThreatDisciplineApplies(BotSnapshotView const& s)
 {
     if (!Services::Initialized()) return false;
     ConfigReader const& cfg = Services::Config();
     if (!cfg.threat_hold_enabled() || s.in_battleground()) return false;
-    if (!s.is_in_instance() && !cfg.threat_hold_open_world()) return false;
+    if (!s.is_in_instance() && !s.in_raid_group() && !cfg.threat_hold_open_world()) return false;
     return !s.group_tank().IsEmpty();
 }
 
@@ -95,13 +97,18 @@ inline float ThreatOpeningLead(BotSnapshotView const& s, NearbyUnit const& u)
 
 // A tank-held mob the tank has not secured yet against THIS bot: the tank is
 // still under its opening lead, or this bot's threat (incl. pet) is already
-// at the configured ratio of the tank's.
+// at the configured ratio of the tank's. A raid group holds at the tank's own threat, as its damage hold does (State_InCombat
+// EvaluateThreatHold, kRaidThreatMaxRatio): at the configured 90 % the fury, held between 90 and 100 % of the tank on the support
+// scorecard's one boss, never cast Whirlwind in 244 druid runs 2 and 3 (all 81 "holds melee AoE Whirlwind ... not_tanked" lines of the
+// 244 support run fell between 90 and 100 % of the tank's threat): a melee AoE on a lone boss is one more hit on the bot's own target.
 inline bool TankNotSecured(BotSnapshotView const& s, NearbyUnit const& u)
 {
     if (!u.has_threat_list || !u.unit_in_combat) return false;
     if (s.big_raid() && !(u.is_dungeon_boss || u.is_boss_rank)) return false;
     if (u.tank_threat < ThreatOpeningLead(s, u)) return true;
-    return u.my_threat >= u.tank_threat * Services::Config().threat_max_ratio();
+    float const cfg_ratio = Services::Config().threat_max_ratio();
+    float const ratio = s.raid_rules() ? std::max(cfg_ratio, 1.0f) : cfg_ratio;
+    return u.my_threat >= u.tank_threat * ratio;
 }
 
 enum class AoeHazardKind : uint8 { None, CrowdControlled, Unpulled, NotTanked, SchoolAvoided };
@@ -130,7 +137,12 @@ struct AoeHazard
 //   * for a non-tank in a tanked group: a mob a tank is holding but has not
 //     secured yet (TankNotSecured).
 //   * school_spell != 0: a mob whose raid school hint (PveOrder::SchoolHint)
-//     avoids that spell's school (Plague Slime immunity), in or out of a group.
+//     reflects that spell's school (an Anubisath Sentinel), in or out of a group.
+//     A mob merely immune to it or resisting it is no hazard: the area spell
+//     still hits everything else in it (bwl_nefarian 1108f: Victor Nefarius,
+//     immune to all schools behind his barrier, held every Multi-Shot and
+//     Arcane Explosion near him, and a Bronze Drakonid's arcane resistance
+//     held Arcane Explosion on the whole pile).
 // Mobs already on this bot or another non-tank member are fair game (the
 // fight is on them anyway); players and un-fightable props are ignored.
 // The hard vetoes (crowd-controlled, school avoided) win over the threat ones
@@ -148,7 +160,7 @@ inline AoeHazard FindAoeHazard(BotSnapshotView const& s, float cx, float cy, flo
     {
         if (!aoe_school) return false;
         PveOrder::SchoolHint const* h = po.school_hint_for(u.guid);
-        return h && (h->avoid_mask & aoe_school) != 0;
+        return h && (h->reflect_mask & aoe_school) != 0;
     };
     const bool tanked = ThreatDisciplineApplies(s);
     const bool me_tank = caster_is_tank || s.group_tank() == s.guid() ||

@@ -1,0 +1,16 @@
+# Baseline: support_scorecard_warrior on build 233 (3 runs, averages); only the label and dps columns are read. The dps column holds each bot's
+# scorecard value: threat per second for the tank, effective healing per second for a healer, damage per second for a dps bot.
+# support_scorecard 2026-10-23 23:21-23:29 (server time): 10 bots, Spttankw tanking (swings of 3500 every 2 s) and a pulse of 1200 at 6 raiders every 6 s
+# on a level 63 boss, Tier 3, 120 s measured after 75 s of buffing. Run values: tank 644/721/706; hpriest 337/288/333, dpriest 277/298/244,
+# hpala 264/271/284, rdruid 251/247/206, rshaman 225/213/207; fury 917/897/910, combat 690/760/787, fire 611/690/612, aff 579/628/593.
+run	label	role	dps
+233	Spttankw	tank	690
+233	Spthpriest	healer	319
+233	Sptdpriest	healer	273
+233	Spthpala	healer	273
+233	Sptrdruid	healer	235
+233	Sptrshaman	healer	215
+233	Sptfury	dps	908
+233	Sptcombat	dps	746
+233	Sptfire	dps	638
+233	Sptaff	dps	600

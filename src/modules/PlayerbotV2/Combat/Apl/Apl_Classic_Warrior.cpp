@@ -10,7 +10,7 @@
 // (Overpower, Revenge, Execute) are gated by the snapshot's aura-state
 // check, so their predicates only test rage and stance.
 //
-// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
+// Priorities follow Karrz's ike3 vanilla strategies (Karrz1/wow-1.12
 // raid10-revamp, playerbot/strategy/warrior/*Strategy.cpp, MANGOSBOT_ZERO).
 
 #include "../ApRegistry.h"
@@ -73,20 +73,19 @@ constexpr uint32 BLOODTHIRST        = 23881;   // Fury talent
 constexpr uint32 SHIELD_SLAM        = 23922;   // Protection talent
 constexpr uint32 LAST_STAND         = 12975;   // Protection talent
 constexpr uint32 CONCUSSION_BLOW    = 12809;   // Protection talent
-constexpr uint32 DEATH_WISH         = 12292;   // Fury talent
-constexpr uint32 SWEEPING_STRIKES   = 12328;   // Arms talent
+// The client data names 12292 Sweeping Strikes (5 charges, 20 s) and 12328 Death Wish (+20% damage, 30 s); the two were swapped here, so a boss
+// fight cast Sweeping Strikes for "Death Wish" and Death Wish needed two enemies in Battle Stance.
+constexpr uint32 DEATH_WISH         = 12328;   // Fury talent
+constexpr uint32 SWEEPING_STRIKES   = 12292;   // Arms talent
 constexpr uint32 MOCKING_BLOW       = 694;     // Battle Stance only
 // Nefarian's class call for warriors (BWL): forces Berserker Stance for
 // ~30 s. Every stance switch fails meanwhile (and the aura puts the warrior
 // straight back), so a stance rule that keeps trying - the Defensive switch
 // back, the Battle Stance dance, a DPS stance fix - spends a GCD per tick.
 constexpr uint32 NEFARIAN_WARRIOR_CALL = 23397;
-// Tactical Mastery (Arms talent), ranks 1-5: a stance change keeps up to 5
-// rage per rank (vanilla; without it the switch keeps none).
-constexpr uint32 TACTICAL_MASTERY_RANKS[] = { 12295, 12676, 12677, 12678, 12679 };
-
 constexpr uint8 POWER_RAGE = 1;
 
+constexpr uint32 SPEC_ARMS       = 71;
 constexpr uint32 SPEC_FURY       = 72;
 constexpr uint32 SPEC_PROTECTION = 73;
 
@@ -140,9 +139,22 @@ int32 VictimHpPct(ApPredicateContext const& ctx)
 
 // DPS stance: Fury lives in Berserker Stance once it is trained (level 30);
 // Arms and low-level warriors stay in Battle Stance (Overpower, Charge).
+// An arms warrior in a group's boss fight (Classic::BossFight) fights in Berserker Stance as well, as vanilla raid arms did: Whirlwind on
+// its cooldown and the stance's 3% crit, where Battle Stance gives only Overpower after a dodge. Scorecard 0.1.29: arms sat at 40-90 rage
+// in Battle Stance, the Whirlwind dance never started (it waits for 25 rage or less, so no rage is lost in the switch), Overpower landed
+// 2-6 times in 120 s and the spare rage went to Heroic Strike; arms did 681-788 dps against fury's 1016-1144. Solo, and on trash, arms
+// keeps Battle Stance (Charge, Overpower, Sweeping Strikes, Thunder Clap).
+bool ArmsBerserkerFight(ApPredicateContext const& ctx)
+{
+    return ctx.bot.spec() == SPEC_ARMS && ctx.bot.in_group() && ctx.bot.knows_spell(BERSERKER_STANCE) && ctx.bot.knows_spell(WHIRLWIND)
+        && ctx.bot.knows_spell(MORTAL_STRIKE) && Classic::BossFight(ctx.bot);
+}
+
 uint32 DpsStance(ApPredicateContext const& ctx)
 {
     if (ctx.bot.spec() == SPEC_FURY && ctx.bot.knows_spell(BERSERKER_STANCE))
+        return BERSERKER_STANCE;
+    if (ArmsBerserkerFight(ctx))
         return BERSERKER_STANCE;
     return BATTLE_STANCE;
 }
@@ -151,13 +163,21 @@ uint32 DpsStance(ApPredicateContext const& ctx)
 
 bool ShouldBloodrage(ApPredicateContext const& ctx)
 {
-    return ctx.bot.in_combat() && Rage(ctx) < 20 && ctx.bot.hp_pct() > 40 && Ready(ctx, BLOODRAGE);
+    // On cooldown: its 20 rage (10 at once, 10 over 10 s) is free rage, and a fury / arms bot averages 20-30 rage a leg (damage_parity 146/147, rage
+    // below 30 for most of every leg), so waiting for under 20 let a cooldown pass unused. Only a nearly full bar is not worth it.
+    return ctx.bot.in_combat() && Rage(ctx) < 70 && ctx.bot.hp_pct() > 40 && Ready(ctx, BLOODRAGE);
 }
 void DoBloodrage(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(BLOODRAGE); }
 
+// Renewed in its last seconds, not after it has gone: the shout is the whole party's, and a recast only once it had expired left the party
+// without it at every two-minute mark (244 support scorecard, paladin run 1: Battle Shout missing on four bots as the measurement began
+// at 19:39:14, the fury's recast at 19:39:15).
+constexpr int64 kBattleShoutRefreshMs = 3000;
 bool ShouldBattleShout(ApPredicateContext const& ctx)
 {
-    return Rage(ctx) >= 10 && Ready(ctx, BATTLE_SHOUT) && !ctx.bot.has_aura(BATTLE_SHOUT);
+    if (Rage(ctx) < 10 || !Ready(ctx, BATTLE_SHOUT)) return false;
+    AuraEntry const* bs = ctx.bot.find_aura(BATTLE_SHOUT);
+    return !bs || bs->remaining.count() < kBattleShoutRefreshMs;
 }
 void DoBattleShout(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(BATTLE_SHOUT); }
 
@@ -168,6 +188,14 @@ bool ShouldBerserkerRageFear(ApPredicateContext const& ctx)
         && (ctx.bot.has_mechanic(5) || ctx.bot.has_mechanic(30));
 }
 void DoBerserkerRage(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(BERSERKER_RAGE); }
+
+// Fury also keeps Berserker Rage on its 30 s cooldown (it costs nothing and has no downside in Berserker Stance): the client's Improved Berserker
+// Rage talent (23690) is a rage talent in this build, and the fury bot was rage-starved (damage_parity 147: average 16-19 rage, Bloodthirst 22-25 casts of 30).
+bool ShouldBerserkerRageOnCooldown(ApPredicateContext const& ctx)
+{
+    // Scorecard group 6: fury averaged 80.7 rage and sat at the 100 cap for 36 s of 120, so free rage is taken only while there is room for it.
+    return ctx.bot.in_combat() && ctx.bot.spec() == SPEC_FURY && InStance(ctx, BERSERKER_STANCE) && Rage(ctx) < 60 && Ready(ctx, BERSERKER_RAGE);
+}
 
 bool ShouldExecute(ApPredicateContext const& ctx)
 {
@@ -198,9 +226,21 @@ void DoHeroicStrike(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast
 
 // ======================= DPS =======================
 
+// Defined with the Battle Stance dance below.
+bool DanceActive(ApPredicateContext const& ctx, uint32 spell);
+void DanceBegin(ApPredicateContext const& ctx, uint32 spell);
+void DanceEnd(ApPredicateContext const& ctx);
+int32 RageAfterStanceSwitch(ApPredicateContext const& ctx);
+int32 StanceRageKeep(ApPredicateContext const& ctx);
+bool StanceReady(ApPredicateContext const& ctx, uint32 stance);
+
 bool ShouldDpsStance(ApPredicateContext const& ctx)
 {
     uint32 const want = DpsStance(ctx);
+    // An arms bot that went to Berserker Stance for Whirlwind stays until the Whirlwind is cast (or the hold window ends).
+    // It goes back at once if the Whirlwind cannot be cast (group 19: dances that sat in Berserker Stance for the whole 3 s hold and cast nothing).
+    if (DanceActive(ctx, WHIRLWIND) && Rage(ctx) >= 25 && Ready(ctx, WHIRLWIND))
+        return false;
     return !StanceForced(ctx) && !InStance(ctx, want) && Ready(ctx, want);
 }
 void DoDpsStance(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(DpsStance(ctx)); }
@@ -254,12 +294,20 @@ void DoSweepingStrikes(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(
 
 bool ShouldOverpower(ApPredicateContext const& ctx)
 {
+    // Mortal Strike (30 rage) comes first: while it is ready or about to be, Overpower (5 rage) waits unless both fit, otherwise the cheap strike
+    // spends the rage every cooldown and the bigger one lands only about half as often (damage_parity 2026-10-21: 13-19 casts a leg of ~30).
+    if (ctx.bot.knows_spell(MORTAL_STRIKE) && Rage(ctx) < 35 && ctx.bot.cd_remaining(MORTAL_STRIKE).count() <= 1500)
+        return false;
     return HasLiveTarget(ctx) && InStance(ctx, BATTLE_STANCE) && Rage(ctx) >= 5 && (Ready(ctx, OVERPOWER) && ctx.bot.victim_in_spell_range(OVERPOWER));
 }
 void DoOverpower(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(OVERPOWER, ctx.bot.victim()); }
 
 bool ShouldMortalStrike(ApPredicateContext const& ctx)
 {
+    // Fury has Bloodthirst; the trainer teaches Mortal Strike to every warrior, and it came first in the list (30 rage, 6 s) so fury cast it for
+    // all of its rage and Bloodthirst never fired.
+    if (ctx.bot.spec() == SPEC_FURY)
+        return false;
     return HasLiveTarget(ctx) && Rage(ctx) >= 30 && (Ready(ctx, MORTAL_STRIKE) && ctx.bot.victim_in_spell_range(MORTAL_STRIKE));
 }
 void DoMortalStrike(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(MORTAL_STRIKE, ctx.bot.victim()); }
@@ -275,11 +323,69 @@ bool ShouldWhirlwind(ApPredicateContext const& ctx)
     // Bloodthirst (30 rage) comes first: below 55 rage, Whirlwind waits while Bloodthirst is about to come off cooldown.
     if (ctx.bot.knows_spell(BLOODTHIRST) && Rage(ctx) < 55 && ctx.bot.cd_remaining(BLOODTHIRST).count() <= 1500)
         return false;
+    // Arms the same with Mortal Strike (Bloodthirst is a fury talent, so a fury warrior never reaches this line with Mortal Strike's gate).
+    if (ctx.bot.spec() == SPEC_ARMS && ctx.bot.knows_spell(MORTAL_STRIKE) && Rage(ctx) < 55 && ctx.bot.cd_remaining(MORTAL_STRIKE).count() <= 1500)
+        return false;
     return HasLiveTarget(ctx) && InStance(ctx, BERSERKER_STANCE) && Rage(ctx) >= 25
         && ctx.bot.enemies_within(8.0f) >= 1 && (Ready(ctx, WHIRLWIND) && ctx.bot.victim_in_spell_range(WHIRLWIND))
         && MeleeAoeSafe(ctx.bot, InRaid(ctx), 8.0f, /*tank*/ false, "Whirlwind");
 }
-void DoWhirlwind(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(WHIRLWIND, ctx.bot.victim()); }
+void DoWhirlwind(ApPredicateContext const& ctx, BotIntentEmitter& e)
+{
+    e.cast(WHIRLWIND, ctx.bot.victim());
+    DanceEnd(ctx);   // an arms bot's Whirlwind dance: classic_war:stance takes it back to Battle Stance next tick
+}
+
+// Arms Whirlwind: the vanilla arms rotation steps into Berserker Stance for it and back (Tactical Mastery keeps up to 25 rage across the switch).
+// Whirlwind is a full normalised weapon hit for 25 rage, where Heroic Strike adds only its flat bonus to a swing that happens anyway, so it is
+// the better use of rage on a boss. Boss fights and raids only (Classic::BossFight), never as a tank, and only when the switch loses little:
+// rage above what Tactical Mastery keeps is gone, so the dance starts between 25 and 45 rage, after Mortal Strike has had its turn.
+// Every gate of the dance, once per 10 s per arms bot in combat while the dance is not running (group 8: 0 Whirlwinds in 120 s, no log said which gate).
+void LogArmsDanceGates(ApPredicateContext const& ctx)
+{
+    static std::mutex mtx;
+    static std::unordered_map<uint64, uint32> last;
+    uint32 const now = ctx.bot.published_at_ms();
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (last.size() > 4096)
+            last.clear();
+        auto [it, fresh] = last.try_emplace(ctx.bot.guid().GetCounter(), now);
+        if (!fresh && now - it->second < 10'000u)
+            return;
+        it->second = now;
+    }
+    TC_LOG_INFO("playerbot.v2", "[war_dance] {} knows_ww={} knows_berserker={} in_battle={} live_target={} boss_fight={} ww_ready={} ww_cd_ms={} in_range={} rage={} rage_kept={} ms_cd_ms={} stance_ready={} aoe_safe={}",
+                ctx.bot.name(), int(ctx.bot.knows_spell(WHIRLWIND)), int(ctx.bot.knows_spell(BERSERKER_STANCE)), int(InStance(ctx, BATTLE_STANCE)), int(HasLiveTarget(ctx)),
+                int(Classic::BossFight(ctx.bot)), int(Ready(ctx, WHIRLWIND)), ctx.bot.cd_remaining(WHIRLWIND).count(), int(ctx.bot.victim_in_spell_range(WHIRLWIND)),
+                Rage(ctx), RageAfterStanceSwitch(ctx), ctx.bot.cd_remaining(MORTAL_STRIKE).count(), int(StanceReady(ctx, BERSERKER_STANCE)),
+                int(MeleeAoeSafe(ctx.bot, InRaid(ctx), 8.0f, /*tank*/ false, "Whirlwind")));
+}
+
+bool ShouldArmsWhirlwindDance(ApPredicateContext const& ctx)
+{
+    if (ctx.bot.spec() != SPEC_ARMS)
+        return false;
+    if (ctx.bot.in_combat())
+        LogArmsDanceGates(ctx);
+    if (StanceForced(ctx) || !InStance(ctx, BATTLE_STANCE) || !ctx.bot.knows_spell(BERSERKER_STANCE))
+        return false;
+    if (!HasLiveTarget(ctx) || !Classic::BossFight(ctx.bot) || !Ready(ctx, WHIRLWIND) || !ctx.bot.victim_in_spell_range(WHIRLWIND))
+        return false;
+    int32 const rage = Rage(ctx);
+    // Rage above what the switch keeps is destroyed (classic_spell_warr_stance_rage), and arms is rage-limited (group 19: 29-50 rage on average,
+    // Mortal Strike on its 6 s cooldown), so the dance starts only with no rage to lose.
+    if (rage < 25 || rage > StanceRageKeep(ctx))
+        return false;
+    if (ctx.bot.knows_spell(MORTAL_STRIKE) && ctx.bot.cd_remaining(MORTAL_STRIKE).count() <= 1500)
+        return false;
+    return StanceReady(ctx, BERSERKER_STANCE) && MeleeAoeSafe(ctx.bot, InRaid(ctx), 8.0f, /*tank*/ false, "Whirlwind");
+}
+void DoArmsWhirlwindDance(ApPredicateContext const& ctx, BotIntentEmitter& e)
+{
+    DanceBegin(ctx, WHIRLWIND);
+    e.cast(BERSERKER_STANCE);
+}
 
 // Rend while leveling: worth it before the big talent strikes exist.
 bool ShouldRend(ApPredicateContext const& ctx)
@@ -287,6 +393,8 @@ bool ShouldRend(ApPredicateContext const& ctx)
     if (!HasLiveTarget(ctx) || Rage(ctx) < 10 || InStance(ctx, BERSERKER_STANCE)) return false;
     if (ctx.bot.knows_spell(MORTAL_STRIKE) || ctx.bot.knows_spell(BLOODTHIRST)) return false;
     if (VictimHpPct(ctx) < 40) return false;
+    // A bleed-immune mob never takes the aura, so the cast would repeat every GCD.
+    if (NearbyUnit const* v = ctx.bot.victim_info(); v && v->bleed_immune) return false;
     return (Ready(ctx, REND) && ctx.bot.victim_in_spell_range(REND)) && !ctx.bot.has_aura(REND, ctx.bot.victim());
 }
 void DoRend(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(REND, ctx.bot.victim()); }
@@ -306,6 +414,7 @@ ApRule const kDpsRules[] = {
     { ShouldCharge,            DoCharge,          "classic_war:charge" },
     { ShouldPummel,            DoPummel,          "classic_war:pummel" },
     { ShouldBloodrage,         DoBloodrage,       "classic_war:bloodrage" },
+    { ShouldBerserkerRageOnCooldown, DoBerserkerRage, "classic_war:berserker_rage_cd" },
     { ShouldBattleShout,       DoBattleShout,     "classic_war:battle_shout" },
     { ShouldDeathWish,         DoDeathWish,       "classic_war:death_wish" },
     { ShouldRecklessness,      DoRecklessness,    "classic_war:recklessness" },
@@ -313,6 +422,7 @@ ApRule const kDpsRules[] = {
     { ShouldSweepingStrikes,   DoSweepingStrikes, "classic_war:sweeping_strikes" },
     { ShouldOverpower,         DoOverpower,       "classic_war:overpower" },
     { ShouldMortalStrike,      DoMortalStrike,    "classic_war:mortal_strike" },
+    { ShouldArmsWhirlwindDance, DoArmsWhirlwindDance, "classic_war:arms_whirlwind_dance" },
     { ShouldBloodthirst,       DoBloodthirst,     "classic_war:bloodthirst" },
     { ShouldWhirlwind,         DoWhirlwind,       "classic_war:whirlwind" },
     { ShouldThunderClapDps,    DoThunderClap,     "classic_war:thunder_clap" },
@@ -382,19 +492,25 @@ bool DanceLockedOut(ApPredicateContext const& ctx)
     return d.started_ms != 0 && ctx.bot.published_at_ms() - d.started_ms < kDanceLockoutMs;
 }
 
-// Rage a stance change keeps: 5 per Tactical Mastery rank, none without it.
-int32 RageAfterStanceSwitch(ApPredicateContext const& ctx)
+// Rage a stance change keeps (classic_spell_warr_stance_rage): the baseline Tactical Mastery (1310185) amount plus Improved Tactical Mastery's
+// (12295), each read from the spell data while the bot has the aura. The old list of vanilla rank ids resolved to rank 1 for every warrior
+// (group 12: rage_kept=5 in all 31 lines), which held the arms Whirlwind dance back. The talent aura's amount follows its trait rank, which the
+// snapshot does not carry, so the improved part is the spell data's value at the rank the build buys (5 of 5).
+int32 StanceRageKeep(ApPredicateContext const& ctx)
 {
     int32 keep = 0;
-    // Highest rank first; resolve_rank returns the id itself only when that
-    // rank is the one known (a chain walk reports the top known rank).
-    for (int r = int(std::size(TACTICAL_MASTERY_RANKS)) - 1; r >= 0; --r)
-        if (ctx.bot.resolve_rank(TACTICAL_MASTERY_RANKS[r]) == TACTICAL_MASTERY_RANKS[r])
-        {
-            keep = 5 * (r + 1);
-            break;
-        }
-    return std::min(Rage(ctx), keep);
+    constexpr uint32 kBaselineTacticalMastery = 1310185;
+    constexpr uint32 kImprovedTacticalMastery = 12295;
+    for (uint32 const id : { kBaselineTacticalMastery, kImprovedTacticalMastery })
+        if (ctx.bot.has_aura(id))
+            if (SpellInfo const* si = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE))
+                keep += std::max<int32>(0, si->GetEffect(EFFECT_0).CalcValue());
+    return keep;
+}
+
+int32 RageAfterStanceSwitch(ApPredicateContext const& ctx)
+{
+    return std::min(Rage(ctx), StanceRageKeep(ctx));
 }
 
 // The spell's own cooldown is clear (a running GCD aside).
@@ -631,7 +747,8 @@ bool TankOnDuty(ApPredicateContext const& ctx)
 }
 
 // Last Stand at 25% health; Shield Wall at 20%, or at 25% once Last Stand is
-// spent (up already, on cooldown or not trained).
+// spent (up already, on cooldown or not trained). Shield Wall needs a shield
+// (70532 data: equipped armor, subclass mask 64), as Shield Bash and Block do.
 bool ShouldLastStand(ApPredicateContext const& ctx)
 {
     return ctx.bot.in_combat() && ctx.bot.hp_pct() <= 25 && TankOnDuty(ctx) && Ready(ctx, LAST_STAND);
@@ -647,7 +764,7 @@ bool ShouldShieldWall(ApPredicateContext const& ctx)
     int32 const hp = ctx.bot.hp_pct();
     bool const last_stand_spent = !Ready(ctx, LAST_STAND) || ctx.bot.has_aura(LAST_STAND);
     return ctx.bot.in_combat() && (hp <= 20 || (hp <= 25 && last_stand_spent)) && TankOnDuty(ctx)
-        && InStance(ctx, DEFENSIVE_STANCE) && Ready(ctx, SHIELD_WALL) && !ctx.bot.has_aura(SHIELD_WALL);
+        && InStance(ctx, DEFENSIVE_STANCE) && Interrupt::HasShield(ctx.bot) && Ready(ctx, SHIELD_WALL) && !ctx.bot.has_aura(SHIELD_WALL);
 }
 void DoShieldWall(ApPredicateContext const& ctx, BotIntentEmitter& e)
 {
@@ -864,12 +981,17 @@ void DoSunder(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(SUNDE
 constexpr int32 kDemoShoutRage = 25;
 bool ShouldDemoShout(ApPredicateContext const& ctx)
 {
-    return ctx.bot.in_combat() && HasLiveTarget(ctx) && Rage(ctx) >= kDemoShoutRage
+    if (!ctx.bot.in_combat() || !HasLiveTarget(ctx))
+        return false;
+    bool const ok = Rage(ctx) >= kDemoShoutRage
         && Ready(ctx, DEMORALIZING_SHOUT)
         && TankThreat::DemoRefreshWorth(ctx.bot, 10.0f)
         && MeleeAoeSafe(ctx.bot, InRaid(ctx), 10.0f, /*tank*/ true, "Demoralizing Shout")
         // No damage (a sheep survives it), but it aggroes every mob it lands on.
         && AoeSafeAroundSelf(ctx.bot, 10.0f, /*damaging*/ false, /*tank*/ true, "Demoralizing Shout");
+    if (!ok)
+        TankThreat::NoteDemoSkip(ctx.bot, "Demoralizing Shout", Rage(ctx), Ready(ctx, DEMORALIZING_SHOUT));
+    return ok;
 }
 void DoDemoShout(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(DEMORALIZING_SHOUT); }
 

@@ -5,10 +5,14 @@
 // header holds no game objects, so the order of the rules is unit-tested (tests/game/ClassicLazyLock.cpp).
 //
 // Priority (vanilla affliction / destruction), first rule that applies wins:
-//   1. emergency  Death Coil <=30% hp; Life Tap <=25% mana while healthy; Drain Life <=35% hp
-//   2. upkeep     Demon Armor; the pet only out of combat (a missing pet, shard or summon never holds the rest back)
+//   1. emergency  Death Coil <=30% hp; an enemy hitting the warlock in melee range: Death Coil, then Howl of Terror on two or more,
+//                 then Fear (outside dungeons and raids, or on a player; never a boss); Life Tap <=25% mana while healthy;
+//                 Drain Life <=35% hp
+//   2. upkeep     Demon Armor and the pet only with no enemy selected (an enemy selected always gets a spell, never a 10 s summon);
+//                 the pet only out of combat (a missing pet, shard or summon never holds the rest back)
 //   3. proc       Shadow Trance instant Shadow Bolt
-//   4. cooldowns  racial, then Amplify Curse before Agony, on a fight that will last
+//   4. cooldowns  both on-use trinkets and the racial whenever ready on a fight that will last, then Amplify Curse before Agony.
+//                 Trinkets, racial and Amplify Curse cost no global cooldown: the caller casts them and picks again in the same press
 //   5. dots       ONE curse (Tongues on mana users, else Agony), Corruption, Immolate, Siphon Life; not into a dying mob
 //   6. execute    Conflagrate on Immolate; Shadowburn in the last 20% (keeps one shard); Drain Soul on a dying mob when shards are low
 //   7. filler     Shadow Bolt; the wand only when Shadow Bolt cannot be cast (out of mana)
@@ -41,6 +45,10 @@ enum Cast : uint8_t
     DrainSoul,
     ShadowBolt,
     Wand,
+    Fear,
+    HowlOfTerror,
+    Trinket1,          // on-use trinket in the top trinket slot
+    Trinket2,
     Count
 };
 
@@ -66,6 +74,11 @@ struct Input
     bool wand_equipped = false;
     bool wand_shooting = false;  // the wand is already on auto-repeat
     bool another_tongues = false; // another warlock's Curse of Tongues is already on the target
+    bool target_player = false;  // the target is a player (PvP)
+    bool target_close = false;   // the target is in melee range (8y) and attacking the warlock
+    bool target_feared = false;  // the target is already feared or horrified
+    bool fear_safe = true;       // a feared mob running off is fine here (outside dungeons and raids)
+    int attackers_close = 0;     // enemies attacking the warlock within Howl of Terror's 10y
 
     int hp_pct = 100;
     int mana_pct = 100;
@@ -82,6 +95,12 @@ inline bool DotWorthwhile(Input const& in)
     return in.mana_pct >= 10 && (in.target_boss || in.target_hp_pct >= 35);
 }
 
+// Costs no global cooldown: cast it and pick again in the same press.
+constexpr bool OffGlobalCooldown(Cast s) { return s == Racial || s == AmplifyCurse || s == Trinket1 || s == Trinket2; }
+
+// A fight worth a cooldown: a boss, a player, or a target still above half health.
+inline bool LongFight(Input const& in) { return in.target_boss || in.target_player || in.target_hp_pct >= 50; }
+
 // The next spell, and in `why` (when given) the rule that chose it, for the press log.
 inline Cast Pick(Input const& in, char const** why = nullptr)
 {
@@ -95,11 +114,25 @@ inline Cast Pick(Input const& in, char const** why = nullptr)
 
     // Emergencies and upkeep.
     if (in.hp_pct <= 30 && in.in_combat && in.has_target && in.target_in_range && Can(in, DeathCoil)) return pick(DeathCoil, "health <=30%");
-    if (in.mana_pct <= 25 && in.hp_pct >= 50 && Can(in, LifeTap)) return pick(LifeTap, "mana <=25%, health ok");
-    if (!in.armor_up && Can(in, DemonArmor)) return pick(DemonArmor, "armor down");
-    if (!in.has_pet && !in.in_combat && Can(in, SummonPet)) return pick(SummonPet, "no pet");
 
-    if (!in.has_target) return pick(None, "no target");
+    // An enemy on the warlock in melee range: horrify it, then fear it, so the next presses cast from range.
+    if (in.in_combat && in.has_target && in.target_close && !in.target_feared)
+    {
+        bool const fear_ok = !in.target_boss && (in.fear_safe || in.target_player);
+        if (Can(in, DeathCoil)) return pick(DeathCoil, "enemy in melee: Death Coil");
+        if (fear_ok && in.attackers_close >= 2 && Can(in, HowlOfTerror)) return pick(HowlOfTerror, "two or more in melee: Howl of Terror");
+        if (fear_ok && Can(in, Fear)) return pick(Fear, "enemy in melee: Fear");
+    }
+
+    if (in.mana_pct <= 25 && in.hp_pct >= 50 && Can(in, LifeTap)) return pick(LifeTap, "mana <=25%, health ok");
+
+    // Upkeep only with no enemy selected: a press at an enemy always fights.
+    if (!in.has_target)
+    {
+        if (!in.armor_up && Can(in, DemonArmor)) return pick(DemonArmor, "armor down");
+        if (!in.has_pet && !in.in_combat && Can(in, SummonPet)) return pick(SummonPet, "no pet");
+        return pick(None, "no target");
+    }
     if (!in.target_in_range) return pick(None, "target out of range");
 
     if (in.hp_pct <= 35 && in.in_combat && in.mana_pct >= 10 && Can(in, DrainLife)) return pick(DrainLife, "health <=35%");
@@ -107,8 +140,13 @@ inline Cast Pick(Input const& in, char const** why = nullptr)
     // The free instant bolt first.
     if (in.trance && in.mana_pct >= 8 && Can(in, ShadowBoltTrance)) return pick(ShadowBoltTrance, "Shadow Trance proc");
 
-    // Cooldowns: a racial on a fight that will last (a boss, or a target still above 60%).
-    if (in.in_combat && in.mana_pct >= 30 && (in.target_boss || in.target_hp_pct >= 60) && Can(in, Racial)) return pick(Racial, "long fight: cooldown");
+    // Cooldowns whenever ready on a fight that will last: both trinkets, then the racial.
+    if (in.in_combat && LongFight(in))
+    {
+        if (Can(in, Trinket1)) return pick(Trinket1, "long fight: trinket 1");
+        if (Can(in, Trinket2)) return pick(Trinket2, "long fight: trinket 2");
+        if (in.mana_pct >= 30 && Can(in, Racial)) return pick(Racial, "long fight: racial");
+    }
 
     if (DotWorthwhile(in))
     {

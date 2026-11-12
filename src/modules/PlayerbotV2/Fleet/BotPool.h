@@ -63,6 +63,7 @@ constexpr Verdict CheckFree(FreeFacts const& f)
 } // namespace Playerbot::Pool
 
 #include "Define.h"
+#include <vector>
 class Player;
 
 namespace Playerbot::Pool {
@@ -70,9 +71,12 @@ namespace Playerbot::Pool {
 // Role of a bot by id. Not a lifecycle bot (a real player) counts as Owned.
 BotRole RoleOf(uint64 bot_id);
 // A scenario test squad member is Owned without an owner account: raid-tier gear, never scrubbed to the world tier, never freed or
-// drawn into a battleground fill mid-run. Marked by the scenario runner before the bot's setup; stays for the session.
+// drawn into a battleground fill mid-run. Marked by the scenario runner before the bot's setup, and at the first world tick for every
+// catalogue character that already exists (Scenario::MarkTestCharacters), so a restart does not turn them into pool bots; stays for the session.
 void MarkScenarioBot(uint64 bot_id);
 bool IsScenarioBot(uint64 bot_id);
+// Every character marked so far (the scenario runner's idle sweep logs out the ones still online).
+std::vector<uint64> ScenarioBots();
 // Facts for a connected bot and the one-call verdict.
 FreeFacts FreeFactsOf(Player const* bot, uint64 bot_id);
 inline Verdict CheckFreeBot(Player const* bot, uint64 bot_id) { return CheckFree(FreeFactsOf(bot, bot_id)); }

@@ -174,6 +174,21 @@ public:
         return false;
     }
 
+    // The known gate of that faction nearest (x, y) on `map` within `radius`, for the town errands (a resident now and then runs out to it).
+    bool GateNear(std::uint32_t map, float x, float y, float radius, bool alliance, GateSpot& out, std::uint32_t& city_out) const
+    {
+        std::lock_guard<std::mutex> g(m_);
+        float best = radius;
+        bool found = false;
+        for (auto const& [city, s] : gates_)
+        {
+            if (!s.known || s.map != map || s.alliance != alliance) continue;
+            float const d = std::hypot(s.x - x, s.y - y);
+            if (d <= best) { best = d; out = s; city_out = city; found = true; }
+        }
+        return found;
+    }
+
     // A bot may challenge `player` when no bot has in the last `cooldown_ms`; the call records it. One bot wins the race.
     bool ChallengeTake(std::uint64_t player, std::uint32_t now_ms, std::uint32_t cooldown_ms)
     {

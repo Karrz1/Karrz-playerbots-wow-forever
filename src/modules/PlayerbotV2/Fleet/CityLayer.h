@@ -24,6 +24,16 @@ inline bool AcrossDrop(float bot_z, float hint_z, float ground_z)
     return std::fabs(hint_z - bot_z) < kSameLevelYards && hint_z - ground_z > kCityDropYards;
 }
 
+constexpr float kLiquidDropYards = 6.0f;   // a liquid floor this far under a same-level ask is a pit, not the street
+
+// The same for a pit of liquid under the asked point: the Great Forge of Ironforge is lava at z 483, 18.5 y under the walkways at
+// 501.7, less than kCityDropYards, so a step over its rim was snapped down into it and every path there ended in the liquid
+// (outcome=Liquid, live 275: a bot party ran back and forth at the Military Ward for half an hour).
+inline bool IntoLiquidPit(float bot_z, float hint_z, float ground_z, bool ground_in_liquid)
+{
+    return ground_in_liquid && std::fabs(hint_z - bot_z) < kSameLevelYards && hint_z - ground_z > kLiquidDropYards;
+}
+
 constexpr float kCliffDropYards = 15.0f;   // a path segment falling this far over no more ground than it falls is a face, not a ramp
 
 // Is a path segment a cliff face? Detour joins the layers of a capital over steep faces that a bot cannot walk; a ramp or a stair falls

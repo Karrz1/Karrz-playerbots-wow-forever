@@ -26,6 +26,8 @@
 #include "SpellMgr.h"
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <string>
 #include <vector>
 
 namespace Playerbot::Combat::TankThreat {
@@ -244,6 +246,22 @@ inline bool DemoRefreshWorth(BotSnapshotView const& s, float range)
 {
     bool boss = false;
     return DemoMissingWithin(s, range, kDemoRefreshMs, &boss) >= 2 || boss;
+}
+
+// Why a tank in an instance did not shout / roar with a boss within `range` (the bear cast Demoralizing Roar only before the
+// support scorecard's measurement and never again in it, cause unproven): the boss's remaining Demo, the rage and the readiness.
+// One line per tank every 10 s. A remaining time of "permanent" means the aura carries no duration.
+inline void NoteDemoSkip(BotSnapshotView const& s, char const* what, int32 rage, bool ready)
+{
+    if (!s.is_in_instance() || !s.in_combat()) return;
+    NearbyUnit const* v = s.victim_info();
+    if (!v || !Classic::IsBossUnit(*v) || !Engaged(*v) || Dist2(s, *v) > 10.0f * 10.0f) return;
+    if (!RaidLogDue(RaidLogKey(s, RaidLogKind::DemoSkip), s.published_at_ms(), 10000u)) return;
+    std::string const left = v->ap_debuff_ms == std::numeric_limits<int32>::max() ? std::string("permanent")
+        : std::to_string(v->ap_debuff_ms) + " ms";
+    TC_LOG_INFO("playerbot.v2", "[raid_tank] {} skips {} on entry {} ({}): its Demo has {} left (refresh under {} ms), rage {}, ready {}, "
+        "worth {}, pack missing it {}", s.name(), what, v->entry, v->guid.GetCounter(), left, kDemoRefreshMs, rage, ready ? 1 : 0,
+        DemoRefreshWorth(s, 10.0f) ? 1 : 0, DemoMissingWithin(s, 10.0f, kDemoRefreshMs));
 }
 
 // Engaged mobs (Engaged: in combat with a threat table, fightable) within

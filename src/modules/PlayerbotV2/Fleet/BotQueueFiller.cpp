@@ -56,10 +56,12 @@ struct FillMix
 {
     std::array<uint32, 16> cls{};
     uint32 tanks = 0, healers = 0, dps = 0;
+    uint32 dps_shamans = 0;         // shamans in damage places (Enhancement): a raid's totems and Windfury
     void Add(uint8 c, uint8 role)   // role: 0 DPS, 1 tank, 2 healer
     {
         if (c < cls.size()) ++cls[c];
         if (role == 1) ++tanks; else if (role == 2) ++healers; else ++dps;
+        if (role == 0 && c == CLASS_SHAMAN) ++dps_shamans;
     }
     uint32 Total() const { return tanks + healers + dps; }
     std::string Describe() const
@@ -99,6 +101,10 @@ uint32 RoleCap(uint32 count, uint32 tenths)
     uint32 const whole = (count * tenths) / 10u;
     return whole + (urand(0, 9) < (count * tenths) % 10u ? 1u : 0u);
 }
+
+struct JitBatch { uint32 at_ms; uint32 count; };
+std::unordered_map<uint32, std::vector<JitBatch>> g_jit_in_flight;   // (bg type << 1 | alliance) -> bots handed to setup
+constexpr uint32 JitInFlightMs = 90u * 1000u;                       // the invite window
 
 RoleNeeds NeedsFor(BotQueueFiller::QueueKind kind)
 {
@@ -256,6 +262,10 @@ void BotQueueFiller::Fill(FillRequest const& req)
     uint32 queued_t = 0, queued_h = 0, queued_d = 0;
     FillMix mix;
     uint32 const dps_class_cap = std::max(2u, (needs.dps + 5u) / 6u);
+    // A raid gets at least one Enhancement shaman for its totems (Windfury, Strength of Earth, Grace of Air...), Alliance
+    // as well (Forever's Dwarf Shaman): the last damage place waits for a shaman and the JIT spawn makes one if the pool
+    // has none.
+    bool const raid_wants_shaman = req.kind == QueueKind::Raid10 || req.kind == QueueKind::Raid20;
 
     // Rejection histogram for diagnostics — without this we can't tell whether
     // the pool was small (online count low) or filtered (most bots in WSG queue).
@@ -436,6 +446,8 @@ void BotQueueFiller::Fill(FillRequest const& req)
             if (r == Role::Tank   && queued_t >= needs.tanks)   return false;
             if (r == Role::Healer && queued_h >= needs.healers) return false;
             if (r == Role::Dps    && queued_d >= needs.dps)     return false;
+            if (r == Role::Dps && raid_wants_shaman && cls != CLASS_SHAMAN && !mix.dps_shamans && queued_d + 1 >= needs.dps)
+                return false;
             // Spec match? If yes, no respec needed.
             bool spec_matches = false;
             switch (r)
@@ -680,6 +692,10 @@ void BotQueueFiller::Fill(FillRequest const& req)
         uint32 roll_fail = 0, create_fail = 0, success = 0, reused = 0;
         std::string last_create_reason;
 
+        // A raid without a damage-place shaman yet keeps one place out of the reuse pass for a new shaman of this faction.
+        uint32 const shaman_slot = (raid_wants_shaman && role == Role::Dps && count && !mix.dps_shamans) ? 1u : 0u;
+        count -= shaman_slot;
+
         // REUSE pass before creating anything: the DB accumulates offline
         // marked L80 bots from every previous JIT cycle (each seed used to
         // mint ~70 brand-new characters; nothing ever logged the old ones
@@ -745,6 +761,8 @@ void BotQueueFiller::Fill(FillRequest const& req)
                     Field const* f = reuse_res->Fetch();
                     uint64 const g = f[0].GetUInt64();
                     uint8 const c = f[1].GetUInt8();
+                    // A scenario test character (Tier 3 test gear, the scorecard raids) never fills a battleground or a Group Finder slot.
+                    if (::Playerbot::Pool::IsScenarioBot(g)) continue;
                     cands.push_back({ g, c, spread ? ClassicRoleRollFor(g, c) : uint8(0), false });
                 } while (reuse_res->NextRow());
 
@@ -795,13 +813,35 @@ void BotQueueFiller::Fill(FillRequest const& req)
             }
         }
         count = (reused >= count) ? 0u : count - reused;
+        count += shaman_slot;
         success += reused;
+        // The reuse pass may have found one after all; then the kept place is an ordinary one.
+        bool const force_shaman = shaman_slot && !mix.dps_shamans;
+        auto shaman_race = [&](uint32 offset) -> uint8
+        {
+            for (size_t k = 0; k < races.size(); ++k)
+            {
+                uint8 const rc = races[(offset + k) % races.size()];
+                if (BotComposition::IsLegalRaceClass(rc, CLASS_SHAMAN))
+                    return rc;
+            }
+            return 0;
+        };
 
         for (uint32 i = 0; i < count; ++i)
         {
             uint8 race_hint = races[uint64(i + std::time(nullptr)) % races.size()];
             uint8 cls_hint  = (role == Role::Dps) ? PickBalancedClass(race_hint, mix)
                                                   : pick_role_class(role, uint64(i + std::time(nullptr)));
+            bool const make_shaman = force_shaman && i == 0;
+            if (make_shaman)
+            {
+                if (uint8 const rc = shaman_race(uint32(std::time(nullptr))))
+                {
+                    race_hint = rc;
+                    cls_hint = CLASS_SHAMAN;
+                }
+            }
             BotComposition::Pick pick = BotComposition::Roll(race_hint, cls_hint);
             if (!pick.race) { ++roll_fail; continue; }
             auto created = BotCharacterFactory::Create(/*ownerSession=*/nullptr,
@@ -820,9 +860,14 @@ void BotQueueFiller::Fill(FillRequest const& req)
                 // so re-rolling the same race draws from the same (possibly
                 // exhausted) pool and collides again (observed: tank/heal
                 // passes failing all retries while DPS succeeded).
-                const uint8 retry_race =
+                uint8 retry_race =
                     races[uint64(i + retry + 1 + std::time(nullptr)) % races.size()];
-                if (role == Role::Dps) cls_hint = PickBalancedClass(retry_race, mix);
+                if (make_shaman && cls_hint == CLASS_SHAMAN)
+                {
+                    if (uint8 const rc = shaman_race(uint32(i + retry + 1 + std::time(nullptr))))
+                        retry_race = rc;
+                }
+                else if (role == Role::Dps) cls_hint = PickBalancedClass(retry_race, mix);
                 pick = BotComposition::Roll(retry_race, cls_hint);
                 if (!pick.race) break;
                 created = BotCharacterFactory::Create(/*ownerSession=*/nullptr,
@@ -835,7 +880,9 @@ void BotQueueFiller::Fill(FillRequest const& req)
                 continue;
             }
             ++success;
-            mix.Add(pick.cls, ClassicRoleRollFor(created.guid.GetCounter(), pick.cls));
+            // A shaman made for a damage place plays Enhancement whatever its role roll (BotPopulationManager's JIT hook).
+            mix.Add(pick.cls, (role == Role::Dps && pick.cls == CLASS_SHAMAN) ? uint8(0)
+                                                                            : ClassicRoleRollFor(created.guid.GetCounter(), pick.cls));
             // Mark distribution_level + JIT-tag with instance + role so the
             // setup pipeline post-completion hook (BotPopulationManager::
             // DriveSetupPipelines) can fire the matching queue intent once
@@ -883,6 +930,8 @@ void BotQueueFiller::Fill(FillRequest const& req)
                 "[QueueFill] spawn_jit role={} requested={} success={} (reused={}) roll_fail={} create_fail={}{}",
                 role_name, count + reused, success, reused, roll_fail, create_fail,
                 create_fail ? fmt::format(" last_reason='{}'", last_create_reason) : std::string());
+        if (is_bg && success)
+            g_jit_in_flight[(req.instance_id << 1) | (want_alliance ? 1u : 0u)].push_back({ getMSTime() | 1u, success });
     };
 
     // Skip JIT spawn entirely when caller asked for online-only fill
@@ -1155,6 +1204,7 @@ struct Placement
     Battleground* bg = nullptr;
     uint32 missing = 0;                                     // places the human's party still needs after the free ones
     std::vector<std::pair<std::pair<int32, int32>, Player*>> victims;
+    bool busy_bots = false;                                 // an instance is full of bots that cannot leave this moment: wait, do not open another
     bool any_room = false;                                  // some instance has the places already: TC's queue invites the player there
     std::string why;                                        // per-instance verdicts, for the "no running instance" log
 };
@@ -1203,6 +1253,8 @@ Placement ChoosePlacement(Team team, uint32 need, uint32 bg_type_id, uint8 brack
         uint32 const free_slots = Battleground::PhysicalRoom(taken, bg->GetMaxPlayersPerTeam());
         uint32 const missing = Battleground::PlacesToMake(taken, bg->GetMaxPlayersPerTeam(), need);
         auto victims = missing ? EvictableBots(bg, team) : decltype(best.victims){};
+        if (missing && Battleground::WaitForBotToFree(missing, uint32(victims.size()), BotsOnTeam(bg, team)))
+            best.busy_bots = true;
         if (missing && victims.size() < missing)             // only real players on that side to swap: not a candidate
         { best.why += Trinity::StringFormat(" [inst {} free {} need {} evictable {}]", bg->GetInstanceID(), free_slots, need, victims.size()); return; }
         if (!missing) best.any_room = true;
@@ -1213,10 +1265,10 @@ Placement ChoosePlacement(Team team, uint32 need, uint32 bg_type_id, uint8 brack
             best_humans = humans; best_bots = bots;
         }
     };
-    BattlegroundTemplate const* tmpl = sBattlegroundMgr->GetBattlegroundTemplateByTypeId(BattlegroundTypeId(bg_type_id));
-    if (!tmpl) return best;
-    for (int32 map_id : tmpl->MapIDs)
-        for (Battleground* bg : sBattlegroundMgr->GetBGFreeSlotQueueStore(map_id))
+    if (!sBattlegroundMgr->GetBattlegroundTemplateByTypeId(BattlegroundTypeId(bg_type_id))) return best;
+    // a running instance of this type can sit in its own queue's list or in a random/brawl queue's list
+    for (auto const& [_, free_slot_store] : sBattlegroundMgr->GetBGFreeSlotQueues())
+        for (Battleground* bg : free_slot_store)
             if (bg && uint32(bg->GetTypeID()) == bg_type_id) consider(bg);
     // full instances leave the free-slot store: reach them through the bots inside
     for (BotId id : Services::Lifecycle().snapshot_ids())
@@ -1243,6 +1295,17 @@ bool BotQueueFiller::ClaimRunningBgForHuman(Player* human, uint32 bg_type_id, ui
     Battleground* best = placed.bg;
     uint32 const best_missing = placed.missing;
     std::string const& why = placed.why;
+    if (!best && placed.busy_bots)
+    {
+        // The match is full of bots and every one of them is in combat or carries a flag: MakeRoomForRealPlayers asks one to leave as soon
+        // as it can. A second instance would split the players.
+        for (auto& w : g_human_waits)
+            if (w.guid == human->GetGUID() && w.bg_type == bg_type_id)
+                w.hold_until_ms = getMSTime() + 60u * 1000u;
+        TC_LOG_INFO("playerbot.v2", "[bg_queue] HumanPriority: {} queued bg_type={} bracket={}: the running match is full of bots that cannot leave this moment, waiting for one;{}",
+                    human->GetName(), bg_type_id, uint32(bracket), why);
+        return true;
+    }
     if (!best)
     {
         TC_LOG_INFO("playerbot.v2", "[bg_queue] HumanPriority: {} queued bg_type={} bracket={}: no running instance can take {} slot(s), a normal fill follows;{}",
@@ -1325,6 +1388,8 @@ void BotQueueFiller::MakeRoomForRealPlayers(uint32 now_ms)
         // Same choice as ClaimRunningBgForHuman: the instance with the most real players, then the most bots on the player's team.
         Placement placed = ChoosePlacement(team, need, w.bg_type, uint8(diff->GetBracketId()));
         Battleground* target = placed.bg;
+        if (!target && placed.busy_bots)
+            w.hold_until_ms = now_ms + 60u * 1000u;            // still no bot free to leave: keep the new-match hold
         // no instance, or one has the places already (TC's queue invites the player there at once, an eviction elsewhere would be wasted)
         if (!target || placed.missing == 0 || placed.any_room) continue;
         uint32 const missing = placed.missing;
@@ -1348,6 +1413,19 @@ void BotQueueFiller::MakeRoomForRealPlayers(uint32 now_ms)
         if (asked) g_room_made_ms[w.bg_type] = now_ms ? now_ms : 1u;
         w.last_try_ms = now_ms;
     }
+}
+
+uint32 BotQueueFiller::JitInFlight(uint32 bg_type_id, bool alliance)
+{
+    auto const it = g_jit_in_flight.find((bg_type_id << 1) | (alliance ? 1u : 0u));
+    if (it == g_jit_in_flight.end())
+        return 0;
+    uint32 const now_ms = getMSTime();
+    std::erase_if(it->second, [now_ms](JitBatch const& b) { return getMSTimeDiff(b.at_ms, now_ms) >= JitInFlightMs; });
+    uint32 total = 0;
+    for (JitBatch const& b : it->second)
+        total += b.count;
+    return total;
 }
 
 bool BotQueueFiller::RoomRecentlyMade(uint32 bg_type_id, uint32 now_ms)

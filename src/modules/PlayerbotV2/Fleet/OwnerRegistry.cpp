@@ -1,6 +1,9 @@
 #include "OwnerRegistry.h"
+#include "Bot/CcDeny.h"
 #include "DatabaseEnv.h"
 #include "Log.h"
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <stdexcept>
 #include <unordered_set>
@@ -18,10 +21,19 @@ size_t OwnerRegistry::LoadFromDb()
         "FROM playerbot_v2_character "
         "WHERE owner_account_id != 0 OR companion_role != 0");
     auto gear_modes = Db().Query("SELECT owner_account_id, gear_mode FROM playerbot_v2_owner_gear");
+    auto tactics = Db().Query("SELECT owner_account_id, boss_entry, tactics FROM playerbot_v2_owner_tactics");
     std::unique_lock lk(mtx_);
     owner_gear_mode_.clear();
     if (gear_modes)
         do { Field* g = gear_modes->Fetch(); owner_gear_mode_[g[0].GetUInt32()] = g[1].GetUInt8(); } while (gear_modes->NextRow());
+    boss_tactics_.clear();
+    if (tactics)
+        do
+        {
+            Field* t = tactics->Fetch();
+            if (std::string s = t[2].GetString(); !s.empty())
+                boss_tactics_[t[0].GetUInt32()][t[1].GetUInt32()] = std::move(s);
+        } while (tactics->NextRow());
     owners_.clear();
     starter_pet_granted_.clear();
     gear_varied_.clear();
@@ -279,6 +291,54 @@ void OwnerRegistry::SetOwnerGearMode(uint32 account_id, uint8 mode)
     Db().DirectPExecute("REPLACE INTO playerbot_v2_owner_gear (owner_account_id, gear_mode) VALUES ({}, {})", account_id, uint32(mode));
 }
 
+std::string OwnerRegistry::BossTacticsOf(uint32 account_id, uint32 boss_entry) const
+{
+    std::shared_lock lk(mtx_);
+    auto const a = boss_tactics_.find(account_id);
+    if (a == boss_tactics_.end())
+        return {};
+    auto const b = a->second.find(boss_entry);
+    return b == a->second.end() ? std::string() : b->second;
+}
+
+void OwnerRegistry::SetBossTactics(uint32 account_id, uint32 boss_entry, std::string const& stored)
+{
+    // The stored form is SerializeTactics': letters, digits and . , - = ; only. Anything else is never written into the query.
+    for (char c : stored)
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != ',' && c != '-' && c != '=' && c != ';')
+        {
+            TC_LOG_ERROR("playerbot.v2", "[tactics] refused to store a plan with '{}' in it for account {}", c, account_id);
+            return;
+        }
+    {
+        std::unique_lock lk(mtx_);
+        auto& plans = boss_tactics_[account_id];
+        if (stored.empty())
+        {
+            plans.erase(boss_entry);
+            if (plans.empty())
+                boss_tactics_.erase(account_id);
+        }
+        else
+            plans[boss_entry] = stored;
+    }
+    if (stored.empty())
+        Db().PExecute("DELETE FROM playerbot_v2_owner_tactics WHERE owner_account_id = {} AND boss_entry = {}", account_id, boss_entry);
+    else
+        Db().PExecute("REPLACE INTO playerbot_v2_owner_tactics (owner_account_id, boss_entry, tactics) VALUES ({}, {}, '{}')", account_id,
+                      boss_entry, stored);
+}
+
+std::vector<std::pair<uint32, std::string>> OwnerRegistry::AllBossTactics(uint32 account_id) const
+{
+    std::vector<std::pair<uint32, std::string>> out;
+    std::shared_lock lk(mtx_);
+    if (auto const a = boss_tactics_.find(account_id); a != boss_tactics_.end())
+        out.assign(a->second.begin(), a->second.end());
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 bool OwnerRegistry::CcEnabled(uint32 account_id) const
 {
     std::shared_lock lk(mtx_);
@@ -289,6 +349,104 @@ bool OwnerRegistry::SetCcEnabled(uint32 account_id, bool enabled)
 {
     std::unique_lock lk(mtx_);
     return enabled ? cc_disabled_.erase(account_id) > 0 : cc_disabled_.insert(account_id).second;
+}
+
+uint16 OwnerRegistry::CcDenied(uint32 account_id, uint8 cls) const
+{
+    static_assert(kDefaultCcDenied == CcDeny::Fear, "the default crowd-control deny is Fear");
+    std::shared_lock lk(mtx_);
+    auto it = cc_deny_.find(account_id);
+    if (it == cc_deny_.end())
+        return kDefaultCcDenied;
+    CcDenyState const& st = it->second;
+    if (cls >= st.deny.size())
+        return st.every;
+    return uint16((st.every & ~st.allow[cls]) | st.deny[cls]);
+}
+
+void OwnerRegistry::SetCcDeny(uint32 account_id, uint8 cls, uint16 kinds, bool deny)
+{
+    std::unique_lock lk(mtx_);
+    CcDenyState& st = cc_deny_[account_id];
+    if (cls == 0 || cls >= st.deny.size())
+    {
+        // Every class: a class's own "yes" or "no" for these kinds gives way to this order.
+        if (deny) st.every |= kinds; else st.every &= uint16(~kinds);
+        for (size_t c = 0; c < st.deny.size(); ++c)
+        {
+            st.deny[c]  &= uint16(~kinds);
+            st.allow[c] &= uint16(~kinds);
+        }
+    }
+    else if (deny)
+    {
+        st.deny[cls]  |= kinds;
+        st.allow[cls] &= uint16(~kinds);
+    }
+    else
+    {
+        st.deny[cls]  &= uint16(~kinds);
+        st.allow[cls] |= uint16(kinds & st.every);
+    }
+}
+
+void OwnerRegistry::ClearCcDeny(uint32 account_id)
+{
+    // "on cc" turns every kind on, Fear included: an explicit state, not the default (which keeps Fear off).
+    std::unique_lock lk(mtx_);
+    CcDenyState st;
+    st.every = 0;
+    cc_deny_[account_id] = st;
+}
+
+OwnerRegistry::FightIgnoreChange OwnerRegistry::ToggleFightIgnore(uint32 account_id, ObjectGuid mob, uint32 now_ms)
+{
+    std::unique_lock lk(mtx_);
+    std::vector<FightIgnoreEntry>& list = fight_ignore_[account_id];
+    // Forget the old ones first (a mob that respawned keeps its spawn guid; half an hour later it is a new fight).
+    list.erase(std::remove_if(list.begin(), list.end(), [now_ms](FightIgnoreEntry const& e) { return now_ms - e.added_ms >= kFightIgnoreMs; }),
+               list.end());
+    for (auto it = list.begin(); it != list.end(); ++it)
+    {
+        if (it->mob != mob)
+            continue;
+        if (now_ms - it->toggled_ms < kFightIgnoreRepeatMs)
+            return FightIgnoreChange::Repeat;
+        list.erase(it);
+        removed_ms_[account_id] = { mob, now_ms };
+        return FightIgnoreChange::Removed;
+    }
+    // Just taken off: the second copy of that press must not put it back.
+    if (auto r = removed_ms_.find(account_id); r != removed_ms_.end() && r->second.first == mob && now_ms - r->second.second < kFightIgnoreRepeatMs)
+        return FightIgnoreChange::Repeat;
+    if (list.size() >= kMaxFightIgnore)
+        list.erase(list.begin());   // the oldest goes
+    list.push_back({ mob, now_ms, now_ms });
+    return FightIgnoreChange::Added;
+}
+
+size_t OwnerRegistry::ClearFightIgnore(uint32 account_id)
+{
+    std::unique_lock lk(mtx_);
+    auto it = fight_ignore_.find(account_id);
+    if (it == fight_ignore_.end())
+        return 0;
+    size_t const n = it->second.size();
+    fight_ignore_.erase(it);
+    return n;
+}
+
+std::vector<ObjectGuid> OwnerRegistry::FightIgnored(uint32 account_id, uint32 now_ms) const
+{
+    std::vector<ObjectGuid> out;
+    std::shared_lock lk(mtx_);
+    auto it = fight_ignore_.find(account_id);
+    if (it == fight_ignore_.end())
+        return out;
+    for (FightIgnoreEntry const& e : it->second)
+        if (now_ms - e.added_ms < kFightIgnoreMs)
+            out.push_back(e.mob);
+    return out;
 }
 
 Role OwnerRegistry::DeclaredRole(BotId bot) const

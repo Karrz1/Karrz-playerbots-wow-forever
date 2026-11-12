@@ -241,21 +241,22 @@ bool IsHealerSpec(uint8 cls, uint16 spec)
     return false;
 }
 
+// Highest-damage PvE spec per class (raid scorecard + Karrz's list): Fury, Ret, MM, Combat, Shadow, Enhancement, Fire, Destruction, Cat.
 uint32 DpsSpecForClass(uint8 cls)
 {
     switch (cls)
     {
-        case CLASS_WARRIOR:      return 71;   // Arms
+        case CLASS_WARRIOR:      return 72;   // Fury
         case CLASS_PALADIN:      return 70;   // Retribution
         case CLASS_HUNTER:       return 254;  // Marksmanship (ranged)
         case CLASS_ROGUE:        return 260;  // Outlaw/Combat
         case CLASS_PRIEST:       return 258;  // Shadow
         case CLASS_DEATH_KNIGHT: return 251;  // Frost
         case CLASS_SHAMAN:       return 263;  // Enhancement
-        case CLASS_MAGE:         return 64;   // Frost
-        case CLASS_WARLOCK:      return 265;  // Affliction
+        case CLASS_MAGE:         return 63;   // Fire
+        case CLASS_WARLOCK:      return 267;  // Destruction
         case CLASS_MONK:         return 269;  // Windwalker
-        case CLASS_DRUID:        return 102;  // Balance
+        case CLASS_DRUID:        return 103;  // Feral (cat)
         case CLASS_DEMON_HUNTER: return 577;  // Havoc
         case CLASS_EVOKER:       return 1467; // Devastation
         default:                 return 0;

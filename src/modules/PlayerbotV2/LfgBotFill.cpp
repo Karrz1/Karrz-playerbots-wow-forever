@@ -1,4 +1,5 @@
 #include "LfgBotFill.h"
+#include "Api/BotLanguage.h"
 
 #include "Chat.h"
 #include "Common.h"
@@ -22,6 +23,7 @@
 #include "Fleet/OwnerRegistry.h"
 #include "GroupFinderListings.h"
 #include "Services.h"
+#include "Session/BotSessionMgr.h"
 #include "Util/ConfigReader.h"
 
 #include <algorithm>
@@ -98,19 +100,19 @@ namespace
     std::unordered_map<uint64, uint32> g_lastSize;
     uint32 g_lastTickMs = 0;
 
-    // The player limit of the dungeon a listing is for: the activity's map (Playerbot.Lfg.ActivityMaps) and that map's MaxPlayers
-    // (Upper Blackrock Spire, map 229 = 10); the largest of the listed activities. An unknown activity or map is a 5-man party.
+    // The party size a listing is filled to: the activity's entry in Playerbot.Lfg.ActivityMaps (Upper Blackrock Spire is 10, a raid is
+    // as big as its map, any other dungeon is a 5-man); the largest of the listed activities. An unknown activity is a 5-man party.
     uint32 PartySizeOf(std::vector<uint32> const& activities)
     {
         uint32 size = kLfgMinPartySize;
-        auto const& maps = Playerbot::Services::Config().lfg_activity_maps();
         for (uint32 activity : activities)
         {
-            auto const itr = std::ranges::find(maps, activity, &std::pair<uint32, uint32>::first);
+            auto const& maps = Playerbot::Services::Config().lfg_activity_maps();
+            auto const itr = std::ranges::find(maps, activity, &ConfigReader::LfgActivityMap::activity);
             if (itr == maps.end())
                 continue;
-            if (MapEntry const* map = sMapStore.LookupEntry(itr->second))
-                size = std::max<uint32>(size, std::min<uint32>(uint32(map->MaxPlayers), kLfgMaxPartySize));
+            MapEntry const* map = sMapStore.LookupEntry(itr->map);
+            size = std::max(size, LfgActivityPartySize(itr->size, map && map->IsRaid(), map ? uint32(map->MaxPlayers) : 0));
         }
         return size;
     }
@@ -125,13 +127,15 @@ namespace
 
     uint8 RoleMaskOf(Player const* leader, ObjectGuid guid, uint8 cls, uint8 leaderRole)
     {
+        // a role the member's class cannot play is not counted: a rogue leader who picked Tank still needs a tank
         if (Group const* group = leader->GetGroup())
         {
-            if (uint8 const r = group->GetLfgRoles(guid) & (kLfgRoleTank | kLfgRoleHealer | kLfgRoleDamage))
+            if (uint8 const r = LfgRoleForClass(cls, group->GetLfgRoles(guid)))
                 return r;
         }
-        if (guid == leader->GetGUID() && leaderRole)
-            return leaderRole;
+        if (guid == leader->GetGUID())
+            if (uint8 const r = LfgRoleForClass(cls, leaderRole))
+                return r;
         return DefaultRoleForClass(cls);
     }
 
@@ -170,7 +174,7 @@ namespace
     void Tell(Player* player, std::string const& text)
     {
         if (player && player->GetSession())
-            ChatHandler(player->GetSession()).SendSysMessage(text.c_str());
+            Playerbot::BotLanguage::LocalizedHandler(player->GetSession()).SendSysMessage(text.c_str());
     }
 
     uint8 PickDpsClass()
@@ -179,7 +183,47 @@ namespace
         return classes[urand(0, std::size(classes) - 1)];
     }
 
-    // Adds the missing roles as the owner's companions. Returns how many were started.
+    // The group is at its party size and still lacks a tank or healer: a bot dealing damage (never a real player, never the leader)
+    // leaves to make room, as a dismissed companion does. False when the group has no such bot.
+    bool DropDamageBot(Player* leader, std::string& report)
+    {
+        Group* group = leader->GetGroup();
+        if (!group)
+            return false;
+        // a bot the owner has not saved on their roster goes first
+        Player* leave = nullptr;
+        bool leaveSaved = true;
+        for (GroupReference const& ref : group->GetMembers())
+        {
+            Player* member = ref.GetSource();
+            if (!member || member == leader || !member->GetSession() || !member->GetSession()->IsBot())
+                continue;
+            if (RoleMaskOf(leader, member->GetGUID(), member->GetClass(), 0) & (kLfgRoleTank | kLfgRoleHealer))
+                continue;
+            bool const saved = Playerbot::Services::Owners().GetOwner(member->GetGUID().GetCounter()).saved;
+            if (!leave || (leaveSaved && !saved))
+            {
+                leave = member;
+                leaveSaved = saved;
+            }
+        }
+        if (!leave)
+            return false;
+        ObjectGuid const guid = leave->GetGUID();
+        std::string const name = leave->GetName();
+        bool const companion = Playerbot::Services::Owners().GetOwner(guid.GetCounter()).account_id == leader->GetSession()->GetAccountId();
+        if (!group->RemoveMember(guid, GROUP_REMOVEMETHOD_LEAVE))
+            return false;
+        // the leader's companion is dismissed (logged out, as `.bot dismiss`); a world bot goes back to its own life
+        if (companion)
+            Playerbot::Services::SessionMgr().LogoutBot(guid);
+        TC_LOG_INFO("playerbot.v2", "[lfg] {}: {} (damage) left the full group to make room for a tank or healer", leader->GetName(), name);
+        report += " " + name + " left to make room.";
+        return true;
+    }
+
+    // Adds the missing roles as the owner's companions. Returns how many were started. A tank or healer missing from a group that is
+    // already at its party size takes the place of a damage dealer bot.
     uint32 FillGap(Player* leader, LfgRoleGap gap, uint32 size, std::string& report)
     {
         uint32 started = 0;
@@ -187,6 +231,14 @@ namespace
         {
             for (uint8 i = 0; i < count; ++i)
             {
+                if (Group const* group = leader->GetGroup(); group && group->GetMembersCount() >= size)
+                {
+                    if (role == Playerbot::Role::Dps || !DropDamageBot(leader, report))
+                    {
+                        report += " The group is full.";
+                        return;
+                    }
+                }
                 // A group of more than 5 is a raid: the first companion makes the group, the next ones need it converted before they
                 // are invited. The open-world companion cap does not apply here, the dungeon's own limit does (inside an instance).
                 if (size > MAX_GROUP_SIZE)
@@ -389,15 +441,22 @@ bool LfgFillNow(Player* leader, Playerbot::Role ownRole, std::string& msg)
         size = itr->second;
     if (Group const* group = leader->GetGroup(); group && group->isRaidGroup())
         size = std::max<uint32>(size, 10);
-    LfgRoleGap const gap = GapOf(leader, ownRole, size);
+    LfgRoleGap gap;
+    std::string report;
+    uint32 const started = LfgFillToSize(leader, ownRole, size, gap, report);
     if (!gap.Total())
     { msg = "Your group is already full: " + std::to_string(size) + " players."; return true; }
-    std::string report;
-    uint32 const started = FillGap(leader, gap, size, report);
     TC_LOG_INFO("playerbot.v2", "[lfg] {}: .bot lfg, party of {}, missing {} -> {} bot(s) started.{}", leader->GetName(), size, GapText(gap), started, report);
     msg = std::to_string(started) + " bot(s) are joining (" + GapText(gap) + " missing)." + report;
     g_pending.erase(leader->GetGUID().GetCounter());
     return true;
+}
+
+uint32 LfgFillToSize(Player* leader, Playerbot::Role ownRole, uint32 size, LfgRoleGap& gap, std::string& report)
+{
+    gap = GapOf(leader, ownRole, size);
+    g_lastSize[leader->GetGUID().GetCounter()] = size;
+    return gap.Total() ? FillGap(leader, gap, size, report) : 0;
 }
 
 namespace
@@ -409,6 +468,7 @@ namespace
         uint32 startMs = 0, lifetimeMs = 0;
         bool alliance = true;
         uint32 bots = 0;                    // members, for the bot budget
+        uint32 activity = 0;                // the Group Finder activity id it is listed for
         uint32 capacity = 5;                // the party size of the dungeon: a player joining a full group takes a bot's place
     };
     std::vector<ListedBotGroup> g_botGroups;
@@ -445,6 +505,7 @@ namespace
             }
         if (!human)
             return;
+        uint32 const partySize = ListedGroupOf(group) ? ListedGroupOf(group)->capacity : kLfgMinPartySize;
         if (Player const* leader = ObjectAccessor::FindConnectedPlayer(listedLeader))
             GroupFinderListings::RemoveBotListing(leader);
         group->ChangeLeader(human->GetGUID());
@@ -458,6 +519,17 @@ namespace
         TC_LOG_INFO("playerbot.v2", "[lfg] {} joined the listed bot group of {}: {} bot(s) are now their companions", human->GetName(),
                     listedLeader.ToString(), bots);
         Tell(human, "Group Finder: you are the leader of this group now. Its " + std::to_string(bots) + " bot(s) follow you like your companions.");
+
+        // The open places fill up with companions one at a time, the same as after a posted listing (Lfg.Trickle), so the group
+        // reaches its party size (UBRS 10).
+        uint32 const seconds = LfgJoinedFillSeconds(Playerbot::Services::Config().lfg_bot_fill_seconds());
+        if (seconds && group->GetMembersCount() < partySize)
+        {
+            uint32 const now = getMSTime();
+            g_lastSize[human->GetGUID().GetCounter()] = partySize;
+            g_pending[human->GetGUID().GetCounter()] = PendingListing{ now + seconds * IN_MILLISECONDS, 0, partySize, now };
+            TC_LOG_INFO("playerbot.v2", "[lfg] {}: the joined group fills its open places up to {} within {} s", human->GetName(), partySize, seconds);
+        }
     }
 
     void EndListedGroup(ListedBotGroup const& listed, char const* why)
@@ -565,11 +637,14 @@ namespace
         // The dungeons are tried in random order; each is filled only with bots of its own level range, so the level of the listed
         // members fits the dungeon. A dungeon without enough free bots of that range is skipped (a group too small, or without the
         // tank and healer its mix lists, is dissolved again and the next one is tried).
+        // A dungeon with no listed group of the faction yet comes first: every dungeon has a group before one has two.
+        std::vector<uint32> listedHere;
+        for (ListedBotGroup const& g : g_botGroups)
+            if (g.alliance == alliance)
+                listedHere.push_back(g.activity);
         std::vector<ListedActivity const*> order;
-        for (ListedActivity const& candidate : activities)
-            order.push_back(&candidate);
-        for (size_t i = order.size(); i > 1; --i)
-            std::swap(order[i - 1], order[urand(0, uint32(i - 1))]);
+        for (size_t index : ListedActivityOrder(activities, listedHere, [](uint32 n) { return urand(0, n - 1); }))
+            order.push_back(&activities[index]);
 
         ListedActivity const* chosen = nullptr;
         uint32 size = 0;
@@ -633,7 +708,7 @@ namespace
         GroupFinderListings::PostBotListing(leader, category, { act.activity }, "", "", kDefaultPlayStyle);
         g_botGroups.push_back(ListedBotGroup{ leaderLow, nowMs,
             ListedGroupLifetimeMs(config.lfg_bot_groups_min_seconds(), config.lfg_bot_groups_max_seconds(), Roll()), alliance,
-            group->GetMembersCount(), size });
+            group->GetMembersCount(), act.activity, size });
         TC_LOG_INFO("playerbot.v2", "[lfg] bot group listed: leader {} activity {} category {} members {}/{} looking for {} ({}; now {} listed)",
                     leader->GetName(), act.activity, category, group->GetMembersCount(), size, GapText(shape.missing),
                     alliance ? "Alliance" : "Horde", g_botGroups.size());
@@ -759,6 +834,31 @@ bool LfgBotGroupCanTake(Player* member, Player* applicant)
         return false;
     Player const* leader = ObjectAccessor::FindConnectedPlayer(group->GetLeaderGUID());
     return leader && leader->GetTeam() == applicant->GetTeam();
+}
+
+Player* LfgBotGroupMemberFor(Player* applicant, uint32 map)
+{
+    if (!IsHuman(applicant) || !Playerbot::Services::Initialized() || applicant->GetGroup())
+        return nullptr;
+    bool const alliance = applicant->GetTeam() == ALLIANCE;
+    uint32 const level = applicant->GetLevel();
+    for (ListedBotGroup const& g : g_botGroups)
+    {
+        if (g.alliance != alliance)
+            continue;
+        ListedActivity const* act = nullptr;
+        for (ListedActivity const& a : Playerbot::Services::Config().lfg_bot_groups_activities())
+            if (a.activity == g.activity) { act = &a; break; }
+        if (!act || (map && act->map != map))
+            continue;
+        if (level + 2 < act->levelMin || level > uint32(act->levelMax) + 2)
+            continue;
+        Player* leader = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g.leader));
+        if (!leader || !leader->GetGroup() || leader->GetTeam() != applicant->GetTeam())
+            continue;
+        return leader;
+    }
+    return nullptr;
 }
 
 bool LfgBotGroupJoinRequest(Player* member, Player* applicant)

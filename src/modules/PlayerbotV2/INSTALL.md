@@ -76,6 +76,10 @@ mv etc/worldserver.conf.d/playerbot.conf.dist etc/worldserver.conf.d/playerbot.c
 `ConfigMgr::LoadAdditionalDir` walks that directory and loads every `*.conf`, so
 the rename is all that is needed. A `.dist` file is ignored by design.
 
+A `playerbot.conf` placed next to `worldserver.conf` instead is also read, and
+its `Playerbot.*` keys win over the same keys in `worldserver.conf`. Use one of
+the two places, not both.
+
 Skipping this step is not fatal — every `Playerbot.*` key falls back to its
 compiled-in default, and `Playerbot.SharedDatabase` already defaults to
 `playerbot` — but nothing is tunable until you do it.

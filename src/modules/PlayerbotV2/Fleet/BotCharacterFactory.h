@@ -44,8 +44,9 @@ public:
         uint8              gender = 0);
 
     // Re-roll the appearance of every bot character whose customizations the
-    // client could reject (options or choices it doesn't offer). Run at module
-    // init, before any bot logs in. Returns how many were rewritten.
+    // client could reject (options or choices it doesn't offer) or that has
+    // none at all. Run at module init, before any bot logs in. Returns how many
+    // were rewritten.
     static uint32 RepairAppearances();
 };
 

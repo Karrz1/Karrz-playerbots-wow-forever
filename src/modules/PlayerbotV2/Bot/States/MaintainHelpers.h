@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "BotTypes.h"
+#include "../BotTypes.h"
 #include "ObjectGuid.h"
 
 namespace Playerbot {
@@ -133,8 +133,15 @@ GroupMemberSummary const* GroupAnchorTank(BotSnapshotView const& s, BotAI const&
 // group. Instances only, in and out of combat. Returns true when it emitted
 // or holds a step already under way (caller consumes the tick). Definition
 // in State_Idle.cpp.
+// traps_only: only when the zone the bot stands in is a trap game object.
 bool RaidHazardStepOut(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g,
-                       BotIntentEmitter& emit);
+                       BotIntentEmitter& emit, bool traps_only = false);
+
+// Ground-hazard detour ([raid_hazard_detour]). A melee bot outside every ground
+// hazard whose line to its victim crosses a trap zone walks to a point beside it first.
+// Instances only. Returns true when it emitted or holds that walk (caller
+// consumes the tick). Definition in State_Idle.cpp.
+bool RaidHazardDetour(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit);
 
 // The generic stand-point filter: (x, y, z) lies in a hostile ground hazard
 // (snapshot combat.ground_hazards, same floor) or in a raid-layer avoid circle
@@ -147,6 +154,10 @@ bool RaidStandPointBlocked(BotSnapshotView const& s, float x, float y, float z);
 // than a few yards away (the boss pulled back or repositioned). True when it emitted a move or holds one in flight. Definition in
 // State_Idle.cpp.
 bool RaidFormationHold(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit);
+
+// The raid formation, not the group follow, places this bot: a ranged DPS / healer of a raid (or raid group) whose anchor tank is
+// fighting, whether or not the bot itself is in combat. Definition in State_Idle.cpp.
+bool RaidFormationOwnsMovement(BotSnapshotView const& s, BotAI const& ai, GroupSnapshotView const& g);
 
 // Playerbot.Behavior.SpreadOut: this melee bot's own stand spot on an arc round the back / sides of `victim`
 // (rank = guid order among the group's melee on the same victim, evenly spaced, plus stable per-bot angle and
@@ -164,6 +175,21 @@ bool MeleeSpreadSpot(BotSnapshotView const& s, GroupSnapshotView const& g, Nearb
 // exempt_victim_pack false: the pack of the bot's own victim counts too (a caster's approach step must not walk into the
 // neighbours of the mob it is after).
 bool RaidPointInUnpulledReach(BotSnapshotView const& s, float x, float y, float z, bool exempt_victim_pack = true);
+
+// (x, y, z) lies inside an unpulled (idle) mob's aggro reach + margin, whatever the bot's own position (the world-thread planners
+// that pick a spot for the whole group: PveGroupCoordinator::PlanSightPull). Instances only. Definition in State_Idle.cpp.
+bool PointInUnpulledPackReach(BotSnapshotView const& s, float x, float y, float z);
+
+// Line-of-sight pull (PveOrder::sight_pull, PveGroupCoordinator::PlanSightPull): a bot of the group farther than a few yards from the
+// spot walks there (a cast in progress goes out first). True when the walk owns the tick. In combat (State_InCombat SightPullTick)
+// and out of it (idle:sight_pull, a member not yet hit). Definition in State_InCombat.cpp.
+bool SightPullGather(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit, bool in_combat_state);
+
+// A spot on the victim's level that sees it and is in reach for the role (the melee ring, or 25-10 y out for a ranged bot);
+// pack_safe also keeps it out of unpulled packs' reach (RaidPointInUnpulledReach). Emits the run there and returns the spot and
+// its distance from the victim. Definition in State_InCombat.cpp (used by [idle_reposition] and the opener's blocked approach).
+bool SightSpotMove(BotSnapshotView const& s, NearbyUnit const& victim, bool melee, bool pack_safe, BotIntentEmitter& emit,
+                   float& ox, float& oy, float& oz, float& oradius);
 
 // Instance LoS step ([raid_los]). A ranged / healer bot whose cast target
 // (healer: its anchor tank; ranged: its victim) is out of line of sight steps

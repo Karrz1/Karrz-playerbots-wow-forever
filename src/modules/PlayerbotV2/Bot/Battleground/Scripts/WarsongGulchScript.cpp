@@ -41,7 +41,7 @@ public:
             BgRole::FlagCarrier,
             BgRole::FCEscort,
             BgRole::Defender,     // flag room guards: two, each at its own post beside the stand (not on it: the owner, two bots camped on
-            BgRole::Defender,     // the stand). Ported from the ike3 bots' two defender posts (the ike3-based playerbot code)
+            BgRole::Defender,     // the stand). Ported from the ike3 bots' two defender posts (Karrz1/wow-1.12 raid10-revamp bcc8b9f)
             BgRole::Roamer,
             BgRole::Roamer,
             BgRole::Attacker,

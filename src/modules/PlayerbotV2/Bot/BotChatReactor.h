@@ -37,6 +37,12 @@ public:
     // No-op when sender is null / a bot / message is empty.
     static void React(Player* sender, Group* group, std::string const& msg);
 
+    // Playerbot.ChatModel party/raid path. Called from PlayerbotV2::Module::OnPartyChat for a line that is not an order. A bot
+    // named in the line, or now and then one picked by hash, answers through BotChatModel on the channel it heard: raid chat
+    // for a raid-chat line (any bot in the raid), party chat for a party line (only bots in the speaker's own subgroup, the
+    // ones a party line reaches). No-op when the model's party replies are off.
+    static void ReactPartyModel(Player* sender, Group* group, std::string const& msg, bool raid_chat);
+
     // Whisper variant. Called from OnWhisperReceived AFTER BotCommandParser
     // returned false (command not recognized) — treats the line as a
     // social cue and emits a whisper-back if the message matches a known
@@ -65,6 +71,10 @@ public:
     // per-bot cooldown AND a per-area cooldown so crowded hubs don't explode
     // at scale. No-op when sender is a bot / message is a command prefix.
     static void ReactSay(Player* sender, std::string const& msg);
+
+    // A small-talk answer from `bot`'s own state (BotConversation) to a line `sender` wrote where everyone reads it (a channel):
+    // false when the rules have nothing to say. No cooldowns here; the caller keeps its own.
+    static bool SmallTalk(Player* bot, Player* sender, std::string const& msg, std::string& out);
 
     // SC-P1a /yell reactor. Same machinery as ReactSay but anchored at
     // CONFIG_LISTEN_RANGE_YELL and gated to a LOWER fire chance — players

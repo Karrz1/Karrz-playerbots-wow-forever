@@ -18,6 +18,7 @@
 #include <vector>
 #include "World.h"
 #include "SpellFamily.h"
+#include "GroupControl.h"
 
 namespace Playerbot {
 
@@ -426,9 +427,14 @@ bool BotSnapshotView::in_spell_range(uint32 spell_id, NearbyUnit const& t, float
         limit = std::max(kSelfReach + t.combat_reach + 4.0f / 3.0f, kNominalMelee);
     else
     {
-        float const base = si->GetMaxRange(false);
+        float base = si->GetMaxRange(false);
         if (base <= 0.f)
             return true;
+        // The bot's range modifiers on this spell (SpellbookState::range_bonus), as Spell::CalcMinMaxRange applies them.
+        auto const& rb = s_->spellbook.range_bonus;
+        if (auto it = std::lower_bound(rb.begin(), rb.end(), spell_id, [](std::pair<uint32, float> const& e, uint32 id) { return e.first < id; });
+            it != rb.end() && it->first == spell_id)
+            base += it->second;
         limit = base + kSelfReach + t.combat_reach;
         if (si->CalcCastTime() > 0)   // Spell::CheckRange: hard casts get +10% (<= 3y)
             limit += std::min(3.0f, base * 0.1f);
@@ -850,6 +856,10 @@ NearbyUnit const* BotSnapshotView::assigned_tank_mob() const
     PveOrder const& po = s_->pve_order;
     if (!po.active || po.tank_target.IsEmpty())
         return nullptr;
+    // The coordinator's pass already skips a raid-forbidden mob, but its order is a pass older than the raid brain's.
+    RaidOrder const& ro = s_->raid_order;
+    if (ro.active && std::find(ro.forbidden_targets.begin(), ro.forbidden_targets.end(), po.tank_target) != ro.forbidden_targets.end())
+        return nullptr;
     for (auto const& e : s_->combat.nearby_enemies)
         if (e.guid == po.tank_target)
             return e.hp > 0 ? &e : nullptr;
@@ -953,6 +963,11 @@ static NearbyUnit const* UnclaimedLooseAttacker(BotSnapshot const& s, float rang
     float ctl_leash = Services::Config().behavior_passive_leash_yd();
     if (ctl_leash <= 0.f && s.instance_ctx.is_in_instance)
         ctl_leash = kPickupLeashYd;
+    // Every mob here is loose on a group member: the group's fight, which reaches GroupControl::kFightJoinYd from the player. With the
+    // passive leash (25 y) a warlock's tank left a mob beating his healer 37 y from him (UBRS 2026-10-28 22:09:45, Hadley); the
+    // healer leash above still keeps the pickup where the healers see it.
+    if (ctl_leash > 0.f)
+        ctl_leash = std::max(ctl_leash, GroupControl::kFightJoinYd);
     if ((leash || controller_leash) && ctl_leash > 0.f && !controller.IsEmpty())
         for (auto const& f : s.combat.nearby_friends)
             if (f.guid == controller) { owner_unit = &f; break; }
@@ -962,6 +977,15 @@ static NearbyUnit const* UnclaimedLooseAttacker(BotSnapshot const& s, float rang
         if (ThreatVictim(e.victim_kind) != ThreatVictim::Member) continue;
         if (s.pve_order.active && s.pve_order.claimed_by_other_tank(e.guid) && LooseOnMemberMs(e.guid, s.published_at_ms) < kClaimStaleMs) continue;
         if (OtherTankTakesLoose(s, e)) continue;
+        // The raid brain forbids it to this bot (a fixed tank row's tank waits at its slot for an add still far out): a pickup or a taunt
+        // would pull the tank off its slot all the same (bwl_nefarian 1109a: tanks left the arc for drakonids 40-60 y out and died there).
+        if (s.raid_order.active && std::find(s.raid_order.forbidden_targets.begin(), s.raid_order.forbidden_targets.end(), e.guid) !=
+                                       s.raid_order.forbidden_targets.end())
+            continue;
+        // The line-of-sight pull (PveOrder::sight_pull): a mob standing off out of the group's sight is on its way to the spot; a tank
+        // that walks out to it takes the fight back to where it stood (smlibrary_loksey 8d2fd499aa: Taunt reach 4 y, the tank walked 30 y
+        // to the Beastmaster on the priest).
+        if (s.pve_order.active && s.pve_order.sight_pull_mob(e.guid)) continue;
         if (leash && BeyondHealerLeash(s, e.x, e.y))
         {
             static std::atomic<uint32> s_hleash_log{ 0 };
@@ -1017,7 +1041,11 @@ NearbyUnit const* BotSnapshotView::taunt_candidate(float range) const
         // Ours, and not on us yet: taunt it wherever it is, another tank
         // included. No ping-pong: the holder sees it as a mob on itself,
         // and its own fallback below skips mobs claimed by other tanks.
-        if (ThreatVictim(a->victim_kind) != ThreatVictim::Me)
+        // A raid boss another tank holds is left there: each swap turns it (Onyxia's Flame Breath and Tail Sweep, Broodlord's
+        // Cleave) and the taunt war never settles. The planned swaps (debuff stacks) are RaidBrain's taunt orders, not this.
+        bool const boss_on_tank = s_->instance_ctx.is_in_raid && ThreatVictim(a->victim_kind) == ThreatVictim::Tank &&
+                                  (a->is_dungeon_boss || a->is_boss_rank);
+        if (ThreatVictim(a->victim_kind) != ThreatVictim::Me && !boss_on_tank)
         {
             const float dx = a->x - s_->position.x;
             const float dy = a->y - s_->position.y;

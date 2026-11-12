@@ -72,6 +72,10 @@ public:
     // count as a town's NPCs.
     TownNpc const* NearestMailbox(uint32 map, float x, float y, float z, float max_dist) const;
 
+    // Calls fn for every mailbox object on `map` within `radius` (2D) of (x,y).
+    void ForEachMailboxNear(uint32 map, float x, float y, float radius,
+                            std::function<void(TownNpc const&)> const& fn) const;
+
     // True when any auctioneer spawn (either side) stands within `radius`.
     // Cheap gate for the snapshot builder's auction-house scan.
     bool AuctioneerNear(uint32 map, float x, float y, float radius) const;

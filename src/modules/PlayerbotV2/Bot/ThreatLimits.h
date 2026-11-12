@@ -10,6 +10,11 @@ namespace Playerbot {
 constexpr float kThreatHardRatioMelee  = 1.0f;    // a melee DPS never releases above the tank's own threat
 constexpr float kThreatHardRatioCaster = 1.10f;   // a caster keeps a tenth of margin under the 130 % a ranged attacker needs
 
+// The core's aggro switch (ThreatManager::UpdateVictim): a mob turns on another attacker at 110 % of its victim's threat in melee reach and at
+// 130 % at range. Below these a non-tank cannot take the mob, however close to the tank it holds.
+constexpr float kAggroSwitchRatioMelee  = 1.10f;
+constexpr float kAggroSwitchRatioRanged = 1.30f;
+
 // A raid tank with tens of thousands of threat takes one cast as a few percent, so a caster keeps ten points under the 130 % there (n10
 // mc_geddon: a mage held at 109 % of the tank for 20 s while the tank, out of melee in the Inferno, gained nothing). Early in a pull the
 // tank holds a few thousand and one Frostbolt is a fifth of it: below kRaidTankThreatFloor the 110 % limit stays.
@@ -78,15 +83,16 @@ constexpr unsigned kStalledTankHoldMs = 6000;
 struct StalledTankClock { unsigned since_ms = 0; unsigned last_ms = 0; float tank_threat = 0.0f; };
 
 // One poll of a hold past the hard limit: true once the hold has lasted kStalledTankHoldMs with the tank's threat at a standstill.
-// The clock restarts when the tank's threat rises (the tank is building, the hold is doing its job) and after gap_ms without a
-// poll (a new hold).
+// The clock restarts when the tank's threat rises since the previous poll (the tank is building, the hold is doing its job) and after
+// gap_ms without a poll (a new hold). The threat it compares against is the last one polled, not the one the clock started with: after a
+// threat wipe (a boss's reset or cut, the support scorecard's next run) the tank rebuilds from below the old value, and against the old
+// value it never "rose" - 242 support scorecard: the fury held over from one run to the next was released every poll for the whole run
+// ("tank threat stalled at 3697 for 6000 ms", then 5324, 6926 ...) and kept the boss from the paladin tank for 116 of 120 s.
 constexpr bool StalledTankHoldExpired(StalledTankClock& c, unsigned now, float tank_threat, unsigned gap_ms)
 {
     if (!c.since_ms || now - c.last_ms > gap_ms || tank_threat > c.tank_threat)
-    {
         c.since_ms = now;
-        c.tank_threat = tank_threat;
-    }
+    c.tank_threat = tank_threat;
     c.last_ms = now;
     return now - c.since_ms >= kStalledTankHoldMs;
 }

@@ -91,7 +91,7 @@ bool LootDrainGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     // corpses and back to the tank without drinking.
     if (s.is_in_instance() && s.max_power(POWER_MANA) > 0 && Classic::DrinksForPull(s, &g)
         && s.power_pct(POWER_MANA) < Classic::OocDrinkStartManaPct(s, &g, 0)
-        && Classic::BestConsumable(s, Classic::ConsumableKind::Drink))   // no drink in the bags: it loots rather than waits for nothing
+        && Classic::RecoveryConsumable(s, Classic::ConsumableKind::Drink))   // nothing to drink (supplies off, empty bags): it loots rather than waits
         return false;
     // Loot etiquette with a human in the group (the owner's AddLootAction): no
     // looting while the bot or a human of the group on its map is still

@@ -20,6 +20,7 @@
 #include "Define.h"
 #include "ObjectGuid.h"
 #include <string>
+#include <vector>
 
 class Player;
 
@@ -51,5 +52,8 @@ struct TalentNode
     int32 MaxRanks = 0;
 };
 TC_GAME_API TalentNode const* FindTalent(Player const* player, std::string const& name);
+// Every talent name (lower-cased key) the player's class trees answer to: for a build pick FindTalent does not find, this shows
+// what the client data calls it.
+TC_GAME_API std::vector<std::string> ListTalentNames(Player const* player);
 
 } // namespace Playerbot::Classic

@@ -5,6 +5,7 @@
 #include "../Bot/BotIntentEmitter.h"
 #include "../Bot/BotRegistry.h"
 #include "../Bot/BotSnapshot.h"
+#include "../Bot/ClassicUpkeep.h"
 #include "../Bot/PlayerCraftOrder.h"
 #include "../Services.h"
 #include "../Threading/IntentQueue.h"
@@ -17,9 +18,13 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "SpellAuras.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "TradeData.h"
+#include "TradePackets.h"
 #include "World.h"
+#include "WorldSession.h"
 
 #include <algorithm>
 #include <cctype>
@@ -38,6 +43,7 @@ constexpr std::uint32_t kOrderDeadlineMs = 10u * 60u * 1000u;
 constexpr std::uint32_t kMailWaitMs = 15000;       // for the mail intent to take the items out of the bags
 constexpr std::uint32_t kMaxDismounts = 3;         // a rule that mounts the bot again is not fought for ever
 constexpr std::uint32_t kExtraCasts = 3;           // casts beyond the plan before the order is given up (a cast can fail and be retried)
+constexpr std::uint32_t kRoomWaitMs = 4000;        // for the make-room intent to clear bag rot before a full bag ends the order
 
 enum class Phase : std::uint8_t { Crafting, Mailing };
 
@@ -59,6 +65,8 @@ struct Job
     std::uint32_t mail_ms = 0;
     std::uint32_t mailing = 0;            // items handed to the mail intents
     std::uint32_t before_mail = 0;        // the bot's stock when the mail intents were pushed
+    bool told_mana = false;               // the requester was told the bot drinks first
+    bool by_trade = false;                // handed over in a trade window, not mailed (conjured, or he stood next to the bot)
     Phase phase = Phase::Crafting;
 };
 
@@ -136,6 +144,10 @@ std::vector<pc::Option> Options(Player const* bot)
             o.yield = std::max<std::uint32_t>(1u, std::uint32_t(std::max(eff.CalcValueAsInt(bot), 1)));
             o.name = Lower(t->GetName(sWorld->GetDefaultDbcLocale()));
             o.rank = std::uint32_t(std::max(t->GetBaseRequiredLevel(), 0)) * 1000u + std::min<std::uint32_t>(t->GetBaseItemLevel(), 999u);
+            if (si->SpellName)
+                o.spell_name = Lower(si->SpellName->Str[sWorld->GetDefaultDbcLocale()]);
+            if (::Playerbot::Classic::ConsumableKind kind = {}; ::Playerbot::Classic::IsMageConjure(spell, kind))
+                o.conjured = kind == ::Playerbot::Classic::ConsumableKind::Drink ? pc::Conjured::Water : pc::Conjured::Food;
             out.push_back(std::move(o));
             break;
         }
@@ -155,6 +167,51 @@ pc::Delivery DeliveryOf(Player const* bot, std::uint32_t item)
     ItemTemplate const* t = sObjectMgr->GetItemTemplate(item);
     std::vector<Item*> const held = bot->GetItemListByEntry(item, false);
     return pc::DeliveryFor(t && t->HasFlag(ITEM_FLAG_CONJURED), !held.empty() && held.front()->IsSoulBound());
+}
+
+// A food / drink aura is up (the drink rule sat the bot down).
+bool Drinking(Player const* bot)
+{
+    for (auto const& [id, app] : bot->GetAppliedAuras())
+    {
+        SpellSpecificType const spec = app->GetBase()->GetSpellInfo()->GetSpellSpecific();
+        if (spec == SPELL_SPECIFIC_DRINK || spec == SPELL_SPECIFIC_FOOD_AND_DRINK)
+            return true;
+    }
+    return false;
+}
+
+// The mana one cast of `spell` costs the bot now, 0 for a spell without a mana cost.
+std::uint32_t ManaCost(Player const* bot, std::uint32_t spell)
+{
+    SpellInfo const* si = sSpellMgr->GetSpellInfo(spell, DIFFICULTY_NONE);
+    if (!si)
+        return 0;
+    for (SpellPowerCost const& cost : si->CalcPowerCost(bot, si->GetSchoolMask()))
+        if (cost.Power == POWER_MANA)
+            return std::uint32_t(std::max(cost.Amount, 0));
+    return 0;
+}
+
+// One cast's items fit in the bags now. A cast whose item does not fit is refused before it goes out (CastBlockedByOwnState).
+bool Fits(Player* bot, Job const& j)
+{
+    ItemPosCountVec dest;
+    return bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, j.item, std::max<std::uint32_t>(1, j.yield)) == EQUIP_ERR_OK;
+}
+
+// The order is ready and goes by trade: when the requester stands within reach and neither is trading, the bot opens the window
+// itself as a player would (CMSG_INITIATE_TRADE; the handler makes every check), and TradeShop puts the item in. True: it opened.
+bool OpenTradeWith(Player* bot, Player* requester)
+{
+    if (!bot || !requester || bot->GetTradeData() || requester->GetTradeData() || requester->GetMap() != bot->GetMap()
+        || !bot->IsWithinDistInMap(requester, TRADE_DISTANCE - 1.0f))
+        return false;
+    WorldPacket packet(CMSG_INITIATE_TRADE);
+    WorldPackets::Trade::InitiateTrade init(std::move(packet));
+    init.Guid = requester->GetGUID();
+    bot->GetSession()->HandleInitiateTradeOpcode(init);
+    return bot->GetTradeData() != nullptr;
 }
 
 void Finish(Job const& j, Player const* bot, std::string const& text)
@@ -196,7 +253,7 @@ bool Order(Player* requester, Player* bot, std::string const& text)
         return true;
     }
 
-    int const idx = pc::Match(req, opts);
+    int const idx = pc::Match(req, opts, requester->GetLevel());
     if (idx < 0)
     {
         Say(bot, to, "I don't know a recipe for that.");
@@ -252,6 +309,35 @@ bool Order(Player* requester, Player* bot, std::string const& text)
         return true;
     }
 
+    // Will the bags take it? A cast whose item does not fit is refused before it goes out (API CastBlockedByOwnState,
+    // API_ITEM_AT_LIMIT), and the order used to end in "no item came out" with no reason (Gun's water, 2026-11-08).
+    bool room_first = false;   // the bags are full: the bot clears what it may first, and says only that
+    {
+        ItemPosCountVec dest;
+        InventoryResult const room = bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, o.item, std::max<std::uint32_t>(1, o.yield));
+        if (room != EQUIP_ERR_OK)
+        {
+            TC_LOG_INFO("playerbot.v2", "[craft_order] {} can't store item {} x{}: InventoryResult {} (limit category {}, max count {}, "
+                        "free slots {})", bot->GetName(), o.item, o.yield, uint32(room), t->GetItemLimitCategory(), t->GetMaxCount(),
+                        bot->GetFreeInventorySlotCount());
+            if (room == EQUIP_ERR_INV_FULL || room == EQUIP_ERR_BAG_FULL)
+            {
+                Push(bot, MakeBagRoomIntent{ 2 });
+                Say(bot, to, fmt::format("My bags are full, let me make some room first for {}.", ItemLink(t)));
+                room_first = true;
+            }
+            else
+            {
+                Say(bot, to, fmt::format("I can't carry any more {} right now.", ItemLink(t)));
+                return true;
+            }
+        }
+    }
+
+    // A conjured item can't be mailed, and a player standing next to the bot wants it now: those go by trade, and the bot says so.
+    bool const by_trade = DeliveryOf(bot, o.item) != pc::Delivery::Mail || t->HasFlag(ITEM_FLAG_CONJURED)
+        || (requester->GetMap() == bot->GetMap() && bot->IsWithinDistInMap(requester, 30.0f));
+
     Job j;
     j.bot = bot->GetGUID().GetCounter();
     j.requester = to;
@@ -262,13 +348,16 @@ bool Order(Player* requester, Player* bot, std::string const& text)
     j.wanted = plan.items;
     j.baseline = bot->GetItemCount(o.item, false);
     j.casts_planned = plan.casts;
+    j.by_trade = by_trade;
     j.started_ms = GameTime::GetGameTimeMS();
     g_jobs.push_back(j);
-    Say(bot, to, plan.items > req.count
+    char const* const how = by_trade ? "trade it to you" : "mail it to you";
+    if (!room_first)
+        Say(bot, to, plan.items > req.count
         ? fmt::format("One cast makes {}, so I'm making {} x{} and will hand them over when done.", o.yield, ItemLink(t), plan.items)
         : plan.trimmed
-        ? fmt::format("I can make {} of the {} you asked for with my reagents; I'll mail {} to you when done.", plan.items, ItemLink(t), plan.items)
-        : fmt::format("Making {} x{}, I'll mail it to you when done.", ItemLink(t), plan.items));
+        ? fmt::format("I can make {} of the {} you asked for with my reagents; I'll {} when done.", plan.items, ItemLink(t), how)
+        : fmt::format("Making {} x{}, I'll {} when done.", ItemLink(t), plan.items, how));
     TC_LOG_INFO("playerbot.v2", "[craft_order] queued: {} for {} item {} x{} (spell {}, {} casts, {} per cast)", bot->GetName(), to, o.item, plan.items, o.spell, plan.casts, o.yield);
     return true;
 }
@@ -316,16 +405,20 @@ void Tick(std::uint32_t now_ms)
                             Finish(j, bot, "I couldn't make that (no item came out), sorry.");
                         done = true;
                     }
-                    else if (pc::Delivery const how = DeliveryOf(bot, j.item); how != pc::Delivery::Mail)
+                    else if (pc::Delivery const how = DeliveryOf(bot, j.item); how != pc::Delivery::Mail || j.by_trade)
                     {
-                        // The mail refuses a conjured item: it stays in the bags and goes over in a trade window.
+                        // The mail refuses a conjured item, and a requester at hand gets it now: it goes over in a trade window,
+                        // which the bot opens itself when he is within reach.
                         std::string const link = ItemLink(sObjectMgr->GetItemTemplate(j.item));
                         if (how == pc::Delivery::Bound)
                             Finish(j, bot, fmt::format("I made {}, but it is soulbound to me and I cannot give it away.", link));
                         else
                         {
                             TradeShop::StoreDelivery(bot, j.requester_guid, j.item);
-                            Finish(j, bot, fmt::format("I made {}. It cannot go by mail, open a trade with me and I'll hand it over.", link));
+                            if (OpenTradeWith(bot, ObjectAccessor::FindConnectedPlayer(j.requester_guid)))
+                                Finish(j, bot, fmt::format("Here you go, {}.", link));
+                            else
+                                Finish(j, bot, fmt::format("I made {}. Open a trade with me and I'll hand it over.", link));
                         }
                         done = true;
                     }
@@ -351,7 +444,31 @@ void Tick(std::uint32_t now_ms)
                 }
                 else if (!bot->IsNonMeleeSpellCast(false) && !bot->IsInCombat() && bot->IsAlive() && now_ms - j.last_cast_ms >= kCastGapMs)
                 {
-                    if (bot->IsMounted() && j.dismounts < kMaxDismounts)
+                    if (!Fits(bot, j))
+                    {
+                        // Full bags: every cast would be refused, and the order used to end in "no item came out" after four of
+                        // them (Gun's water, 2026-11-09). The make-room intent had its chance; nothing it may throw away was left.
+                        if (now_ms - j.started_ms >= kRoomWaitMs)
+                        {
+                            ItemTemplate const* t = sObjectMgr->GetItemTemplate(j.item);
+                            TC_LOG_INFO("playerbot.v2", "[craft_order] {} bags full for item {} x{} (free slots {}): order ended before a cast",
+                                        bot->GetName(), j.item, j.yield, bot->GetFreeInventorySlotCount());
+                            Finish(j, bot, fmt::format("My bags are full, so I can't make {}. I need to sell or drop something first.",
+                                                       t ? ItemLink(t) : std::string("that")));
+                            g_jobs.erase(g_jobs.begin() + std::ptrdiff_t(i));
+                            continue;
+                        }
+                    }
+                    else if (pc::WaitForMana(Drinking(bot), bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA), ManaCost(bot, j.spell)))
+                    {
+                        // Not a cast: the give-up count stands still while the bot drinks (the order deadline still runs).
+                        if (!j.told_mana)
+                        {
+                            Say(bot, j.requester, "I'm out of mana, I'll drink first and then finish your order.");
+                            j.told_mana = true;
+                        }
+                    }
+                    else if (bot->IsMounted() && j.dismounts < kMaxDismounts)
                     {
                         // The spell code refuses every cast of a mounted caster (NOT_MOUNTED): get off first.
                         Push(bot, DismountIntent{});

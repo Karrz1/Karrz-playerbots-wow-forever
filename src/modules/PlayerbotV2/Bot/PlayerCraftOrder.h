@@ -97,6 +97,8 @@ inline Request ParseRequest(std::string_view text, std::uint32_t max_count)
         std::size_t from = h;
         if (h >= 10 && s.compare(h - 10, 2, "|c") == 0)
             from = h - 10;
+        else if (auto const c = s.rfind("|cn", h); c != std::string::npos && s.find(' ', c) > h)
+            from = c;                                                          // the 12.x quality colour: |cnIQ4:
         std::size_t to = s.size();
         if (auto open = s.find("|h", h + 7); open != std::string::npos)         // end of the link target: |h[Name]
             if (auto close = s.find("|h", open + 2); close != std::string::npos)  // end of the visible text
@@ -139,6 +141,8 @@ inline Request ParseRequest(std::string_view text, std::uint32_t max_count)
     return r;
 }
 
+enum class Conjured : std::uint8_t { None, Water, Food };
+
 struct Option
 {
     std::uint32_t spell = 0;
@@ -146,13 +150,44 @@ struct Option
     std::uint32_t yield = 1;   // items one cast makes
     std::string name;          // lower case item name
     std::uint32_t rank = 0;    // how good the item is (required level, then item level): the better one wins a name that fits several ranks
+    std::string spell_name;    // lower case recipe name ("conjure food"), tried only when no item name fits
+    Conjured conjured = Conjured::None;   // a Conjure Water / Conjure Food rank, from the spell data (no names, so any locale)
 };
 
-// Index of the recipe that answers the request, -1 when none. A link matches by item entry; a name matches exactly, then as a prefix,
-// then as a substring (ties: the better rank, then shorter name, then lower spell id). "craft water" fits every Conjure Water rank and the
-// mage gave the first one; an exact name still gets exactly that item.
-inline int Match(Request const& request, std::span<Option const> options)
+namespace detail {
+
+// "water" / "food" in English, and the Russian words, whatever the server's locale: the item and recipe names are in the server's
+// language, so on a ruRU server "craft water" fitted nothing (Tornn, 2026-10-27). The add-on's Conjure buttons send the English words.
+// The Russian words are UTF-8 bytes (this file is Latin-1): voda/vodu, napitok/napitki; eda/edu, pishcha/pishchu, lower and capitalised.
+inline Conjured Keyword(std::string_view name)
 {
+    static constexpr std::string_view kWater[] = {
+        "water", "drink", "drinks", "\xd0\xb2\xd0\xbe\xd0\xb4\xd0\xb0", "\xd0\xb2\xd0\xbe\xd0\xb4\xd1\x83", "\xd0\x92\xd0\xbe\xd0\xb4\xd0\xb0",
+        "\xd0\x92\xd0\xbe\xd0\xb4\xd1\x83", "\xd0\xbd\xd0\xb0\xd0\xbf\xd0\xb8\xd1\x82\xd0\xbe\xd0\xba",
+        "\xd0\xbd\xd0\xb0\xd0\xbf\xd0\xb8\xd1\x82\xd0\xba\xd0\xb8", "\xd0\x9d\xd0\xb0\xd0\xbf\xd0\xb8\xd1\x82\xd0\xbe\xd0\xba",
+        "\xd0\x9d\xd0\xb0\xd0\xbf\xd0\xb8\xd1\x82\xd0\xba\xd0\xb8",
+    };
+    static constexpr std::string_view kFood[] = {
+        "food", "\xd0\xb5\xd0\xb4\xd0\xb0", "\xd0\xb5\xd0\xb4\xd1\x83", "\xd0\x95\xd0\xb4\xd0\xb0", "\xd0\x95\xd0\xb4\xd1\x83",
+        "\xd0\xbf\xd0\xb8\xd1\x89\xd0\xb0", "\xd0\xbf\xd0\xb8\xd1\x89\xd1\x83", "\xd0\x9f\xd0\xb8\xd1\x89\xd0\xb0",
+        "\xd0\x9f\xd0\xb8\xd1\x89\xd1\x83",
+    };
+    for (std::string_view w : kWater)
+        if (name == w)
+            return Conjured::Water;
+    for (std::string_view w : kFood)
+        if (name == w)
+            return Conjured::Food;
+    return Conjured::None;
+}
+
+// `field` null: match by `want` (the conjured kind) instead of a name.
+inline int MatchBy(Request const& request, std::span<Option const> options, std::string Option::*field, std::uint32_t user_level,
+    Conjured want = Conjured::None)
+{
+    auto const usable = [user_level](Option const& o) { return user_level == 0 || o.rank / 1000u <= user_level; };
+    std::string const empty;
+    auto const text = [&](Option const& o) -> std::string const& { return field ? o.*field : empty; };
     int best = -1;
     int best_rank = 4;
     for (std::size_t i = 0; i < options.size(); ++i)
@@ -161,11 +196,13 @@ inline int Match(Request const& request, std::span<Option const> options)
         int rank = 4;
         if (request.item_entry)
             rank = o.item == request.item_entry ? 0 : 4;
+        else if (!field)
+            rank = o.conjured == want ? 1 : 4;
         else if (!request.name.empty())
         {
-            if (o.name == request.name) rank = 1;
-            else if (o.name.rfind(request.name, 0) == 0) rank = 2;
-            else if (o.name.find(request.name) != std::string::npos) rank = 3;
+            if (text(o) == request.name) rank = 1;
+            else if (text(o).rfind(request.name, 0) == 0) rank = 2;
+            else if (text(o).find(request.name) != std::string::npos) rank = 3;
         }
         if (rank == 4)
             continue;
@@ -173,10 +210,12 @@ inline int Match(Request const& request, std::span<Option const> options)
         if (!better && rank == best_rank)
         {
             Option const& b = options[std::size_t(best)];
-            if (o.rank != b.rank && rank != 1)
+            if (usable(o) != usable(b))
+                better = usable(o);
+            else if (o.rank != b.rank && (rank != 1 || field != &Option::name))   // every rank shares its recipe name and its kind
                 better = o.rank > b.rank;
             else
-                better = o.name.size() < b.name.size() || (o.name.size() == b.name.size() && o.spell < b.spell);
+                better = text(o).size() < text(b).size() || (text(o).size() == text(b).size() && o.spell < b.spell);
         }
         if (better)
         {
@@ -185,6 +224,26 @@ inline int Match(Request const& request, std::span<Option const> options)
         }
     }
     return best;
+}
+} // namespace detail
+
+// Index of the recipe that answers the request, -1 when none. A link matches by item entry; a name matches exactly, then as a prefix,
+// then as a substring (ties: the better rank, then shorter name, then lower spell id). "craft water" fits every Conjure Water rank and the
+// mage gave the first one; an exact name still gets exactly that item. When no item name fits, the recipe names are tried the same way:
+// "craft food" names no conjured item (Conjured Muffin .. Conjured Cinnamon Roll) but fits every Conjure Food rank.
+// `user_level` is the requester's level (0 = any): among the items a name fits, one he is high enough to use beats a better one he
+// is not, so a level 30 player asking a level 60 mage for water gets water he can drink. "water" and "food" (and the Russian words) go
+// first to the mage's Conjure Water / Conjure Food ranks by the spell data, so they work whatever language the server's names are in.
+inline int Match(Request const& request, std::span<Option const> options, std::uint32_t user_level = 0)
+{
+    if (!request.item_entry)
+        if (Conjured const want = detail::Keyword(request.name); want != Conjured::None)
+            if (int const kind = detail::MatchBy(request, options, nullptr, user_level, want); kind >= 0)
+                return kind;
+    int const best = detail::MatchBy(request, options, &Option::name, user_level);
+    if (best >= 0 || request.item_entry || request.name.empty())
+        return best;
+    return detail::MatchBy(request, options, &Option::spell_name, user_level);
 }
 
 struct Facts
@@ -251,6 +310,19 @@ constexpr Delivery DeliveryFor(bool conjured, bool soulbound)
     if (soulbound)
         return Delivery::Bound;
     return conjured ? Delivery::Trade : Delivery::Mail;
+}
+
+// The next cast of an order waits for mana. Out of mana, each cast stood the drinking mage up again (a cast stands the bot first), the
+// cast failed, and the drink rule sat it down: it bobbed up and down on the spot and never drank (Tornn, 2026-10-27). So a bot that is
+// drinking finishes the drink (mana full), and one short of the cast's cost waits for the drink rule (or its own regeneration).
+// A cast without a mana cost (most profession recipes) never waits.
+constexpr bool WaitForMana(bool drinking, std::uint32_t mana, std::uint32_t max_mana, std::uint32_t cost)
+{
+    if (cost == 0)
+        return false;
+    if (drinking && mana < max_mana)
+        return true;
+    return mana < cost;
 }
 
 } // namespace Playerbot::V2::PlayerCraft

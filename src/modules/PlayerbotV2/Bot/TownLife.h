@@ -18,10 +18,13 @@ namespace Playerbot::V2::TownLife
 
 // What the shows did since the server started, for the [world] report line. Counted when a rule fires, so inn_ticks and mailbox_ticks
 // are bot-ticks on the show (walking or standing), duels and campfires are single events. idle_town and idle_field count idle-watch
-// strikes (a bot stood still too long), split by capital and elsewhere, which is how a frozen bot shows up in the log.
+// strikes (a bot stood still too long), split by capital and elsewhere, which is how a frozen bot shows up in the log. errands counts
+// places a capital resident reached (TownErrand.h), errand_gave_up the places it could not reach, inn_full / mailbox_full the bots
+// turned away by the crowd cap, player_nudges the standing bots that moved on because a real player stood next to them.
 struct Stats
 {
-    std::atomic<std::uint32_t> inn_ticks{0}, inn_walk{0}, inn_none{0}, inn_stuck{0}, mailbox_ticks{0}, duels{0}, campfires{0}, lfg_calls{0}, idle_town{0}, idle_field{0}, gate_duels{0}, gate_challenges{0};
+    std::atomic<std::uint32_t> inn_ticks{0}, inn_walk{0}, inn_none{0}, inn_stuck{0}, mailbox_ticks{0}, duels{0}, campfires{0}, lfg_calls{0}, idle_town{0}, idle_field{0}, gate_duels{0}, gate_challenges{0},
+                               errands{0}, errand_gave_up{0}, inn_full{0}, mailbox_full{0}, player_nudges{0};
 };
 inline Stats& Counters()
 {

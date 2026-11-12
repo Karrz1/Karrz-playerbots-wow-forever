@@ -371,7 +371,10 @@ void RegisterMaintainRules(IdleRuleRegistry& r)
     };
     add("idle:starter_talents",       696, &StarterTalentsFire);
     add("idle:starter_extend",        694, &StarterExtendFire);
-    add("idle:apply_context_talents", 692, &ContextTalentsFire);
+    // 721 (was 692): above the quest funnel (698-703), the bg and dungeon dispatches (718 / 720). At 692 a bot with a quest objective to
+    // walk to (or a dungeon / battleground run) never reached it, so the point of a level gained by kills waited for a standing-still tick.
+    // Out of combat only, and a bot whose talents match its level and build returns at once.
+    add("idle:apply_context_talents", 721, &ContextTalentsFire);
     add("idle:auto_equip",            690, &AutoEquipFire);
     add("idle:equip_bag_upgrade",     689, &BagUpgradeFire);
     // 993 / 993 (were 688 / 686): above the classic upkeep (992) and the quest funnel, so the dead are raised and the hurt healed

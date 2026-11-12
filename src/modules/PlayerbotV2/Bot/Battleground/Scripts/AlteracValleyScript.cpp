@@ -44,14 +44,15 @@ public:
         // AV banners are GO type 1 (BUTTON) / type 10 (GOOBER) — there are
         // NO type-42/24 GOs on map 30 (audit B26), so node interaction was
         // impossible. Enumerate the DB-verified banner entries instead
-        // (every per-state Alliance/Horde/Contested variant on map 30).
+        // (every per-state Alliance/Horde/Contested variant on map 30). The
+        // "[PH] ... Tower Banner BIG" / "Pre-Banner BIG" objects on the tower
+        // tops are decorations (no lock, no script): clicking one does nothing,
+        // and the AV 247 soak spent 103 captures on 178927, so they are not here.
         a.auto_use_go_entries = {
-            178364, 178365, 178388, 178389, 178393, 178394, 178925, 178927,
-            178929, 178932, 178935, 178936, 178940, 178943, 178944, 178945,
-            178946, 178947, 178948, 178955, 178956, 178957, 178958, 179284,
+            178364, 178365, 178388, 178389, 178393, 178394, 178925, 178929,
+            178935, 178936, 178940, 178943, 178944, 178945, 178946, 179284,
             179285, 179286, 179287, 179304, 179305, 179308, 179310, 179435,
-            179436, 179439, 179440, 179441, 179442, 179443, 179444, 179445,
-            179446, 179449, 179450, 179453, 179454, 179458, 179465, 179466,
+            179439, 179441, 179443, 179445, 179449, 179453, 179465, 179466,
             179467, 179468, 179470, 179471, 179472, 179473, 179481, 179482,
             179483, 179484, 180418, 180419, 180420,
         };
@@ -67,8 +68,9 @@ public:
         // spawn clusters on map 30.
         if (s.is_horde())
         {
-            // Horde spawn — Frostwolf Stadium (V1 HORDE_SPAWNS[0]).
-            a.home_base_x = -1437.00f; a.home_base_y = -610.00f; a.home_base_z = 51.16f;
+            // Horde start = world_safe_locs 610 (world SQL 2026_10_25_95): behind the Horde gate. The old (-1437,-610,51) was inside the hill
+            // in the 70532 map 30 (no geometry, no navmesh), so no Horde bot ever left it.
+            a.home_base_x = -890.00f; a.home_base_y = -575.00f; a.home_base_z = 70.24f;
             // Endgame: Vanndar Stormpike in Dun Baldar (NORTH end, +X).
             a.endgame_target_x = 722.4f;
             a.endgame_target_y = -11.0f;
@@ -85,11 +87,15 @@ public:
             a.endgame_target_z =    98.5f;
             a.endgame_creature_entry = 11946;  // DREKTHAR_ENTRY
         }
-        // Captain staging (ike3 BattleGroundTacticsAV.cpp, the ike3-based playerbot code, named locations
+        // Captain staging (ike3 BattleGroundTacticsAV.cpp, Karrz1/wow-1.12 raid10-revamp bcc8b9fe, named locations
         // AV_ICEBLOOD_GARRISON_WAITING_ALLIANCE / AV_STONEHEART_OUTPOST_WAITING_HORDE): the squad for the enemy captain gathers here and
         // goes in together (BgTeamCoordinator::PlanNodeRace), not one bot after another. The Alliance hunts Galvangar, the Horde Balinda.
+        // Horde: not ike3's (28.1,-302.6), which lies east of Balinda inside Stonehearth Outpost (an Alliance Sentinel 3 yd away,
+        // Lieutenant Stouthandle 11 yd): coming from the west every bot had to pass her and her guards to get there, and in bot-only
+        // AV 261 the Horde squad did not gather for 51 minutes (first assault 00:17, "5 at the waiting spot, squad 31"). This is the
+        // recorded river road node 115 yd west of her, on the way in from the Horde base, nearest creature 58 yd.
         if (s.is_horde())
-        { a.captain_stage_x = 28.1264f;  a.captain_stage_y = -302.593f;  a.captain_stage_z = 15.076f; }
+        { a.captain_stage_x = -171.3f;  a.captain_stage_y = -266.6f;  a.captain_stage_z = 9.1f; }
         else
         { a.captain_stage_x = -492.17f;  a.captain_stage_y = -187.077f;  a.captain_stage_z = 57.1342f; }
         // ike3 only goes for the general once every enemy tower / bunker is down (they carry the general's buffs).
@@ -122,7 +128,7 @@ public:
             // Graveyards — priority 0 (rez logistics only).
             {   669.0f, -294.0f,  30.0f, "Stormpike GY",            0 },
             {   638.5f,  -31.5f,  46.0f, "Stormpike Aid Station",   0 },
-            {    73.7f, -426.0f,  61.0f, "Stonehearth GY",          0 },
+            {    77.8f, -404.7f,  46.9f, "Stonehearth GY",          0 },
             {  -202.5f, -113.0f,  78.0f, "Snowfall GY (neutral)",   0 },
             {  -612.5f, -397.0f,  61.0f, "Iceblood GY",             0 },
             { -1082.5f, -347.0f,  55.0f, "Frostwolf GY",            0 },
@@ -130,10 +136,10 @@ public:
             // Alliance bunkers — priority 2 (-75 reinf on destruction).
             // South is the lower-X bunker (the classic map script's node
             // table, VMaNGOS BG_AV_Nodes against its banner spawns).
-            {   556.0f,  -84.0f,  52.0f, "Dun Baldar South Bunker", 2 },
-            {   678.0f, -139.0f,  64.0f, "Dun Baldar North Bunker", 2 },
+            {   553.8f,  -78.7f,  51.9f, "Dun Baldar South Bunker", 2 },
+            {   674.0f, -143.1f,  63.7f, "Dun Baldar North Bunker", 2 },
             {   203.0f, -361.0f,  56.0f, "Icewing Bunker",          2 },
-            {  -154.0f, -446.0f,  45.0f, "Stonehearth Bunker",      2 },
+            {  -152.4f, -441.6f,  40.4f, "Stonehearth Bunker",      2 },
             // Horde towers — priority 2.
             // Labels corrected (BG audit §2): the DB captain garrisons prove
             // the names were reversed — Commander Dardosh (13140) garrisons

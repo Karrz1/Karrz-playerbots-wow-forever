@@ -7,6 +7,10 @@
 #include "Diagnostics/DamageParity.h"
 #include "Bot/Formation.h"                      // StableJitter / MeleeArcSpot (SpreadOut)
 #include "Bot/BotSnapshotView.h"
+#include "Bot/CompanionLeash.h"
+#include "Bot/GroupControl.h"
+#include "Bot/GroupFight.h"
+#include "Bot/MeleeReach.h"
 #include "Bot/BotIntentEmitter.h"
 #include "Bot/Raid/RaidCombat.h"                 // raid encounter orders (MC/BWL/Onyxia/Naxx)
 #include "Bot/Raid/RaidEncounters.h"             // Raid::Retaunts
@@ -40,6 +44,12 @@
 #include "UnitDefines.h"                      // UNIT_NPC_FLAG_* (solo flee town-NPC pick)
 #include "SharedDefines.h"
 #include "Log.h"                                   // TC_LOG_INFO — TEMP AV push diag
+#include "Player.h"
+#include "ObjectAccessor.h"
+#include "Map.h"
+#include "ModelIgnoreFlags.h"
+#include <cstring>
+#include <span>
 #include <limits>
 #include <cmath>
 #include <algorithm>
@@ -98,10 +108,23 @@ bool IsMeleeSpec(uint8 cls, uint32 spec)
 // cannot_reach covers the mob-cannot-reach-bot direction (the diagnosed
 // case); the asymmetric bot-cannot-reach-mob case is handled by the
 // pull-gate / disengage machinery, not here.
-bool IsAttackerFightable(NearbyUnit const& u)
+// "cannot_reach" only counts in a dungeon or raid (the WC corridor ledge pack it was made for) and never for a mob that is hitting this
+// bot. Out in the world the creature's flag goes stale: it is set when one chase path fails (a slope, shallow water, a rock) and is
+// not cleared while the mob stands in reach and hits, so the bot skipped its own attacker and stood taking damage without fighting
+// back (Discord 2026-11-05, 0.1.29.1: "in the open world some bots just stand and take damage").
+bool CannotReachCounts(BotSnapshotView const& s, NearbyUnit const& u)
+{
+    if (!u.cannot_reach)
+        return false;
+    if (!s.is_in_instance() || s.in_battleground())
+        return false;
+    return u.victim != s.guid();
+}
+
+bool IsAttackerFightable(BotSnapshotView const& s, NearbyUnit const& u)
 {
     // A boss pacified by its own spell (Geddon's Inferno) is the fight, not a prop; the builder's tally agrees.
-    return !u.untargetable && (!u.is_pacified || u.is_dungeon_boss || u.is_boss_rank) && u.hp > 0 && !u.cannot_reach;
+    return !u.untargetable && (!u.is_pacified || u.is_dungeon_boss || u.is_boss_rank) && u.hp > 0 && !CannotReachCounts(s, u);
 }
 
 // Names which fightable ingredient failed, for the [skip_unfightable] diag:
@@ -163,6 +186,18 @@ bool MaybeUseResistPotion(BotSnapshotView const& s, BotIntentEmitter& emit)
     return true;
 }
 
+// The cure item for an aura no dispel removes (RaidRules::cureItem: Hourglass Sand on Chromaggus' Brood Affliction: Bronze), between the stuns
+// the aura brings.
+bool MaybeUseCureItem(BotSnapshotView const& s, BotIntentEmitter& emit)
+{
+    uint32 const item = Classic::PickCureItem(s);
+    if (!item)
+        return false;
+    emit.emit(UseItemByEntryIntent{item, ObjectGuid::Empty});
+    Classic::NoteConsumableUse(s, item, "cure item");
+    return true;
+}
+
 // Defensive racials, each on the debuff it clears: Stoneform (Dwarf) on bleed
 // / poison / disease (curse too outside vanilla), Will of the Forsaken
 // (Undead) on fear / charm / sleep, Escape Artist (Gnome) on root / snare.
@@ -173,7 +208,14 @@ bool MaybeUseDefensiveRacial(BotSnapshotView const& s, BotIntentEmitter& emit)
     if (s.race() == RACE_DWARF)
     {
         constexpr uint32 STONEFORM = 20594;
-        if (s.knows_spell(STONEFORM) && s.is_ready(STONEFORM))
+        // Stoneform takes every poison, disease and bleed at once: not while the dwarf carries one the raid keeps on (Raid::KeepsAura,
+        // Poisonous Blood on Hakkar, which turns his Blood Siphon against him).
+        bool keeps = false;
+        for (auto const& a : s.raw().auras.own_auras)
+            if (a.is_harmful && Raid::KeepsAura(s.map_id(), a.spell_id))
+                keeps = keeps || a.dispel_type == DispelType::Bleed || a.dispel_type == DispelType::Poison
+                                || a.dispel_type == DispelType::Disease || (a.dispel_type == DispelType::Curse && !IsVanillaRealm());
+        if (!keeps && s.knows_spell(STONEFORM) && s.is_ready(STONEFORM))
         {
             for (auto const& a : s.raw().auras.own_auras)
             {
@@ -332,8 +374,8 @@ bool MaybeUseOnUseTrinket(BotSnapshotView const& s, BotIntentEmitter& emit)
 {
     if (!s.in_combat() || s.victim().IsEmpty()) return false;
     if (s.is_casting()) return false;
-    const uint32 sid = s.ready_on_use_trinket();
-    if (sid == 0) return false;
+    const uint32 item = s.ready_on_use_trinket_item();
+    if (item == 0) return false;
     // PvP-aware gate: real players hoard the trinket for CC-break. If the
     // bot is fighting players (any attacker is a Player), only fire when
     // *actively* CC'd. The CC check walks own_auras for any harmful
@@ -368,8 +410,10 @@ bool MaybeUseOnUseTrinket(BotSnapshotView const& s, BotIntentEmitter& emit)
     // Most trinkets self-buff (ObjectGuid::Empty target); a few target enemy
     // (e.g. damage-dealing trinkets). cast() with no target lets Spell.cpp
     // pick implicit targets from the spell info.
-    emit.cast(sid);
-    return true;
+    // Not a spent tick: an item use is off the global cooldown, and a use the core refuses must not starve the rotation (217: every caster
+    // cast nothing while the use repeated each tick).
+    emit.use_item_by_entry(item);
+    return false;
 }
 
 // Race-appropriate offensive cooldown. Fired once per cooldown cycle while
@@ -488,6 +532,37 @@ bool MaybeUseOffensiveRacial(BotSnapshotView const& s, Role role, BotIntentEmitt
             }
         } break;
         case RACE_DARK_IRON_DWARF: if (s.knows_spell(FIREBLOOD)      && s.is_ready(FIREBLOOD))      { emit.cast(FIREBLOOD);      return true; } break;
+        case RACE_NIGHTELF:
+        {
+            // Classic 1.60 (Forever): Elune's Light, +10% physical and spell critical strike chance for 15 s, taught to every Night Elf
+            // at character start (2026_10_06_00 start sniff). A burst cooldown like Berserking: the same boss gate. The wowsims/forever
+            // (MIT) warrior, rogue and druid lists fire it with the other cooldowns.
+            constexpr uint32 ELUNES_LIGHT = 1259799;
+            if (!burst_ok) break;
+            if (s.knows_spell(ELUNES_LIGHT) && s.is_ready(ELUNES_LIGHT))
+            {
+                emit.cast(ELUNES_LIGHT);
+                Classic::NoteCooldownUse(s, ELUNES_LIGHT, "Elune's Light");
+                return true;
+            }
+        } break;
+        case RACE_SKYBORNE_ALLIANCE:
+        {
+            // Classic 1.60 (Forever): High Order Skyborne Read Ley Line 1259705 (0.5 s cast, classic_spell_skyborne_read_ley_line):
+            // Energized 1270842, +50% health and mana regeneration for 15 s. A mana user that is running low uses it; never under
+            // Innervate (which replaces it), never while casting or moving.
+            constexpr uint32 READ_LEY_LINE = 1259705;
+            constexpr uint32 ENERGIZED     = 1270842;
+            constexpr uint32 INNERVATE     = 29166, INNERVATE_2 = 456195;
+            if (s.max_power(0) > 0 && s.power_pct(0) <= 50 && !s.is_casting() && !s.is_moving()
+                && !s.has_aura(ENERGIZED) && !s.has_aura(INNERVATE) && !s.has_aura(INNERVATE_2)
+                && s.knows_spell(READ_LEY_LINE) && s.is_ready(READ_LEY_LINE))
+            {
+                emit.cast(READ_LEY_LINE);
+                Classic::NoteCooldownUse(s, READ_LEY_LINE, "Read Ley Line");
+                return true;
+            }
+        } break;
         case RACE_VULPERA:         if (s.knows_spell(BAG_OF_TRICKS)  && s.is_ready(BAG_OF_TRICKS))  { emit.cast(BAG_OF_TRICKS,   s.victim()); return true; } break;
         default: break;
     }
@@ -637,6 +712,19 @@ bool PartyOverThreatExpired(BotSnapshotView const& s, ObjectGuid target)
     return HoldClockExpired(g_party_hold_mu, g_party_hold, s, target, kPartyOverThreatMaxMs, kPartyOverThreatGapMs);
 }
 
+// A raid group in a dungeon map (UBRS, ten players) keeps raid threat discipline, whose hold past the hard limit has no timed release.
+// With a human leading the fight it ends after kLedHardHoldMaxMs on one target as well (the owner, 2026-10-27: "bots should always
+// fight if you're fighting"; UBRS the same day: the rogue stood through the whole first dragon of the pull). The tank takes a mob
+// that turns back with its taunt, as in a party.
+constexpr uint32 kLedHardHoldMaxMs = 6000;
+std::mutex g_led_hold_mu;
+std::unordered_map<uint64, LooseHoldClock> g_led_hold;
+
+bool LedHardHoldExpired(BotSnapshotView const& s, ObjectGuid target)
+{
+    return HoldClockExpired(g_led_hold_mu, g_led_hold, s, target, kLedHardHoldMaxMs, kPartyOverThreatGapMs);
+}
+
 // Past the hard limit the hold has no timed release: it waits for the tank's threat to rise (Bot/ThreatLimits.h, StalledTankHoldExpired).
 // One clock per bot and target, polled with the tank's threat; it expires after kStalledTankHoldMs at a standstill.
 constexpr uint32 kStalledTankHoldGapMs = 4000;
@@ -663,7 +751,9 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
     if (target.IsEmpty()) return ThreatHold::None;
     ConfigReader const& cfg = Services::Config();
     if (!cfg.threat_hold_enabled() || s.in_battleground()) return ThreatHold::None;
-    if (!s.is_in_instance() && !cfg.threat_hold_open_world()) return ThreatHold::None;
+    // A raid group holds threat wherever it fights (a world boss, the support scorecard on open ground: on 230 the fury out-threatened the
+    // warrior tank in every run with no hold at all); open-world parties just fight.
+    if (!s.is_in_instance() && !s.in_raid_group() && !cfg.threat_hold_open_world()) return ThreatHold::None;
     if (ai.effective_role(s) == Role::Tank) return ThreatHold::None;
     // A boss fight script owns this bot's start and target (RaidFightScript.h): its start wait is the only hold.
     if (s.raw().raid_order.active && s.raw().raid_order.script_owns) return ThreatHold::None;
@@ -700,14 +790,52 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
     // A boss that cuts its tank's threat on a schedule (Onyxia's Knock Away, -25 %) is held at what stays of the tank's threat after a cut.
     float const threat_share = (boss && s.is_in_raid()) ? Raid::ThreatShareAfterDrop(s.map_id(), u->entry) : 1.0f;
     bool const melee_spec = IsMeleeSpec(s.cls(), s.spec());
-    float const base_ratio = std::min(s.is_in_raid() ? std::max(cfg.threat_max_ratio(), kRaidThreatMaxRatio) : cfg.threat_max_ratio(), threat_share);
+    // Raid discipline is the raid group's, wherever it fights: in the support scorecard (236) the open-world raid group fell to the party
+    // rule below, which drops the over-threat hold, and the fury and combat bots out-threatened the paladin tank from the pull (648 against
+    // 321 threat a second, the boss on the tank 0 of 120 s).
+    bool const raid_discipline = s.raid_rules();
+    float const base_ratio = std::min(raid_discipline ? std::max(cfg.threat_max_ratio(), kRaidThreatMaxRatio) : cfg.threat_max_ratio(), threat_share);
     // Early in a raid pull the hold starts a typical hit short of the tank's threat (ThreatEarlyHoldRatio).
-    float const max_ratio = s.is_in_raid() ? ThreatEarlyHoldRatio(base_ratio, melee_spec, u->tank_threat, threat_share) : base_ratio;
+    float const max_ratio = raid_discipline ? ThreatEarlyHoldRatio(base_ratio, melee_spec, u->tank_threat, threat_share) : base_ratio;
     ThreatHold h = s.threat_hold(target, lead, max_ratio);
+    // A mob that has turned on this bot while the tank is on it (the tank has threat there) is the tank's to take back, and raid discipline
+    // stops damage until it has: threat_hold's self-defence rule ("everyone fights a mob on a member") is the party's. 238 support
+    // scorecard: the fury's opener took the boss from the paladin tank in the first second (1062 against 523), kept swinging at it as its
+    // victim, and the paladin, which has no taunt, never had it back (0 of 120 s, the fury at 189-220 % of the tank). The release limits
+    // below apply: a tank whose threat stands still does not keep the bot idle.
+    // The tank takes the mob back only at kAggroSwitchRatioMelee of this bot's threat (ThreatManager: the challenger needs 110 % of its victim's
+    // threat in melee reach), so the bot holds until it is under the tank's threat / 1.10, not at the tank's own threat. 240 support scorecard:
+    // the fury, held at 100-108 % of the paladin tank with the boss on it (39381 against 36581), kept the boss for 96-116 of 120 s in every
+    // run; the paladin, no taunt, needed 110 % of the fury's threat and never got there.
+    bool const mob_on_me = raid_discipline && ThreatVictim(u->victim_kind) == ThreatVictim::Me && !(s.big_raid() && !boss) &&
+                           u->unit_in_combat && u->has_threat_list && u->tank_threat > 0.0f;
+    float const take_back_ratio = 1.0f / kAggroSwitchRatioMelee;
+    if (mob_on_me && h == ThreatHold::None && u->my_threat >= u->tank_threat * std::min(max_ratio, take_back_ratio))
+        h = ThreatHold::OverThreat;
     // A 5-man party has one threat rule: the DPS wait for the owner's Attack, at most kPartyOpenWaitMs (6 s) from the tank's first hit (bounded below). The over-threat
     // hold and its release limits are raid discipline; in a party the tank holds with its own threat and the healer heals.
-    if (!s.is_in_raid() && h == ThreatHold::OverThreat)
+    if (!raid_discipline && h == ThreatHold::OverThreat)
         h = ThreatHold::None;
+    // The bot main tank's own pull back is out or on its way back (PveOrder::tank_pulling_back): the pack comes to the return point,
+    // and a damage dealer that opens on it or on a mob of it out there turns it round (eea74327b3 dmnorth_moldar: the mage opened on
+    // the Mage-Lord at 48 y the second the tank's shot landed, the hunter and the rogue on a Brute at 50 y; two Brutes reached the
+    // priest and killed it). Not a mob that hits this bot (self-defence), not a healer.
+    // A raid group in a dungeon too (a 10-man Blackrock Spire group is a raid group, 2026-11-08): the coordinator sets
+    // tank_pulling_back only for a group it plays as a dungeon.
+    if (s.is_in_dungeon() && h == ThreatHold::None && u->victim != s.guid() &&
+        ai.effective_role(s) != Role::Healer)
+    {
+        PveOrder const& po = s.raw().pve_order;
+        // Returned here, not left to the release rules below: the group's fight opens on a trash mob once the tank has hit it, and the
+        // tank's opening shot is what starts the pull back. It ends when the pull back is in its Hold phase, at the return point.
+        if (po.active && po.tank_pulling_back)
+        {
+            if (RaidLogDue(RaidLogKey(s, RaidLogKind::ThreatHold), s.published_at_ms(), 5000u))
+                TC_LOG_INFO("playerbot.v2", "[pull_back] {} holds damage on entry {} ({}): the tank's pull back is under way",
+                    s.name(), u->entry, target.GetCounter());
+            return ThreatHold::TankOpening;
+        }
+    }
     // After the owner's Pull / Pull back the party's DPS wait for his Attack even once the tank has its lead. There is one timer:
     // kPartyOpenWaitMs below (6 s from the tank's first hit) lets them open by themselves. The Pull counts for the fight that
     // follows it, until an Attack or the end of that fight. Not a mob that hits this bot (self-defence), not a healer.
@@ -716,7 +844,9 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
     {
         uint32 const pull_ms = ai.owner_pull_ms(), t = s.published_at_ms();
         uint32 const last_exit_ms = uint32(ai.combat_exit_ms());   // end of the bot's previous fight (0: none yet)
-        if (pull_ms && ai.owner_attack_ms() < pull_ms && last_exit_ms < pull_ms &&
+        // In the group's fight the Pull's wait is a leader order of the last few seconds: 3 s into the fight the DPS open (GroupFight.h rule 4).
+        bool const pull_spent = ai.group_fight() && t - ai.group_fight_since_ms() >= 3000u;
+        if (pull_ms && !pull_spent && ai.owner_attack_ms() < pull_ms && last_exit_ms < pull_ms &&
             !(ai.is_manual_mode(t) && ai.owner_command() == BotAI::OwnerCommand::Engage && ai.owner_target() == target))
             h = ThreatHold::TankOpening;
     }
@@ -728,8 +858,9 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
     // keeps a tenth of margin under the 130 % a ranged attacker needs to take the mob.
     // The scheduled cut lowers both limits: a hold released at 100 % of a tank about to lose a quarter of it pulls the boss.
     // While one more hit would take the bot past the pull-safe ratio, the early ratio is also the release limit: the hold stays until the tank has built up.
-    const float hard_ratio = std::min({ ThreatHardRatio(melee_spec, s.is_in_raid(), u->tank_threat), threat_share,
-                                        max_ratio < base_ratio ? max_ratio : 1.0e9f });
+    // A mob on this bot: no timed release above the take-back ratio either, or the hold ends after 3 s at 95 % of the tank and the bot keeps the mob.
+    const float hard_ratio = std::min({ ThreatHardRatio(melee_spec, raid_discipline, u->tank_threat), threat_share,
+                                        max_ratio < base_ratio ? max_ratio : 1.0e9f, mob_on_me ? take_back_ratio : 1.0e9f });
     const bool past_hard_limit = u->tank_threat > 0.0f && u->my_threat >= u->tank_threat * hard_ratio;
     if (h == ThreatHold::OverThreat && !past_hard_limit && PartyOverThreatExpired(s, target))
     {
@@ -750,7 +881,16 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
                 s.name(), u->entry, target.GetCounter(), u->tank_threat, kStalledTankHoldMs, u->my_threat);
         h = ThreatHold::None;
     }
-    if (h == ThreatHold::OverThreat && s.is_in_raid() &&
+    if (h == ThreatHold::OverThreat && past_hard_limit && !s.is_in_raid() && s.is_in_dungeon() && g && !g->leader_is_bot() &&
+        LedHardHoldExpired(s, target))
+    {
+        if (RaidLogDue(RaidLogKey(s, RaidLogKind::ThreatHold), s.published_at_ms(), 5000u))
+            TC_LOG_INFO("playerbot.v2",
+                "[party_threat] {} stops holding on entry {} ({}) after {} ms past the tank's threat in a player-led dungeon mine={:.0f} tank={:.0f}",
+                s.name(), u->entry, target.GetCounter(), kLedHardHoldMaxMs, u->my_threat, u->tank_threat);
+        h = ThreatHold::None;
+    }
+    if (h == ThreatHold::OverThreat && raid_discipline &&
         RaidLogDue(RaidLogKey(s, RaidLogKind::ThreatHold), s.published_at_ms(), 5000u))
         TC_LOG_INFO("playerbot.v2",
             "[raid_threat] {} holds damage on entry {} ({}): over threat mine={:.0f} tank={:.0f}",
@@ -758,7 +898,8 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
     // Raid DPS wait for the owner's Attack: the tanks pull, everyone else holds until the owner presses Attack
     // (/focus, an Engage order, or the group's mark release) - the owner, MC Gehennas 2026-10-08. A mob that hits this
     // bot or its pet is still answered (self-defence), and no mob held by a bot-led group is touched.
-    if (h == ThreatHold::None && cfg.raid_dps_wait_attack() && s.is_in_raid() && g && !g->leader_is_bot() &&
+    // Not on the trash between bosses: the group's fight is everyone's (GroupFight.h; the gate is off in a raid boss fight).
+    if (h == ThreatHold::None && cfg.raid_dps_wait_attack() && s.is_in_raid() && !ai.group_fight() && g && !g->leader_is_bot() &&
         u->victim != s.guid() && ai.effective_role(s) != Role::Healer)
     {
         const uint32 t = s.published_at_ms();
@@ -776,9 +917,17 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
 
     const uint32 now = s.published_at_ms();
 
+    // The group's fight (GroupFight.h, the owner 2026-10-28: "kill fast, especially trash"): a trash mob in the fight is opened on once
+    // the tank has hit it (or at once with no tank); a boss gets the tank 3 s at most (the opening clock below).
+    if (ai.group_fight() && u->unit_in_combat && !boss &&
+        (u->tank_threat > 0.0f || ThreatVictim(u->victim_kind) == ThreatVictim::Tank || s.group_tank().IsEmpty()))
+        return ThreatHold::None;
+
     // The owner's Attack on this target is instant in a party: no wait for the tank's lead (the over-threat limits above still hold).
-    // Pull and Pull back put only the tank into Engage, so they keep the tank first.
-    if (!s.is_in_raid() && ai.is_manual_mode(now) && ai.owner_command() == BotAI::OwnerCommand::Engage && ai.owner_target() == target)
+    // Pull and Pull back put only the tank into Engage, so they keep the tank first. A raid group waits for the lead wherever it fights:
+    // in the support scorecard (237) the open-world raid's DPS opened on the Attack with the paladin tank at no threat, the boss turned on
+    // a raider, and a paladin has no taunt to take it back (the boss on the tank 0 of 120 s in all three runs).
+    if (!raid_discipline && ai.is_manual_mode(now) && ai.owner_command() == BotAI::OwnerCommand::Engage && ai.owner_target() == target)
         return ThreatHold::None;
 
     // Unpulled mob (nobody in the group has engaged it): opening on it IS a
@@ -826,6 +975,8 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
     // 26 bots sat the full 4 s on a Giant the tank was already hitting).
     // A party's trash the tank already holds gets the same short wait: every new target of a multi-mob pull restarts the
     // clock, and 4 s a target left the DPS idle through most of an 8-mob fight (Deadmines 2026-10-09 run 3).
+    if (ai.group_fight())
+        wait_ms = std::min<uint32>(wait_ms, 3000u);
     if (s.is_in_raid() && u->unit_in_combat && !boss && ThreatVictim(u->victim_kind) == ThreatVictim::Tank)
         wait_ms = std::min<uint32>(wait_ms, 2000u);
     // Separate clocks for the unpulled and the engaged phase of a target, so
@@ -930,7 +1081,9 @@ bool LooseMobEscape(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView const
     const float mdx = mob->x - bx, mdy = mob->y - by, mdz = mob->z - bz;
     const float mob_d2 = mdx * mdx + mdy * mdy + mdz * mdz;
 
-    if (!s.is_casting())
+    // A bot the raid brain told to keep the mob (the Son of Hakkar puller) drops no threat: it only walks the mob to its tank.
+    bool const keep_aggro = s.raw().raid_order.active && s.raw().raid_order.keep_aggro;
+    if (!s.is_casting() && !keep_aggro)
     {
         uint32 drop = 0;
         bool on_target = false;
@@ -969,6 +1122,10 @@ bool LooseMobEscape(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView const
     if (mob->is_ranged_caster)
         return false;
 
+    // In the group's fight outside the raid rules the bot keeps hitting and its tank takes the mob (GroupFight.h rule 5): the walk to the
+    // tank stopped the damage (UBRS 2026-10-28: [raid_escape] "stepping to tank" on Jaidal, Gun, Elentinari through every pull).
+    if (ai.group_fight() && !s.raid_rules())
+        return false;
     // Step toward the tank so it can taunt / body-pull the mob off us.
     GroupMemberSummary const* tk = GroupAnchorTank(s, ai, g);
     if (!tk || !tk->online || !tk->is_alive || tk->guid == s.guid() || tk->map_id != s.map_id() || s.is_rooted())
@@ -1269,17 +1426,12 @@ struct CombatIdleProbe
         uint32 const now = s.published_at_ms();
         bool const dps = s.is_alive() && ai.effective_role(s) == Role::Dps;
         bool const melee = IsMeleeSpec(s.cls(), s.spec());
-        // A melee bot swings without any emitted action: it is busy while its victim is in reach.
-        bool swinging = false;
-        if (melee)
-            if (NearbyUnit const* vi = s.victim_info(); vi && vi->hp > 0)
-            {
-                float bx, by, bz; s.position(bx, by, bz);
-                float const dx = vi->x - bx, dy = vi->y - by;
-                swinging = std::sqrt(dx * dx + dy * dy) <= 5.0f + vi->combat_reach;
-            }
-        bool const acting = !dps || emit.combat_action_count() != actions_before || s.is_casting() ||
-                            s.raw().cast.is_autorepeat || s.gcd_active() || swinging;
+        // A swing or an Auto Shot is an action no intent shows, and "victim in reach" or "auto-repeat flag set" is not proof it lands: the 225
+        // scorecard had arms, fury, ret and the hunters at 0 to 90 dps with both true and never idle. Damage the bot itself dealt in the last 4 s
+        // (a slow two-hander's swing interval fits) is what counts.
+        int32 const since_damage = int32(now - ai.last_damage_done_ms());
+        bool const landing = ai.last_damage_done_ms() != 0 && since_damage >= 0 && since_damage <= 4000;
+        bool const acting = !dps || emit.combat_action_count() != actions_before || s.is_casting() || s.gcd_active() || landing;
         if (acting)
         {
             st.idle_since_ms = 0;
@@ -1288,6 +1440,8 @@ struct CombatIdleProbe
         if (st.idle_since_ms == 0)
         {
             st.idle_since_ms = now ? now : 1u;
+            float bx, by, bz; s.position(bx, by, bz);
+            st.anchor_x = bx; st.anchor_y = by; st.anchor_ms = st.idle_since_ms;
             return;
         }
         uint32 const idle_ms = now - st.idle_since_ms;
@@ -1321,6 +1475,102 @@ struct CombatIdleProbe
             dist, u ? int(u->in_los) : 0, int(s.is_moving()), has_mana ? s.power_pct(0) : -1);
     }
 };
+
+// SightSpotMove (MaintainHelpers.h). A spot on the victim's level that sees it and is in reach for the role: the melee ring, or 25-10 y out for a
+// ranged bot, from the bot's own bearing outwards in 15 degree steps. pack_safe: not deeper in an unpulled pack's reach than the bot stands.
+// Emits the run there and returns the spot.
+bool SightSpotMoveImpl(BotSnapshotView const& s, NearbyUnit const& vu, bool melee, bool pack_safe, BotIntentEmitter& emit,
+                       float& ox, float& oy, float& oz, float& oradius)
+{
+    Player* self = ObjectAccessor::FindConnectedPlayer(s.raw().guid);
+    Map* map = self ? self->GetMap() : nullptr;
+    if (!map)
+        return false;
+    float bx, by, bz; s.position(bx, by, bz);
+    static constexpr float kRangedRadii[] = { 25.0f, 20.0f, 15.0f, 10.0f };
+    static constexpr float kMeleeRadii[]  = { 3.5f };
+    float const bearing = std::atan2(by - vu.y, bx - vu.x);
+    for (float const radius : melee ? std::span<float const>(kMeleeRadii) : std::span<float const>(kRangedRadii))
+        for (int k = 0; k < 24; ++k)
+        {
+            float const a = bearing + float((k + 1) / 2) * 0.2618f * (k % 2 ? 1.0f : -1.0f);
+            float const x = vu.x + std::cos(a) * radius, y = vu.y + std::sin(a) * radius;
+            float const z = map->GetHeight(self->GetPhaseShift(), x, y, vu.z + 2.0f, true, 6.0f);
+            if (z <= INVALID_HEIGHT + 1.0f || std::fabs(z - vu.z) > 2.5f)
+                continue;
+            if (!map->isInLineOfSight(self->GetPhaseShift(), x, y, z + 2.0f, vu.x, vu.y, vu.z + 2.0f, LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::M2))
+                continue;
+            if (pack_safe && RaidPointInUnpulledReach(s, x, y, z))
+                continue;
+            if (!emit.move_to(x, y, z, /*run*/ true))
+                continue;
+            ox = x; oy = y; oz = z; oradius = radius;
+            return true;
+        }
+    return false;
+}
+
+// Idle watchdog ([idle_reposition]). A damage bot in combat with a victim that has started no cast, swing or Auto Shot for 3 s (the
+// [dps_idle_reason] probe's streak) and is not getting anywhere (still within 6 y of where the streak began, or where the watchdog last sent it)
+// goes to a spot that sees the victim and is in reach for its role: the melee ring for a melee bot, about 25 y out for a ranged one, on the
+// victim's level. The group scorecard (222) had six casters standing under the dummy without line of sight for the whole window.
+// Left alone: a deliberate hold (threat, tank wait, kill focus, marked crowd control, raid / BG orders), Stay / Hold, a bot that is out of mana,
+// raids, and dungeons the autopilot runs (the dungeon and raid positioning own the ground there). A dungeon a human leads has no autopilot
+// positioning, so the watchdog runs there too, on spots clear of unpulled packs (playtest 2026-10-27, Zul'Farrak: the mage and the other
+// casters stood through whole fights while only the player and the tank hit the mobs).
+bool IdleWatchdog(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& emit)
+{
+    BotAI::CombatIdleState& st = ai.combat_idle();
+    uint32 const now = s.published_at_ms();
+    constexpr uint32 kIdleMs = 3000u;
+    constexpr float  kStuckYd = 6.0f;
+    if (st.idle_since_ms == 0 || now - st.idle_since_ms < kIdleMs || now - st.anchor_ms < kIdleMs)
+        return false;
+    if (!s.is_alive() || s.is_casting() || s.is_rooted() || s.is_stunned() || s.is_mounted() || s.victim().IsEmpty() ||
+        ai.effective_role(s) != Role::Dps || ai.holding_position(now))
+        return false;
+    bool const instance = s.is_in_instance() && !s.in_battleground();
+    if (instance && (s.is_in_raid() || ai.dungeon_active()))
+        return false;
+    if (char const* rule = ai.last_rule_fired())
+        for (char const* held : { "combat:threat", "combat:shield", "combat:pve_", "combat:marked_cc", "combat:tank_hold", "combat:bg_", "combat:raid_", "raid:", "combat:flee", "combat:disengage" })
+            if (std::strncmp(rule, held, std::strlen(held)) == 0)
+                return false;
+    NearbyUnit const* vu = s.victim_info();
+    if (!vu || vu->hp <= 0)
+        return false;
+    bool const melee = IsMeleeSpec(s.cls(), s.spec());
+    if (!melee && s.max_power(0) > 0 && s.power_pct(0) < 10)
+        return false;
+    float bx, by, bz; s.position(bx, by, bz);
+    float const ax = bx - st.anchor_x, ay = by - st.anchor_y;
+    if (ax * ax + ay * ay > kStuckYd * kStuckYd)
+    {
+        st.anchor_x = bx; st.anchor_y = by; st.anchor_ms = now;   // walking somewhere: look again in 3 s
+        return false;
+    }
+
+    float const dx = vu->x - bx, dy = vu->y - by, dz = vu->z - bz;
+    float const dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    char const* reason = !vu->in_los                                    ? "no line of sight" :
+                         melee && dist > 5.0f + vu->combat_reach        ? "not in melee range" :
+                         !melee && dist > 30.0f + vu->combat_reach      ? "out of range" :
+                                                                          "no rule acted";
+    float x, y, z, radius;
+    if (SightSpotMoveImpl(s, *vu, melee, /*pack_safe*/ instance, emit, x, y, z, radius))
+    {
+        ai.note_move_commit(s.map_id(), x, y, z, now);
+        ai.set_last_rule_fired("combat:idle_reposition");
+        TC_LOG_INFO("playerbot.v2", "[idle_reposition] {} idle {:.1f}s ({}) victim {}/{} dist {:.1f} dz {:.1f} los {} -> {} spot ({:.1f},{:.1f},{:.1f}) {:.0f} y from the victim",
+                    s.name(), (now - st.idle_since_ms) / 1000.f, reason, vu->entry, s.victim().GetCounter(), dist, dz, int(vu->in_los), melee ? "melee ring" : "ranged ring", x, y, z, radius);
+        st.anchor_x = bx; st.anchor_y = by; st.anchor_ms = now;
+        return true;
+    }
+    st.anchor_ms = now;   // nothing found: try again in 3 s rather than every tick
+    TC_LOG_INFO("playerbot.v2", "[idle_reposition] {} idle {:.1f}s ({}) victim {}/{} dist {:.1f} dz {:.1f} los {}: no spot on the {} that sees the victim on its level",
+                s.name(), (now - st.idle_since_ms) / 1000.f, reason, vu->entry, s.victim().GetCounter(), dist, dz, int(vu->in_los), melee ? "melee ring" : "ranged ring");
+    return false;
+}
 
 // Combat re-facing (Playerbot.Behavior.ReFace). A swing needs the victim within +-60 degrees
 // (Unit::DoMeleeAttackIfReady -> BadFacing) and a facing cast within +-90; a bot has no client to
@@ -1369,12 +1619,12 @@ void ReFaceVictim(BotSnapshotView const& s, BotIntentEmitter& emit)
             // out at the usual pace; the core refuses a bot that really walks (Locked), and a walker gets the same request
             // again within a quarter second of stopping.
             if (moving && now - c.last_emit_ms < 500u) action = nullptr;
-            else if (moving && emit.face_victim(v)) { c.last_emit_ms = now; action = "refaced while moving (core decides)"; }
+            else if (moving && emit.face_victim(v)) { c.last_emit_ms = now; action = "face requested while moving (the core decides)"; }
             else if (moving)                  action = "skipped: emit refused while moving";
             else if (s.is_casting())          action = "skipped: casting";
             else if (s.is_stunned())          action = "skipped: controlled";
             else if (!just_stopped && now - c.last_emit_ms < 250u) action = nullptr;
-            else if (emit.face_victim(v)) { c.last_emit_ms = now; action = "refaced"; }
+            else if (emit.face_victim(v)) { c.last_emit_ms = now; action = "face requested (the core logs [face_locked] when it refuses)"; }
             else                              action = "skipped: emit refused";
         }
         if (action && off_deg > 60.0f && now - c.last_log_ms >= 2000u)
@@ -1384,6 +1634,204 @@ void ReFaceVictim(BotSnapshotView const& s, BotIntentEmitter& emit)
                 s.name(), vu->entry, off_deg, dist, int(moving), int(melee), action);
         }
     }
+}
+
+// ---- A mob running for help (combat:help_runner) ----
+// A group mob in its flee-for-assist run (NearbyUnit::seeks_help: Creature::DoFleeToGetAssistance) is heading for the nearest friend
+// within CreatureFamilyFleeAssistanceRadius (30 y) and calls assistance there, which brings that friend's pack back with it. SM
+// 2026-10-30 (0.1.27 set A): every Scarlet humanoid flees at 15 % (VMaNGOS EventAI), the library pairs stand 18-27 y apart, and
+// 2-3 mob pulls ended as 8 with the priest out of mana. Melee do not chase it out of the group (combat:flee_no_chase); this is the
+// "leave it to the ranged" half: a damage bot that reaches it (ranged: in sight within kHelpRunnerRangedYd; melee: in melee reach)
+// switches to it, and opens with a snare or stun it has ready. Not a mob a group member holds in crowd control, nor the plan's
+// CC-reserved mob (a Frost Shock breaks the mage's sheep). It is not fighting anyone while it runs, so the threat hold does not
+// apply. Dungeons and raids, never a battleground; tanks hold the pack and healers heal.
+constexpr float kHelpRunnerRangedYd = 30.0f;
+
+struct HelpRunnerStopper
+{
+    uint8  cls;
+    uint32 spell;
+    bool   stun;          // a stun: not on a stun-immune mob
+    bool   combo;         // needs a combo point
+};
+// Vanilla first ranks (the cast resolves the known rank): Concussive Shot, Wing Clip, Hamstring, Kidney Shot, Hammer of Justice,
+// Frost Shock.
+constexpr HelpRunnerStopper kHelpRunnerStoppers[] = {
+    { CLASS_HUNTER,  5116, false, false },
+    { CLASS_HUNTER,  2974, false, false },
+    { CLASS_WARRIOR, 1715, false, false },
+    { CLASS_ROGUE,    408, true,  true  },
+    { CLASS_PALADIN,  853, true,  false },
+    { CLASS_SHAMAN,  8056, false, false },
+};
+
+// ---- Line-of-sight pull (PveOrder::sight_pull; PveGroupCoordinator::PlanSightPull) ----
+// The group gathers at a spot out of the sight of the pull's mobs that stand off and shoot (smlibrary_loksey 8d2fd499aa: a Scarlet
+// Beastmaster and an Adept shot from 37-47 y, the tank walked out to taunt them and the fight moved next to the following pack). At
+// the spot nobody walks out to such a mob: it has to come round the corner, and it leaves the order's list once it is in.
+constexpr float kSightPullAtYd   = 4.0f;    // at the spot
+constexpr float kSightPullJoinYd = 45.0f;   // a member farther off is not part of this fight (a corpse run, another room)
+constexpr float kSightPullNearYd = 10.0f;   // a mob this close to the spot is fought while the others come
+constexpr float kSightPullOwnReachYd = 6.0f;   // ... and one this close to the bot (plus its combat reach), wherever the spot is
+constexpr float kSightPullShootYd = 30.0f;  // a ranged bot shoots a mob out there it sees from the spot within this
+constexpr int32 kSightPullHealFirstPct = 50;   // a member under this share of health keeps the healer healing where it stands
+
+// The b3ca0b4b67 overnight runs lost bots under these rules in ten dungeons: a healer whose wand target was a mob out there "waited" and
+// healed nobody, and a tank whose mobs stood just outside the 8 y circle round the spot waited while they beat it. Now a healer only walks
+// to the spot, and only while nobody is low; a bot fights any mob in its own reach or at the spot; a ranged bot shoots a mob out there
+// that it can see from where it stands; only a bot with nothing to fight waits.
+static bool SightPullTick(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView const& g, BotIntentEmitter& emit)
+{
+    PveOrder const& po = s.raw().pve_order;
+    if (!po.active || !po.sight_pull || !s.is_alive() || !s.is_in_dungeon()) return false;
+    float bx, by, bz; s.position(bx, by, bz);
+    auto d2spot = [&](float x, float y) { return (x - po.sight_x) * (x - po.sight_x) + (y - po.sight_y) * (y - po.sight_y); };
+    if (d2spot(bx, by) > kSightPullJoinYd * kSightPullJoinYd) return false;
+    const uint32 now_ms = s.published_at_ms();
+    Role const role = ai.effective_role(s);
+    bool const healer = role == Role::Healer || IsHealerSpec(s.cls(), uint16(s.spec()));
+    // A mob that has come in, in this bot's own reach or at the spot: the one to fight while the others come.
+    NearbyUnit const* near = nullptr;
+    float near_d2 = 1.0e9f;
+    for (auto const& u : s.raw().combat.nearby_enemies)
+    {
+        if (u.hp <= 0 || u.is_player || u.untargetable || u.is_pacified || u.is_cc_locked || !u.unit_in_combat) continue;
+        if (po.sight_pull_mob(u.guid) || po.cc_reserved_mob(u.guid)) continue;
+        ThreatVictim const k = ThreatVictim(u.victim_kind);
+        if (k != ThreatVictim::Me && k != ThreatVictim::Tank && k != ThreatVictim::Member && k != ThreatVictim::MemberPet) continue;
+        const float mx = u.x - bx, my = u.y - by;
+        const float d2 = mx * mx + my * my;
+        const float own = kSightPullOwnReachYd + u.combat_reach;
+        if (d2 > own * own && d2spot(u.x, u.y) > kSightPullNearYd * kSightPullNearYd) continue;
+        if (d2 < near_d2) { near_d2 = d2; near = &u; }
+    }
+    // A pet on a mob out there holds it where it stands (it melees the pet and never walks in): it comes back, or takes the near mob.
+    // Not a claim on the tick: the bot's own walk or fight below goes on.
+    ObjectGuid const pv = s.raw().pet.pet_victim;
+    if (!pv.IsEmpty() && po.sight_pull_mob(pv))
+    {
+        if (near) emit.pet_attack(near->guid);
+        else      emit.pet_set_command_state(1 /*COMMAND_FOLLOW*/);
+        if (RaidLogDue(RaidLogKey(s, RaidLogKind::SightPull) ^ 0x706574u, now_ms, 4000u))
+            TC_LOG_INFO("playerbot.v2", "[sight_pull] {} calls its pet off {} out there: {}", s.name(), pv.GetCounter(),
+                        near ? fmt::format("onto entry {} ({}) at the spot", near->entry, near->guid.GetCounter()) : std::string("follow"));
+    }
+    if (healer)
+    {
+        // Heals come first: a member under kSightPullHealFirstPct keeps the healer where it stands, healing.
+        bool low = false;
+        if (auto const* mems = g.members())
+            for (GroupMemberSummary const& m : *mems)
+                if (m.online && m.is_alive && m.map_id == s.map_id() && m.max_hp > 0 && int64(m.hp) * 100 < int64(m.max_hp) * kSightPullHealFirstPct)
+                { low = true; break; }
+        return !low && SightPullGather(s, ai, emit, /*in_combat_state*/ true);
+    }
+    if (SightPullGather(s, ai, emit, /*in_combat_state*/ true))
+        return true;
+    if (d2spot(bx, by) > kSightPullAtYd * kSightPullAtYd) return false;   // not there and the walk was not taken: the other rules
+    NearbyUnit const* v = s.victim_info();
+    if (!v || v->hp <= 0 || !po.sight_pull_mob(v->guid)) return false;
+    // The victim is a mob still standing off out there: fight one that has come in.
+    if (near)
+    {
+        if (!emit.start_attack(near->guid))
+            return false;
+        if (RaidLogDue(RaidLogKey(s, RaidLogKind::SightPull), now_ms, 4000u))
+            TC_LOG_INFO("playerbot.v2", "[sight_pull] {} leaves entry {} ({}) out there {:.0f} y off and fights entry {} ({}) at the spot",
+                        s.name(), v->entry, v->guid.GetCounter(), std::sqrt(d2spot(v->x, v->y)), near->entry, near->guid.GetCounter());
+        ai.set_last_rule_fired("combat:sight_pull_switch");
+        return true;
+    }
+    // A ranged bot that sees it from here shoots it from here (the rotation; its approach steps are the only thing this rule holds).
+    if (!IsMeleeSpec(s.cls(), s.spec()) && role != Role::Tank && v->in_los)
+    {
+        const float vx = v->x - bx, vy = v->y - by;
+        if (vx * vx + vy * vy <= kSightPullShootYd * kSightPullShootYd)
+            return false;
+    }
+    if (s.is_moving())
+        emit.stop_movement();
+    if (RaidLogDue(RaidLogKey(s, RaidLogKind::SightPull), now_ms, 4000u))
+        TC_LOG_INFO("playerbot.v2", "[sight_pull] {} waits at the spot for entry {} ({}), {:.0f} y off out of sight", s.name(), v->entry,
+                    v->guid.GetCounter(), std::sqrt(d2spot(v->x, v->y)));
+    ai.set_last_rule_fired("combat:sight_pull_wait");
+    return true;
+}
+
+static bool HelpRunnerTick(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView const& g, BotIntentEmitter& emit)
+{
+    if (!s.is_in_instance() || s.in_battleground() || !g.exists() || !s.is_alive())
+        return false;
+    Role const role = ai.effective_role(s);
+    if (role == Role::Tank || role == Role::Healer)
+        return false;
+    bool const melee = IsMeleeSpec(s.cls(), s.spec());
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    PveOrder const& po = s.raw().pve_order;
+    auto const* mems = g.members();
+    auto held_by_member = [&](NearbyUnit const& u)
+    {
+        if (!u.is_cc_locked) return false;
+        if (u.cc_caster.IsEmpty() || u.cc_caster == s.guid()) return true;
+        if (mems)
+            for (GroupMemberSummary const& m : *mems)
+                if (m.guid == u.cc_caster || (m.pet_alive && m.pet_guid == u.cc_caster)) return true;
+        return false;
+    };
+    NearbyUnit const* runner = nullptr;
+    float best_d2 = 0.f;
+    for (NearbyUnit const& u : s.raw().combat.nearby_enemies)
+    {
+        if (!u.seeks_help || u.hp <= 0 || u.is_player || !u.unit_in_combat || !u.in_los || u.untargetable || u.is_pacified || u.no_xp_kill)
+            continue;
+        // MotionMaster::MoveSeekAssistance calls AttackStop: a runner has no victim, so it is ours by the threat we hold on it
+        // (smlibrary_loksey 0.1.27 test2: every Scarlet runner read victim None, and no help_runner line came in 106 s).
+        switch (ThreatVictim(u.victim_kind))
+        {
+            case ThreatVictim::Me: case ThreatVictim::Tank: case ThreatVictim::Member: case ThreatVictim::MemberPet: break;
+            case ThreatVictim::None: if (u.has_threat_list && (u.my_threat > 0.f || u.tank_threat > 0.f)) break; continue;
+            default: continue;
+        }
+        if (held_by_member(u) || (po.active && po.cc_reserved_mob(u.guid)))
+            continue;
+        const float dx = u.x - bx, dy = u.y - by, dz = u.z - bz;
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        const float reach = melee ? MeleeReach::Of(u.combat_reach) : kHelpRunnerRangedYd;
+        if (d2 > reach * reach)
+            continue;
+        if (!runner || d2 < best_d2) { runner = &u; best_d2 = d2; }
+    }
+    if (!runner)
+        return false;
+    uint32 const now = s.published_at_ms();
+    if (s.victim() != runner->guid)
+    {
+        if (!emit.start_attack(runner->guid))
+            return false;
+        if (RaidLogDue(RaidLogKey(s, RaidLogKind::ThreatHold) ^ 0x72756e6eu, now, 2000u))
+            TC_LOG_INFO("playerbot.v2", "[help_runner] {} switches to entry {} ({}) running for help, {}% hp, {:.0f} y away",
+                s.name(), runner->entry, runner->guid.GetCounter(), runner->max_hp > 0 ? int(int64(runner->hp) * 100 / runner->max_hp) : 0,
+                std::sqrt(best_d2));
+        ai.set_last_rule_fired("combat:help_runner");
+        return true;
+    }
+    if (s.is_casting() || s.gcd_active() || runner->snared)
+        return false;
+    for (HelpRunnerStopper const& st : kHelpRunnerStoppers)
+    {
+        if (st.cls != s.cls() || (st.stun && runner->stun_immune) || (st.combo && s.power(POWER_COMBO_POINTS) <= 0))
+            continue;
+        if (!s.is_ready(st.spell) || !s.in_spell_range(st.spell, *runner))
+            continue;
+        if (!emit.cast(st.spell, runner->guid))
+            continue;
+        TC_LOG_INFO("playerbot.v2", "[help_runner] {} casts {} on entry {} ({}) running for help", s.name(), st.spell, runner->entry,
+            runner->guid.GetCounter());
+        ai.set_last_rule_fired("combat:help_runner_stop");
+        return true;
+    }
+    return false;
 }
 
 // ---- Solo low-HP run-away (combat:solo_flee, Playerbot.Behavior.SoloFlee) ----
@@ -1629,8 +2077,90 @@ bool SoloFleeTick(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView const& 
 
 } // anonymous
 
+// Shared (MaintainHelpers.h). The line-of-sight pull's walk to the spot (SightPullTick above, idle:sight_pull).
+bool SightPullGather(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit, bool in_combat_state)
+{
+    PveOrder const& po = s.raw().pve_order;
+    if (!po.active || !po.sight_pull || !s.is_alive() || !s.is_in_dungeon()) return false;
+    float bx, by, bz; s.position(bx, by, bz);
+    const float dx = po.sight_x - bx, dy = po.sight_y - by;
+    const float d2 = dx * dx + dy * dy;
+    if (d2 > kSightPullJoinYd * kSightPullJoinYd || d2 <= kSightPullAtYd * kSightPullAtYd) return false;
+    // The cast in progress goes out (a heal on the tank), the walk follows on the next tick; a stunned or rooted bot cannot walk.
+    if (s.is_casting() || s.is_stunned() || s.is_rooted()) return false;
+    char const* const tag = in_combat_state ? "combat:sight_pull_gather" : "idle:sight_pull_gather";
+    if (s.is_moving() && s.has_path_destination())
+    {
+        float qx, qy, qz; s.path_destination(qx, qy, qz);
+        if ((qx - po.sight_x) * (qx - po.sight_x) + (qy - po.sight_y) * (qy - po.sight_y) < 2.0f * 2.0f)
+        {
+            ai.set_last_rule_fired(tag);
+            return true;
+        }
+    }
+    if (!emit.move_already_emitted(po.sight_x, po.sight_y, po.sight_z) && !emit.move_to(po.sight_x, po.sight_y, po.sight_z, /*run*/ true))
+        return false;
+    const uint32 now_ms = s.published_at_ms();
+    if (RaidLogDue(RaidLogKey(s, RaidLogKind::SightPull), now_ms, 4000u))
+        TC_LOG_INFO("playerbot.v2", "[sight_pull] {} gathers at ({:.1f},{:.1f}), {:.0f} y away, out of the shooters' sight", s.name(),
+                    po.sight_x, po.sight_y, std::sqrt(d2));
+    ai.set_last_rule_fired(tag);
+    return true;
+}
+
+// Shared (MaintainHelpers.h).
+bool SightSpotMove(BotSnapshotView const& s, NearbyUnit const& victim, bool melee, bool pack_safe, BotIntentEmitter& emit,
+                   float& ox, float& oy, float& oz, float& oradius)
+{
+    return SightSpotMoveImpl(s, victim, melee, pack_safe, emit, ox, oy, oz, oradius);
+}
+
+// CompanionLeash.h: a led bot's target 30 y or more from the player it follows (its owner, else the human in the group).
+static bool CompanionChaseLeashed(BotAI const& ai, BotSnapshotView const& s, GroupSnapshotView const& g, NearbyUnit const& v)
+{
+    CompanionLeash::Inputs in;
+    in.led = s.is_in_instance() && !s.in_battleground() && ai.dungeon_autopilot_suspended();
+    in.victim_on_me = v.victim == s.guid();
+    if (!in.led || in.victim_on_me)
+        return false;
+    GroupMemberSummary const* lead = nullptr;
+    if (auto const* mems = g.members())
+    {
+        ObjectGuid const ctl = s.controller_guid();
+        for (auto const& m : *mems)
+        {
+            if (m.is_bot || !m.online || !m.is_alive || m.map_id != s.map_id() || m.guid == s.guid()) continue;
+            if (!lead || m.guid == ctl) lead = &m;
+        }
+    }
+    in.leader_known = lead != nullptr;
+    if (lead)
+    {
+        in.victim_to_leader_d2 = (v.x - lead->x) * (v.x - lead->x) + (v.y - lead->y) * (v.y - lead->y);
+        // The group's own fight: the player's target (a caster's has no melee victim), or a mob on a member who stands by him.
+        in.leader_target = v.guid == lead->victim || v.guid == lead->casting_target;
+        if (auto const* mems = g.members())
+            for (auto const& m : *mems)
+            {
+                if (!m.online || m.map_id != s.map_id() || v.victim.IsEmpty()) continue;
+                bool const on_member = m.guid == v.victim && m.is_alive;
+                bool const on_pet = m.pet_alive && m.pet_guid == v.victim;
+                if (!on_member && !on_pet) continue;
+                float const vx = on_member ? m.x : m.pet_x, vy = on_member ? m.y : m.pet_y;
+                float const mx = vx - lead->x, my = vy - lead->y;
+                float const ox = v.x - vx, oy = v.y - vy;
+                // ...and fighting him there: an unreachable add far off with the member on its threat list is no fight of the group's.
+                in.on_member_near_leader = CompanionLeash::OnMemberNearLeader(std::sqrt(mx * mx + my * my), std::sqrt(ox * ox + oy * oy));
+                break;
+            }
+    }
+    return CompanionLeash::StopsChase(in);
+}
+
 bool HeldByOwner(BotAI const& ai, BotSnapshotView const& s)
 {
+    // A Stay given before the group's fight began is out-of-combat behaviour (GroupFight.h rule 6); a fresh one makes the mode Ordered.
+    if (ai.group_fight()) return false;
     if (!ai.holding_position(s.published_at_ms())) return false;
     for (NearbyUnit const& at : s.raw().combat.attackers)
         if (at.hp > 0 && at.victim == s.guid()) return false;
@@ -1682,13 +2212,261 @@ bool MeleeSpreadSpot(BotSnapshotView const& s, GroupSnapshotView const& g, Nearb
     return false;
 }
 
+// The player a bot in the group's fight answers to (BotAI::update_group_fight picks the same one).
+static GroupMemberSummary const* GroupFightLeader(BotAI const& ai, BotSnapshotView const& s, GroupSnapshotView const& g)
+{
+    bool const scenario_lead = ai.scenario_player_lead(s.published_at_ms());   // a scenario squad's bot leader stands in for the player
+    auto const* members = g.members();
+    if (!members)
+        return nullptr;
+    ObjectGuid lead = g.leader();
+    if (s.is_companion_with_owner())
+        for (auto const& m : *members)
+            if (m.guid == s.raw().owner_guid && m.online && m.map_id == s.map_id()) { lead = m.guid; break; }
+    for (auto const& m : *members)
+        if (m.guid == lead && m.online && m.map_id == s.map_id() && (!m.is_bot || scenario_lead))
+            return &m;
+    return nullptr;
+}
+
+// Rule 1 and 5 of the group's fight (Bot/GroupFight.h): a damage dealer takes the leader's order, the script's priority add, the tank's
+// target, the leader's target, then the nearest mob on a member; a tank first takes a mob off a non-tank. Only mobs of the group's own
+// fight (GroupControl::LeaderFightMayJoin), never a mob in combat with someone across the map. A damage dealer keeps a live victim of the
+// fight unless the leader names another; a tank switches at most every 2 s. Returns true when it started an attack.
+static bool GroupFightPick(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView const& g, BotIntentEmitter& emit)
+{
+    Role const role = ai.effective_role(s);
+    if (role == Role::Healer || !s.is_alive())
+        return false;
+    // On the trash of a raid map the raid plan keeps assigning its tanks (x5 threat, the roster); the damage dealers pick here.
+    if (role == Role::Tank && s.raid_rules())
+        return false;
+    GroupMemberSummary const* lead = GroupFightLeader(ai, s, g);
+    auto const* members = g.members();
+    if (!lead || !members)
+        return false;
+    uint32 const now = s.published_at_ms();
+    GroupMemberSummary const* tank = g.tank();
+    ObjectGuid const tank_victim = tank && tank->is_alive && tank->guid != s.guid() ? tank->victim : ObjectGuid::Empty;
+    ObjectGuid const lead_target = !lead->victim.IsEmpty() ? lead->victim : (lead->is_casting ? lead->casting_target : ObjectGuid::Empty);
+    ObjectGuid const ordered = ai.is_manual_mode(now) && ai.owner_command() == BotAI::OwnerCommand::Engage ? ai.owner_target()
+                             : ai.focus_target();
+    // The player's skull is his order too (a bot leader's marks are its own auto-skull, GroupSnapshotView::leader_is_bot).
+    ObjectGuid const skull = g.leader_is_bot() ? ObjectGuid::Empty : g.explicit_kill_mark();
+    auto const& forbidden = s.raw().raid_order.forbidden_targets;
+    float bx, by, bz;
+    s.position(bx, by, bz);
+
+    std::vector<GroupFight::TankCandidate> cands;
+    std::vector<NearbyUnit const*> units;
+    auto consider = [&](NearbyUnit const& u)
+    {
+        if (u.hp <= 0 || u.is_player || u.no_xp_kill || u.is_pacified || u.untargetable)
+            return;
+        for (NearbyUnit const* seen : units)
+            if (seen->guid == u.guid)
+                return;
+        bool const on_me = u.victim == s.guid();
+        bool const leader_target = u.guid == lead_target;
+        ThreatVictim const vk = ThreatVictim(u.victim_kind);
+        bool const on_member = on_me || vk == ThreatVictim::Tank || vk == ThreatVictim::Member || vk == ThreatVictim::MemberPet;
+        bool const named = (!ordered.IsEmpty() && u.guid == ordered) || (!skull.IsEmpty() && u.guid == skull && u.unit_in_combat);   // an idle skull is a plan, not a pull
+        if (!on_me && !leader_target && !(on_member && u.unit_in_combat) && !named)
+            return;
+        // The group's own fight: near the leader, or on a member near him and fighting him there.
+        float member_to_leader = -1.f, mob_to_member = -1.f;
+        GroupMemberSummary const* victim_member = nullptr;
+        for (auto const& m : *members)
+        {
+            if (!m.online || m.map_id != s.map_id() || u.victim.IsEmpty()) continue;
+            bool const on_m = m.guid == u.victim, on_pet = m.pet_alive && m.pet_guid == u.victim;
+            if (!on_m && !on_pet) continue;
+            if (on_m) victim_member = &m;
+            float const vx = on_m ? m.x : m.pet_x, vy = on_m ? m.y : m.pet_y;
+            member_to_leader = std::hypot(vx - lead->x, vy - lead->y);
+            mob_to_member = std::hypot(u.x - vx, u.y - vy);
+            break;
+        }
+        if (!on_me && !named &&
+            !GroupControl::LeaderFightMayJoin(leader_target, std::hypot(u.x - lead->x, u.y - lead->y), member_to_leader, mob_to_member))
+            return;
+        GroupFight::TankCandidate c;
+        c.mob.leader_ordered = named;
+        c.mob.priority_add = s.raw().pve_order.active && u.guid == s.raw().pve_order.kill_focus;
+        c.mob.tank_target = !tank_victim.IsEmpty() && u.guid == tank_victim;
+        c.mob.leader_target = leader_target;
+        c.mob.on_member = on_member;
+        c.mob.on_me = on_me;
+        c.mob.crowd_controlled = u.is_cc_locked;
+        c.mob.held_by_group = u.is_cc_locked && u.cc_caster == s.guid();
+        if (u.is_cc_locked && !u.cc_caster.IsEmpty() && !c.mob.held_by_group)
+            for (auto const& m : *members)
+                if (m.guid == u.cc_caster || (m.pet_alive && m.pet_guid == u.cc_caster)) { c.mob.held_by_group = true; break; }
+        c.mob.forbidden = std::find(forbidden.begin(), forbidden.end(), u.guid) != forbidden.end() || ai.engage_shielded(u.guid, now)
+            || ai.chase_unreachable(u.guid, now);   // the chase found no path to it twice in a row: the next mob, not a stand beside the fight
+        c.mob.dist = std::sqrt((u.x - bx) * (u.x - bx) + (u.y - by) * (u.y - by) + (u.z - bz) * (u.z - bz));
+        // A mob on someone who is not a tank (a member or a member's pet): the tank's to take.
+        c.on_non_tank = !on_me && (vk == ThreatVictim::MemberPet || (vk == ThreatVictim::Member && !(victim_member && victim_member->role == Role::Tank)));
+        cands.push_back(c);
+        units.push_back(&u);
+    };
+    for (NearbyUnit const& u : s.raw().combat.attackers) consider(u);
+    for (NearbyUnit const& u : s.raw().combat.nearby_enemies) consider(u);
+    if (cands.empty())
+        return false;
+
+    ObjectGuid const cur = s.victim();
+    int cur_idx = -1;
+    for (size_t i = 0; i < units.size(); ++i)
+        if (units[i]->guid == cur) { cur_idx = int(i); break; }
+    bool const cur_ok = cur_idx >= 0 && !cands[cur_idx].mob.crowd_controlled && !cands[cur_idx].mob.forbidden;
+
+    size_t pick;
+    char const* why;
+    if (role == Role::Tank)
+    {
+        pick = GroupFight::PickTankTarget(cands);
+        if (pick == GroupFight::kNone)
+            return false;
+        why = cands[pick].on_non_tank ? "loose on a member" : cands[pick].mob.leader_ordered ? "leader's order"
+            : cands[pick].mob.leader_target ? "leader's target" : "on a member";
+        // Keep a mob it already holds unless one is loose on a member; switch at most every 2 s.
+        if (cur_ok && (!cands[pick].on_non_tank || cands[cur_idx].on_non_tank))
+            return false;
+    }
+    else
+    {
+        pick = GroupFight::PickTarget(std::vector<GroupFight::Candidate>([&] {
+            std::vector<GroupFight::Candidate> v;
+            v.reserve(cands.size());
+            for (auto const& c : cands) v.push_back(c.mob);
+            return v;
+        }()));
+        if (pick == GroupFight::kNone)
+            return false;
+        GroupFight::Candidate const& m = cands[pick].mob;
+        why = m.leader_ordered ? "leader's order" : m.priority_add ? "priority add" : m.tank_target ? "tank's target"
+            : m.leader_target ? "leader's target" : m.on_me ? "on me" : "on a member";
+        if (cur_ok && !m.leader_ordered)
+            return false;
+    }
+    if (units[pick]->guid == cur)
+        return false;
+    uint32& last = ai.group_fight_pick_ms();
+    if (last != 0 && now - last < 2000u && cur_ok)
+        return false;
+    if (!emit.start_attack(units[pick]->guid))
+        return false;
+    last = now ? now : 1u;
+    TC_LOG_INFO("playerbot.v2", "[group_fight] {} attacks entry {} ({}): {} ({:.0f}y)", s.name(), units[pick]->entry,
+        units[pick]->guid.GetCounter(), why, cands[pick].mob.dist);
+    ai.set_last_rule_fired("combat:group_fight_pick");
+    return true;
+}
+
+// [group_idle]: a bot in the group's fight (not a healer) that did nothing this tick and has done nothing for kIdleFaultMs. Names the
+// last rule that held the tick, so a hold that keeps a bot out of the fight shows in the log (and fails the scenario check).
+struct GroupIdleProbe
+{
+    BotAI&                  ai;
+    BotSnapshotView const&  s;
+    BotIntentEmitter const& emit;
+    uint32                  actions_before;
+    uint32                  emitted_before;
+    uint32                  rules_before;
+
+    ~GroupIdleProbe()
+    {
+        uint32 const now = s.published_at_ms();
+        uint32 const since = ai.group_idle_since_ms();
+        bool const healer = ai.effective_role(s) == Role::Healer;
+        if (!ai.group_fight() || healer || !s.is_alive())
+        {
+            ai.set_group_idle_since_ms(0);
+            return;
+        }
+        int32 const since_damage = int32(now - ai.last_damage_done_ms());
+        bool const landing = ai.last_damage_done_ms() != 0 && since_damage >= 0 && since_damage <= 4000;
+        bool const acting = emit.combat_action_count() != actions_before || emit.emitted_count() != emitted_before || s.is_casting() ||
+                            s.gcd_active() || s.is_moving() || landing;
+        bool const controlled = s.is_stunned() || s.is_feared() || s.raw().vitals.is_confused;   // a root alone is no excuse: casters still cast
+        if (acting || controlled)
+        {
+            ai.set_group_idle_since_ms(0);
+            return;
+        }
+        if (since == 0)
+        {
+            ai.set_group_idle_since_ms(now ? now : 1u);
+            return;
+        }
+        if (!GroupFight::IdleFault(ai.group_fight_mode(), healer, controlled, since, now))
+            return;
+        uint32& logged = ai.group_idle_logged_ms();
+        if (logged != 0 && now - logged < 3000u)
+            return;
+        logged = now ? now : 1u;
+        ObjectGuid const v = s.victim();
+        NearbyUnit const* u = v.IsEmpty() ? nullptr : s.hostile_unit(v);
+        char const* rule = ai.rule_fire_seq() != rules_before ? ai.last_rule_fired() : "no rule acted";
+        char const* derived = v.IsEmpty() ? "no target" : !u ? "target not in snapshot" : !u->in_los ? "out of LoS" : "in reach";
+        TC_LOG_INFO("playerbot.v2", "[group_idle] {} idle {:.1f}s while the group fights: {} / {} target={}",
+            s.name(), (now - since) / 1000.f, rule, derived,
+            v.IsEmpty() ? std::string("none") : (u ? std::to_string(u->entry) + "/" : std::string()) + std::to_string(v.GetCounter()));
+    }
+};
+
+// The owner's full Passive and Ignore target (BotSnapshot::no_fight / fight_ignore). The snapshot already hides the mobs and the emitter
+// drops any new attack on them; this calls off what is already under way: the bot's own swing or shot, a harmful cast on its way, and
+// the pet. Then the tick goes on, so a healer still heals and buffs go out (the full Passive leaves no enemy for any rule to pick).
+static void NoFightTick(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& emit)
+{
+    BotSnapshot const& raw = s.raw();
+    if (!raw.no_fight && raw.fight_ignore.empty())
+        return;
+    auto const leave = [&raw](ObjectGuid g)
+    {
+        return !g.IsEmpty() &&
+               (raw.no_fight || std::find(raw.fight_ignore.begin(), raw.fight_ignore.end(), g) != raw.fight_ignore.end());
+    };
+    uint32 const now = s.published_at_ms();
+    bool const log_due = RaidLogDue(raw.guid.GetCounter() ^ 0x4e6f466967687400ull, now, 5000u);
+    if (ObjectGuid const v = s.victim(); leave(v))
+    {
+        emit.stop_attack();
+        if (log_due)
+            TC_LOG_INFO("playerbot.v2", "[no_fight] {} stops attacking {} ({})", s.name(), v.ToString(),
+                        raw.no_fight ? "passive" : "ignored target");
+    }
+    if (s.is_casting() && raw.cast.current_cast_spell_id)
+        if (SpellInfo const* si = sSpellMgr->GetSpellInfo(raw.cast.current_cast_spell_id, DIFFICULTY_NONE); si && !si->IsPositive())
+            if (raw.no_fight || leave(raw.cast.current_cast_target) || (raw.cast.current_cast_target.IsEmpty() && leave(s.victim())))
+                emit.cancel_cast();
+    if (!s.pet_guid().IsEmpty())
+    {
+        if (leave(s.pet_victim()))
+        {
+            emit.pet_set_react_state(0 /*REACT_PASSIVE*/);
+            emit.pet_set_command_state(1 /*COMMAND_FOLLOW*/);
+        }
+        else if (raw.no_fight && raw.pet.pet_react != 0)
+            emit.pet_set_react_state(0 /*REACT_PASSIVE*/);
+    }
+    if (raw.no_fight)
+        ai.set_last_rule_fired("combat:no_fight");
+}
+
 void DispatchInCombat(BotAI& ai,
                       BotSnapshotView snapshot,
                       GroupSnapshotView group,
                       BotIntentEmitter& emit)
 {
+    NoFightTick(ai, snapshot, emit);
     // Reports a damage bot that ends this tick with nothing to do ([dps_idle_reason]).
     CombatIdleProbe const idle_probe{ ai, snapshot, emit, emit.combat_action_count(), ai.rule_fire_seq() };
+    GroupIdleProbe const group_idle_probe{ ai, snapshot, emit, emit.combat_action_count(), emit.emitted_count(), ai.rule_fire_seq() };
+    if (IdleWatchdog(ai, snapshot, emit))
+        return;
     ReFaceVictim(snapshot, emit);
     // The Stay left by a "use <object>" ends with the fight: the bot is in the group's combat now and must fight (UBRS 132f 22:25: a rogue
     // pinned by the altar's Stay stood idle through the Emberseer fight).
@@ -1780,6 +2558,23 @@ void DispatchInCombat(BotAI& ai,
     // returns on every tick a bot has a move, a wait or a job, so only the bots the raid left idle ever drank it (Geddon, MC 2026-10-13:
     // 9 of 40 bots drank, no mage did; a mage Living Bomb carrier took the full 3200 and died).
     const bool resist_potion_used = !survival_item_used && MaybeUseResistPotion(snapshot, emit);
+
+    // A cure item goes out the same way, alongside a raid move: a Bronze carrier gets a short gap between two stuns to act (bwl_chromaggus
+    // 0.1.28i: the stunned carriers stood in the breath).
+    const bool cure_item_used = !survival_item_used && !resist_potion_used && MaybeUseCureItem(snapshot, emit);
+
+    // A trap zone (a game object the raid brain does not track: Majordomo's Intense Heat pit) before the raid orders: the orders own
+    // every tick a bot has a job or a target switch, so the step-out further down never ran for a bot the brain was busy with
+    // (release-0130 mc_majordomo 8304ad94: four raiders teleported into the pit by Majordomo died there under raid:switch_target /
+    // raid:drop_target, and three melee walked across it to their next add). A raid order with a move of its own (the brain's hazards)
+    // still goes first, and spell zones keep their old place below.
+    if (snapshot.is_in_instance() && !snapshot.in_battleground() && !snapshot.raw().raid_order.move)
+    {
+        if (RaidHazardStepOut(snapshot, ai, group, emit, /*traps_only*/ true))
+            return;
+        if (RaidHazardDetour(snapshot, ai, emit))
+            return;
+    }
 
     // Raid encounter orders (Bot/Raid): hazard moves, taunt swaps, dispels,
     // purges, crowd control and forbidden targets come before everything else.
@@ -1961,6 +2756,23 @@ void DispatchInCombat(BotAI& ai,
         RaidHazardStepOut(snapshot, ai, group, emit))
         return;
 
+    // ---- A mob running for help (HelpRunnerTick above) ----
+    // Ahead of the group's fight pick: that pick keeps a live victim, so the switch has to come first.
+    if (HelpRunnerTick(ai, snapshot, group, emit))
+        return;
+
+    // ---- Line-of-sight pull (SightPullTick above) ----
+    // After the runner: a mob fleeing for help is still stopped. Ahead of the group's fight pick, the loose-mob pickup and every
+    // line-of-sight step below, which would walk the bot out to a mob that stands off.
+    if (SightPullTick(ai, snapshot, group, emit))
+        return;
+
+    // ---- The group's fight (Bot/GroupFight.h) ----
+    // A bot whose human-led group fights takes its target by the fixed list: the leader's order, the priority add, the tank's target, the
+    // leader's target, a mob on a member; a tank first takes a mob off a non-tank. Healers heal (their own rules below).
+    if (ai.group_fight() && GroupFightPick(ai, snapshot, group, emit))
+        return;
+
     // ---- Zero-yield combat watchdog ----
     // (a) No-XP victim (Training Dummy etc.): the target is attackable but
     //     never dies and awards nothing — a bot that opens on one stays
@@ -2045,7 +2857,7 @@ void DispatchInCombat(BotAI& ai,
                 // A target the owner ordered us onto (Attack / Engage) is never dropped for giving no XP: the order is the reason, and
                 // dropping it every tick restarted the rotation (damage_parity 2026-10-11: ~590 drops a leg, white swings and Overpower only).
                 const bool ordered = ai.is_manual_mode(now_ms) && ai.owner_command() == BotAI::OwnerCommand::Engage && ai.owner_target() == vg;
-                if ((vu->no_xp_kill || vu->is_pacified) && !quest_target && !fighting_us && !ordered)
+                if ((vu->no_xp_kill || vu->is_pacified) && !quest_target && !fighting_us && !ordered && !Diagnostics::Parity::IsDummy(vg))   // the damage_parity dummy gives no XP by design
                 {
                     emit.stop_attack();
                     ai.note_engage(vg, now_ms);   // 8s re-engage shield
@@ -2347,7 +3159,7 @@ void DispatchInCombat(BotAI& ai,
     // A ranged DPS / healer whose tank has moved it more than a few yards off its slot walks back to it, so the raid stays in shape
     // when the boss is pulled back or repositioned. A DPS bot with no victim is waiting for the Attack and stays put; a healer
     // (it has no victim of its own) holds its slot too, which lies 22 y / 17 y behind its anchor tank, inside heal range.
-    if (snapshot.is_in_raid() && !snapshot.in_battleground() && group.exists() &&
+    if (snapshot.raid_rules() && !snapshot.in_battleground() && group.exists() &&
         snapshot.raw().pve_order.cc_target.IsEmpty() &&   // a bot on crowd-control duty stands still to cast it
         (!snapshot.victim().IsEmpty() || ai.effective_role(snapshot) == Role::Healer) &&
         RaidFormationHold(snapshot, ai, group, emit))
@@ -2361,7 +3173,9 @@ void DispatchInCombat(BotAI& ai,
     // hazard / avoid circle, never while casting or rooted.
     if (snapshot.is_in_raid() && !snapshot.in_battleground() && !snapshot.victim().IsEmpty() &&
         ai.effective_role(snapshot) == Role::Dps && !IsMeleeSpec(snapshot.cls(), snapshot.spec()) &&
-        !snapshot.is_casting() && !snapshot.is_rooted())
+        !snapshot.is_casting() && !snapshot.is_rooted() &&
+        // ... not off a raid camp post (Nefarian): the enemies come to the tanks' arc round it, a step in is walked back by the post.
+        !(snapshot.raw().raid_order.active && !snapshot.raw().raid_order.post_enemy.IsEmpty()))
     {
         NearbyUnit const* vu = snapshot.victim_info();
         if (vu && vu->hp > 0 && vu->in_los)
@@ -2479,8 +3293,13 @@ void DispatchInCombat(BotAI& ai,
     // Not mid-cast: a cast in progress is on a target in range (an out-of-
     // range heal fails at once and never enters the casting state), and
     // moving would throw it away.
+    // Not for a raid healer with an encounter post (RaidOrder::post_enemy): the encounter put its tanks within heal reach of the post, and
+    // a tank gone further (after a loose add) comes back to it. bwl_nefarian 1108i: the healers walked after a tank to the drakonid doors
+    // and the post's move walked them back (runs 1 and 3: 125-146 "healer_follow_tank" against 164-181 "raid:move" in the healers' last
+    // seconds); 103-405 heals a pull against 622 in 1108g.
     if (snapshot.raw().group.my_role == Role::Healer && !snapshot.is_casting() &&
-        snapshot.is_in_dungeon() && snapshot.hp_pct() > 40 && group.exists())
+        snapshot.is_in_dungeon() && snapshot.hp_pct() > 40 && group.exists() &&
+        !(snapshot.raw().raid_order.active && !snapshot.raw().raid_order.post_enemy.IsEmpty()))
     {
         // A raid healer keeps ITS heal_focus tank in range (the tank rule 5c
         // walks it to), not g.tank() — following the main tank would drag it
@@ -2627,8 +3446,12 @@ void DispatchInCombat(BotAI& ai,
     if (!snapshot.in_battleground() && ai.effective_role(snapshot) == Role::Tank)
     {
         auto const& th_po = snapshot.raw().pve_order;
-        if (th_po.active && th_po.tank_hold && th_po.tank_target.IsEmpty() && snapshot.is_alive() &&
+        // Outside the raid rules a tank in the group's fight picks up its own mobs (GroupFightPick): no wait for a plan's assignment.
+        if (th_po.active && th_po.tank_hold && th_po.tank_target.IsEmpty() && snapshot.is_alive() && !(ai.group_fight() && !snapshot.raid_rules()) &&
             !snapshot.is_casting() && snapshot.attackers_count() == 0 &&
+            // ... unless the raid brain sent it onto an enemy (RaidOrder::attack_target: the off-tank taking an idle Son of Hakkar before
+            // Blood Siphon); it walks in and attacks, and the hold would drop that target every tick until the mob hit it ...
+            (!snapshot.raw().raid_order.active || snapshot.raw().raid_order.attack_target.IsEmpty()) &&
             // ... unless a mob nobody was given stands on a group member: that one is this tank's to pick up or taunt, whatever the plan
             // holds it for (n24 mc_garr: Mctankwb sat in tank_hold 7 y from a Firesworn on a healer, taunt ready, for a minute).
             !snapshot.pickup_candidate())
@@ -2648,7 +3471,7 @@ void DispatchInCombat(BotAI& ai,
     if (!snapshot.in_battleground() && ai.effective_role(snapshot) == Role::Tank)
     {
         auto const& tt_po = snapshot.raw().pve_order;
-        if (tt_po.active && !tt_po.tank_target.IsEmpty() &&
+        if (tt_po.active && !tt_po.tank_target.IsEmpty() && !(ai.group_fight() && !snapshot.raid_rules()) &&
             snapshot.is_alive() && !snapshot.is_casting() &&
             snapshot.victim() != tt_po.tank_target)
         {
@@ -2922,6 +3745,7 @@ void DispatchInCombat(BotAI& ai,
                 continue;
             emit.use_game_object(o.guid);
             ai.note_action_retry(BotAI::ActionKind::BgUseGo, go_low, bg_now_ms);
+            ai.note_action_retry(BotAI::ActionKind::BgFormHold, 0, bg_now_ms);
             ai.set_last_rule_fired("combat:bg_grab_dropped_flag");
             return;
         }
@@ -3036,6 +3860,7 @@ void DispatchInCombat(BotAI& ai,
         // win — worth more than any trash kill). Uncapped distance (the general
         // is across the map). Scoped strictly to PushEndgame + a target entry so
         // normal node/CTF combat is untouched.
+        bool on_push_target = false;   // the ordered captain / general is in sight and in range: the rotation fights it (see below)
         {
             auto const& ord = snapshot.raw().bg.order;
             // NOTE: deliberately NOT gated on !is_casting. A pusher stalled at
@@ -3060,6 +3885,24 @@ void DispatchInCombat(BotAI& ai,
                     const float d2 = dx * dx + dy * dy;
                     if (d2 < tgt_dsq) { tgt_dsq = d2; tgt = &e; }
                 }
+                // A creature hitting this bot in melee is fought before the march goes on (BgTargetPick::BesetBy: bot-only AV 255, 298
+                // deaths walking on with the killer 2-5 yd behind), and so is an enemy player shooting it (BgTargetPick::ShotBy: bot-only
+                // AV 264, the two general pushes walked past each other on the river road). Healers keep to their rotation, which heals them.
+                NearbyUnit const* beset = BgTargetPick::BesetBy<NearbyUnit, ObjectGuid>(snapshot.guid(), bx, by, snapshot.raw().combat.attackers);
+                if (!beset)
+                    beset = BgTargetPick::ShotBy<NearbyUnit, ObjectGuid>(snapshot.guid(), bx, by, snapshot.raw().combat.attackers);
+                auto fight_back = [&]()
+                {
+                    bool const victim_on_me = std::any_of(snapshot.raw().combat.attackers.begin(), snapshot.raw().combat.attackers.end(),
+                        [&](NearbyUnit const& u) { return u.guid == snapshot.victim() && u.victim == snapshot.guid() && u.hp > 0; });
+                    if (!victim_on_me && ai.effective_role(snapshot) != Role::Healer)
+                    {
+                        emit.start_attack(beset->guid);
+                        ai.set_last_rule_fired("combat:bg_push_endgame_beset");
+                        return true;
+                    }
+                    return false;
+                };
                 if (tgt)
                 {
                     // ENGAGE-ON-LINE-OF-SIGHT. The captain (Galvangar) / general
@@ -3078,21 +3921,36 @@ void DispatchInCombat(BotAI& ai,
                     // attacking, so the ~5 bots that reached the courtyard circled
                     // him at 6-7y los=1 landing almost no damage (live: capalive
                     // never flipped). Below 40y + clear LoS = open fire.
+                    // Open on him once, then let the class rotation fight (bot-only AV 254: this returned every tick, so the
+                    // rotation below never ran while Galvangar was in sight. 50 of the 58 bots he killed in the third assault died
+                    // with this as their last rule: casters only swung, healers never healed, ranged never kept their distance, and
+                    // they stood 1-3 yd from him in his Whirlwind and Intimidating Shout). A healer does not take him as its victim
+                    // at all: it heals the squad.
                     if (tgt->in_los && tgt_dsq <= 40.0f * 40.0f)
                     {
-                        emit.start_attack(tgt->guid);
-                        ai.set_last_rule_fired("combat:bg_push_endgame_target");
-                        return;
+                        on_push_target = true;
+                        if (snapshot.victim() != tgt->guid && ai.effective_role(snapshot) != Role::Healer)
+                        {
+                            emit.start_attack(tgt->guid);
+                            ai.set_last_rule_fired("combat:bg_push_endgame_target");
+                            return;
+                        }
                     }
-                    // ENTRANCE STAGING. No LoS yet (wall between us and the boss).
-                    // If this boss has a known interior entrance staging point and
-                    // we're within 80y but still outside, route THROUGH the entrance
-                    // (to the staging point) rather than straight at the boss — a
-                    // direct move_to dead-ends in the perimeter wall pockets (live:
-                    // pushers pinned at ~25-44y los=0, 0 damage). Once we reach the
-                    // staging point (inside) we gain LoS and the engage branch above
-                    // fires. Switch back to the boss within 8y of staging (we're in).
+                    else if (beset)
                     {
+                        if (fight_back())
+                            return;
+                    }
+                    else
+                    {
+                        // ENTRANCE STAGING. No LoS yet (wall between us and the boss).
+                        // If this boss has a known interior entrance staging point and
+                        // we're within 80y but still outside, route THROUGH the entrance
+                        // (to the staging point) rather than straight at the boss — a
+                        // direct move_to dead-ends in the perimeter wall pockets (live:
+                        // pushers pinned at ~25-44y los=0, 0 damage). Once we reach the
+                        // staging point (inside) we gain LoS and the engage branch above
+                        // fires. Switch back to the boss within 8y of staging (we're in).
                         float sx = 0.f, sy = 0.f, sz = 0.f;
                         if (tgt_dsq <= 80.0f * 80.0f &&
                             BgBossStagingPoint(ord.target_entry, sx, sy, sz))
@@ -3105,10 +3963,10 @@ void DispatchInCombat(BotAI& ai,
                                 return;
                             }
                         }
+                        emit.move_to(tgt->x, tgt->y, tgt->z, /*run=*/true);
+                        ai.set_last_rule_fired("combat:bg_push_endgame_advance");
+                        return;
                     }
-                    emit.move_to(tgt->x, tgt->y, tgt->z, /*run=*/true);
-                    ai.set_last_rule_fired("combat:bg_push_endgame_advance");
-                    return;
                 }
                 // Target not in sight yet — keep pushing toward the boss room
                 // through the trash rather than brawling in place. The boss room
@@ -3116,7 +3974,12 @@ void DispatchInCombat(BotAI& ai,
                 // partial-path cap, so a raw move_to never advances; leapfrog the
                 // node chain (same shared mover the idle push march uses) so each
                 // leg is a single navmesh-routable hop.
-                if ((ord.x != 0.f || ord.y != 0.f))
+                else if (beset)
+                {
+                    if (fight_back())
+                        return;
+                }
+                else if ((ord.x != 0.f || ord.y != 0.f))
                 {
                     const float odx = ord.x - bx, ody = ord.y - by;
                     if (odx * odx + ody * ody > 144.0f)  // >12y
@@ -3135,7 +3998,8 @@ void DispatchInCombat(BotAI& ai,
         // carrier > enemy healer focus. Hysteresis via BgTargetSwitch (8s)
         // so the focus doesn't flip every tick. Friendly-CC'd targets are
         // skipped — breaking our own CC wastes it.
-        if (!i_am_carrier)
+        // Not while the ordered captain / general is in sight (2d): he is the objective, an enemy healer or player next to him is not.
+        if (!i_am_carrier && !on_push_target)
         {
             ObjectGuid switch_to;
             char const* switch_rule = nullptr;
@@ -3260,6 +4124,9 @@ void DispatchInCombat(BotAI& ai,
     // Raid resistance potion (boss engaged): emitted above, ahead of the raid orders.
     if (resist_potion_used) return;
 
+    // Cure item (Hourglass Sand on Brood Affliction: Bronze): emitted above, ahead of the raid orders.
+    if (cure_item_used) return;
+
     // Mana refill for low-mana casters. Shares the potion CD with the
     // healing potion above; one will block the other in the API layer.
     if (MaybeUseManaPotion(snapshot, group, emit)) return;
@@ -3339,7 +4206,7 @@ void DispatchInCombat(BotAI& ai,
             // IsAttackerFightable test. Kill switch:
             // PlayerbotV2.Combat.SkipUnfightable.
             if (Services::Config().combat_skip_unfightable() &&
-                (a.is_pacified || a.cannot_reach))
+                (a.is_pacified || CannotReachCounts(snapshot, a)))
             {
                 DiagSkipUnfightable(snapshot, a.guid, UnfightableReason(a));
                 continue;
@@ -3367,7 +4234,12 @@ void DispatchInCombat(BotAI& ai,
             seed = &a;
             break;
         }
-        if (seed)
+        // Not an attacker the threat hold keeps the bot off (threat discipline, like the pet's target below): the hold's stop_attack empties
+        // the victim, and this seed swung at the same boss on the next tick. 244 support scorecard, paladin run 1: the fury, with the boss
+        // on it and held at 105-113 % of the tank, re-engaged every few ticks ("attacks ... last_rule combat:threat_hold victim_kind 1")
+        // and gained about 230 threat a second while held, so the paladin, no taunt, needing 110 % of the fury's threat, had the boss
+        // 48 of 120 s.
+        if (seed && !ThreatHoldActive(ai, snapshot, seed->guid, &group))
             emit.start_attack(seed->guid);
         // Pet-assist (2026-06-19). A pet pulling mobs flags the OWNER in-combat
         // immediately (TC: owner is in combat while its pet is), so a pet-class
@@ -3548,7 +4420,7 @@ void DispatchInCombat(BotAI& ai,
     // A raid healer never walks into melee: its job is range, whatever its
     // spec table says (a resto druid or holy paladin flagged melee by spec).
     // Playerbot.Behavior.DungeonFlow: a 5-man healer keeps range and waits for the next heal too ([dungeon_flow]).
-    const bool raid_healer = (snapshot.is_in_raid() ||
+    const bool raid_healer = (snapshot.raid_rules() ||
                               (snapshot.is_in_dungeon() && Services::Config().behavior_dungeon_flow() &&
                                group.exists() && group.tank() != nullptr)) &&
                              !snapshot.in_battleground() &&
@@ -3556,12 +4428,13 @@ void DispatchInCombat(BotAI& ai,
     if (!snapshot.victim().IsEmpty() && !i_am_carrier &&  // BG-P0a: carrier runs home, never chases
         !raid_healer && IsMeleeSpec(snapshot.cls(), snapshot.spec()))
     {
-        constexpr float kMeleeRange = 5.0f;
         constexpr float kFleeLeashYd = 8.0f;   // a fleeing mob this far from the bot is let go
         constexpr uint16 kStuckChaseTicksMax = 50;   // ~5s @ 10Hz combat tier
         NearbyUnit const* vu = snapshot.victim_info();
         if (vu)
         {
+            // In melee by the server's own reach (MeleeReach.h): a flat 5 y counted a bot swinging at a big creature as out of reach.
+            const float kMeleeRange = MeleeReach::Of(vu->combat_reach);
             float bx, by, bz;
             snapshot.position(bx, by, bz);
             const float dx = vu->x - bx;
@@ -3598,6 +4471,18 @@ void DispatchInCombat(BotAI& ai,
                 ai.set_last_rule_fired("combat:flee_no_chase");
                 return;
             }
+            else if (d2 > kMeleeRange * kMeleeRange && CompanionChaseLeashed(ai, snapshot, group, *vu))
+            {
+                // A led bot does not walk after a mob 30 y or more from the player it follows (CompanionLeash.h).
+                if (RaidLogDue(RaidLogKey(snapshot, RaidLogKind::ThreatHold) ^ 0x6c656164u, snapshot.published_at_ms(), 5000u))
+                    TC_LOG_INFO("playerbot.v2", "[companion_leash] {} does not chase entry {} ({:.0f} y away): beyond {:.0f} y of the player it follows",
+                                snapshot.name(), vu->entry, std::sqrt(d2), CompanionLeash::kGroupFightYd);
+                emit.stop_attack();
+                ai.note_engage(snapshot.victim(), snapshot.published_at_ms());
+                ai.set_stuck_chase(ObjectGuid::Empty, 0);
+                ai.set_last_rule_fired("combat:companion_leash");
+                return;
+            }
             else if (d2 > kMeleeRange * kMeleeRange)
             {
                 if (ai.stuck_chase_victim() == snapshot.victim())
@@ -3622,7 +4507,9 @@ void DispatchInCombat(BotAI& ai,
                         if (f.guid == snapshot.raw().owner_guid)
                         {
                             const float ox = vu->x - f.x, oy = vu->y - f.y;
-                            constexpr float kTankChaseLeashYd = 30.0f;
+                            // The group's fight reaches kFightJoinYd from the player: with 30 y both tanks let a mob 32 y from a
+                            // warlock casting from range go (UBRS 2026-10-28 22:10:39).
+                            constexpr float kTankChaseLeashYd = GroupControl::kFightJoinYd;
                             if (ox * ox + oy * oy > kTankChaseLeashYd * kTankChaseLeashYd)
                             {
                                 tank_keeps_chase = false;
@@ -3633,8 +4520,12 @@ void DispatchInCombat(BotAI& ai,
                             break;
                         }
                 // ...nor out of its healers' reach: in a 5-man the tank stays where the healer sees it and lets the mob come (the DPS
-                // finish it). Ends the chase at once, not after the stuck-chase window.
-                if (ai.effective_role(snapshot) == Role::Tank && vu->victim != snapshot.guid() && snapshot.beyond_healer_leash(vu->x, vu->y))
+                // finish it). Ends the chase at once, not after the stuck-chase window. A mob on the tank itself too: a caster that
+                // nukes him from range does not walk in, and a tank that walks out to it takes the fight into the next packs
+                // (smlibrary 0.1.28f run 2: the tank followed the Scarlet Adepts 55 y deeper, more than 30 y from the priest, and the
+                // Beastmaster and his hound joined a fight that ran 105 s until the priest was dry).
+                if (ai.effective_role(snapshot) == Role::Tank && !(ai.group_fight() && !snapshot.raid_rules()) &&
+                    snapshot.beyond_healer_leash(vu->x, vu->y))
                 {
                     if (RaidLogDue(RaidLogKey(snapshot, RaidLogKind::ThreatHold) ^ 0x68656c70u, snapshot.published_at_ms(), 5000u))
                         TC_LOG_INFO("playerbot.v2", "[tank_chase] {} stops chasing entry {} ({:.0f}y away): further than the healer's reach",
@@ -3671,8 +4562,20 @@ void DispatchInCombat(BotAI& ai,
                 // SpreadOut settle: in reach but piled on the victim - a raid / elite fight with the mob
                 // busy on someone else - slide to this bot's own spot, only when > 2 y from it, at most
                 // every 3 s, never while casting, rooted or already walking.
-                if (Services::Config().behavior_spread_out() &&
-                    snapshot.is_in_raid() &&
+                // Not only in raids: a melee bot that arrived from the front of a mob facing someone else (or nobody, a dummy) stood there and ate
+                // the front-only parries (damage_parity 143: bot_in_front_of_dummy, 14% parry). Outside a raid it slides only while it is in front
+                // of the mob: once behind, it stays put (no walking, no lost swings) until the mob turns.
+                bool in_front_of_victim = true;
+                if (!snapshot.is_in_raid())
+                {
+                    float fx, fy, fz;
+                    snapshot.position(fx, fy, fz);
+                    float diff = std::atan2(fy - vu->y, fx - vu->x) - vu->o;
+                    while (diff > float(M_PI)) diff -= 2.0f * float(M_PI);
+                    while (diff < -float(M_PI)) diff += 2.0f * float(M_PI);
+                    in_front_of_victim = std::fabs(diff) < 0.5f * float(M_PI);
+                }
+                if (Services::Config().behavior_spread_out() && in_front_of_victim &&
                     vu->victim != snapshot.guid() && ai.effective_role(snapshot) != Role::Tank &&
                     !snapshot.is_rooted() && !snapshot.is_casting() && !snapshot.has_path_destination() &&
                     !ai.action_recently_tried(BotAI::ActionKind::RaidSpacing, 0, snapshot.published_at_ms()))
@@ -3705,7 +4608,7 @@ void DispatchInCombat(BotAI& ai,
                 // DungeonCombatPositioning (route-aware) keeps movement
                 // ownership and the mob is left to leash.
                 if (Services::Config().combat_skip_unfightable() &&
-                    !IsAttackerFightable(*vu))
+                    !IsAttackerFightable(snapshot, *vu))
                 {
                     DiagSkipUnfightable(snapshot, snapshot.victim(),
                                         UnfightableReason(*vu));
@@ -3726,7 +4629,11 @@ void DispatchInCombat(BotAI& ai,
                 // quest area) AND HP is healthy (low-HP defensives/flee fired
                 // earlier own that case); a NEAR goal chases normally so the bot
                 // can actually kill its quest mobs.
-                if (snapshot.hp_pct() > 50 &&
+                // Never for a bot in a group: it fights with its group, and its own quest goal is not where the group is going
+                // (Discord 2026-11-04, KailON: Rayso, a cat druid in his party, ran off toward its own Ashenvale objective 770 y
+                // away in the middle of every fight, "running away to the side").
+                if (!group.exists() &&
+                    snapshot.hp_pct() > 50 &&
                     snapshot.has_current_objective() &&
                     snapshot.current_objective_poi().valid &&
                     snapshot.current_objective_poi().map_id == snapshot.map_id())
@@ -3856,9 +4763,8 @@ void DispatchInCombat(BotAI& ai,
     // While a hard cast is in flight on the bot, every additional cast intent
     // we emit gets rejected with SPELL_FAILED_SPELL_IN_PROGRESS by the engine
     // (Spell.cpp:3461). Skip APL evaluation entirely until the cast resolves.
-    // We accept the small efficiency loss during the LAUNCHED window (where
-    // new casts would actually be valid) in exchange for not flooding the
-    // intent queue with rejected casts on every 250ms tick.
+    // The snapshot does not count the LAUNCHED window (cast time over, projectile in flight) as casting, so the
+    // next cast goes out then, as the core accepts it.
     if (CancelOverheal(ai, snapshot, group, emit)) return;
     if (snapshot.is_casting()) return;
 
@@ -3955,6 +4861,21 @@ void DispatchInCombat(BotAI& ai,
                     emit.cancel_aura(25780);
                 break;
             case CLASS_DRUID:   rotation_spec = 103; break;
+            default: break;
+        }
+    }
+    // A bot with no group (an ambient world bot grinding) plays its class's damage rotation whatever role it rolled for dungeon
+    // fills: a tank or healer rotation kills slowly alone. Talents and gear are untouched; grouped bots keep their role.
+    if (!group.exists() && rotation_spec &&
+        (IsTankSpec(snapshot.cls(), uint16(rotation_spec)) || IsHealerSpec(snapshot.cls(), uint16(rotation_spec))))
+    {
+        switch (snapshot.cls())
+        {
+            case CLASS_WARRIOR: rotation_spec = 71;  break;
+            case CLASS_PALADIN: rotation_spec = 70;  break;
+            case CLASS_DRUID:   rotation_spec = IsHealerSpec(CLASS_DRUID, uint16(rotation_spec)) ? 102u : 103u; break;
+            case CLASS_PRIEST:  rotation_spec = 258; break;
+            case CLASS_SHAMAN:  rotation_spec = 262; break;
             default: break;
         }
     }

@@ -220,6 +220,23 @@ TownNpc const* TownNpcIndex::NearestMailbox(uint32 map, float x, float y, float 
     return best;
 }
 
+void TownNpcIndex::ForEachMailboxNear(uint32 map, float x, float y, float radius,
+                                      std::function<void(TownNpc const&)> const& fn) const
+{
+    if (!_initialized.load(std::memory_order_acquire))
+        return;
+    auto it = _mail.find(map);
+    if (it == _mail.end())
+        return;
+    const float r2 = radius * radius;
+    for (TownNpc const& n : it->second)
+    {
+        const float dx = n.x - x, dy = n.y - y;
+        if (dx * dx + dy * dy <= r2)
+            fn(n);
+    }
+}
+
 bool TownNpcIndex::AuctioneerNear(uint32 map, float x, float y, float radius) const
 {
     bool found = false;

@@ -4,10 +4,13 @@
 // Backed by TrinityCore's existing ConfigMgr. No new file format.
 
 #pragma once
+
+#include "Bot/AlwaysBuffs.h"
 #include <vector>
 
 #include "Bot/BotTypes.h"
 #include "BotListedGroupPlan.h"
+#include "DungeonFinderPlan.h"
 #include <string>
 
 namespace Playerbot {
@@ -43,6 +46,7 @@ public:
     uint8  population_horde_pct()    const { return pop_horde_pct_; }
     std::string const& population_shape() const { return pop_shape_; }
     float  population_max_heavy_factor() const { return pop_max_heavy_factor_; }
+    float  population_spawn_cap_factor() const { return pop_spawn_cap_factor_; }
 
     // Interaction
     std::string const& accept_invites_policy() const { return accept_invites_; }
@@ -52,6 +56,8 @@ public:
     // Raid brain (Bot/Raid): read once per config load, not per tick.
     bool   raid_enabled() const { return raid_enabled_; }
     bool   boss_warnings_enabled() const { return boss_warnings_enabled_; }
+    bool   raid_callouts_enabled() const { return raid_callouts_enabled_; }
+    int32  raid_banter() const { return raid_banter_; }   // 0 off, 1 mild, 2 harsh (Raid/RaidBanter.h)
     bool   raid_auto_accept_rez() const { return raid_auto_accept_rez_; }
 
     // Housing
@@ -171,6 +177,12 @@ public:
     uint16 guilds_max_members_per_guild() const { return guilds_max_members_per_guild_; }
     bool   guilds_events_enabled() const { return guilds_events_enabled_; }
     bool   guilds_recruitment_channel_enabled() const { return guilds_recruitment_channel_enabled_; }
+    // PlayerbotV2.Guilds.InvitePlayers: 1 = a bot guild officer may send a guild invite to a real player near it (the player
+    // accepts or declines). 0 (default) = bot guilds only take in bots.
+    bool   guilds_invite_players() const { return guilds_invite_players_; }
+    // PlayerbotV2.Guilds.BankDeposit: 1 = bots put spare gold into their guild bank on their own. 0 (default) = they never do
+    // (vanilla had no guild bank, and a bank filled by bots is free gold for any player who can withdraw).
+    bool   guilds_bank_deposit() const { return guilds_bank_deposit_; }
     // Per-account cap on alts a player can summon as bots via the
     // `.playerbot summon` command. Default 5 matches a 5-man dungeon
     // group (tank + healer + 3 dps). Operators can lower for shared
@@ -298,12 +310,17 @@ public:
     bool   threat_hold_enabled() const         { return threat_hold_enabled_; }
     bool   raid_dps_wait_attack() const        { return raid_dps_wait_attack_; }
     bool   raid_provide_consumables() const    { return raid_provide_consumables_; }
+    bool   raid_consumables_in_dungeons() const { return raid_consumables_in_dungeons_; }
     // Playerbot.Raid.ResistGear: a raid bot wears resistance gear for the boss it stands before (Bot/ResistGear.h). Default off.
     bool   raid_resist_gear() const            { return raid_resist_gear_; }
+    // Playerbot.Raid.OnyxiaCloak: a grouped level 60 bot wears an Onyxia Scale Cloak in Blackwing Lair (Bot/ResistGear.h). Default on.
+    bool   raid_onyxia_cloak() const           { return raid_onyxia_cloak_; }
     // Playerbot.Consumables.PvE / .PvP: whether bots use (and are stocked with) flasks, elixirs, buff food, combat
     // potions, healthstones and resistance potions in PvE (open world, dungeons, raids) or in PvP (battlegrounds, arenas).
     bool   consumables_pve() const             { return consumables_pve_; }
     bool   consumables_pvp() const             { return consumables_pvp_; }
+    // Playerbot.AlwaysBuffs.<Switch>.<Place>: what bots are kept supplied with, and where (Bot/AlwaysBuffs.h).
+    bool   always_on(AlwaysSwitch what, AlwaysPlace where) const { return always_[uint8(what)][uint8(where)]; }
     uint32 raid_dps_wait_timeout_ms() const    { return raid_dps_wait_timeout_ms_; }
     bool   threat_hold_open_world() const      { return threat_hold_open_world_; }
     float  threat_max_ratio() const            { return threat_max_ratio_; }
@@ -321,6 +338,7 @@ public:
     bool behavior_tank_ranged_weapon()  const { return bhv_tank_ranged_weapon_; }
     bool behavior_ammo_supply()         const { return bhv_ammo_supply_; }
     bool behavior_raid_gear()           const { return bhv_raid_gear_; }
+    bool gear_raid_enchants()           const { return gear_raid_enchants_; }
     bool behavior_accept_owner_trade()  const { return bhv_accept_owner_trade_; }
     bool behavior_formation()          const { return bhv_formation_; }
     bool behavior_distance_order()      const { return bhv_distance_order_; }
@@ -339,6 +357,80 @@ public:
     bool behavior_warrior_stance_dance() const { return bhv_warrior_stance_dance_; }
     bool behavior_bot_whisperable()     const { return bhv_bot_whisperable_; }
     bool chatter_conversation()         const { return chatter_conversation_; }
+    // Playerbot.ChatModel.*: bots answer whispers and party chat through a local Ollama server (off by default).
+    struct ChatModelConfig
+    {
+        bool        enable            = false;
+        bool        whispers          = true;
+        bool        party             = true;
+        bool        say_reply         = true;
+        std::string host              = "127.0.0.1";
+        uint32      port              = 11434;
+        std::string model             = "llama3.2:3b";
+        uint32      timeout_ms        = 45000;
+        uint32      max_tokens        = 60;
+        float       temperature       = 0.8f;
+        std::string keep_alive        = "30m";
+        uint32      context_length    = 2048;
+        bool        think             = false;
+        uint32      party_chance      = 100;
+        uint32      second_reply_chance = 35;
+        uint32      quiet_chance      = 30;
+        uint32      say_chance        = 100;
+        uint32      say_per_minute    = 10;
+        bool        date_in_prompt    = true;
+        uint32      bot_cooldown_ms   = 3000;
+        uint32      group_cooldown_ms = 0;
+        uint32      max_per_minute    = 30;
+        uint32      max_queue         = 6;
+        uint32      max_wait_ms       = 60000;
+        uint32      history_lines     = 8;
+        uint32      history_minutes   = 10;
+        std::string language          = "auto";
+        std::string extra_prompt;
+    };
+    ChatModelConfig const& chat_model() const { return chat_model_; }
+    // Playerbot.Bridge.* (Bot/BotBridge.h): the optional file bridge to an outside program. Off by default.
+    struct BridgeConfig
+    {
+        bool        enable             = false;
+        std::string folder             = "BotBridge";
+        std::string crash_folder       = "Crashes";
+        bool        chat               = true;
+        bool        events             = true;
+        bool        prompt_in_chat     = true;
+        uint32      client_timeout_sec = 120;
+        uint32      event_cooldown_sec = 300;
+        uint32      max_events_per_sec = 30;
+        uint32      reply_max_age_sec  = 60;
+        uint32      bot_line_gap_ms    = 8000;
+        uint32      max_line_bytes     = 200;
+        uint32      rotate_mb          = 20;
+        uint32      keep_days          = 3;
+        uint32      spell_fail_count   = 5;
+        uint32      death_loop_count   = 3;
+        uint32      read_ms            = 200;    // how often replies.jsonl is read
+        bool        swearing           = false;  // chat_in says the program may use everyday bad language (never slurs)
+        bool        moments            = true;   // the bots' own party lines (loot, level-up, wipe...) come from the program
+        uint32      moments_per_minute = 6;      // at most this many moment events a minute for the whole server
+        bool        talk               = true;   // world bots' gathering talk (bot to bot) comes from the program too
+        // Playerbot.Bridge.Actions.*: a reply may also carry one action from a fixed list ("do"). Off by default.
+        bool        actions                = false;
+        bool        actions_owned_bots     = false;
+        std::string actions_allowed        = "all";
+        uint32      actions_bot_gap_ms     = 5000;
+        uint32      actions_per_sec        = 20;
+        uint32      actions_max_age_sec    = 30;
+        uint32      actions_follow_minutes = 10;
+        uint32      actions_max_goto_yards = 200;
+        uint32      actions_near_yards     = 60;    // hostiles listed in "near" and reachable by attack / cast
+        bool        actions_spells         = true;  // chat_in lists the bot's spells and "cast" may use them
+    };
+    BridgeConfig const& bridge() const { return bridge_; }
+    bool   chatter_channel_replies()      const { return chatter_channel_replies_; }
+    uint32 chatter_channel_question_pct() const { return chatter_channel_question_pct_; }
+    uint32 chatter_channel_greet_pct()    const { return chatter_channel_greet_pct_; }
+    bool   chatter_lfg_channel()          const { return chatter_lfg_channel_; }
     bool behavior_world_bot_say_reply() const { return bhv_world_bot_say_reply_; }
     bool behavior_instance_group_cap()  const { return bhv_instance_group_cap_; }
     uint32 behavior_open_world_group_cap() const { return bhv_open_world_group_cap_; }
@@ -348,7 +440,9 @@ public:
     uint32 lfg_level_range()            const { return lfg_level_range_; }
     uint32 lfg_bot_fill_seconds()       const { return lfg_bot_fill_seconds_; }
     std::vector<uint32> const& lfg_categories() const { return lfg_categories_; }
-    std::vector<std::pair<uint32, uint32>> const& lfg_activity_maps() const { return lfg_activity_maps_; }
+    // activity id, its map id and the party size when the entry names one (0 = from the map: a raid is as big as the map, a dungeon is a 5-man)
+    struct LfgActivityMap { uint32 activity = 0, map = 0, size = 0; };
+    std::vector<LfgActivityMap> const& lfg_activity_maps() const { return lfg_activity_maps_; }
     uint32 lfg_bot_groups_max()         const { return lfg_bot_groups_max_; }
     uint32 lfg_bot_groups_max_bots()    const { return lfg_bot_groups_max_bots_; }
     uint32 lfg_bot_groups_category()    const { return lfg_bot_groups_category_; }
@@ -356,6 +450,8 @@ public:
     uint32 lfg_bot_groups_max_seconds() const { return lfg_bot_groups_max_seconds_; }
     uint32 lfg_bot_groups_interval_seconds() const { return lfg_bot_groups_interval_seconds_; }
     std::vector<V2::ListedActivity> const& lfg_bot_groups_activities() const { return lfg_bot_groups_activities_; }
+    bool   lfg_finder_enable()          const { return lfg_finder_enable_; }
+    std::vector<V2::FinderEntrance> const& lfg_finder_entrances() const { return lfg_finder_entrances_; }
     bool behavior_bg_human_priority()   const { return bhv_bg_human_priority_; }
     bool behavior_tank_markers()        const { return bhv_tank_markers_; }
     bool behavior_mark_cc()             const { return bhv_mark_cc_; }
@@ -370,6 +466,14 @@ public:
     bool behavior_ranged_slow()         const { return bhv_ranged_slow_; }
     bool behavior_ike3_commands()       const { return bhv_ike3_commands_; }
     bool behavior_owner_commands()      const { return bhv_owner_commands_; }
+    // A player's bots board his flight with him, and the ones that could not are brought to him when he lands (Fleet/OwnerCatchUp.h).
+    bool behavior_fly_with_owner()      const { return bhv_fly_with_owner_; }
+    // A player's bots ride his ship or zeppelin with him, and the ones that could not get on are brought to him when he steps off
+    // (PlayerbotV2.cpp DriveRideWithOwner).
+    bool behavior_ride_with_owner()     const { return bhv_ride_with_owner_; }
+    // A bot with no way closer to its player while he is well away is set down beside him (Fleet/OwnerCatchUp.h).
+    bool behavior_catch_up_to_owner()   const { return bhv_catch_up_to_owner_; }
+    bool behavior_follow_owner_steps()  const { return bhv_follow_owner_steps_; }
     // Yards from the group's leader: a Passive bot defends a mob only within this of the leader (or of the member it is on), and an
     // Aggressive one attacks a hostile only within the aggressive radius of the leader. 0 switches the Passive leash off.
     float behavior_passive_leash_yd()   const { return bhv_passive_leash_yd_; }
@@ -385,15 +489,47 @@ public:
     bool behavior_party_banter()        const { return bhv_party_banter_; }
     bool behavior_social_emotes()       const { return bhv_social_emotes_; }
     bool behavior_polite_world_bots()   const { return bhv_polite_world_bots_; }
+    // Playerbot.Behavior.InvitePassingPlayers: 1 = a world bot may send a group invite to a real player who walks past (old way);
+    // 0 (default) = only to other bots. A player still gets an invite by whispering "invite" to the bot.
+    bool behavior_invite_passing_players() const { return bhv_invite_passing_players_; }
     // Playerbot.World.GateDuels.*: pairs of world bots duelling outside the capitals' gates (Fleet/GateDuels.h)
     bool   gate_duels_enable()          const { return gate_duels_enable_; }
     // Playerbot.World.Questing: 1 = world bots pick up and do quests on their own; 0 (default) = they grind mobs and roam, and quest only
     // as companions (grouped with a player, who shares quests with them).
     bool   world_questing()             const { return world_questing_; }
+    bool   kindness_enable()            const { return kindness_enable_; }
+    uint32 kindness_buff_cd_ms()        const { return kindness_buff_cd_ms_; }
+    uint32 kindness_help_hp_pct()       const { return kindness_help_hp_pct_; }
+    uint32 kindness_heal_hp_pct()       const { return kindness_heal_hp_pct_; }   // 0 = no stranger heals
+    uint32 kindness_heal_cd_ms()        const { return kindness_heal_cd_ms_; }
+    uint32 kindness_help_cd_ms()        const { return kindness_help_cd_ms_; }
+    bool   share_mobs_enable()          const { return share_mobs_enable_; }
+    float  share_mobs_camp_radius()     const { return share_mobs_camp_radius_; }
+    float  share_mobs_quest_radius()    const { return share_mobs_quest_radius_; }
+    bool   parties_enable()             const { return parties_enable_; }
+    uint32 parties_pct()                const { return parties_pct_; }
+    uint32 parties_max_size()           const { return parties_max_size_; }
+    uint32 parties_life_ms()            const { return parties_life_ms_; }
     uint32 gate_duels_pairs()           const { return gate_duels_pairs_; }
     float  gate_duels_radius()          const { return gate_duels_radius_; }
     bool   gate_duels_challenge()       const { return gate_duels_challenge_; }
     uint32 gate_duels_challenge_cd_ms() const { return gate_duels_challenge_cd_ms_; }
+    uint32 gate_duels_small_city_pairs() const { return gate_duels_small_pairs_; }
+    // Playerbot.World.Gathering.*: bots sitting round a campfire and standing in a group outside the capitals' gates, talking (Fleet/Gathering.h)
+    struct GatheringConfig
+    {
+        bool   enable          = true;
+        uint32 bots_per_gate   = 8;
+        float  radius          = 90.0f;
+        bool   all_cities      = false;
+        uint32 stay_ms         = 600000;
+        uint32 talk_gap_ms     = 40000;
+        bool   campfire        = true;
+        bool   use_chat_model  = true;
+        uint32 model_per_minute = 4;
+        uint32 city_chats      = 3;      // street chats at once in one capital, where a real player walks (0 = none)
+    };
+    GatheringConfig const& gathering() const { return gathering_; }
     bool behavior_quest_accept()        const { return bhv_quest_accept_; }
     bool behavior_quest_share()         const { return bhv_quest_share_; }
     bool behavior_quest_turn_in()       const { return bhv_quest_turn_in_; }
@@ -464,6 +600,7 @@ private:
     uint8  pop_horde_pct_ = 50;
     std::string pop_shape_ = "MaxHeavy";
     float  pop_max_heavy_factor_ = 0.40f;
+    float  pop_spawn_cap_factor_ = 1.10f;
 
     std::string accept_invites_ = "friends_or_higher";
     bool        auto_leader_handover_ = true;
@@ -471,6 +608,8 @@ private:
 
     bool   raid_enabled_     = true;
     bool   boss_warnings_enabled_ = true;
+    bool   raid_callouts_enabled_ = true;
+    int32  raid_banter_ = 1;
     bool   raid_auto_accept_rez_ = true;
 
     bool   housing_enabled_  = true;
@@ -498,6 +637,8 @@ private:
     uint16 guilds_max_members_per_guild_             = 75;
     bool   guilds_events_enabled_                    = true;
     bool   guilds_recruitment_channel_enabled_       = true;
+    bool   guilds_invite_players_                    = false;
+    bool   guilds_bank_deposit_                      = false;
     uint8  max_alts_as_bots_                         = 5;
     uint32 wedge_watchdog_threshold_ms_              = 90000;
     uint32 wedge_watchdog_combat_threshold_ms_       = 180000;
@@ -526,11 +667,14 @@ private:
     bool   threat_hold_enabled_          = true;
     bool   raid_dps_wait_attack_         = true;
     bool   raid_provide_consumables_     = false;
+    bool   raid_consumables_in_dungeons_ = true;
     bool   raid_resist_gear_             = false;
+    bool   raid_onyxia_cloak_            = true;
     bool   consumables_pve_              = true;
+    bool   always_[kAlwaysSwitchCount][kAlwaysPlaceCount] = {};   // loaded from Playerbot.AlwaysBuffs.<Switch>.<Place>
     bool   consumables_pvp_              = false;
     uint32 raid_dps_wait_timeout_ms_     = 8000;
-    bool   threat_hold_open_world_       = false;
+    bool   threat_hold_open_world_       = true;
     float  threat_max_ratio_             = 0.9f;
     float  threat_opening_lead_boss_     = 900.0f;
     float  threat_opening_lead_trash_    = 250.0f;
@@ -543,6 +687,7 @@ private:
     bool   bhv_tank_ranged_weapon_   = true;
     bool   bhv_ammo_supply_          = true;
     bool   bhv_raid_gear_            = true;
+    bool   gear_raid_enchants_       = true;
     bool   bhv_accept_owner_trade_   = true;
     bool   bhv_formation_            = true;
     bool   bhv_distance_order_       = true;
@@ -561,6 +706,12 @@ private:
     bool   bhv_warrior_stance_dance_ = true;
     bool   bhv_bot_whisperable_      = true;
     bool   chatter_conversation_     = true;
+    ChatModelConfig chat_model_;
+    BridgeConfig bridge_;
+    bool   chatter_channel_replies_  = true;
+    uint32 chatter_channel_question_pct_ = 60;
+    uint32 chatter_channel_greet_pct_    = 40;
+    bool   chatter_lfg_channel_      = true;
     bool   bhv_world_bot_say_reply_  = true;
     bool   bhv_instance_group_cap_   = true;
     uint32 bhv_open_world_group_cap_ = 40;
@@ -570,7 +721,7 @@ private:
     uint32 lfg_level_range_          = 5;
     uint32 lfg_bot_fill_seconds_     = 180;
     std::vector<uint32> lfg_categories_;
-    std::vector<std::pair<uint32, uint32>> lfg_activity_maps_;
+    std::vector<LfgActivityMap> lfg_activity_maps_;
     uint32 lfg_bot_groups_max_              = 6;
     uint32 lfg_bot_groups_max_bots_         = 60;
     uint32 lfg_bot_groups_category_         = 2;
@@ -578,6 +729,8 @@ private:
     uint32 lfg_bot_groups_max_seconds_      = 1200;
     uint32 lfg_bot_groups_interval_seconds_ = 30;
     std::vector<V2::ListedActivity> lfg_bot_groups_activities_;
+    bool   lfg_finder_enable_               = true;
+    std::vector<V2::FinderEntrance> lfg_finder_entrances_;
     bool   bhv_bg_human_priority_    = true;
     bool   bhv_tank_markers_         = true;
     bool   bhv_mark_cc_              = true;
@@ -592,6 +745,10 @@ private:
     bool   bhv_ranged_slow_          = true;
     bool   bhv_ike3_commands_        = true;
     bool   bhv_owner_commands_       = true;
+    bool   bhv_fly_with_owner_       = true;
+    bool   bhv_ride_with_owner_      = true;
+    bool   bhv_catch_up_to_owner_    = true;
+    bool   bhv_follow_owner_steps_   = true;
     float  bhv_passive_leash_yd_     = 25.0f;
     float  bhv_aggressive_radius_yd_ = 10.0f;
     bool   bhv_fidget_               = true;
@@ -604,12 +761,28 @@ private:
     bool   bhv_party_banter_         = true;
     bool   bhv_social_emotes_        = true;
     bool   bhv_polite_world_bots_    = true;
+    bool   bhv_invite_passing_players_ = false;
     bool   world_questing_           = false;
+    bool   kindness_enable_          = true;
+    uint32 kindness_buff_cd_ms_      = 900000u;
+    uint32 kindness_help_hp_pct_     = 60;
+    uint32 kindness_heal_hp_pct_     = 60;
+    uint32 kindness_heal_cd_ms_      = 45000u;
+    uint32 kindness_help_cd_ms_      = 180000u;
+    bool   share_mobs_enable_        = true;
+    float  share_mobs_camp_radius_   = 35.0f;
+    float  share_mobs_quest_radius_  = 120.0f;
+    bool   parties_enable_           = true;
+    uint32 parties_pct_              = 30;
+    uint32 parties_max_size_         = 3;
+    uint32 parties_life_ms_          = 900000u;
     bool   gate_duels_enable_        = true;
     uint32 gate_duels_pairs_         = 2;
     float  gate_duels_radius_        = 80.0f;
     bool   gate_duels_challenge_     = true;
     uint32 gate_duels_challenge_cd_ms_ = 600000u;
+    uint32 gate_duels_small_pairs_   = 1;
+    GatheringConfig gathering_;
     bool   bhv_quest_accept_         = true;
     bool   bhv_quest_share_          = true;
     bool   bhv_quest_turn_in_        = true;

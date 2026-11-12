@@ -168,7 +168,7 @@ inline std::string_view TierSetName(uint8_t cls, int32_t tier)
         { "Nightslayer Armor", "Bloodfang Armor", "Bonescythe Armor" },                                    // 4 rogue
         { "Vestments of Prophecy", "Vestments of Transcendence", "Vestments of Faith" },                   // 5 priest
         { {}, {}, {} },                                                                                    // 6 (death knight: none in Classic)
-        { "The Earthfury", "The Ten Storms", "The Earthshatter" },                                         // 7 shaman
+        { "The Earthfury", "The Ten Storms", "The Earthshatterer" },                                         // 7 shaman
         { "Arcanist Regalia", "Netherwind Regalia", "Frostfire Regalia" },                                 // 8 mage
         { "Felheart Raiment", "Nemesis Raiment", "Plagueheart Raiment" },                                  // 9 warlock
         { {}, {}, {} },                                                                                    // 10 (monk: none in Classic)

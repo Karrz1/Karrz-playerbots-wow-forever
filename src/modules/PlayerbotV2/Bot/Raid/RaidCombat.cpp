@@ -9,6 +9,7 @@
 #include "../IdleRule.h"
 
 #include <algorithm>
+#include <cstring>
 
 namespace Playerbot::Raid {
 
@@ -71,6 +72,12 @@ bool DispatchRaidOrder(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em
     //    refused (the path ring, the API's no-path answer) owns nothing: the bot stood on the spot casting and attacking nothing.
     if (o.move)
     {
+        // A way out of a hazard or a cone is not held back by the bot's own cast: the core refuses every move while a cast runs, and a
+        // healer started the next heal in the same tick the refused move gave the tick back (onyxia_full 245: two healers stood in
+        // Heated Ground 22194/22195 casting Flash Heal and Flash of Light for two to three seconds after their leave-hazard order, and died).
+        if (s.is_casting() && o.move_reason &&
+            (std::strcmp(o.move_reason, "leave hazard") == 0 || std::strcmp(o.move_reason, "leave cone") == 0))
+            emit.cancel_cast();
         if (emit.move_to(o.move_x, o.move_y, o.move_z, /*run=*/true) || emit.move_already_emitted(o.move_x, o.move_y, o.move_z))
         {
             ai.set_last_rule_fired("raid:move");

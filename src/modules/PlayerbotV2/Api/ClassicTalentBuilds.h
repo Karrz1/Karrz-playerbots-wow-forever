@@ -20,6 +20,7 @@ struct TalentPick
 {
     char const* name;
     uint8 ranks;
+    bool filler = false;   // bought only with points left after every other pick has been tried
 };
 
 struct TalentBuild

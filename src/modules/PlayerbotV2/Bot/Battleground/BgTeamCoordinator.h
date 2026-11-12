@@ -48,6 +48,7 @@
 
 #include "../BotSnapshot.h"
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <string>
 
@@ -151,9 +152,25 @@ private:
         std::vector<DroppedFlag> dropped_flags;
     };
 
+    // `targets` = a signature of what the latched squad attacks: a new target (a node taken, the window sliding on) starts the grace again.
+    // `count` / `rise` = the bots at the waiting spot last plan and when that count last grew (the time cap waits for arrivals to stop).
+    struct AvGate
+    {
+        std::unordered_map<uint64, uint32> go, wait, count, rise;
+        std::unordered_map<uint64, uint64> targets;
+        void Reset(uint64 key) { go.erase(key); wait.erase(key); count.erase(key); rise.erase(key); targets.erase(key); }
+    };
+
     void PlanTeam(TeamPlanContext& ctx, uint32 now_ms);
     void PlanCtf(TeamPlanContext& ctx);
     void PlanNodeRace(TeamPlanContext& ctx);
+    // AV: runs the gather-at-the-waiting-spot / go in together / regroup-after-a-wipe cycle of `gate` and returns whether the squad goes
+    // in. `targets` are what the squad attacks (the wipe check looks within BgAvPlan::kCaptainSquadRadius of them, after a grace for the
+    // walk from the waiting spot to the nearest one); `squad` = the bots the plan sends; `wiped` is set when this call ended an assault.
+    bool AvAssaultGo(TeamPlanContext const& ctx, AvGate& gate, uint64 key, float stage_x, float stage_y,
+                     std::vector<std::pair<float, float>> const& targets, int squad, char const* what, bool& wiped);
+    // Whether `guid` died after the assault wave of `key` that went at `wave_ms` (BgAvPlan::OutOfWave).
+    bool OutOfWave(uint64 key, uint64 guid, uint32 wave_ms) const;
     void AssignOrder(uint64 guid, uint8 kind, float x, float y, float z,
                      ObjectGuid focus = ObjectGuid::Empty, uint8 squad = 0,
                      uint32 target_entry = 0);
@@ -179,11 +196,23 @@ private:
     // pile into the captain's courtyard to kill him. Value = commit timestamp
     // (unused beyond presence); key packs (instance_id<<8 | team).
     std::unordered_map<uint64, uint32>  endgame_commit_;
-    // Per-(instance,team) AV captain assault latch: set once enough of the team stood at the staging spot, cleared when the captain
-    // dies. Without it the squad leaving the spot would drop the count below the threshold and send everyone back.
-    std::unordered_map<uint64, uint32>  captain_go_;
-    // Per-(instance,team) match time at which the captain squad started waiting at the staging spot (BgAvPlan::kCaptainGatherMaxMs time cap).
-    std::unordered_map<uint64, uint32>  captain_wait_;
+    // AvGate (above) per (instance,team): `go` is the latch, set once enough of the squad stood at the waiting spot and cleared when the
+    // target is gone or the squad that went in is wiped (BgAvPlan::CaptainAssaultBroken); without it the squad leaving the spot would
+    // drop the count below the threshold and send everyone back. `wait` = match time the squad started waiting (the time cap).
+    // The captain assault, and the assault on the enemy nodes (towers and graveyards) once the captain is dead or left.
+    AvGate captain_gate_;
+    AvGate node_gate_;
+    AvGate general_gate_;   // the general push (BgAvPlan::GeneralDue or the tower rule), gathering short of his room
+    // Per-(instance,team) count of wiped captain assaults; at BgAvPlan::kCaptainMaxAssaults the team leaves the captain for the towers.
+    std::unordered_map<uint64, uint32>  captain_wipes_;
+    // Per-(instance,team): the enemy captain's death has been logged.
+    std::unordered_set<uint64>          captain_down_;
+    // Per-(instance,team): match time at which the enemy captain was first seen dead or was left (BgAvPlan::GeneralDue counts from it).
+    std::unordered_map<uint64, uint32>  captain_done_ms_;
+    // Per-(instance,team): bot guid -> match time of the last plan that saw it dead (AV assault waves, BgAvPlan::OutOfWave).
+    std::unordered_map<uint64, std::unordered_map<uint64, uint32>> died_ms_;
+    // Per-(instance,team): the graveyard the general push last went for (BgAvPlan::GeneralRouteGraveyard), so each new one is logged once.
+    std::unordered_map<uint64, uint64>  general_step_;
     // Per-(instance,team) AV brawl state: the match's random base share, the follow mode in force
     // (0 = base, 1 = a human fights in the valley, 2 = a human pushes the enemy bases) and when a
     // different mode was first wanted (kMidModeHoldMs hysteresis so bots do not flip-flop).

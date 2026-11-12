@@ -256,6 +256,13 @@ inline constexpr DpsRange kDpsRanges[] = {
     { "enhance",   300, 450, 600, 750 },
     { "ret",       250, 350, 450, 600 },
     { "mage",      350, 550, 700, 950 },
+    // Frost and arcane mage (spec 64 and 62; fire keeps "mage"). Naxx: warcraftlogs classic averages on warcrafttavern.com/wow-classic-dps-rankings
+    // (read 2026-10-23): frost 616 in the Naxxramas table and 330 in the AQ40 table, fire 906 and 470. The range is 616 -15% / +15%. Molten Core:
+    // the "mage" column scaled by frost/fire from those tables (0.68-0.70), 350-550 -> 250-390. The page has no arcane figure (vanilla arcane was not
+    // a raid damage spec) and no other source was found, so "arcane" uses the frost range: the bot casts Frostbolt under Arcane Power, and this is an
+    // assumption, not a measured vanilla number.
+    { "frost",     250, 390, 520, 710 },
+    { "arcane",    250, 390, 520, 710 },
     { "warlock",   350, 550, 700, 950 },
     { "shadow",    250, 400, 450, 600 },
     { "elemental", 300, 450, 500, 650 },
@@ -272,8 +279,11 @@ inline DpsRange const* FindRange(std::string const& key)
 
 // The range keys a class can be (the damage spec the bot ended up with picks one; a class with two DPS specs lists both and the verdict
 // takes the widest range). Class ids are the 1.12 ones.
-inline std::vector<std::string> RangeKeysForClass(std::uint8_t cls)
+// `spec` is the bot's spec id when known (0 = unknown: the class's widest range); only the mage has per-spec ranges so far.
+inline std::vector<std::string> RangeKeysForClass(std::uint8_t cls, std::uint32_t spec = 0)
 {
+    if (cls == 8 && spec == 64) return { "frost" };
+    if (cls == 8 && spec == 62) return { "arcane" };
     switch (cls)
     {
         case 1:  return { "warrior" };
@@ -306,12 +316,12 @@ constexpr char const* ToString(RangeVerdict v)
 // buffs); it is never allowed above the high end.
 constexpr double kUnbuffedAllowancePct = 15.0;
 
-inline RangeVerdict DpsVerdict(std::uint8_t cls, int gear_tier, bool raid_buffs, double dps, std::string* range_text = nullptr)
+inline RangeVerdict DpsVerdict(std::uint8_t cls, int gear_tier, bool raid_buffs, double dps, std::string* range_text = nullptr, std::uint32_t spec = 0)
 {
     if (gear_tier != 1 && gear_tier != 3)
         return RangeVerdict::NoReference;
     int lo = 0, hi = 0;
-    for (std::string const& key : RangeKeysForClass(cls))
+    for (std::string const& key : RangeKeysForClass(cls, spec))
     {
         DpsRange const* r = FindRange(key);
         if (!r)

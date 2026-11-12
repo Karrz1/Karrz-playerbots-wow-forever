@@ -15,13 +15,12 @@
 // spell). Out of combat idle:classic_druid_form owns the form: it leaves it
 // to cast an owed class buff and puts a feral druid back in before the pull.
 //
-// Skipped on purpose: Prowl / Pounce / Ravage (stealth positioning), Shred
-// (needs behind-the-target positioning, Claw is used instead), Maim, Bash
-// as a CC, Hurricane, Mark of the Wild / Thorns (out-of-combat group buffs
+// Skipped on purpose: Prowl / Pounce / Ravage (stealth positioning), Maim, Bash
+// as a CC, Mark of the Wild / Thorns (out-of-combat group buffs
 // are handled by the idle-state buff maintenance), Omen of Clarity, Cat
 // bail-out to heal.
 //
-// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
+// Priorities follow Karrz's ike3 vanilla strategies (Karrz1/wow-1.12
 // raid10-revamp, playerbot/strategy/druid/*Strategy.cpp, MANGOSBOT_ZERO).
 
 #include "../ApRegistry.h"
@@ -41,6 +40,7 @@
 #include "Log.h"
 #include "SharedDefines.h"
 #include <algorithm>
+#include <cmath>
 
 namespace Playerbot::Combat {
 
@@ -63,9 +63,11 @@ constexpr uint32 INSECT_SWARM       = 5570;
 constexpr uint32 FAERIE_FIRE        = 770;
 constexpr uint32 INNERVATE          = 29166;
 constexpr uint32 BARKSKIN           = 22812;
+constexpr uint32 HURRICANE          = 16914;
 // Cat
 constexpr uint32 CLAW               = 1082;
 constexpr uint32 RAKE               = 1822;
+constexpr uint32 SHRED              = 5221;
 constexpr uint32 RIP                = 1079;
 constexpr uint32 FEROCIOUS_BITE     = 22568;
 constexpr uint32 TIGERS_FURY        = 5217;
@@ -79,6 +81,10 @@ constexpr uint32 DEMORALIZING_ROAR  = 99;
 constexpr uint32 ENRAGE             = 5229;
 constexpr uint32 FRENZIED_REGEN     = 22842;
 constexpr uint32 BASH               = 5211;
+// Forever Feral talent (level 25; trainer ranks 1328616 at 34, 414644, 1235826, 1235827): 15 rage, a bleed that stacks to 5 on the
+// victim, 3 s ticks. The bot casts the highest rank it knows (HighestKnownRank) and find_aura matches any rank.
+constexpr uint32 LACERATE           = 1328617;
+constexpr uint8  kLacerateStacks    = 5;
 // Restoration
 constexpr uint32 HEALING_TOUCH      = 5185;
 constexpr uint32 REGROWTH           = 8936;
@@ -296,6 +302,34 @@ bool ShouldWrath(ApPredicateContext const& ctx)
 }
 void DoWrath(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(WRATH, ctx.bot.victim()); }
 
+// Hurricane: a 10 s ground channel (60 s cooldown) that ticks every second on every enemy in 8 yd of the victim (the area script
+// classic_spell_ground_area_damage). Three or more attackers in the area out-damage the single-target nukes: its tick hits each of them
+// for the rank's damage plus 10.7% spell power, Starfire hits one target once per 3.5 s cast. Only with the mana for the whole channel,
+// standing still, and never over a crowd-controlled or unpulled mob (AoeSafeAroundVictim).
+constexpr float kHurricaneRadius = 8.0f;
+bool ShouldHurricane(ApPredicateContext const& ctx)
+{
+    NearbyUnit const* v = ctx.bot.victim_info();
+    if (!v || !HasLiveTarget(ctx) || !ctx.bot.in_combat() || ctx.bot.is_moving() || ManaPct(ctx) < 40 || VictimHpPct(ctx) < 30)
+        return false;
+    if (!(BalanceReady(ctx, HURRICANE) && ctx.bot.victim_in_spell_range(HURRICANE)))
+        return false;
+    int n = 0;
+    float const r2 = kHurricaneRadius * kHurricaneRadius;
+    for (NearbyUnit const& a : ctx.bot.attackers())
+    {
+        if (a.hp <= 0 || a.untargetable || a.is_pacified) continue;
+        float const dx = a.x - v->x, dy = a.y - v->y, dz = a.z - v->z;
+        if (dx * dx + dy * dy + dz * dz <= r2) ++n;
+    }
+    return n >= 3 && AoeSafeAroundVictim(ctx.bot, kHurricaneRadius, "Hurricane", HURRICANE);
+}
+void DoHurricane(ApPredicateContext const& ctx, BotIntentEmitter& e)
+{
+    if (NearbyUnit const* v = ctx.bot.victim_info())
+        e.cast_at(HURRICANE, v->x, v->y, v->z);
+}
+
 // Raid school rule (ApSchoolHint.h): the victim's preferred school first among
 // Balance's dots and nukes - nature: Insect Swarm / Wrath; arcane: Moonfire /
 // Starfire. Same gates as the rules below.
@@ -340,6 +374,7 @@ ApRule const kBalanceRules[] = {
     { ShouldLeaveWrongFormBalance, DoLeaveWrongFormBalance, "classic_balance:leave_wrong_form" },
     { ShouldMoonkinForm,       DoMoonkinForm,     "classic_balance:moonkin_form" },
     { ShouldFaerieFireBalance, DoFaerieFire,      "classic_balance:faerie_fire" },
+    { ShouldHurricane,         DoHurricane,       "classic_balance:hurricane" },
     { ShouldBalanceSchoolNuke, DoBalanceSchoolNuke, "classic_balance:school_nuke" },
     { ShouldMoonfire,          DoMoonfire,        "classic_balance:moonfire" },
     { ShouldInsectSwarm,       DoInsectSwarm,     "classic_balance:insect_swarm" },
@@ -363,10 +398,36 @@ void DoCatForm(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(CAT_FORM
 
 bool InCat(ApPredicateContext const& ctx) { return ctx.bot.has_aura(CAT_FORM); }
 
+// Furor (5 of 5) gives 40 energy when the druid shifts into Cat Form: with energy at 10 or less, leaving the form and entering it again is worth
+// four Claws of waiting. The cancel goes out now, Cat Form follows next tick (ShouldCatForm); the Cat Form cast costs mana, so only with enough
+// for it and a few shifts to spare. Combo points stay on the target through the shift.
+constexpr uint32 FUROR_TALENT = 17056;
+constexpr int32  POWERSHIFT_MAX_ENERGY = 10;
+
+bool ShouldPowershift(ApPredicateContext const& ctx)
+{
+    if (!HasLiveTarget(ctx) || !InCat(ctx) || Energy(ctx) > POWERSHIFT_MAX_ENERGY || !ctx.bot.knows_spell(FUROR_TALENT) || !Ready(ctx, CAT_FORM))
+        return false;
+    int32 const cost = ctx.bot.mana_cost(CAT_FORM);
+    return cost > 0 && ctx.bot.power(POWER_MANA) >= cost * 3;
+}
+void DoPowershift(ApPredicateContext const& ctx, BotIntentEmitter& e)
+{
+    TC_LOG_INFO("playerbot.v2", "[powershift] bot={} energy {} combo {} mana {} (Cat Form costs {})", ctx.bot.raw().guid.GetCounter(), Energy(ctx), ComboPoints(ctx),
+                ctx.bot.power(POWER_MANA), ctx.bot.mana_cost(CAT_FORM));
+    e.cancel_aura(CAT_FORM);
+}
+
+// Tiger's Fury (30 energy, more damage for a few seconds) is worth it on a boss or a pack, and only with the energy a Claw cannot use yet: below
+// 45 nothing else in the rotation can be cast, so the 30 does not take a builder's place. Never with a finisher waiting or a powershift due.
 bool ShouldTigersFury(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && InCat(ctx) && Energy(ctx) >= 30 && Ready(ctx, TIGERS_FURY)
-        && !ctx.bot.has_aura(TIGERS_FURY);
+    if (!HasLiveTarget(ctx) || !InCat(ctx) || !Ready(ctx, TIGERS_FURY) || ctx.bot.has_aura(TIGERS_FURY))
+        return false;
+    int32 const energy = Energy(ctx);
+    if (energy < 30 || energy >= 45 || ComboPoints(ctx) >= 5)
+        return false;
+    return VictimIsBossLike(ctx) || ctx.bot.enemies_within(8.0f) >= 2;
 }
 void DoTigersFury(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(TIGERS_FURY); }
 
@@ -396,16 +457,44 @@ bool ShouldFerociousBite(ApPredicateContext const& ctx)
 }
 void DoFerociousBite(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(FEROCIOUS_BITE, ctx.bot.victim()); }
 
+// Rake is a builder for a druid that has nothing better: per energy it deals less than Claw and Shred, bleed included (druid 163, t3, damage per
+// energy over the leg: Shred 14842 / (26 x 60) = 9.5, Claw 2689 / (8 x 45) = 7.5, Rake 3503 / (18 x 35) = 5.6; each builds one point), and each
+// Rake pushes a Shred out. Cast only before Claw is learned.
 bool ShouldRake(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && InCat(ctx) && Energy(ctx) >= 35 && VictimHpPct(ctx) >= 30
+    return HasLiveTarget(ctx) && InCat(ctx) && !ctx.bot.knows_spell(CLAW) && ComboPoints(ctx) < 5 && Energy(ctx) >= 35 && VictimHpPct(ctx) >= 30
         && (Ready(ctx, RAKE) && ctx.bot.victim_in_spell_range(RAKE)) && !ctx.bot.has_aura(RAKE, ctx.bot.victim());
 }
 void DoRake(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(RAKE, ctx.bot.victim()); }
 
+// Behind the victim (outside its front half, with a 10 degree margin so the cast is not refused at the edge): Shred needs it.
+bool BehindVictim(ApPredicateContext const& ctx)
+{
+    NearbyUnit const* v = ctx.bot.victim_info();
+    if (!v) return false;
+    float bx, by, bz; ctx.bot.position(bx, by, bz);
+    float a = std::atan2(by - v->y, bx - v->x) - v->o;
+    while (a > float(M_PI))  a -= 2.f * float(M_PI);
+    while (a < -float(M_PI)) a += 2.f * float(M_PI);
+    return std::fabs(a) > float(M_PI) / 2.f + 0.18f;
+}
+
+// Shred (60 energy, 225% weapon damage plus its flat bonus) beats Claw (45 energy, 100% weapon damage plus its flat bonus) per energy
+// from behind the target: rank 5 of each is 79 + 2.25 weapon against 63 + 1.0 weapon (classic_spell_value / client weapon percent), so a
+// bot behind the victim waits for the 60 energy instead of spending 45 on a Claw. Combo points stop at 5.
+bool ShouldShred(ApPredicateContext const& ctx)
+{
+    return HasLiveTarget(ctx) && InCat(ctx) && Energy(ctx) >= 60 && ComboPoints(ctx) < 5
+        && (Ready(ctx, SHRED) && ctx.bot.victim_in_spell_range(SHRED)) && BehindVictim(ctx);
+}
+void DoShred(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(SHRED, ctx.bot.victim()); }
+
 bool ShouldClaw(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && InCat(ctx) && Energy(ctx) >= 45 && (Ready(ctx, CLAW) && ctx.bot.victim_in_spell_range(CLAW));
+    if (!HasLiveTarget(ctx) || !InCat(ctx) || Energy(ctx) < 45 || ComboPoints(ctx) >= 5
+        || !(Ready(ctx, CLAW) && ctx.bot.victim_in_spell_range(CLAW)))
+        return false;
+    return !(Energy(ctx) < 60 && ctx.bot.knows_spell(SHRED) && BehindVictim(ctx));   // wait for the Shred
 }
 void DoClaw(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(CLAW, ctx.bot.victim()); }
 
@@ -413,11 +502,13 @@ ApRule const kCatRules[] = {
     { ShouldBarkskin,         DoBarkskin,         "classic_cat:barkskin" },
     { ShouldLeaveWrongFormCat, DoLeaveWrongFormCat, "classic_cat:leave_wrong_form" },
     { ShouldCatForm,          DoCatForm,          "classic_cat:cat_form" },
+    { ShouldPowershift,       DoPowershift,       "classic_cat:powershift" },
     { ShouldTigersFury,       DoTigersFury,       "classic_cat:tigers_fury" },
     { ShouldFaerieFireCat,    DoFaerieFireFeral,  "classic_cat:faerie_fire_feral" },
     { ShouldRip,              DoRip,              "classic_cat:rip" },
     { ShouldFerociousBite,    DoFerociousBite,    "classic_cat:ferocious_bite" },
     { ShouldRake,             DoRake,             "classic_cat:rake" },
+    { ShouldShred,            DoShred,            "classic_cat:shred" },
     { ShouldClaw,             DoClaw,             "classic_cat:claw" },
     { HasLiveTarget,          DoAutoAttack,       "classic_cat:auto_attack" },
 };
@@ -546,12 +637,17 @@ void DoBash(ApPredicateContext const& ctx, BotIntentEmitter& e) { Interrupt::Cas
 constexpr int32 kDemoRoarRage = 20;
 bool ShouldDemoRoar(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && InBear(ctx) && ctx.bot.in_combat() && Rage(ctx) >= kDemoRoarRage
+    if (!HasLiveTarget(ctx) || !InBear(ctx) || !ctx.bot.in_combat())
+        return false;
+    bool const ok = Rage(ctx) >= kDemoRoarRage
         && Ready(ctx, DEMORALIZING_ROAR)
         && TankThreat::DemoRefreshWorth(ctx.bot, 10.0f)
         && MeleeAoeSafe(ctx.bot, ctx.group.is_raid() || ctx.bot.is_in_raid(), 10.0f, /*tank*/ true, "Demoralizing Roar")
         // No damage (a sheep survives it), but it aggroes every mob it lands on.
         && AoeSafeAroundSelf(ctx.bot, 10.0f, /*damaging*/ false, /*tank*/ true, "Demoralizing Roar");
+    if (!ok)
+        TankThreat::NoteDemoSkip(ctx.bot, "Demoralizing Roar", Rage(ctx), Ready(ctx, DEMORALIZING_ROAR));
+    return ok;
 }
 void DoDemoRoar(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(DEMORALIZING_ROAR); }
 
@@ -593,6 +689,17 @@ bool ShouldFaerieFireBear(ApPredicateContext const& ctx)
         && !ctx.bot.has_aura(FAERIE_FIRE_FERAL, ctx.bot.victim());
 }
 
+// Lacerate: the bear's single-target threat, like a warrior's Sunder. Stack it to 5 on the victim, then keep it up when under 4 s are
+// left. Maul only after: both cost rage, and Lacerate's bleed and stack threat are worth more per point once the talent is taken.
+bool ShouldLacerate(ApPredicateContext const& ctx)
+{
+    if (!HasLiveTarget(ctx) || !InBear(ctx) || Rage(ctx) < 15 || !(Ready(ctx, LACERATE) && ctx.bot.victim_in_spell_range(LACERATE)))
+        return false;
+    AuraEntry const* mine = ctx.bot.find_aura(LACERATE, ctx.bot.victim());
+    return !mine || mine->stacks < kLacerateStacks || mine->remaining.count() < 4000;
+}
+void DoLacerate(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(LACERATE, ctx.bot.victim()); }
+
 bool ShouldMaul(ApPredicateContext const& ctx)
 {
     return HasLiveTarget(ctx) && InBear(ctx) && Rage(ctx) >= 15 && (Ready(ctx, MAUL) && ctx.bot.victim_in_spell_range(MAUL));
@@ -613,7 +720,8 @@ ApRule const kBearRules[] = {
     { ShouldSwipe,            DoSwipe,            "classic_bear:swipe" },
     { ShouldBearSpreadFaerieFire, DoBearSpreadFaerieFire, "classic_bear:spread_faerie_fire" },
     { ShouldFaerieFireBear,   DoFaerieFireFeral,  "classic_bear:faerie_fire_feral" },
-    { ShouldMaul,             DoMaul,             "classic_bear:maul" },
+    { ShouldLacerate,         DoLacerate,         "classic_bear:lacerate" },
+    { ShouldMaul,            DoMaul,             "classic_bear:maul" },
     { HasLiveTarget,          DoAutoAttack,       "classic_bear:auto_attack" },
 };
 
@@ -699,11 +807,26 @@ bool ShouldHealingTouch(ApPredicateContext const& ctx)
     return CasterReady(ctx, HEALING_TOUCH) && LowestFriendOrSelf(ctx).hp_pct <= 65;
 }
 
+// Regrowth on a patient the triage hands over at 66-75 %, above the Healing Touch line: the druid stood idle there (245 support
+// scorecard: 8-20 casts in 120 s, no Regrowth at all, ending on 26-96 % mana; 143 of its 195 patients were at 70-89 %). One per
+// patient while its own Regrowth HoT runs, from 40 % mana up, the rank sized to the deficit (ClassicHeal::EmitHeal / PlanHeal),
+// so it is not a top-rank spam.
+bool ShouldRegrowthTopUp(ApPredicateContext const& ctx)
+{
+    if (!CasterReady(ctx, REGROWTH) || ManaPct(ctx) < ClassicHeal::kSaveManaPct) return false;
+    HealTarget const t = LowestFriendOrSelf(ctx);
+    return t.hp_pct <= 75 && !TargetHasMyAura(ctx, REGROWTH, t.guid);
+}
+void DoRegrowthTopUp(ApPredicateContext const& ctx, BotIntentEmitter& e)
+{
+    ClassicHeal::EmitHeal(ctx.bot, ctx.group, e, REGROWTH, ClassicHeal::PickPatient(ctx));
+}
+
 bool ShouldRejuvenation(ApPredicateContext const& ctx)
 {
     if (!CasterReady(ctx, REJUVENATION)) return false;
     HealTarget const t = LowestFriendOrSelf(ctx);
-    return t.hp_pct <= 85 && ClassicHeal::CanPayMana(ctx.bot, ctx.bot.resolve_rank(REJUVENATION)) && !TargetHasMyAura(ctx, REJUVENATION, t.guid) && ClassicHeal::HotAllowed(ctx.bot, ctx.group, t.guid)
+    return t.hp_pct <= 90 && ClassicHeal::CanPayMana(ctx.bot, ctx.bot.resolve_rank(REJUVENATION)) && !TargetHasMyAura(ctx, REJUVENATION, t.guid) && ClassicHeal::HotAllowed(ctx.bot, ctx.group, t.guid)
         && ClassicHeal::HotWorthIt(ctx.bot, ctx.group, t.guid)
         && !ClassicHeal::HotClaimedByOther(ctx.bot, ctx.group, t.guid, REJUVENATION);
 }
@@ -817,6 +940,7 @@ ApRule const kHealerRules[] = {
     { ShouldTranquility,          DoTranquility,       "classic_resto:tranquility" },
     { ShouldHealingTouch,         DoHealingTouch,      "classic_resto:healing_touch" },
     { ShouldDispel,               DoDispel,            "classic_resto:dispel" },
+    { ShouldRegrowthTopUp,        DoRegrowthTopUp,     "classic_resto:regrowth_top_up" },
     { ShouldRejuvenation,         DoRejuvenation,      "classic_resto:rejuvenation" },
     { ShouldHealerSchoolNuke,     DoHealerSchoolNuke,  "classic_resto:school_nuke" },
     { ShouldHealerMoonfire,       DoMoonfire,          "classic_resto:moonfire" },

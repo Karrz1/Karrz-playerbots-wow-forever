@@ -17,6 +17,7 @@
 #include "GameTime.h"
 #include "Log.h"
 #include "PathGenerator.h"
+#include "Random.h"
 #include "Player.h"
 #include "PlayerbotMovement.h"
 #include "ScriptMgr.h"
@@ -27,6 +28,7 @@
 #include "Bot/Raid/RaidIncoming.h"
 #include "Bot/Raid/RaidManaLedger.h"
 #include "WorldSession.h"
+#include <algorithm>
 
 void AddSC_playerbot_v2_commandscript();
 
@@ -41,7 +43,7 @@ bool IsHuman(Player const* player)
 
 // PathGenerator::LiquidRouteCheck: a bot in a capital keeps out of canals (module liquid policy, PathLiquid.h). Sampling is along
 // the whole path, not only its corners.
-bool BotPathTouchesAvoidedLiquid(WorldObject const* source, Movement::PointsArray const& path)
+bool BotPathTouchesAvoidedLiquid(WorldObject const* source, Movement::PointsArray const& path, bool waterPolys)
 {
     using namespace Playerbot::BotMovement;
     if (!g_LiquidPathPolicy)
@@ -51,6 +53,9 @@ bool BotPathTouchesAvoidedLiquid(WorldObject const* source, Movement::PointsArra
         return false;
     if (g_LiquidPathPolicy(player) == LiquidPolicy::None)
         return false;
+    // The navmesh marks its own water polygons; the point probe below can miss them (Stormwind's canal water lies level with the quay).
+    if (waterPolys)
+        return true;
     std::vector<PathPoint> pts;
     pts.reserve(path.size());
     for (G3D::Vector3 const& v : path)
@@ -101,6 +106,12 @@ public:
 
     void OnLogin(Player* player, bool /*firstLogin*/) override
     {
+        if (player->GetSession() && player->GetSession()->IsBot())
+        {
+            // A bot has no client to choose its ammo: it takes a stack that is drawn with a model, not the generic white box.
+            player->SetPreferDrawableAmmo(true);
+            player->AutoSelectAmmo();
+        }
         Module::instance().OnPlayerLogin(player);
     }
 
@@ -109,11 +120,39 @@ public:
         Module::instance().OnPlayerLogout(player);
     }
 
+    // A bot's autosave comes far less often than a player's (PlayerSaveInterval, 90 s). With a High bot crowd (500 active)
+    // every bot saving each 90 s puts about 6 saves a second, 30-50 statements each, on the one characters DB worker. The
+    // player's own auction buy/list replies and the login load wait behind that queue: the auction list went empty and slow
+    // and login took long until the bots were set to Low. Logout and the module's own saves still happen as before; a crash
+    // loses at most this much of a bot's progress. The core sets the timer before this hook, so this only stretches it.
+    void OnSave(Player* player) override
+    {
+        if (!player || !player->GetSession() || !player->GetSession()->IsBot())
+            return;
+        int32 const sec = std::clamp<int32>(sConfigMgr->GetIntDefault("Bots.SaveIntervalSec", 900, true), 0, 7200);
+        if (sec <= 0)
+            return;
+        uint32 const ms = uint32(sec) * IN_MILLISECONDS;
+        if (ms > player->GetSaveTimer())
+            player->SetSaveTimer(urand(ms * 3 / 4, ms * 5 / 4)); // spread, so bots that logged in together do not save together
+    }
+
+    void OnDelete(ObjectGuid guid, uint32 /*accountId*/) override
+    {
+        Module::instance().OnPlayerDeleted(guid.GetCounter());
+    }
+
     // Raid mana ledger: what a cast cost (the core's own figure, taken when the cast completes) and what a mana potion, rune or
     // Innervate restored. Only a healer the raid brain watches in a pull is recorded.
     void OnSpellCast(Player* player, Spell* spell, bool /*skipCheck*/) override
     {
         using namespace Playerbot::Raid;
+        // A world marker a player puts on the ground (the Positions tab's "Place at cursor" button casts one): the marker's spot
+        // takes a waiting Positions order (BotCommandParser::TakePendingPlace); nothing happens without one.
+        if (player && spell && IsHuman(player) && spell->m_targets.HasDst())
+            if (SpellInfo const* mi = spell->GetSpellInfo(); mi && mi->HasEffect(SPELL_EFFECT_CHANGE_RAID_MARKER))
+                if (WorldLocation const* dst = spell->m_targets.GetDstPos())
+                    Module::instance().OnWorldMarkerPlaced(player, dst->GetPosition());
         if (!player || !spell || !ManaLedgerWatching(player->GetGUID().GetCounter()))
             return;
         SpellInfo const* si = spell->GetSpellInfo();
@@ -181,6 +220,14 @@ public:
             Module::instance().OnYellChat(player, msg);
     }
 
+    // General, Trade and LookingForGroup: world bots answer a player's LFM / LFG / WTB line or question. Read only, before the
+    // line is sent; the answers come a few seconds later.
+    void OnChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Channel* channel) override
+    {
+        if (type == CHAT_MSG_CHANNEL && channel)
+            Module::instance().OnChannelChat(player, channel, msg);
+    }
+
     void OnChatSent(Player* player, uint32 /*type*/, uint32 /*lang*/, std::string const& msg, Player* receiver) override
     {
         Module::instance().OnWhisperReceived(player, receiver, msg);
@@ -193,11 +240,13 @@ public:
         {
             case CHAT_MSG_PARTY:
             case CHAT_MSG_PARTY_LEADER:
-            case CHAT_MSG_RAID:
-            case CHAT_MSG_RAID_LEADER:
             case CHAT_MSG_INSTANCE_CHAT:
             case CHAT_MSG_INSTANCE_CHAT_LEADER:
-                Module::instance().OnPartyChat(player, group, msg);
+                Module::instance().OnPartyChat(player, group, msg, /*raid_chat=*/false);
+                break;
+            case CHAT_MSG_RAID:
+            case CHAT_MSG_RAID_LEADER:
+                Module::instance().OnPartyChat(player, group, msg, /*raid_chat=*/true);
                 break;
             default:
                 break;
@@ -301,6 +350,11 @@ public:
         Module::instance().NoteDamageSpell(spellInfo ? spellInfo->Id : 0);
     }
 
+    void OnHitOutcome(Unit* attacker, Unit* victim, uint32 spellId, uint8 outcome, uint32 damage) override
+    {
+        Module::instance().OnHitOutcome(attacker, victim, spellId, outcome, damage);
+    }
+
     void OnDamage(Unit* attacker, Unit* victim, uint32& damage) override
     {
         Module::instance().OnDamageTaken(attacker, victim, int32(damage), 0);
@@ -311,6 +365,11 @@ public:
         if (attacker && victim && victim->GetTypeId() == TYPEID_UNIT)
             if (Player* dealer = attacker->GetCharmerOrOwnerPlayerOrPlayerItself())
                 Playerbot::Raid::DealtHit(victim->GetEntry(), victim->GetName().c_str(), dealer->GetGUID().GetCounter(), damage);
+    }
+
+    void OnHealOutcome(Unit* healer, Unit* target, uint32 spellId, uint32 raw, uint32 effective) override
+    {
+        Module::instance().OnHealOutcome(healer, target, spellId, raw, effective);
     }
 
     // Raid mana ledger: healing that landed (the core passes the effective gain, overheal already removed).
@@ -363,8 +422,18 @@ public:
     }
 };
 
+// Playerbot.Enable = 0 turns the whole module off, as if the server were built without it: no script of the module is registered,
+// so it never starts (no bot sessions, bot database or migrations), gets no world, player, unit, group or guild hook, has no
+// commands and no world update, and the path check below is not installed. Only read at start-up: a change needs a restart.
+// Playerbot.World.Enable is the second level: with the module on, it turns only the wandering world bots on or off.
 void AddSC_playerbot_v2()
 {
+    if (!sConfigMgr->GetBoolDefault("Playerbot.Enable", true))
+    {
+        TC_LOG_INFO("server.loading", "[startup] bots: off (Playerbot.Enable = 0), the bot module does not start");
+        return;
+    }
+
     new playerbot_v2_world();
     new playerbot_v2_player();
     new playerbot_v2_unit();

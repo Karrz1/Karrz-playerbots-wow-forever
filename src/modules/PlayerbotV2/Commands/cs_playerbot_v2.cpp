@@ -4,7 +4,9 @@
  */
 
 #include "ScriptMgr.h"
+#include "TypedName.h"
 #include <set>
+#include <unordered_set>
 
 #include "BattlegroundMgr.h"
 #include "BattlegroundPackets.h"
@@ -12,6 +14,7 @@
 #include "ChatCommand.h"
 #include "CharacterCache.h"
 #include "DatabaseEnv.h"
+#include "Creature.h"
 #include "GameObject.h"          // .playerbot bgzones â control-zone census
 #include "Group.h"
 #include "GroupMgr.h"
@@ -27,9 +30,15 @@
 #include "Log.h"
 #include <fstream>
 #include "Player.h"
+#include "../Fleet/PlayerCraftOrders.h"   // .playerbot craftfor
+#include "../Bot/BotBridge.h"           // .playerbot bridgeask
+#include "GameTime.h"
+#include "MovementPackets.h"
 #include "WorldSession.h"
 #include "TypeContainerVisitor.h"
 #include "PlayerbotAPI.h"
+#include "ClassicSpec.h"      // .playerbot questrun: spec override
+#include "DB2Stores.h"        // .playerbot questrun: sMapStore
 #include "PlayerbotV2.h"
 #include "LfgBotFill.h"
 #include "StringFormat.h"
@@ -43,15 +52,19 @@
 #include "Diagnostics/BotInspector.h"
 #include "Diagnostics/BotSmokeTest.h"
 #include "Diagnostics/CreatureStats.h"
+#include "Diagnostics/DamageParity.h"
 #include "Diagnostics/SpellAuditFormat.h"
+#include "Diagnostics/SpellCheckExpected.h"
 #include "Diagnostics/ScenarioRunner.h"
 #include "Fleet/BotAccountMgr.h"
 #include "Fleet/BotCharacterFactory.h"
 #include "Fleet/BotComposition.h"
 #include "Fleet/BotIdentityRegistry.h"
 #include "Fleet/BotPopulationManager.h"
+#include "Fleet/BotSize.h"
 #include "Fleet/InstanceGroupCap.h"
 #include "Fleet/BotSetupPipeline.h"
+#include "Fleet/CompanionDelete.h"
 #include "Fleet/OwnerRegistry.h"
 #include "Bot/Gear/OwnedGearPolicy.h"
 #include "Bot/BotAI.h"
@@ -62,6 +75,7 @@
 #include "Bot/BotRegistry.h"
 #include "Bot/BotPersonality.h"
 #include "Bot/BotTextMgr.h"
+#include "Api/BotLanguage.h"
 #include "Bot/BotRng.h"
 #include "Session/BotSessionMgr.h"
 #include "Threading/TickScheduler.h"
@@ -80,8 +94,15 @@
 #include "Session/LazyLock.h"
 #include "World/WorldMetadata.h"
 #include "ObjectMgr.h"
+#include "QuestDef.h"               // .playerbot xpprobe
+#include "SpellAuraEffects.h"
+#include "SpellAuras.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "Trainer.h"
+#include "TraitMgr.h"
+#include "Containers.h"
+#include "MapUtils.h"
 #include "DB2Stores.h"
 #include "HandcraftedRoadStorage.h"   // .playerbot reloadroutes â road segment reload
 #include "HandcraftedRoadGraph.h"     // .playerbot reloadroutes â invalidate road graph cache
@@ -102,13 +123,30 @@ namespace
 // no character with that name exists. This lets GMs run `.playerbot mark
 // <name>` against a character that has never logged in â a chicken-and-egg
 // fix for the original mark/unmark which required `FindConnectedPlayerByName`.
-Playerbot::BotId ResolveCharacterId(std::string const& name)
+Playerbot::BotId ResolveCharacterId(std::string name)
 {
-    if (name.empty()) return 0;
+    // Names are stored as "Name": `.playerbot summon myalt` has to find Myalt.
+    if (!normalizePlayerName(name)) return 0;
     if (Player const* p = ObjectAccessor::FindConnectedPlayerByName(name))
         return p->GetGUID().GetCounter();
     ObjectGuid g = sCharacterCache->GetCharacterGuidByName(name);
     return g.IsEmpty() ? 0 : g.GetCounter();
+}
+
+// The character name a player typed, normalized ("kar kar" = Kar when Kar's surname is "kar"; Commands/TypedName.h). Empty
+// when nothing usable was typed.
+std::string TypedCharacterName(std::string_view typed)
+{
+    std::string name = Playerbot::V2::TypedName::Pick(typed, [](std::string first) -> std::string
+    {
+        if (!normalizePlayerName(first))
+            return {};
+        ObjectGuid const g = sCharacterCache->GetCharacterGuidByName(first);
+        return g.IsEmpty() ? std::string{} : sCharacterCache->GetCharacterSurnameByGuid(g);
+    });
+    if (!normalizePlayerName(name))
+        return {};
+    return name;
 }
 
 // Map-object-store visitor collecting CONTROL_ZONE gameobjects for the
@@ -532,6 +570,11 @@ public:
         static ChatCommandTable v2Table =
         {
             { "inspect",       HandleInspect,       rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            // Dev checks that need no client logged in (GM console / SOAP): can a player's bags take an item, a craft order as if
+            // a player whispered it, and a line to a bot through the bot bridge as if said in party.
+            { "canstore",      HandleCanStore,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "craftfor",      HandleCraftFor,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "bridgeask",     HandleBridgeAsk,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "status",        HandleStatus,        rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "activity",      HandleActivity,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "levels",        HandleLevels,        rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -561,6 +604,7 @@ public:
             { "levelall",      HandleLevelAll,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "delete",        HandleDelete,        rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "level",         HandleLevel,         rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "questrun",      HandleQuestRun,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "reset",         HandleReset,         rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "money",         HandleMoney,         rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "goto",          HandleGoto,          rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -591,6 +635,19 @@ public:
             { "scenario",      HandleScenario,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "creaturestats", HandleCreatureStats, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "spellaudit",    HandleSpellAudit,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "spellcheck",    HandleSpellCheck,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "auracheck",     HandleAuraCheck,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "proccheck",     HandleProcCheck,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "casttest",      HandleCastTest,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "xpprobe",       HandleXpProbe,       rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "formprobe",     HandleFormProbe,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "campprobe",     HandleCampProbe,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "spotprobe",     HandleSpotProbe,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "collisionprobe", HandleCollisionProbe, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "langprobe",     HandleLangProbe,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "learncheck",    HandleLearnCheck,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "traitcheck",    HandleTraitCheck,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "talentwalk",    HandleTalentWalk,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "graveyardscan", HandleGraveyardScan, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "wipefleet",     HandleWipeFleet,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "roadstats",     HandleRoadStats,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -618,6 +675,7 @@ public:
             { "addon",         HandleBotAddonHello, rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No },
             { "add",           HandleBotAdd,        rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "lfg",           HandleBotLfg,        rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "dungeon",       HandleBotDungeon,    rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "call",          HandleBotCall,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             // Every player: brings the caller's own bots only (`.bot summon all|saved|<bot name>`).
             { "summon",        HandleBotSummon,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No },
@@ -629,7 +687,10 @@ public:
             { "unsave",        HandleBotUnsave,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "delete",        HandleBotDelete,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "list",          HandleBotList,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "language",      HandleBotLanguage,   rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "world",         HandleBotWorld,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            // GM only: how many world bots the realm has (Off / Low / Medium / High), set in game until the next restart (the launcher's Bots setting decides at every start).
+            { "population",    HandleBotPopulation, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "bgstress",      HandleBotBgStress,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "bgsoak",        HandleBotBgSoak,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
         };
@@ -648,8 +709,73 @@ public:
         return root;
     }
 
+    // `.playerbot canstore <player> <item id> [count]`: what the game answers when that many of the item would go into the player's
+    // bags (the check a conjure or craft makes first), with the item's limits and the free bag slots.
+    static bool HandleCanStore(ChatHandler* handler, std::string name, uint32 item, Optional<uint32> count)
+    {
+        Player* p = ObjectAccessor::FindConnectedPlayerByName(name);
+        ItemTemplate const* t = sObjectMgr->GetItemTemplate(item);
+        if (!p || !t)
+        {
+            handler->SendSysMessage(!p ? "No such player online." : "No such item.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        uint32 const n = std::max<uint32>(1, count.value_or(1));
+        ItemPosCountVec dest;
+        uint32 no_space = 0;
+        InventoryResult const r = p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item, n, &no_space);
+        handler->PSendSysMessage("%s, item %u (%s) x%u: InventoryResult %u%s; limit category %u, max count %d, stack %u, carried %u, "
+                                 "free bag slots %u, no room for %u",
+            p->GetName().c_str(), item, t->GetName(DEFAULT_LOCALE), n, uint32(r), r == EQUIP_ERR_OK ? " (fits)" : "",
+            t->GetItemLimitCategory(), t->GetMaxCount(), t->GetMaxStackSize(), p->GetItemCount(item, true), p->GetFreeInventorySlotCount(),
+            no_space);
+        return true;
+    }
+
+    // `.playerbot craftfor <requester> <bot> <order>`: the bot takes a craft order ("craft water 10") from `requester` as if he had
+    // whispered it (no rights check: a test of the craft path itself). The bot's whispers go to the requester and the log.
+    static bool HandleCraftFor(ChatHandler* handler, std::string requester, std::string bot, Tail text)
+    {
+        Player* r = ObjectAccessor::FindConnectedPlayerByName(requester);
+        Player* b = ObjectAccessor::FindConnectedPlayerByName(bot);
+        std::string order(text);
+        if (!r || !b || order.empty())
+        {
+            handler->SendSysMessage("Usage: .playerbot craftfor <requester> <bot> craft <item> [count] (both online)");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        if (order.rfind("craft ", 0) != 0)
+            order = "craft " + order;
+        bool const taken = Playerbot::V2::PlayerCraftOrders::Order(r, b, order);
+        handler->PSendSysMessage("%s: \"%s\" %s (see the [craft_order] lines)", b->GetName().c_str(), order.c_str(),
+                                 taken ? "read as a craft order" : "not a craft order");
+        return true;
+    }
+
+    // `.playerbot bridgeask <from> <bot> <text>`: a chat_in to the bot bridge's program as if `from` had said it in party, so the
+    // program's answer and action can be tested without a client. Needs the bridge on and its program answering.
+    static bool HandleBridgeAsk(ChatHandler* handler, std::string from, std::string bot, Tail text)
+    {
+        Player* f = ObjectAccessor::FindConnectedPlayerByName(from);
+        Player* b = ObjectAccessor::FindConnectedPlayerByName(bot);
+        std::string line(text);
+        if (!f || !b || line.empty())
+        {
+            handler->SendSysMessage("Usage: .playerbot bridgeask <from> <bot> <text> (both online)");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        uint64 const id = Playerbot::BotBridge::ReportChat(b, f, "party", line, "");
+        handler->PSendSysMessage(id ? "chat_in %llu written for %s" : "not written (bridge off, or no program answering)",
+                                 (unsigned long long)id, b->GetName().c_str());
+        return true;
+    }
+
     static bool HandleWhisperCmd(ChatHandler* handler, std::string name, Tail text)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         WorldSession* sess = handler->GetSession();
         if (!sess || !sess->GetPlayer())
             return false;
@@ -696,8 +822,8 @@ public:
     // The caller's own race when it can be this class, else a random race of the caller's faction that can.
     static uint8 PickCompanionRace(Player const* owner, uint8 cls)
     {
-        // Legal on this realm, not merely present in the retail-derived PlayerInfo: a Human/Gnome/Undead owner has
-        // PlayerInfo for a hunter but no 1.12 hunter, and BotComposition::Roll refuses it.
+        // Legal on this realm, not merely present in the retail-derived PlayerInfo: a Gnome/Undead owner has
+        // PlayerInfo for a hunter but no Forever hunter, and BotComposition::Roll refuses it.
         using Playerbot::V2::BotComposition;
         if (BotComposition::IsLegalRaceClass(owner->GetRace(), cls))
             return owner->GetRace();
@@ -727,8 +853,38 @@ public:
     }
 
     // .bot about: the name of the bots, so it shows in the command list and `.bot` help
+    // .bot language [auto|en|ru]: the language your bots answer you in (whispers, group chat, these command replies). auto, the start
+    // setting, follows the game client's language; the choice is kept per account (Api/BotLanguage.h).
+    static bool HandleBotLanguage(ChatHandler* handler, Optional<std::string> word)
+    {
+        namespace Lang = Playerbot::BotLanguage;
+        WorldSession* sess = handler->GetSession();
+        Player* me = sess ? sess->GetPlayer() : nullptr;
+        if (!me)
+            return false;
+        if (word)
+        {
+            Lang::Pref pref = Lang::Pref::Auto;
+            if (!Lang::ParsePref(*word, pref))
+            {
+                Lang::LocalizedHandler localized(handler);
+                localized.Get()->SendSysMessage("Usage: .bot language auto|en|ru");
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+            Lang::SetPref(sess->GetAccountId(), pref);
+        }
+        // Taken after the change, so the answer is already in the language just chosen.
+        Lang::LocalizedHandler localized(handler); handler = localized.Get();
+        bool const russian = Lang::LangOf(me) == Playerbot::Locale::Lang::Ru;
+        handler->PSendSysMessage("Bot replies: %s (%s). .bot language auto|en|ru changes it.", russian ? "Russian" : "English",
+            Lang::GetPref(sess->GetAccountId()) == Lang::Pref::Auto ? "your client's language" : "your choice");
+        return true;
+    }
+
     static bool HandleBotAbout(ChatHandler* handler)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         handler->SendSysMessage("WoW Forever Bots by Karrz, based on agatho's PlayerbotV2 (GPL-2.0). .bot add <class> [tank|healer|dps], .bot call, .bot dismiss; all orders: BOT_COMMANDS.md");
         return true;
     }
@@ -737,6 +893,7 @@ public:
     // (the Group Finder does the same by itself when nobody joins a posted listing in time). The word is your own role.
     static bool HandleBotLfg(ChatHandler* handler, Optional<std::string> ownRoleArg)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         WorldSession* sess = handler->GetSession();
         Player* me = sess ? sess->GetPlayer() : nullptr;
         if (!me || !Playerbot::Services::Initialized())
@@ -755,10 +912,46 @@ public:
         return ok ? true : Refuse(handler);
     }
 
+    // .bot dungeon [list | <name|any> [tank|healer|dps] | leave | cancel]: the bot dungeon finder (DungeonFinder.cpp). A dungeon (or any
+    // for your level) is picked, the missing places are filled with your companions and the group is put inside its door; leave
+    // brings you back to where you queued. The role word is your own role.
+    static bool HandleBotDungeon(ChatHandler* handler, Optional<std::string> what, Optional<std::string> ownRoleArg)
+    {
+        WorldSession* sess = handler->GetSession();
+        Player* me = sess ? sess->GetPlayer() : nullptr;
+        if (!me || !Playerbot::Services::Initialized())
+        { handler->SendSysMessage("`.bot dungeon` is in-game only."); return Refuse(handler); }
+        std::string const word = what ? ToLowerAscii(*what) : std::string("list");
+        std::string msg;
+        bool ok = true;
+        if (word == "list")
+            msg = Playerbot::V2::DungeonFinderList(me);
+        else if (word == "leave")
+            ok = Playerbot::V2::DungeonFinderLeave(me, msg);
+        else if (word == "cancel")
+            ok = Playerbot::V2::DungeonFinderCancel(me, msg);
+        else
+        {
+            Playerbot::Role own = Playerbot::Role::Unknown;
+            if (ownRoleArg)
+            {
+                bool roleOk = false;
+                own = ParseRoleWord(*ownRoleArg, roleOk);
+                if (!roleOk)
+                { handler->SendSysMessage("Usage: .bot dungeon <name|any> [tank|healer|dps] (your own role); .bot dungeon list|leave|cancel"); return Refuse(handler); }
+            }
+            ok = Playerbot::V2::DungeonFinderQueue(me, *what, own, msg);
+        }
+        if (!msg.empty())
+            handler->SendSysMessage(msg.c_str());
+        return ok ? true : Refuse(handler);
+    }
+
     // .bot add <class> [tank|healer|dps] [race] [male|female]
     static bool HandleBotAdd(ChatHandler* handler, std::string const& class_arg, Optional<std::string> arg2,
                              Optional<std::string> arg3, Optional<std::string> arg4)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         if (!Playerbot::Services::Initialized())
         { handler->SendSysMessage("PlayerbotV2 not initialized."); return Refuse(handler); }
         WorldSession* sess = handler->GetSession();
@@ -792,6 +985,7 @@ public:
         Playerbot::Role role = Playerbot::Role::Unknown;
         uint8 race = 0;
         uint8 gender = uint8(urand(GENDER_MALE, GENDER_FEMALE));
+        bool anyClass = false;
         for (Optional<std::string> const* arg : { &arg2, &arg3, &arg4 })
         {
             if (!*arg)
@@ -800,6 +994,8 @@ public:
             bool is_role = false;
             Playerbot::Role const r = ParseRoleWord(word, is_role);
             if (is_role) { role = r; continue; }
+            // "anyclass": the add-on's Quick party picks the classes itself, so with hired bots any free one of the role may come.
+            if (word == "anyclass")                { anyClass = true; continue; }
             if (word == "male" || word == "m")     { gender = GENDER_MALE; continue; }
             if (word == "female" || word == "f")   { gender = GENDER_FEMALE; continue; }
             if (uint8 const parsed = ParseRace(word); parsed && IsClassicRace(parsed)) { race = parsed; continue; }
@@ -808,16 +1004,100 @@ public:
         }
 
         std::string outMsg;
-        bool const ok = AddCompanionFor(me, sess, cls, role, race, gender, class_arg, outMsg);
-        handler->SendSysMessage(outMsg.c_str());
+        bool const ok = AddCompanionFor(me, sess, cls, role, race, gender, class_arg, outMsg,
+                                        Playerbot::V2::Fleet::Hire::Grade::None, /*finder*/ false, anyClass);
+        if (!outMsg.empty())   // a hired companion that was called instead has said so itself
+            handler->SendSysMessage(outMsg.c_str());
         return ok ? true : Refuse(handler);
+    }
+
+    // A companion of `me`'s account that is not out (not in the group, not called a moment ago) for `role`, the same class first:
+    // in hired mode it comes instead of a new bot. 0 = none. Another class of the same role comes only with `anyClass` (Quick
+    // party): a player who picked a class gets that class (the owner 2026-11-09: Shaman and Paladin bots picked in the add-on,
+    // Priests, Warriors and Druids came instead).
+    static Playerbot::BotId IdleHiredCompanion(Player* me, WorldSession* sess, uint8 cls, Playerbot::Role role, bool anyClass)
+    {
+        using Playerbot::V2::Fleet::HireMgr;
+        uint32 const now = getMSTime();
+        Group const* group = me->GetGroup();
+        Playerbot::BotId fallback = 0;
+        for (Playerbot::BotId id : CompanionsMatching(sess, "all"))
+        {
+            ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(id);
+            if ((group && group->IsMember(guid)) || HireMgr::Instance().RecentlyCalled(id, now) || HireMgr::Instance().IsLoaned(id))
+                continue;   // (a Group Finder loan bot only plays inside the group it was made for)
+            if (Player const* online = ObjectAccessor::FindConnectedPlayer(guid); online && online->GetGroup())
+                continue;   // out with someone else of the account
+            // A companion bound to another character of the account stays with that character: called for this one it joined, the
+            // group check (CompanionGroupHygiene) found its owner character missing and sent it away a second later, and it came at
+            // that character's level (the owner 2026-11-07: his main's level 60 companions for his level 33 alt).
+            if (uint64 const ownerChar = Playerbot::Services::Owners().GetOwner(id).player_guid; ownerChar != 0 && ownerChar != me->GetGUID().GetCounter())
+                continue;
+            Playerbot::Role const declared = Playerbot::Services::Owners().DeclaredRole(id);
+            if (role != Playerbot::Role::Unknown && declared != role)
+                continue;
+            CharacterCacheEntry const* entry = sCharacterCache->GetCharacterCacheByGuid(guid);
+            if (!entry)
+                continue;
+            // A companion above the caller's level would come at its own level (bots are levelled up to the owner, never down): a
+            // fitting one is hired instead (the owner 2026-11-07: an account-wide level 60 companion joined his level 33 character).
+            if (entry->Level > me->GetLevel())
+                continue;
+            if (entry->Class == cls)
+                return id;
+            if (anyClass && !fallback && role != Playerbot::Role::Unknown)
+                fallback = id;
+        }
+        return fallback;
     }
 
     // Creates one companion of `cls` (race 0 = pick one) for `me` and logs it in; it joins the owner's group through the
     // normal companion setup. Shared by `.bot add` and the Group Finder bot fill. `outMsg` is what the owner is told.
     static bool AddCompanionFor(Player* me, WorldSession* sess, uint8 cls, Playerbot::Role role, uint8 race, uint8 gender,
-                                std::string const& className, std::string& outMsg)
+                                std::string const& className, std::string& outMsg,
+                                Playerbot::V2::Fleet::Hire::Grade hireGrade = Playerbot::V2::Fleet::Hire::Grade::None,
+                                bool finder = false, bool anyClass = false)
     {
+        namespace Hire = Playerbot::V2::Fleet::Hire;
+        using Playerbot::V2::Fleet::HireMgr;
+        HireMgr& hire = HireMgr::Instance();
+        bool const loan = finder && hireGrade == Hire::Grade::None && hire.MustHire(me);
+        if (!loan && hireGrade == Hire::Grade::None && hire.MustHire(me))
+        {
+            if (Playerbot::BotId const idle = IdleHiredCompanion(me, sess, cls, role, anyClass))
+            {
+                hire.NoteCalled(idle, getMSTime());
+                ChatHandler handler(sess);
+                outMsg.clear();
+                return CallCompanions(&handler, CompanionName(idle), false);
+            }
+            if (!hire.NearbyBroker(me, Hire::Grade::Sellsword))
+            {
+                char const* const roleWord = role == Playerbot::Role::Tank ? "tank" : role == Playerbot::Role::Healer ? "healer" : "fighter";
+                // A picked class is named: "no hired shaman healer free", not "no hired healer free" while a Priest healer sits idle.
+                std::string const what = anyClass ? std::string(roleWord)
+                    : className + (role == Playerbot::Role::Unknown ? "" : role == Playerbot::Role::Dps ? " dps" : " " + std::string(roleWord));
+                outMsg = Trinity::StringFormat("Hired bots only on this realm: you have no hired {} free. Hire one from a Sellsword Captain at an inn or in a capital city (the Group Finder and the dungeon finder still bring bots).", what);
+                return false;
+            }
+            hireGrade = Hire::Grade::Sellsword;
+        }
+        uint64 price = 0;
+        if (hireGrade != Hire::Grade::None)
+        {
+            if (!hire.NearbyBroker(me, hireGrade))
+            { outMsg = Trinity::StringFormat("There is nobody here who hires out a {}.", Hire::GradeName(hireGrade)); return false; }
+            price = HireMgr::PriceHere(me, hireGrade);
+            if (!price)
+            { outMsg = Trinity::StringFormat("A {} only signs on with a level {} hero.", Hire::GradeName(hireGrade), uint32(Playerbot::MaxPlayerLevel())); return false; }
+            if (uint32 const max = HireMgr::MaxPerAccount(); max && Playerbot::Services::Owners().BotsOwnedBy(sess->GetAccountId()).size() >= max)
+            { outMsg = Trinity::StringFormat("You have {} bots already, the most this realm allows. End a contract first.", max); return false; }
+            if (uint32 const max = HireMgr::LegendMaxPerAccount(); hireGrade == Hire::Grade::Legend && max && hire.CountGrade(sess->GetAccountId(), Hire::Grade::Legend) >= max)
+            { outMsg = Trinity::StringFormat("The cartel hires out {} Legend(s) to one hero at a time.", max); return false; }
+            if (!me->HasEnoughMoney(price))
+            { outMsg = Trinity::StringFormat("You need {} to hire a {}.", Hire::MoneyText(price), Hire::GradeName(hireGrade)); return false; }
+        }
+
         if (race && !Playerbot::V2::BotComposition::IsLegalRaceClass(race, cls))
         { outMsg = "That race can't be a " + className + "."; return false; }
         if (race && Player::TeamForRace(race) != me->GetTeam())
@@ -893,7 +1173,11 @@ public:
 
     // .bot call <name|all>: log your companions in (or fetch the ones already online), level, gear and group them.
     // "all" is your saved roster (`.bot save`) and the companions in your group, not every companion you ever made.
-    static bool HandleBotCall(ChatHandler* handler, std::string const& who) { return CallCompanions(handler, who, false); }
+    static bool HandleBotCall(ChatHandler* handler, std::string const& who)
+    {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
+        return CallCompanions(handler, who, false);
+    }
 
     // groupOnly (`.bot summon all`, Karrz 2026-10-08: in a 2-person party it brought the whole old raid back online): "all" is only the
     // companions in the caller's group right now, wherever they are. It never logs anyone in and never adds anyone.
@@ -979,7 +1263,7 @@ public:
             ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(id);
             if (cap && !ObjectAccessor::FindConnectedPlayer(guid))
             {
-                if (out >= cap) { ++refused; continue; }
+                if (!inInstance && out >= cap) { ++refused; continue; }
                 ++out;
             }
             if (cap && inInstance && !(myGroup && myGroup->IsMember(guid)))
@@ -1003,6 +1287,7 @@ public:
     // summoned with the GM `.summon`, which stays GM-only).
     static bool HandleBotSummon(ChatHandler* handler, Tail args)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         WorldSession* sess = handler ? handler->GetSession() : nullptr;
         if (!sess || !sess->GetPlayer())
             return false;
@@ -1078,6 +1363,7 @@ public:
     // "gear t3". Tier sets are worn at the level cap only; the server may disallow modes (Playerbot.OwnedGear.AllowedModes).
     static bool HandleBotGear(ChatHandler* handler, Optional<std::string> mode_arg)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         if (!Playerbot::Services::Initialized())
         { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
         WorldSession* sess = handler->GetSession();
@@ -1106,6 +1392,7 @@ public:
     // Offline companions are skipped: `.bot call` them first.
     static bool HandleBotRegear(ChatHandler* handler, Optional<std::string> who_arg)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         std::string const who = who_arg ? *who_arg : std::string("all");   // bare `.bot regear` = every companion
         if (!Playerbot::Services::Initialized())
         { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
@@ -1153,16 +1440,45 @@ public:
     // .bot dismiss <name|all>: take your companions out of your group and log them out. They keep their gear and can be
     // called again. Leaving the group matters: a bot still listed in your group is logged back in when you log in
     // (PlayerbotV2 [GroupRelogin]), so a dismissed bot that only logged out came back at every login.
-    static bool HandleBotDismiss(ChatHandler* handler, std::string const& who)
+    // A summoned alt (`.playerbot summon`) is dismissed back to an ordinary character: unmarked and unbound, so the player logs in on
+    // it themselves without the bot logic attaching to it (Module::OnPlayerLogin drives every marked character).
+    static bool HandleBotDismiss(ChatHandler* handler, Tail args)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         if (!Playerbot::Services::Initialized())
-        { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
+        { handler->SendSysMessage("PlayerbotV2 not initialized."); handler->SetSentErrorMessage(true); return false; }
         WorldSession* sess = handler->GetSession();
         if (!sess)
             return false;
         Player* me = sess->GetPlayer();
+        std::string const typed = Playerbot::V2::TypedName::Trim(std::string_view(args));
+        if (typed.empty())
+        {
+            handler->SendSysMessage(".bot dismiss <name|all>: logs out one of your bots or summoned alts and takes it out of your group.");
+            handler->SendSysMessage("Example: .bot dismiss Myalt, or .bot dismiss all");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        bool const all = ToLowerAscii(typed) == "all";
+        std::string const name = all ? std::string("all") : TypedCharacterName(typed);
+        std::vector<Playerbot::BotId> ids = name.empty() ? std::vector<Playerbot::BotId>{} : CompanionsMatching(sess, name);
+        // An alt of the caller's own account that is in world as a bot is theirs to dismiss even when its owner binding is gone.
+        if (ids.empty() && !all && !name.empty())
+        {
+            ObjectGuid const g = sCharacterCache->GetCharacterGuidByName(name);
+            if (!g.IsEmpty() && sCharacterCache->GetCharacterAccountIdByGuid(g) == sess->GetAccountId() &&
+                Playerbot::Services::SessionMgr().IsHeadless(g))
+                ids.push_back(g.GetCounter());
+        }
+        if (ids.empty())
+        {
+            TC_LOG_INFO("playerbot.v2", "[dismiss] {}: nothing matched '{}' (looked up as '{}')", me ? me->GetName() : "?", typed, name);
+            handler->PSendSysMessage("No bot or summoned alt of yours called '%s'. `.bot list` shows your bots.", typed.c_str());
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
         uint32 dismissed = 0;
-        for (Playerbot::BotId id : CompanionsMatching(sess, who))
+        for (Playerbot::BotId id : ids)
         {
             ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(id);
             // ike3: the companion says goodbye to its owner. Queued as a whisper intent; the logout
@@ -1172,7 +1488,16 @@ public:
             bool left_group = false;
             if (Group* group = me ? me->GetGroup() : nullptr; group && group->IsMember(guid))
                 left_group = group->RemoveMember(guid);
-            if (Playerbot::Services::SessionMgr().LogoutBot(guid) || left_group)
+            bool const logged_out = Playerbot::Services::SessionMgr().LogoutBot(guid);
+            bool const own_alt = sCharacterCache->GetCharacterAccountIdByGuid(guid) == sess->GetAccountId();
+            if (own_alt)
+            {
+                Playerbot::Services::Lifecycle().unmark_as_bot(id);
+                Playerbot::Services::Owners().ClearOwner(id);
+            }
+            TC_LOG_INFO("playerbot.v2", "[dismiss] {} <- {}: left_group={} logged_out={} own_alt={}", CompanionName(id),
+                        me ? me->GetName() : "?", left_group, logged_out, own_alt);
+            if (logged_out || left_group)
                 ++dismissed;
         }
         handler->PSendSysMessage("Dismissed %u companion(s).", dismissed);
@@ -1182,6 +1507,7 @@ public:
     // .bot save <name|all>: put a companion, or every companion with you (online, in your group), on your roster.
     static bool HandleBotSave(ChatHandler* handler, std::string const& who)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         if (!Playerbot::Services::Initialized())
         { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
         WorldSession* sess = handler->GetSession();
@@ -1261,6 +1587,7 @@ public:
     // .bot unsave <name|all>: take a companion, or all of them, off your roster. They stay yours; `.bot call <name>` still works.
     static bool HandleBotUnsave(ChatHandler* handler, std::string const& who)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         if (!Playerbot::Services::Initialized())
         { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
         WorldSession* sess = handler->GetSession();
@@ -1280,6 +1607,7 @@ public:
     // .bot delete <name>: get rid of a companion for good (its character is deleted once it has logged out).
     static bool HandleBotDelete(ChatHandler* handler, std::string const& who)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         if (!Playerbot::Services::Initialized())
         { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
         WorldSession* sess = handler->GetSession();
@@ -1294,6 +1622,14 @@ public:
         for (Playerbot::BotId id : ids)
         {
             ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(id);
+            // A summoned alt is owned like a companion, but it is the player's own character: never deleted here.
+            if (!Playerbot::V2::Fleet::MayDeleteCompanion(
+                    Playerbot::Services::Accounts().is_pool_account(sCharacterCache->GetCharacterAccountIdByGuid(guid))))
+            {
+                handler->SendSysMessage(Playerbot::V2::Fleet::CompanionDeleteRefusal(CompanionName(id)).c_str());
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
             if (Group* group = me ? me->GetGroup() : nullptr; group && group->IsMember(guid))
                 group->RemoveMember(guid);
             Playerbot::Services::SessionMgr().LogoutBot(guid);
@@ -1310,6 +1646,38 @@ public:
         if (!Playerbot::Services::Initialized())
         { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
         handler->SendSysMessage(Playerbot::Services::Population().WorldReport().c_str());
+        return true;
+    }
+
+    // `.bot population [off|low|medium|high|file]`: the world bots of the whole realm, right away, until the next restart. No word: what
+    // it is now. `file` hands the numbers back to the config files (Bots.Size and the other Bots.* lines, Playerbot.World.Enable).
+    static bool HandleBotPopulation(ChatHandler* handler, Optional<std::string> word)
+    {
+        if (!Playerbot::Services::Initialized())
+        { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
+        auto& pop = Playerbot::Services::Population();
+        if (word && !word->empty())
+        {
+            std::string const w = ToLowerAscii(*word);
+            if (w == "file" || w == "config" || w == "default")
+                pop.SetWorldPopulation(-1);
+            else if (std::optional<Playerbot::V2::Fleet::PopLevel> const lv = Playerbot::V2::Fleet::ParsePopLevel(w))
+                pop.SetWorldPopulation(int(*lv));
+            else
+            {
+                handler->SendSysMessage("Usage: .bot population off|low|medium|high|file");
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+            static char const* const kSaid[] = { "World bots: Off until the next restart. The world bots online log out now.",
+                                                 "World bots: Low. Applies now, until the next restart (then the launcher's Bots setting decides).",
+                                                 "World bots: Medium. Applies now, until the next restart (then the launcher's Bots setting decides).",
+                                                 "World bots: High. Applies now, until the next restart (then the launcher's Bots setting decides)." };
+            int const now = pop.WorldPopulation();
+            handler->SendSysMessage(now >= 0 && now <= 3 ? kSaid[now] : "World bots: back to the config files (applies now).");
+            return true;
+        }
+        handler->SendSysMessage(pop.WorldPopulationLine().c_str());
         return true;
     }
 
@@ -1337,6 +1705,7 @@ public:
 
     static bool HandleBotList(ChatHandler* handler)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         if (!Playerbot::Services::Initialized())
         { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
         WorldSession* sess = handler->GetSession();
@@ -1577,9 +1946,9 @@ public:
         }
         // Already-online characters get the registry entry without a re-login,
         // so the bot ticks can start at the next world update. Offline characters
-        // get the marker only â the next time someone logs them in (manually or
-        // via .playerbot login), OnPlayerLogin will see is_bot()==true and
-        // attach the bot logic.
+        // get the marker only â the next time they log in through `.playerbot login`, OnPlayerLogin
+        // sees is_bot()==true and attaches the bot logic. A login with the game
+        // client releases the mark instead (Session/HumanLogin.h).
         if (Player const* p = ObjectAccessor::FindConnectedPlayerByName(target_name))
         {
             if (!Playerbot::Services::Registry().has(id))
@@ -2304,6 +2673,182 @@ public:
     // in-world (use `.playerbot login` first); level must be 1..MaxPlayerLevel.
     // GiveLevel handles stat/skill/talent/spell scaling in one shot â no
     // per-level loop needed. The packet it sends drops via BotSession::SendPacket.
+    // .playerbot questrun <bot> <questId> [specId]: stage a world bot on one quest for the quest protocol (operator 2026-11-08).
+    // One step per call, re-run until it says accepted: spec and talents, level up to the quest, repair, bags down to quest
+    // items, gear, teleport to the quest giver's spawn, accept. The bot's own quest rules do the rest.
+    static bool HandleQuestRun(ChatHandler* handler, std::string const& target_name, uint32 questId, Optional<uint32> specArg)
+    {
+        using namespace Playerbot;
+        if (!Services::Initialized())
+        { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
+        Player* p = ObjectAccessor::FindConnectedPlayerByName(target_name);
+        if (!p || !p->IsInWorld())
+        { handler->PSendSysMessage("questrun: '%s' is not in-world (.playerbot login %s first).", target_name.c_str(), target_name.c_str()); return false; }
+        const BotId id = p->GetGUID().GetCounter();
+        if (!Services::Lifecycle().is_bot(id))
+        { handler->PSendSysMessage("questrun: '%s' is not a V2 bot.", target_name.c_str()); return false; }
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!quest)
+        { handler->PSendSysMessage("questrun: no quest %u.", questId); return false; }
+
+        auto say = [&](char const* step, std::string const& detail)
+        {
+            handler->PSendSysMessage("questrun %s quest %u: %s %s", p->GetName().c_str(), questId, step, detail.c_str());
+            TC_LOG_INFO("playerbot.v2", "[questrun] {} quest={} step={} {}", p->GetName(), questId, step, detail);
+        };
+
+        // The quest giver's spawn: of every creature and game object that starts the quest, the first spawn on a map that is not
+        // instanceable; a spawn inside an instance only when there is nothing else. One scan of the spawn tables per quest.
+        struct Giver { uint32 entry = 0; bool go = false; bool open = false; WorldLocation where; };
+        static std::unordered_map<uint32, Giver> s_givers;
+        auto git = s_givers.find(questId);
+        if (git == s_givers.end())
+        {
+            Giver g;
+            auto consider = [&](uint32 mapId, Position const& at, uint32 entry, bool isGo)
+            {
+                MapEntry const* map = sMapStore.LookupEntry(mapId);
+                bool const open = map && !map->Instanceable();
+                if (!g.entry || (open && !g.open))
+                { g.entry = entry; g.go = isGo; g.open = open; g.where = WorldLocation(mapId, at); }
+            };
+            std::unordered_set<uint32> creatures, objects;
+            for (auto const& [entry, q] : *sObjectMgr->GetCreatureQuestRelationMapHACK())
+                if (q == questId) creatures.insert(entry);
+            for (auto const& [entry, q] : *sObjectMgr->GetGOQuestRelationMapHACK())
+                if (q == questId) objects.insert(entry);
+            if (!creatures.empty())
+                for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+                    if (creatures.count(data.id)) { consider(data.mapId, data.spawnPoint, data.id, false); if (g.open) break; }
+            if (!objects.empty() && !g.open)
+                for (auto const& [spawnId, data] : sObjectMgr->GetAllGameObjectData())
+                    if (objects.count(data.id)) { consider(data.mapId, data.spawnPoint, data.id, true); if (g.open) break; }
+            git = s_givers.emplace(questId, g).first;
+        }
+        Giver const& giver = git->second;
+        if (!giver.entry)
+        { say("no_giver", "no creature or game object spawn starts this quest"); return false; }
+
+        // Every call, so a bot that plays a long quest is never logged out by the shaper (the driver calls back while it plays).
+        Services::Population().ProtectFromKick(id, 60u * 60u * 1000u);
+        QuestStatus const status = p->GetQuestStatus(questId);
+        if (status != QUEST_STATUS_NONE)
+        { say("accepted", fmt::format("already in the log, status {}", uint32(status))); return true; }
+        if (p->GetQuestRewardStatus(questId))
+        { say("rewarded", "already rewarded"); return true; }
+        if (p->InBattleground() || p->InArena() || p->InBattlegroundQueue())
+        { say("in_battleground", "refused: leave the battleground first"); return false; }
+        if (Group* g = p->GetGroup())
+        { g->RemoveMember(p->GetGUID()); say("left_group", "a quest is tested alone"); return true; }
+
+        if (!p->IsAlive())
+        { p->ResurrectPlayer(1.0f); p->SpawnCorpseBones(); say("revived", ""); return true; }
+        if (p->IsInCombat())
+            p->CombatStop(true);
+
+        // Talents of the asked tree: the old ones go first, the build is walked until it says Ok (one walk per call). The level
+        // step below clears the mark, so new points are placed the same way.
+        static std::map<BotId, uint32> s_specDone;   // bot -> spec whose build was applied
+        uint32 const want = uint32(std::max<int32>(quest->GetClassicQuestLevel(), quest->GetClassicMinLevel()));
+        uint32 const cap = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+        bool const needsLevel = want > p->GetLevel() && want <= cap;
+        if (!needsLevel && specArg && *specArg && s_specDone[id] != *specArg)
+        {
+            if (Classic::GetSpecOverride(p->GetGUID()) != *specArg)
+            {
+                if (!Classic::SetSpecOverride(p, *specArg))
+                {
+                    // a chain runs through quests of every class on one bot: a spec of another class is simply not applied
+                    s_specDone[id] = *specArg;
+                    say("spec_skipped", fmt::format("{} is not a spec of this class, talents left as they are", *specArg));
+                    return true;
+                }
+                p->ResetTalents(true);
+            }
+            Result const r = API(p).apply_talent_build(0);
+            if (r != Result::Ok)
+            { say("spec_pending", fmt::format("override {} set, talent build result {}, run again", *specArg, int(r))); return false; }
+            s_specDone[id] = *specArg;
+            say("spec", fmt::format("override {} set, talents reset and the build applied", *specArg));
+            return true;
+        }
+
+        if (needsLevel)
+        {
+            p->GiveLevel(uint8(want));
+            p->InitTalentForLevel();
+            p->SetXP(0);
+            V2::Fleet::BotSetupPipeline::LearnLevelKit(p);
+            s_specDone.erase(id);   // the new points are placed by the spec step on the next call (gated on its result)
+            say("levelled", fmt::format("to {} (quest level {}, min {})", want, quest->GetClassicQuestLevel(), quest->GetClassicMinLevel()));
+            return true;
+        }
+
+        // Upkeep once per bot and quest: repair, bags, gear.
+        static std::set<std::pair<BotId, uint32>> s_prepared;
+        if (!s_prepared.count({ id, questId }))
+        {
+            p->DurabilityRepairAll(false, 0.f, false);
+            std::vector<std::pair<uint8, uint8>> slots;
+            p->ForEachItem(ItemSearchLocation::Inventory, [&](Item* item)
+            {
+                ItemTemplate const* tmpl = item->GetTemplate();
+                if (!item->IsBag() && tmpl && tmpl->GetClass() != ITEM_CLASS_QUEST)
+                    slots.emplace_back(item->GetBagSlot(), item->GetSlot());
+                return ItemSearchCallbackResult::Continue;
+            });
+            for (auto const& [bag, slot] : slots)
+                p->DestroyItem(bag, slot, true);
+            bool const regeared = Services::Population().RegearNow(p);
+            s_prepared.insert({ id, questId });
+            say("upkeep", fmt::format("repaired, {} bag items destroyed, regear changed items {}", slots.size(), int(regeared)));
+            return true;
+        }
+
+        if (p->GetMapId() != giver.where.GetMapId() || p->GetExactDist2d(giver.where.GetPositionX(), giver.where.GetPositionY()) > 40.f)
+        {
+            bool const ok = BotMovement::SafeTeleport(p, giver.where.GetMapId(), giver.where.GetPositionX(), giver.where.GetPositionY(), giver.where.GetPositionZ(), 0.f, 0);
+            say(ok ? "teleported" : "teleport_failed", fmt::format("to {} {} at map {} ({:.0f}, {:.0f}, {:.0f})", giver.go ? "object" : "creature", giver.entry,
+                giver.where.GetMapId(), giver.where.GetPositionX(), giver.where.GetPositionY(), giver.where.GetPositionZ()));
+            return ok;
+        }
+
+        // The bot's own travel runs it off the giver within seconds of the teleport (12 s between calls is 80 y of running), and
+        // quest talk needs 5 y: the giver is looked for within 250 y and the quest taken without the talk range. The test is
+        // about the quest, not the walk to its giver.
+        WorldObject* giverObj = nullptr;
+        if (giver.go)
+            giverObj = p->FindNearestGameObject(giver.entry, 250.f);
+        else
+            giverObj = p->FindNearestCreature(giver.entry, 250.f);
+        if (!giverObj)
+        { say("giver_not_here", fmt::format("{} {} not within 250 y (not spawned, or the grid is still loading: run again)", giver.go ? "object" : "creature", giver.entry)); return false; }
+        Result r = API(p).accept_quest(giverObj->GetGUID(), questId);
+        if (r == Result::OutOfRange && p->GetQuestStatus(questId) == QUEST_STATUS_NONE && p->CanTakeQuest(quest, false) && p->CanAddQuest(quest, false))
+        {
+            p->AddQuestAndCheckCompletion(quest, giverObj);
+            r = Result::Ok;
+        }
+        if (r == Result::Ok || p->GetQuestStatus(questId) != QUEST_STATUS_NONE)
+        { say("accepted", fmt::format("from {}", giver.entry)); return true; }
+        // which gate of CanTakeQuest refused, so the driver can act (run the previous quest first, level, skip a class quest)
+        std::string why;
+        if (!p->SatisfyQuestLevel(quest, false)) why += "level ";
+        if (!p->SatisfyQuestClass(quest, false)) why += "class ";
+        if (!p->SatisfyQuestRace(quest, false)) why += "race ";
+        if (!p->SatisfyQuestSkill(quest, false)) why += "skill ";
+        if (!p->SatisfyQuestReputation(quest, false)) why += "reputation ";
+        if (!p->SatisfyQuestPreviousQuest(quest, false)) why += fmt::format("prev={} ", quest->GetPrevQuestId());
+        if (!p->SatisfyQuestDependentQuests(quest, false)) why += "dependent ";
+        if (!p->SatisfyQuestBreadcrumbQuest(quest, false) || !p->SatisfyQuestDependentBreadcrumbQuests(quest, false)) why += "breadcrumb ";
+        if (!p->SatisfyQuestExclusiveGroup(quest, false)) why += "exclusive ";
+        if (!p->SatisfyQuestConditions(quest, false)) why += "conditions ";
+        if (!p->SatisfyQuestExpansion(quest, false)) why += "expansion ";
+        if (!p->SatisfyQuestLog(false)) why += "log_full ";
+        say("accept_refused", fmt::format("result {} gates: {}", int(r), why.empty() ? "none failed (see [accept_quest] reason=)" : why));
+        return false;
+    }
+
     static bool HandleLevel(ChatHandler* handler,
                             std::string const& target_name,
                             uint32 level)
@@ -3763,7 +4308,7 @@ public:
     }
 
     // .playerbot spellaudit
-    // Read-only: writes SpellAudit.tsv to the logs folder, one line per legacy spell (id < 1,000,000) with the numbers this server holds for it:
+    // Read-only: writes SpellAudit.tsv to the logs folder, one line per legacy spell (id < 1,400,000: the client's own and Forever's 12xxxxx ids) with the numbers this server holds for it:
     // cast time, cooldowns, duration, range, proc chance and charges, stack, levels, and per effect the type, aura, base points, the vanilla
     // classic_spell_value mean when one applies, per level points, misc value, tick period, trigger spell, chain targets and radius.
     // tools/classic_spell_values/compare_spells.py compares the file with the VMaNGOS spell_template and writes the coverage report.
@@ -3775,9 +4320,16 @@ public:
         if (!out)
         { handler->PSendSysMessage("spellaudit: cannot write %s", path.c_str()); return false; }
         out << Sa::Header() << '\n';
+        // SpellAuditRules.tsv: what makes a spell castable and what it costs (power rows of every type, aura states, required auras, equipped
+        // item, stances, attributes, cooldown category) plus the attack power / spell power coefficients of each effect.
+        std::ofstream rules(sLog->GetLogsDir() + "SpellAuditRules.tsv", std::ios::trunc);
+        if (rules)
+            rules << "id\tname\tpowers_type:cost:optional:pct:required_aura\tcaster_aura_state\ttarget_aura_state\tcaster_aura_spell\ttarget_aura_spell\tcaster_aura_not\ttarget_aura_not"
+                     "\tequipped_class\tequipped_subclass_mask\tstances\tstances_not\tcategory\tcharge_category\tattr0\tattr1\tattr2\tattr3\tattr4\tattr5\tattr6\tattr7\tattr8"
+                     "\te1_bonus\te1_bonus_ap\te2_bonus\te2_bonus_ap\te3_bonus\te3_bonus_ap\n";
         LocaleConstant const locale = sWorld->GetDefaultDbcLocale();
         uint32 written = 0;
-        for (uint32 id = 1; id < 1000000; ++id)
+        for (uint32 id = 1; id < 1400000; ++id)
         {
             SpellInfo const* info = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE);
             if (!info)
@@ -3831,9 +4383,1261 @@ public:
                 }
             }
             out << Sa::FormatLine(r) << '\n';
+            if (rules)
+            {
+                std::string powers;
+                for (SpellPowerEntry const* power : info->PowerCosts)
+                    if (power)
+                        powers += Trinity::StringFormat("{}{}:{}:{}:{:.1f}:{}", powers.empty() ? "" : ",", int32(power->PowerType), power->ManaCost, power->OptionalCost, power->PowerCostPct, power->RequiredAuraSpellID);
+                std::string name = r.name;
+                for (char& c : name)
+                    if (c == '\t' || c == '\n' || c == '\r')
+                        c = ' ';
+                std::string line = Trinity::StringFormat("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#x}\t{:#x}\t{}\t{}", id, name, powers, info->CasterAuraState, info->TargetAuraState,
+                    info->CasterAuraSpell, info->TargetAuraSpell, info->ExcludeCasterAuraSpell, info->ExcludeTargetAuraSpell, info->EquippedItemClass,
+                    info->EquippedItemSubClassMask, info->Stances, info->StancesNot, info->CategoryId, info->ChargeCategoryId);
+                line += Trinity::StringFormat("\t{:#x}\t{:#x}\t{:#x}\t{:#x}\t{:#x}\t{:#x}\t{:#x}\t{:#x}\t{:#x}", info->Attributes, info->AttributesEx, info->AttributesEx2,
+                    info->AttributesEx3, info->AttributesEx4, info->AttributesEx5, info->AttributesEx6, info->AttributesEx7, info->AttributesEx8);
+                for (size_t i = 0; i < 3; ++i)
+                    line += i < effects.size() ? Trinity::StringFormat("\t{:.4f}\t{:.4f}", effects[i].BonusCoefficient, effects[i].BonusCoefficientFromAP) : std::string("\t0\t0");
+                rules << line << '\n';
+            }
             ++written;
         }
         handler->PSendSysMessage("spellaudit: %u spells written to %s", written, path.c_str());
+        return true;
+    }
+
+    // .playerbot spellcheck [@Player] [class id]
+    // Read-only, no cast. For every spell a class trainer teaches that is also a vanilla spell (Diagnostics/SpellCheckExpected.inc, generated from the VMaNGOS 1.12
+    // spell table by tools/classic_spell_values/gen_spellcheck_expected.py) the vanilla value formula is evaluated at the caster's level and compared with what the
+    // core computes for the same effect (SpellEffectInfo::CalcValue, which includes the classic_spell_value rows). One line per effect in SpellCheck.tsv of the logs
+    // folder: PASS, WRONG (amount differs), LAYOUT (the client builds the effect from another effect or aura, so the amounts are not comparable) or UNTESTED (the
+    // spell or effect is not in this server's spell store). The caster is the GM's own character, or the player named by "@Name" (from the console).
+    static bool HandleSpellCheck(ChatHandler* handler, Tail args)
+    {
+        namespace Sc = Playerbot::Diagnostics::SpellCheck;
+        Player* caster = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        uint32 onlyClass = 0;
+        for (std::string_view token : Trinity::Tokenize(std::string_view(args), ' ', false))
+        {
+            if (!token.empty() && token[0] == '@')
+            {
+                caster = ObjectAccessor::FindPlayerByName(token.substr(1));
+                continue;
+            }
+            if (Optional<uint32> id = Trinity::StringTo<uint32>(token))
+                onlyClass = *id;
+        }
+        if (!caster)
+        {
+            handler->PSendSysMessage("spellcheck: no player to use as the caster (give @Name from the console)");
+            return false;
+        }
+        std::string const path = sLog->GetLogsDir() + "SpellCheck.tsv";
+        std::ofstream out(path, std::ios::trunc);
+        if (!out)
+        { handler->PSendSysMessage("spellcheck: cannot write %s", path.c_str()); return false; }
+        out << "class\tspell\tname\teffect_index\teffect\taura\tverdict\texpected\tgot\tnote\n";
+        LocaleConstant const locale = sWorld->GetDefaultDbcLocale();
+        int32 const casterLevel = caster->GetLevel();
+        uint32 pass = 0, wrong = 0, layout = 0, missing = 0;
+        for (Sc::Expected const& e : Sc::kExpected)
+        {
+            if (onlyClass && e.cls != onlyClass)
+                continue;
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(e.spell, DIFFICULTY_NONE);
+            std::string verdict, note;
+            double expected = 0.0, got = 0.0;
+            if (!info || e.effectIndex >= info->GetEffects().size())
+            {
+                verdict = "UNTESTED";
+                note = "spell or effect not in this server's spell store";
+                ++missing;
+            }
+            else
+            {
+                SpellEffectInfo const& effect = info->GetEffect(SpellEffIndex(e.effectIndex));
+                expected = Sc::VanillaRange(e, casterLevel).mean;
+                if (uint32(effect.Effect) != uint32(e.effect) || uint32(effect.ApplyAuraName) != uint32(e.aura))
+                {
+                    verdict = "LAYOUT";
+                    note = Trinity::StringFormat("client effect {} aura {} against vanilla effect {} aura {}", uint32(effect.Effect), uint32(effect.ApplyAuraName), uint32(e.effect), uint32(e.aura));
+                    ++layout;
+                }
+                else
+                {
+                    // the die makes CalcValue random: the mean of many calls
+                    for (uint32 i = 0; i < 64; ++i)
+                        got += double(effect.CalcValue(caster));
+                    got /= 64.0;
+                    if (std::fabs(got - expected) <= std::max(1.5, 0.03 * std::fabs(expected)))
+                    {
+                        verdict = "PASS";
+                        ++pass;
+                    }
+                    else
+                    {
+                        verdict = "WRONG";
+                        ++wrong;
+                    }
+                }
+            }
+            std::string name = info && info->SpellName ? std::string((*info->SpellName)[locale]) : std::string();
+            for (char& c : name)
+                if (c == '\t' || c == '\n' || c == '\r')
+                    c = ' ';
+            out << Trinity::StringFormat("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2f}\t{:.2f}\t{}\n", uint32(e.cls), e.spell, name, uint32(e.effectIndex), uint32(e.effect), uint32(e.aura),
+                verdict, expected, got, note);
+        }
+        handler->PSendSysMessage("spellcheck: caster %s level %d: %u PASS, %u WRONG, %u LAYOUT, %u UNTESTED; lines in %s", caster->GetName().c_str(), casterLevel, pass, wrong, layout, missing, path.c_str());
+        return true;
+    }
+
+    // .playerbot talentwalk <Name> [<Name> ...]
+    // One talent walk (API::apply_classic_talents) for each named player in the world, timed: the milliseconds the world thread spends and the result. A bot
+    // whose walk is cached or held back by the duty cycle answers in 0 ms with Ok or Locked. 170 froze when about 60 bots logged in and each walk took seconds;
+    // run this from the console on freshly logged-in bots (.playerbot login) to see the cost without a client.
+    static bool HandleTalentWalk(ChatHandler* handler, Tail args)
+    {
+        uint32 walked = 0, total_ms = 0, worst_ms = 0;
+        for (std::string_view name : Trinity::Tokenize(std::string_view(args), ' ', false))
+        {
+            Player* p = ObjectAccessor::FindPlayerByName(name);
+            if (!p || !p->IsInWorld())
+            {
+                handler->PSendSysMessage("talentwalk: %s is not in the world", std::string(name).c_str());
+                continue;
+            }
+            uint32 const start = getMSTime();
+            Playerbot::Result const r = Playerbot::API(p).apply_classic_talents();
+            uint32 const ms = getMSTimeDiff(start, getMSTime());
+            ++walked;
+            total_ms += ms;
+            worst_ms = std::max(worst_ms, ms);
+            handler->PSendSysMessage("talentwalk: %s L%u result %u in %u ms", p->GetName().c_str(), uint32(p->GetLevel()), uint32(r), ms);
+        }
+        handler->PSendSysMessage("talentwalk: %u walked, %u ms in all, worst %u ms", walked, total_ms, worst_ms);
+        return walked > 0;
+    }
+
+    // .playerbot auracheck [@Player] [class id]
+    // For every aura effect of the vanilla spells a class trainer teaches whose amount is a plain number (stat, attack power, armor, crit and hit, speed, healing and
+    // damage done, absorb, periodic damage and heal), the caster gets the real aura on itself (Unit::AddAura: the aura effect's own CalculateAmount, with the
+    // caster's level), the amount of the effect is read and compared with the lowest and highest roll of the VMaNGOS value (SpellCheckExpected.h), and the aura is removed
+    // again in the same call, so no tick or expiry runs. Absorb, periodic damage and periodic heal amounts also carry spell and healing power: they only have to reach
+    // the vanilla minimum. Rows in AuraCheck.tsv of the logs folder: PASS, WRONG (amount outside the range, or no aura came up), LAYOUT (the client effect carries
+    // another aura type). Use a level 60 character without talents and with no spell power in the gear for clean numbers.
+    static bool HandleAuraCheck(ChatHandler* handler, Tail args)
+    {
+        namespace Sc = Playerbot::Diagnostics::SpellCheck;
+        Player* caster = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        uint32 onlyClass = 0;
+        for (std::string_view token : Trinity::Tokenize(std::string_view(args), ' ', false))
+        {
+            if (!token.empty() && token[0] == '@')
+            {
+                caster = ObjectAccessor::FindPlayerByName(token.substr(1));
+                continue;
+            }
+            if (Optional<uint32> id = Trinity::StringTo<uint32>(token))
+                onlyClass = *id;
+        }
+        if (!caster || !caster->IsInWorld())
+        {
+            handler->PSendSysMessage("auracheck: no player in the world to use as the caster (give @Name from the console)");
+            return false;
+        }
+        std::string const path = sLog->GetLogsDir() + "AuraCheck.tsv";
+        std::ofstream out(path, std::ios::trunc);
+        if (!out)
+        { handler->PSendSysMessage("auracheck: cannot write %s", path.c_str()); return false; }
+        out << "class\tspell\tname\teffect_index\taura\tverdict\tvanilla_min\tvanilla_max\tgot\tnote\n";
+        LocaleConstant const locale = sWorld->GetDefaultDbcLocale();
+        int32 const casterLevel = caster->GetLevel();
+        uint32 pass = 0, wrong = 0, layout = 0, spells = 0;
+        uint32 lastSpell = 0;
+        Aura* aura = nullptr;
+        for (Sc::Expected const& e : Sc::kExpected)
+        {
+            if (onlyClass && e.cls != onlyClass)
+                continue;
+            switch (e.aura)
+            {
+                case 3: case 8: case 13: case 22: case 24: case 29: case 31: case 33: case 34: case 52: case 53: case 54: case 55: case 57: case 69: case 71:
+                case 79: case 85: case 87: case 99: case 101: case 107: case 108: case 124: case 134: case 135: case 136: case 137:
+                    break;
+                default:
+                    continue;
+            }
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(e.spell, DIFFICULTY_NONE);
+            if (e.spell != lastSpell)
+            {
+                if (lastSpell)
+                    caster->RemoveAurasDueToSpell(lastSpell);
+                lastSpell = e.spell;
+                aura = nullptr;
+                if (info)
+                {
+                    caster->RemoveAurasDueToSpell(e.spell);
+                    aura = caster->AddAura(e.spell, caster);
+                    ++spells;
+                }
+            }
+            std::string verdict, note;
+            Sc::Range const range = Sc::VanillaRange(e, casterLevel);
+            double const lo = std::min(range.lo, range.hi), hi = std::max(range.lo, range.hi);
+            double got = 0.0;
+            if (!info)
+            {
+                verdict = "LAYOUT";
+                note = "spell not in this server's spell store";
+                ++layout;
+            }
+            else if (!aura)
+            {
+                verdict = "WRONG";
+                note = "no aura came up on the caster (immune, restricted or removed by a script)";
+                ++wrong;
+            }
+            else if (AuraEffect const* effect = aura->GetEffect(e.effectIndex); !effect)
+            {
+                verdict = "LAYOUT";
+                note = "the client spell has no such aura effect";
+                ++layout;
+            }
+            else if (uint32(effect->GetAuraType()) != uint32(e.aura))
+            {
+                verdict = "LAYOUT";
+                note = Trinity::StringFormat("client aura {} against vanilla aura {}", uint32(effect->GetAuraType()), uint32(e.aura));
+                ++layout;
+            }
+            else
+            {
+                got = double(effect->GetAmount());
+                double const tolerance = std::max(1.0, 0.02 * std::fabs(range.mean));
+                bool const lowerBoundOnly = e.aura == 3 || e.aura == 8 || e.aura == 53 || e.aura == 69;
+                bool const ok = lowerBoundOnly ? got >= lo - tolerance : (got >= lo - tolerance && got <= hi + tolerance);
+                verdict = ok ? "PASS" : "WRONG";
+                if (lowerBoundOnly)
+                    note = "minimum only (spell power adds)";
+                if (ok)
+                    ++pass;
+                else
+                    ++wrong;
+            }
+            std::string name = info && info->SpellName ? std::string((*info->SpellName)[locale]) : std::string();
+            for (char& c : name)
+                if (c == '\t' || c == '\n' || c == '\r')
+                    c = ' ';
+            out << Trinity::StringFormat("{}\t{}\t{}\t{}\t{}\t{}\t{:.2f}\t{:.2f}\t{:.2f}\t{}\n", uint32(e.cls), e.spell, name, uint32(e.effectIndex), uint32(e.aura), verdict, lo, hi, got, note);
+        }
+        if (lastSpell)
+            caster->RemoveAurasDueToSpell(lastSpell);
+        handler->PSendSysMessage("auracheck: caster %s level %d, %u spells: %u PASS, %u WRONG, %u LAYOUT; lines in %s", caster->GetName().c_str(), casterLevel, spells, pass, wrong, layout, path.c_str());
+        return true;
+    }
+
+    // .playerbot traitcheck [@Player]
+    // Every learned spell that came from a trait node: its definition, rank, and for each effect the trait gives a curve for, the curve's value at
+    // that rank against what the spell effect (or the live aura) really has. Writes TraitCheck.tsv. A WRONG row is a rank the amounts do not follow.
+    static bool HandleTraitCheck(ChatHandler* handler, Tail args)
+    {
+        Player* p = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        for (std::string_view token : Trinity::Tokenize(std::string_view(args), ' ', false))
+            if (!token.empty() && token[0] == '@')
+                p = ObjectAccessor::FindPlayerByName(token.substr(1));
+        if (!p || !p->IsInWorld())
+        {
+            handler->PSendSysMessage("traitcheck: %s (give @Name from the console)", !p ? "no such online player" : "the player is not in the world");
+            return false;
+        }
+        std::string const path = sLog->GetLogsDir() + "TraitCheck.tsv";
+        std::ofstream out(path, std::ios::trunc);
+        if (!out)
+        { handler->PSendSysMessage("traitcheck: cannot write %s", path.c_str()); return false; }
+        out << "spell\tname\tdefinition\trank\teffect\tcurve\toperation\tcurve_value\tlive\tverdict\tnote\n";
+        LocaleConstant const locale = sWorld->GetDefaultDbcLocale();
+        uint32 traitSpells = 0, rows = 0, ok = 0, wrong = 0;
+        // trait ranks the active config holds against the spells that carry them
+        uint32 configRanks = 0;
+        if (UF::TraitConfig const* cfg = p->GetTraitConfig(p->m_activePlayerData->ActiveCombatTraitConfigID))
+            for (UF::TraitEntry const& e : cfg->Entries)
+                if (e.Rank + e.GrantedRanks > 0)
+                    ++configRanks;
+        if (UF::TraitConfig const* cfg = p->GetTraitConfig(p->m_activePlayerData->ActiveCombatTraitConfigID))
+            for (UF::TraitEntry const& e : cfg->Entries)
+            {
+                if (e.Rank + e.GrantedRanks <= 0)
+                    continue;
+                TraitNodeEntryEntry const* nodeEntry = sTraitNodeEntryStore.LookupEntry(e.TraitNodeEntryID);
+                TraitDefinitionEntry const* definition = nodeEntry ? sTraitDefinitionStore.LookupEntry(nodeEntry->TraitDefinitionID) : nullptr;
+                if (!definition)
+                {
+                    out << Trinity::StringFormat("0\t\t0\t{}\t-\t-\t-\t0\t0\tUNLEARNED\tconfig entry {} has no trait definition\n", int32(e.Rank), e.TraitNodeEntryID);
+                    continue;
+                }
+                PlayerSpell const* learned = definition->SpellID ? Trinity::Containers::MapGetValuePtr(p->GetSpellMap(), uint32(definition->SpellID)) : nullptr;
+                if (!learned || !learned->Trait)
+                {
+                    SpellInfo const* di = definition->SpellID ? sSpellMgr->GetSpellInfo(definition->SpellID, DIFFICULTY_NONE) : nullptr;
+                    std::string dname = di && di->SpellName ? std::string((*di->SpellName)[locale]) : std::string();
+                    out << Trinity::StringFormat("{}\t{}\t{}\t{}\t-\t-\t-\t0\t0\tUNLEARNED\t{}\n", definition->SpellID, dname, nodeEntry->TraitDefinitionID, int32(e.Rank),
+                                                 !definition->SpellID ? "the trait definition grants no spell" : !learned ? "the spell is not in the character's spell map" : "the spell is known but carries no trait link");
+                }
+            }
+        for (auto const& [id, ps] : p->GetSpellMap())
+        {
+            if (ps.state == PLAYERSPELL_REMOVED || !ps.Trait)
+                continue;
+            ++traitSpells;
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE);
+            std::vector<TraitDefinitionEffectPointsEntry const*> const* points = TraitMgr::GetTraitDefinitionEffectPointModifiers(ps.Trait->DefinitionId);
+            if (!info || !points)
+                continue;
+            std::string name = info->SpellName ? std::string((*info->SpellName)[locale]) : std::string();
+            for (char& c : name)
+                if (c == '\t' || c == '\n' || c == '\r')
+                    c = ' ';
+            Aura const* aura = p->GetAura(id);
+            for (TraitDefinitionEffectPointsEntry const* point : *points)
+            {
+                float const curve = sDB2Manager.GetCurveValueAt(point->CurveID, float(int32(ps.Trait->Rank)));
+                double live = 0.0;
+                std::string note;
+                if (aura && aura->GetEffect(uint8(point->EffectIndex)))
+                    live = aura->GetEffect(uint8(point->EffectIndex))->GetAmount();
+                else if (point->EffectIndex < 0 || size_t(point->EffectIndex) >= info->GetEffects().size())
+                    note = "DATA: trait points name effect index " + std::to_string(point->EffectIndex) + " the spell does not have";
+                else
+                {
+                    live = info->GetEffect(SpellEffIndex(point->EffectIndex)).CalcValue(p);
+                    note = aura ? "no aura effect at this index: spell effect value" : "no aura on the character: spell effect value";
+                }
+                std::string verdict;
+                if (point->GetOperationType() == TraitPointsOperationType::Set)
+                    verdict = std::fabs(live - curve) <= 0.51 ? "PASS" : "WRONG";
+                else
+                {
+                    verdict = "UNJUDGED";
+                    note += (note.empty() ? "" : "; ") + std::string("multiply or none: no base to compare");
+                }
+                ++rows;
+                if (verdict == "PASS")
+                    ++ok;
+                else if (verdict == "WRONG")
+                    ++wrong;
+                out << Trinity::StringFormat("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2f}\t{:.2f}\t{}\t{}\n", id, name, int32(ps.Trait->DefinitionId), int32(ps.Trait->Rank), int32(point->EffectIndex),
+                                             int32(point->CurveID), int32(point->OperationType), curve, live, verdict, note);
+            }
+        }
+        handler->PSendSysMessage("traitcheck: %s: %u trait-learned spells for %u config entries with ranks; %u curve rows: %u PASS, %u WRONG; lines in %s", p->GetName().c_str(), traitSpells, configRanks, rows, ok, wrong, path.c_str());
+        return true;
+    }
+
+    // .playerbot proccheck [@Player] [spell id...]
+    // Does a proc talent fire? For each proc spell (the ids given, or every spell of the character with a spell_proc row) the aura is put on the
+    // character and the proc row is tried against events built from the character's own spells: the static answer is
+    // SpellMgr::CanSpellTriggerProcOnEvent (does the row's family mask and school match any spell the class casts), the dynamic one is 200 events
+    // through Unit::ProcSkillsAndAuras, counting how often the triggered spell, a power gain or damage shows up. Writes ProcCheck.tsv.
+    static bool HandleProcCheck(ChatHandler* handler, Tail args)
+    {
+        Player* p = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        std::vector<uint32> ids;
+        for (std::string_view token : Trinity::Tokenize(std::string_view(args), ' ', false))
+        {
+            if (!token.empty() && token[0] == '@')
+            {
+                p = ObjectAccessor::FindPlayerByName(token.substr(1));
+                continue;
+            }
+            if (Optional<uint32> id = Trinity::StringTo<uint32>(token))
+                ids.push_back(*id);
+        }
+        if (!p || !p->IsInWorld() || !p->IsAlive())
+        {
+            handler->PSendSysMessage("proccheck: %s (give @Name from the console)", !p ? "no such online player: a name that is not logged in is not found" :
+                                     !p->IsInWorld() ? "the player is not in the world (loading, teleporting or logged out)" : "the player is dead or a ghost");
+            return false;
+        }
+        if (ids.empty())
+            for (auto const& [id, ps] : p->GetSpellMap())
+                if (ps.state != PLAYERSPELL_REMOVED && !ps.disabled)
+                    if (SpellInfo const* si = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE))
+                        if (si->IsPassive() && sSpellMgr->GetSpellProcEntry(si))
+                            ids.push_back(id);
+        std::string error;
+        Creature* d = Playerbot::Diagnostics::Parity::SpawnProcDummy(p, 2.5f, error);   // in melee reach: a creature moved by NearTeleportTo only arrives at the next map update
+        if (!d)
+        {
+            handler->PSendSysMessage("proccheck: no dummy: %s", error.c_str());
+            return false;
+        }
+        std::string const path = sLog->GetLogsDir() + "ProcCheck.tsv";
+        std::ofstream out(path, std::ios::trunc);
+        if (!out)
+        {
+            d->DespawnOrUnsummon();
+            handler->PSendSysMessage("proccheck: cannot write %s", path.c_str());
+            return false;
+        }
+        out << "spell\tname\tverdict\tevent_spells\taccepted_by\tevents\tfired\texpected_chance\ttrigger\tnote\trow\n";
+        LocaleConstant const locale = sWorld->GetDefaultDbcLocale();
+        constexpr int kEvents = 200;
+        uint32 pass = 0, bad = 0, other = 0;
+        for (uint32 id : ids)
+        {
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE);
+            std::string verdict, note;
+            std::string accepted, row;
+            uint32 candidateCount = 0, fired = 0, events = 0, trig = 0;
+            float expected = 0.f;
+            SpellProcEntry const* entry = info ? sSpellMgr->GetSpellProcEntry(info) : nullptr;
+            if (!info)
+                verdict = "NO_SPELL";
+            else if (!entry)
+            {
+                verdict = "NO_PROC_ROW";
+                row = Trinity::StringFormat("spell proc flags 0x{:x}/0x{:x}, passive {}, effects", uint32(info->ProcFlags[0]), uint32(info->ProcFlags[1]), info->IsPassive());
+                for (SpellEffectInfo const& e : info->GetEffects())
+                    if (e.IsEffect())
+                        row += Trinity::StringFormat(" [{}/{} trigger {}]", uint32(e.Effect), uint32(e.ApplyAuraName), e.TriggerSpell);
+            }
+            else
+            {
+                row = Trinity::StringFormat("flags 0x{:x}/0x{:x} family {} mask 0x{:x}/0x{:x}/0x{:x}/0x{:x} school 0x{:x} type 0x{:x} phase 0x{:x} hit 0x{:x} attr 0x{:x} chance {} ppm {} cd {} ms charges {}",
+                                            uint32(entry->ProcFlags[0]), uint32(entry->ProcFlags[1]), entry->SpellFamilyName, entry->SpellFamilyMask[0], entry->SpellFamilyMask[1],
+                                            entry->SpellFamilyMask[2], entry->SpellFamilyMask[3], entry->SchoolMask, uint32(entry->SpellTypeMask), uint32(entry->SpellPhaseMask),
+                                            uint32(entry->HitMask), uint32(entry->AttributesMask), entry->Chance, entry->ProcsPerMinute, entry->Cooldown.count(), entry->Charges);
+                bool const added = !p->HasAura(id);
+                if (added)
+                    p->AddAura(id, p);
+                if (!p->HasAura(id))
+                    verdict = "NO_AURA";
+                else
+                {
+                    for (SpellEffectInfo const& e : info->GetEffects())
+                        if (!trig && e.TriggerSpell)
+                            trig = e.TriggerSpell;
+                    // the amounts the aura really has on this character (a ranked talent's amounts come from its trait node, not the spell row)
+                    if (Optional<PlayerSpellTrait> trait = p->GetTraitInfoForSpell(id))
+                    {
+                        row += Trinity::StringFormat(" | trait definition {} rank {}", int32(trait->DefinitionId), int32(trait->Rank));
+                        if (std::vector<TraitDefinitionEffectPointsEntry const*> const* points = TraitMgr::GetTraitDefinitionEffectPointModifiers(trait->DefinitionId))
+                            for (TraitDefinitionEffectPointsEntry const* point : *points)
+                                row += Trinity::StringFormat(" curve{}:{}={}", int32(point->EffectIndex), int32(point->CurveID), sDB2Manager.GetCurveValueAt(point->CurveID, float(int32(trait->Rank))));
+                    }
+                    else
+                        row += " | no trait info for this spell (amounts are the spell row's)";
+                    if (Aura const* live = p->GetAura(id))
+                    {
+                        row += " | aura amounts";
+                        for (AuraEffect const* eff : live->GetAuraEffects())
+                            if (eff)
+                                row += Trinity::StringFormat(" e{}={}", uint32(eff->GetEffIndex()), eff->GetAmount());
+                    }
+                    expected = entry->Chance > 0.f ? entry->Chance : float(info->ProcChance);
+                    if (expected > 100.f)
+                        expected = 100.f;
+                    // the spells the class casts that this row's mask covers (one per spell family member, first rank), or one plain event
+                    std::vector<SpellInfo const*> candidates;
+                    if (entry->SpellFamilyName == 0 && !entry->SpellFamilyMask)
+                        candidates.push_back(nullptr);
+                    else
+                    {
+                        std::set<uint32> firstRanks;
+                        for (auto const& [sid, ps] : p->GetSpellMap())
+                        {
+                            if (ps.state == PLAYERSPELL_REMOVED || ps.disabled || candidates.size() >= 6)
+                                continue;
+                            SpellInfo const* si = sSpellMgr->GetSpellInfo(sid, DIFFICULTY_NONE);
+                            if (!si || si->IsPassive() || !si->IsAffected(entry->SpellFamilyName, entry->SpellFamilyMask))
+                                continue;
+                            if (firstRanks.insert(si->GetFirstRankSpell()->Id).second)
+                                candidates.push_back(si);
+                        }
+                    }
+                    candidateCount = uint32(candidates.size());
+                    bool const taken = bool(entry->ProcFlags & TAKEN_HIT_PROC_FLAG_MASK);
+                    ProcFlagsSpellType const spellType = entry->SpellTypeMask ? entry->SpellTypeMask : PROC_SPELL_TYPE_DAMAGE;
+                    ProcFlagsSpellPhase const phase = entry->SpellPhaseMask ? entry->SpellPhaseMask : PROC_SPELL_PHASE_HIT;
+                    ProcFlagsHit const hit = entry->HitMask ? entry->HitMask : (taken ? PROC_HIT_NORMAL : PROC_HIT_NORMAL);
+                    Unit* attacker = taken ? static_cast<Unit*>(d) : static_cast<Unit*>(p);
+                    Unit* victim = taken ? static_cast<Unit*>(p) : static_cast<Unit*>(d);
+                    SpellInfo const* usable = nullptr;
+                    for (SpellInfo const* si : candidates)
+                    {
+                        SpellSchoolMask const school = si ? si->GetSchoolMask() : (entry->SchoolMask ? SpellSchoolMask(entry->SchoolMask) : SPELL_SCHOOL_MASK_NORMAL);
+                        DamageInfo dmg(attacker, victim, 100, si, school, SPELL_DIRECT_DAMAGE, BASE_ATTACK);
+                        ProcEventInfo ev(attacker, victim, entry->ProcFlags, spellType, phase, hit, nullptr, &dmg, nullptr);
+                        if (sSpellMgr->CanSpellTriggerProcOnEvent(*entry, ev))
+                        {
+                            accepted += (accepted.empty() ? "" : ",") + (si ? std::to_string(si->Id) : std::string("melee"));
+                            if (!usable)
+                                usable = si;
+                        }
+                    }
+                    if (accepted.empty())
+                        verdict = "STATIC_REJECT";
+                    else if (!trig)
+                        verdict = "STATIC_OK";
+                    else
+                    {
+                        Powers const power = p->GetPowerType();
+                        for (int i = 0; i < kEvents; ++i)
+                        {
+                            p->RemoveAurasDueToSpell(id);
+                            p->AddAura(id, p);
+                            p->RemoveAurasDueToSpell(trig);
+                            d->RemoveAurasDueToSpell(trig);
+                            d->SetFullHealth();
+                            uint32 const hp = d->GetHealth();
+                            p->SetPower(power, 0);
+                            p->SetPower(POWER_COMBO_POINTS, 0);
+                            SpellSchoolMask const school = usable ? usable->GetSchoolMask() : (entry->SchoolMask ? SpellSchoolMask(entry->SchoolMask) : SPELL_SCHOOL_MASK_NORMAL);
+                            DamageInfo dmg(attacker, victim, 100, usable, school, SPELL_DIRECT_DAMAGE, BASE_ATTACK);
+                            Unit::ProcSkillsAndAuras(attacker, victim, taken ? ProcFlagsInit(PROC_FLAG_NONE) : entry->ProcFlags, taken ? entry->ProcFlags : ProcFlagsInit(PROC_FLAG_NONE),
+                                                     spellType, phase, hit, nullptr, &dmg, nullptr);
+                            ++events;
+                            if (p->HasAura(trig) || d->HasAura(trig) || d->GetHealth() < hp || p->GetPower(power) > 0 || p->GetPower(POWER_COMBO_POINTS) > 0)
+                                ++fired;
+                        }
+                        if (entry->ProcsPerMinute > 0.f)
+                        {
+                            verdict = fired ? "PASS" : "NO_FIRE";
+                            note = "procs per minute: rate not compared";
+                        }
+                        else
+                        {
+                            double const prob = expected / 100.0;
+                            double const sigma = std::sqrt(events * prob * (1.0 - prob));
+                            double const diff = std::fabs(double(fired) - events * prob);
+                            bool const ok = fired > 0 || prob < 0.02;
+                            // a strike or spell that triggered can still miss, dodge or parry against the level 63 dummy: a high chance proc may fall
+                            // short by up to 15 % without the proc being at fault
+                            bool const shortByMiss = prob >= 0.9 && double(fired) >= 0.85 * events * prob && double(fired) <= events * prob;
+                            verdict = !ok ? "NO_FIRE" : (diff > 4.0 * sigma + 2.0 && !shortByMiss ? "RATE_OFF" : "PASS");
+                            if (shortByMiss && diff > 4.0 * sigma + 2.0)
+                                note += (note.empty() ? "" : "; ") + std::string("fired less often than the chance: the triggered strike can miss, dodge or parry");
+                            if (entry->Cooldown.count())
+                                note = "internal cooldown reset per event";
+                        }
+                        // Injected events carry no Spell object, so a proc that reads the cast (a finisher's combo cost) can never fire from them:
+                        // cast the spell that the row accepted for real, ten times, five combo points and full power each time.
+                        if (verdict == "NO_FIRE" && usable)
+                        {
+                            uint32 casts = 0, signals = 0;
+                            int lastResult = -1;
+                            for (int i = 0; i < 10; ++i)
+                            {
+                                p->GetSpellHistory()->ResetAllCooldowns();
+                                // the row's internal cooldown (500 ms) would block back-to-back test casts made in one tick, and resetting it on the live aura
+                                // did not take effect: a freshly applied aura starts with no cooldown, as the injected-event loop above already relies on
+                                p->RemoveAurasDueToSpell(id);
+                                p->AddAura(id, p);
+                                p->GetSpellHistory()->CancelGlobalCooldown(usable);   // ResetAllCooldowns leaves the global cooldown: the second cast is NOT_READY (91)
+                                p->SetPower(power, p->GetMaxPower(power));
+                                p->SetPower(POWER_COMBO_POINTS, 5);
+                                p->RemoveAurasDueToSpell(trig);
+                                d->RemoveAurasDueToSpell(trig);
+                                p->SetFacingToObject(d);
+                                int32 const pointsBefore = p->GetPower(POWER_COMBO_POINTS);
+                                SpellCastResult const r = p->CastSpell(d, usable->Id, CastSpellExtraArgs(TRIGGERED_NONE));
+                                lastResult = int(r);
+                                note += Trinity::StringFormat("{}cast {}: result {}, points {} -> {}, talent aura {}, trigger aura on self {} / target {}, spell on target {}", note.empty() ? "" : "; ", i,
+                                    int(r), pointsBefore, p->GetPower(POWER_COMBO_POINTS), p->HasAura(id), p->HasAura(trig), d->HasAura(trig), d->HasAura(usable->Id));
+                                if (r == SPELL_CAST_OK)
+                                    ++casts;
+                                if (r == SPELL_CAST_OK && (p->GetPower(POWER_COMBO_POINTS) > 0 || p->HasAura(trig) || d->HasAura(trig)))
+                                    ++signals;   // a refused cast leaves the five points set and shows nothing
+                            }
+                            note += Trinity::StringFormat("{}real casts of {}: {} accepted, {} showed the effect, last result {}", note.empty() ? "" : "; ", usable->Id, casts, signals, lastResult);
+                            if (signals)
+                                verdict = "PASS";
+                        }
+                        if (Player const* rogue = p; rogue->GetClass() == CLASS_ROGUE)
+                            note += Trinity::StringFormat("{}off-hand weapon: {}", note.empty() ? "" : "; ", rogue->GetWeaponForAttack(OFF_ATTACK, true) ? "yes" : "NO");
+                    }
+                }
+                p->RemoveAurasDueToSpell(trig);
+                d->RemoveAurasDueToSpell(trig);
+                if (added)
+                    p->RemoveAurasDueToSpell(id);
+            }
+            if (verdict == "PASS" || verdict == "STATIC_OK")
+                ++pass;
+            else if (verdict == "NO_PROC_ROW" || verdict == "NO_SPELL" || verdict == "NO_AURA")
+                ++other;
+            else
+                ++bad;
+            std::string name = info && info->SpellName ? std::string((*info->SpellName)[locale]) : std::string();
+            for (char& c : name)
+                if (c == '\t' || c == '\n' || c == '\r')
+                    c = ' ';
+            out << Trinity::StringFormat("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1f}\t{}\t{}\t{}\n", id, name, verdict, candidateCount, accepted, events, fired, expected, trig, note, row);
+        }
+        d->DespawnOrUnsummon();
+        handler->PSendSysMessage("proccheck: %s, %zu spells: %u PASS/STATIC_OK, %u failing, %u not testable; lines in %s", p->GetName().c_str(), ids.size(), pass, bad, other, path.c_str());
+        return true;
+    }
+
+    // .playerbot learncheck [@Player]
+    // Read-only. `.learn my trainer` teaches every client SkillLineAbility spell of the class family (SpellLevel above 0, valid for the player),
+    // whether or not a trainer sells it. This lists the ones the player does not know, with whether any trainer row of the class teaches the spell,
+    // so spells that only that command gives (and bots never learn) stand out. Writes LearnCheck.tsv; nothing is learned.
+    static bool HandleLearnCheck(ChatHandler* handler, Tail args)
+    {
+        Player* p = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        for (std::string_view token : Trinity::Tokenize(std::string_view(args), ' ', false))
+            if (!token.empty() && token[0] == '@')
+                p = ObjectAccessor::FindPlayerByName(token.substr(1));
+        if (!p || !p->IsInWorld())
+        {
+            handler->PSendSysMessage("learncheck: give @Name of an online player");
+            return false;
+        }
+        ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(p->GetClass());
+        if (!classEntry)
+            return false;
+        std::unordered_set<uint32> taught;
+        for (auto const& [trainerId, trainer] : sObjectMgr->GetTrainers())
+            if (trainer.GetClassMask() & p->GetClassMask())
+                for (Trainer::Spell const& ts : trainer.GetSpells())
+                    taught.insert(ts.SpellId);
+        std::string const path = sLog->GetLogsDir() + "LearnCheck.tsv";
+        std::ofstream out(path, std::ios::trunc);
+        if (!out)
+        {
+            handler->PSendSysMessage("learncheck: cannot write %s", path.c_str());
+            return false;
+        }
+        out << "spell\tname\tspell_level\tbase_level\tpassive\ttrainer_teaches\tknown\tskill_line\tgives_ranks_of\twhy_the_free_pass_skips_it\n";
+        LocaleConstant const locale = sWorld->GetDefaultDbcLocale();
+        uint32 listed = 0, notTrainer = 0, alreadyKnown = 0;
+        std::unordered_set<uint32> seen;
+        for (SkillLineAbilityEntry const* entry : sSkillLineAbilityStore)
+        {
+            if (!entry || !seen.insert(entry->Spell).second)
+                continue;
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(entry->Spell, DIFFICULTY_NONE);
+            if (!info || info->SpellLevel == 0 || info->SpellFamilyName != classEntry->SpellClassSet)
+                continue;
+            if (!p->IsSpellFitByClassAndRace(info->Id) || !SpellMgr::IsSpellValid(info, p, false))
+                continue;
+            bool const known = p->HasSpell(info->Id);
+            if (known)
+            {
+                ++alreadyKnown;
+                continue;
+            }
+            bool const byTrainer = taught.count(info->Id) != 0;
+            if (!byTrainer)
+                ++notTrainer;
+            ++listed;
+            std::string name = info->SpellName ? std::string((*info->SpellName)[locale]) : std::string();
+            for (char& c : name)
+                if (c == '\t' || c == '\n' || c == '\r')
+                    c = ' ';
+            std::string why;
+            if (byTrainer)
+                for (auto const& [trainerId, trainer] : sObjectMgr->GetTrainers())
+                    if (trainer.GetType() != Trainer::Type::Tradeskill && trainer.GetType() != Trainer::Type::Pet)
+                        for (Trainer::Spell const& ts : trainer.GetSpells())
+                            if (ts.SpellId == info->Id && why.empty())
+                                why = trainer.DescribeFreeTeachRefusal(p, info->Id);
+            out << Trinity::StringFormat("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", info->Id, name, info->SpellLevel, info->BaseLevel, info->IsPassive(), byTrainer,
+                known, entry->SkillLine, sSpellMgr->GetFirstSpellInChain(info->Id), why);
+        }
+        handler->PSendSysMessage("learncheck: %s (level %u): %u spells the .learn path would add, %u of them taught by no trainer row; %u already known; lines in %s",
+            p->GetName().c_str(), uint32(p->GetLevel()), listed, notTrainer, alreadyKnown, path.c_str());
+        return true;
+    }
+
+    // .playerbot xpprobe <player> <quest id>
+    // Gives the quest to an online player (a bot over SOAP), completes it and rewards it the way a turn-in does (Player::RewardQuest), and
+    // reports the XP it really gained next to the quest's own value and Rate.XP.Quest, so a rate change (.reload config) can be measured
+    // without a client. The quest is taken off the player afterwards (also its rewarded mark), so the probe can run again on the same
+    // player. Refuses a max-level player (quest XP turns into money there).
+    static bool HandleXpProbe(ChatHandler* handler, std::string name, uint32 questId)
+    {
+        Player* p = normalizePlayerName(name) ? ObjectAccessor::FindPlayerByName(name) : nullptr;
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!p || !p->IsInWorld() || !quest)
+        {
+            handler->SendSysMessage(!quest ? "xpprobe: no such quest" : "xpprobe: no such player in the world");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        if (p->IsMaxLevel())
+        {
+            handler->PSendSysMessage("xpprobe: %s is max level, quest XP turns into money there", p->GetName().c_str());
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        // start from no status, so an earlier run (or the bot's own questing) does not block AddQuest
+        auto const forget = [p, questId]()
+        {
+            if (p->GetQuestStatus(questId) != QUEST_STATUS_NONE)
+                p->RemoveActiveQuest(questId, false);
+            p->RemoveRewardedQuest(questId);
+        };
+        forget();
+
+        uint32 const baseXp = quest->XPValue(p);
+        float const rate = sWorld->getRate(RATE_XP_QUEST);
+        uint32 const expected = p->GetQuestXPReward(quest);
+        uint8 const levelBefore = p->GetLevel();
+        uint32 const xpBefore = p->GetXP();
+
+        p->AddQuest(quest, nullptr);
+        p->CompleteQuest(questId);
+        QuestStatus const status = p->GetQuestStatus(questId);
+        if (status == QUEST_STATUS_COMPLETE)
+            p->RewardQuest(quest, LootItemType::Item, 0, p, false);
+
+        // XP gained across any level-ups: the rest of each level passed, plus what stands in the bar now
+        uint64 gained = 0;
+        uint8 const levelAfter = p->GetLevel();
+        if (levelAfter == levelBefore)
+            gained = p->GetXP() >= xpBefore ? p->GetXP() - xpBefore : 0;
+        else
+        {
+            gained = sObjectMgr->GetXPForLevel(levelBefore) - xpBefore;
+            for (uint8 l = levelBefore + 1; l < levelAfter; ++l)
+                gained += sObjectMgr->GetXPForLevel(l);
+            gained += p->GetXP();
+        }
+
+        forget();
+
+        handler->PSendSysMessage("xpprobe: %s quest %u '%s' level %u->%u: quest value %u, Rate.XP.Quest %.2f, expected %u, gained %u%s",
+            p->GetName().c_str(), questId, quest->GetLogTitle().c_str(), uint32(levelBefore), uint32(levelAfter), baseXp, rate, expected,
+            uint32(gained), status == QUEST_STATUS_COMPLETE ? "" : " (quest did not reach complete, not rewarded)");
+        return true;
+    }
+
+    // .playerbot formprobe <player> <form spell id> [<passive spell id>]
+    // Learns the form spell if needed, takes the form (a triggered cast: no cost, no cooldown, no level check) and reports the armor before
+    // and in the form and whether the form's passive aura is on the player, then leaves the form again and reports the armor back.
+    // Moonkin Form: .playerbot formprobe <druid> 24858 24905 (Bear Form for comparison: 5487 1178).
+    static bool HandleFormProbe(ChatHandler* handler, std::string name, uint32 formSpell, Optional<uint32> passiveSpell)
+    {
+        Player* p = normalizePlayerName(name) ? ObjectAccessor::FindPlayerByName(name) : nullptr;
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(formSpell, DIFFICULTY_NONE);
+        if (!p || !p->IsInWorld() || !p->IsAlive() || !info || !info->HasAura(SPELL_AURA_MOD_SHAPESHIFT))
+        {
+            handler->SendSysMessage(!info || !info->HasAura(SPELL_AURA_MOD_SHAPESHIFT) ? "formprobe: not a shapeshift spell"
+                : "formprobe: no such living player in the world");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        bool const learned = !p->HasSpell(formSpell);
+        if (learned)
+            p->LearnSpell(formSpell, false);
+
+        p->RemoveAurasByType(SPELL_AURA_MOD_SHAPESHIFT);
+        uint32 const armorBefore = p->GetArmor();
+
+        SpellCastResult const result = p->CastSpell(p, formSpell, CastSpellExtraArgs(TRIGGERED_FULL_MASK));
+        uint32 const armorInForm = p->GetArmor();
+        bool const inForm = p->HasAura(formSpell);
+        bool const hasPassive = passiveSpell && p->HasAura(*passiveSpell);
+
+        p->RemoveAurasDueToSpell(formSpell);
+        uint32 const armorAfter = p->GetArmor();
+        bool const passiveGone = !passiveSpell || !p->HasAura(*passiveSpell);
+
+        handler->PSendSysMessage("formprobe: %s level %u spell %u%s cast result %u, in form %s (form %u); armor %u -> %u in form -> %u after; "
+            "passive %u %s in form, %s after",
+            p->GetName().c_str(), uint32(p->GetLevel()), formSpell, learned ? " (learned now)" : "", uint32(result), inForm ? "yes" : "no",
+            uint32(info->GetEffect(EFFECT_0).MiscValue), armorBefore, armorInForm, armorAfter, passiveSpell.value_or(0),
+            !passiveSpell ? "not checked" : hasPassive ? "present" : "MISSING", passiveGone ? "gone" : "STILL THERE");
+        return true;
+    }
+
+    // .playerbot langprobe <english line>
+    // The line as a Russian reader gets it from a bot (Util/BotLocaleText), or "unchanged" when no catalog entry matches: checks the
+    // catalog of the running build without a Russian client.
+    static bool HandleLangProbe(ChatHandler* handler, Tail text)
+    {
+        std::string const english(text);
+        std::string const russian = Playerbot::Locale::Translate(Playerbot::Locale::Lang::Ru, english);
+        if (russian == english)
+            handler->PSendSysMessage("langprobe: unchanged (%u Russian entries): %s", uint32(Playerbot::Locale::Russian().Size()), english.c_str());
+        else
+            handler->PSendSysMessage("langprobe: ru: %s", russian.c_str());
+        return true;
+    }
+
+    // .playerbot campprobe <player> go <map> <x> <y> <z>
+    // .playerbot campprobe <player> sit [<quest id>]
+    // Camping without a client. "go" moves the player (a bot over SOAP) to a camp. "sit" then, in one go: gives the quest if one is named (a
+    // The Great Outdoors quest, taken off again at the end), sits the player down the way the sit key does (WorldSession::UpdateCampfireRest),
+    // reports the campfire found, the nearest spell focus of any kind, whether the rest started and whether the quest's sit objective counted;
+    // then ends the rest as if its minute ran out and reports the camp buffs it gave, and stands the player up again.
+    static bool HandleCampProbe(ChatHandler* handler, std::string name, std::string mode, Optional<float> a1, Optional<float> a2,
+        Optional<float> a3, Optional<float> a4)
+    {
+        static constexpr uint32 SPELL_CAMPFIRE_REST = 1289723;
+        static constexpr uint32 SPELL_CAMP_BENEFITS = 1229741;
+        static constexpr uint32 BoostedBuffs[] = { 1229451, 1229519, 1230164, 1230587, 1230172, 1229513, 1229718, 1230124, 1230098, 1230653 };
+
+        Player* p = normalizePlayerName(name) ? ObjectAccessor::FindPlayerByName(name) : nullptr;
+        if (!p || !p->IsInWorld() || !p->IsAlive())
+        {
+            handler->SendSysMessage("campprobe: no such living player in the world");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        if (mode == "go")
+        {
+            if (!a1 || !a2 || !a3 || !a4)
+            {
+                handler->SendSysMessage("campprobe: go <map> <x> <y> <z>");
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+            bool const ok = p->TeleportTo(uint32(*a1), *a2, *a3, *a4, p->GetOrientation());
+            handler->PSendSysMessage("campprobe: %s teleport to map %u (%.2f, %.2f, %.2f) %s", p->GetName().c_str(), uint32(*a1), *a2, *a3, *a4,
+                ok ? "started, run sit in a few seconds" : "REFUSED");
+            return true;
+        }
+        if (mode != "sit")
+        {
+            handler->SendSysMessage("campprobe: mode is go or sit");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        // the quest, from no status, so earlier runs or the bot's own questing do not get in the way
+        uint32 const questId = a1 ? uint32(*a1) : 0;
+        Quest const* quest = questId ? sObjectMgr->GetQuestTemplate(questId) : nullptr;
+        if (questId && !quest)
+        {
+            handler->SendSysMessage("campprobe: no such quest");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        auto const forget = [p, questId]()
+        {
+            if (p->GetQuestStatus(questId) != QUEST_STATUS_NONE)
+                p->RemoveActiveQuest(questId, false);
+            p->RemoveRewardedQuest(questId);
+        };
+        if (quest)
+        {
+            forget();
+            p->AddQuest(quest, nullptr);
+        }
+
+        // what is near: the campfire as the rest looks for it, and the nearest spell focus of any kind (what the rest used to look at)
+        GameObject* fire = nullptr;
+        Trinity::GameObjectFocusCheck focusCheck(p, 4);
+        Trinity::GameObjectSearcher<Trinity::GameObjectFocusCheck> fireSearcher(p, fire, focusCheck);
+        Cell::VisitGridObjects(p, fireSearcher, 15.0f);
+        GameObject* anyFocus = p->FindNearestGameObjectOfType(GAMEOBJECT_TYPE_SPELL_FOCUS, 15.0f);
+        handler->PSendSysMessage("campprobe: %s map %u (%.2f, %.2f, %.2f); campfire %s; nearest spell focus %s",
+            p->GetName().c_str(), p->GetMapId(), p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(),
+            fire ? Trinity::StringFormat("{} '{}' spawn {} at {:.1f} yd", fire->GetEntry(), fire->GetGOInfo()->name, fire->GetSpawnId(),
+                p->GetDistance(fire)).c_str() : "NONE within 15 yd",
+            anyFocus ? Trinity::StringFormat("{} '{}' focus type {} at {:.1f} yd", anyFocus->GetEntry(), anyFocus->GetGOInfo()->name,
+                anyFocus->GetGOInfo()->spellFocus.spellFocusType, p->GetDistance(anyFocus)).c_str() : "none within 15 yd");
+
+        // sit as the sit key does
+        p->RemoveAurasDueToSpell(SPELL_CAMPFIRE_REST);
+        p->SetStandState(UNIT_STAND_STATE_SIT);
+        p->GetSession()->UpdateCampfireRest(UNIT_STAND_STATE_SIT);
+        bool const resting = p->HasAura(SPELL_CAMPFIRE_REST);
+
+        std::string objectives;
+        if (quest)
+            for (QuestObjective const& objective : quest->GetObjectives())
+                objectives += Trinity::StringFormat(" [{} type {}: {}]", objective.StorageIndex, uint32(objective.Type),
+                    p->IsQuestObjectiveComplete(objective.QuestID, objective.ID) ? "done" : "not done");
+        handler->PSendSysMessage("campprobe: sat down, rest %u %s%s%s", SPELL_CAMPFIRE_REST, resting ? "STARTED" : "did not start",
+            quest ? "; quest objectives:" : "", objectives.c_str());
+
+        // the minute runs out: the rest's own script gives the camp buffs
+        if (resting)
+        {
+            p->RemoveAurasDueToSpell(SPELL_CAMPFIRE_REST, ObjectGuid::Empty, 0, AURA_REMOVE_BY_EXPIRE);
+            std::string buffs;
+            for (uint32 buff : BoostedBuffs)
+                if (p->HasAura(buff))
+                    buffs += Trinity::StringFormat(" {}", buff);
+            handler->PSendSysMessage("campprobe: rest ran out; camp buffs:%s; Camp Benefits %u %s; next rest %s", buffs.empty() ? " NONE" : buffs.c_str(),
+                SPELL_CAMP_BENEFITS, p->HasAura(SPELL_CAMP_BENEFITS) ? "on" : "NOT on", p->HasAura(SPELL_CAMPFIRE_REST) ? "started" : "did not start");
+        }
+
+        p->SetStandState(UNIT_STAND_STATE_STAND);
+        p->GetSession()->UpdateCampfireRest(UNIT_STAND_STATE_STAND);
+        if (quest)
+            forget();
+        return true;
+    }
+
+    // .playerbot spotprobe <player> <x> <y> <z> [<from x> <from y> <from z>]
+    // Checks a spawn or landing spot on the player's own map (any player on that map, a bot over SOAP): the floor the server sees under the
+    // spot (terrain and buildings, as Map::GetHeight finds it searching down from 2 yards above, and from 30 yards above), a 5 x 5 grid of
+    // floors a yard apart around it, whether the spot is in water, and, with a start point, whether a walker finds a path from there.
+    static bool HandleSpotProbe(ChatHandler* handler, std::string name, float x, float y, float z, Optional<float> fromX, Optional<float> fromY,
+        Optional<float> fromZ)
+    {
+        Player* p = normalizePlayerName(name) ? ObjectAccessor::FindPlayerByName(name) : nullptr;
+        if (!p || !p->IsInWorld())
+        {
+            handler->SendSysMessage("spotprobe: no such player in the world");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        Map* map = p->GetMap();
+        PhaseShift const& phaseShift = p->GetPhaseShift();
+        // the spot may be far from the player: load its grid (terrain, buildings, navmesh tile) first
+        map->LoadGrid(x, y);
+        if (fromX && fromY)
+            map->LoadGrid(*fromX, *fromY);
+        auto const floorText = [](float h) { return h <= INVALID_HEIGHT ? std::string("NONE") : Trinity::StringFormat("{:.2f}", h); };
+
+        float const floorNear = map->GetHeight(phaseShift, x, y, z + 2.0f, true, 50.0f);
+        float const floorHigh = map->GetHeight(phaseShift, x, y, z + 30.0f, true, 80.0f);
+        handler->PSendSysMessage("spotprobe: map %u spot (%.2f, %.2f, %.2f): floor below spot %s, highest floor (from 30 yd up) %s, %s",
+            map->GetId(), x, y, z, floorText(floorNear).c_str(), floorText(floorHigh).c_str(),
+            map->IsInWater(phaseShift, x, y, z) ? "IN WATER" : "not in water");
+
+        for (int dy = 2; dy >= -2; --dy)
+        {
+            std::string row;
+            for (int dx = -2; dx <= 2; ++dx)
+            {
+                float const h = map->GetHeight(phaseShift, x + float(dx), y + float(dy), z + 2.0f, true, 50.0f);
+                row += Trinity::StringFormat(" {:>7}", floorText(h));
+            }
+            handler->PSendSysMessage("spotprobe: y%+d:%s", dy, row.c_str());
+        }
+
+        if (fromX && fromY && fromZ)
+        {
+            PathGenerator path(p);
+            bool const found = path.CalculatePath(*fromX, *fromY, *fromZ, x, y, z, false);
+            Movement::PointsArray const& points = path.GetPath();
+            G3D::Vector3 const end = points.empty() ? G3D::Vector3(*fromX, *fromY, *fromZ) : points.back();
+            float const endDist = std::sqrt((end.x - x) * (end.x - x) + (end.y - y) * (end.y - y) + (end.z - z) * (end.z - z));
+            handler->PSendSysMessage("spotprobe: path from (%.2f, %.2f, %.2f): %s, type 0x%X, %u points, length %.1f yd, ends %.1f yd from the spot (%.2f, %.2f, %.2f)",
+                *fromX, *fromY, *fromZ, found ? "found" : "NOT found", uint32(path.GetPathType()), uint32(points.size()), path.GetPathLength(), endDist,
+                end.x, end.y, end.z);
+        }
+        return true;
+    }
+
+    // .playerbot collisionprobe <creature entry> [<player>]
+    // The collision height of each model of a creature template: the model's raw CollisionHeight, the height the core uses
+    // (CreatureModelDataEntry::GetCollisionHeight, which reads the bounding box when the client marks the height "not set") and the
+    // scaled unit height. With a player, every creature of that entry within 60 yards of the player is listed with its live
+    // Unit::GetCollisionHeight and whether the player and the creature see each other (Map line of sight, as spells and melee check it).
+    static bool HandleCollisionProbe(ChatHandler* handler, uint32 entry, Optional<std::string> name)
+    {
+        CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(entry);
+        if (!tmpl)
+        {
+            handler->PSendSysMessage("collisionprobe: no creature template %u", entry);
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        for (CreatureModel const& model : tmpl->Models)
+        {
+            CreatureDisplayInfoEntry const* display = sCreatureDisplayInfoStore.LookupEntry(model.CreatureDisplayID);
+            CreatureModelDataEntry const* modelData = display ? sCreatureModelDataStore.LookupEntry(display->ModelID) : nullptr;
+            if (!modelData)
+            {
+                handler->PSendSysMessage("collisionprobe: %u display %u: no display or model data", entry, model.CreatureDisplayID);
+                continue;
+            }
+            handler->PSendSysMessage("collisionprobe: %u display %u model %u: raw CollisionHeight %.2f, used %.2f, bounds top %.2f, unit height %.2f",
+                entry, model.CreatureDisplayID, display->ModelID, modelData->CollisionHeight, modelData->GetCollisionHeight(), modelData->GeoBox[5],
+                modelData->GetCollisionHeight() * modelData->ModelScale * display->CreatureModelScale);
+        }
+
+        if (!name)
+            return true;
+        std::string playerName = *name;
+        Player* p = normalizePlayerName(playerName) ? ObjectAccessor::FindPlayerByName(playerName) : nullptr;
+        if (!p || !p->IsInWorld())
+        {
+            handler->SendSysMessage("collisionprobe: no such player in the world");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        std::list<Creature*> creatures;
+        p->GetCreatureListWithEntryInGrid(creatures, entry, 60.0f);
+        handler->PSendSysMessage("collisionprobe: %u creature(s) of entry %u within 60 yd of %s", uint32(creatures.size()), entry, p->GetName().c_str());
+        for (Creature const* c : creatures)
+            handler->PSendSysMessage("collisionprobe: spawn %llu at (%.1f, %.1f, %.1f), %.1f yd: unit height %.2f, line of sight %s", uint64(c->GetSpawnId()),
+                c->GetPositionX(), c->GetPositionY(), c->GetPositionZ(), p->GetDistance(c), c->GetCollisionHeight(),
+                p->IsWithinLOSInMap(c) ? "yes" : "NO");
+        return true;
+    }
+
+    // .playerbot casttest [@Player] <spell id> [<spell id>...]
+    // Casts each active spell once at a dummy in melee reach (full power, no cooldowns, 0 combo points) and writes CastTest.tsv with what changed:
+    // the cast result, the dummy's health, the caster's combo points, and every aura that appeared on either unit. A passive spell that carries spell
+    // modifiers (aura 107/108) is not cast: the modifier is read through Player::ApplySpellMod against every spell the player knows that it names.
+    // `>Name` names a friendly target (another online player) for positive spells that need one, such as a blessing; the dummy is used otherwise.
+    static bool HandleCastTest(ChatHandler* handler, Tail args)
+    {
+        Player* p = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        Player* friendTarget = nullptr;
+        bool friendNamed = false;
+        std::vector<uint32> ids;
+        for (std::string_view token : Trinity::Tokenize(std::string_view(args), ' ', false))
+        {
+            if (!token.empty() && token[0] == '@')
+            {
+                p = ObjectAccessor::FindPlayerByName(token.substr(1));
+                continue;
+            }
+            if (!token.empty() && token[0] == '>')
+            {
+                friendNamed = true;
+                friendTarget = ObjectAccessor::FindPlayerByName(token.substr(1));
+                continue;
+            }
+            if (Optional<uint32> id = Trinity::StringTo<uint32>(token))
+                ids.push_back(*id);
+        }
+        if (friendNamed && (!friendTarget || !friendTarget->IsInWorld() || !friendTarget->IsAlive()))
+        {
+            handler->PSendSysMessage("casttest: the friendly target after '>' is not an online living player");
+            return false;
+        }
+        if (!p || !p->IsInWorld() || !p->IsAlive() || ids.empty())
+        {
+            handler->PSendSysMessage("casttest: needs @Name of a living player in the world and at least one spell id");
+            return false;
+        }
+        // spells that name a party or raid member (a blessing, a heal) need the target in the caster's group: put the named player in it, no invitation
+        if (friendTarget && friendTarget != p && !(p->GetGroup() && p->GetGroup() == friendTarget->GetGroup()))
+        {
+            Group* group = p->GetGroup();
+            if (friendTarget->GetGroup() || friendTarget->GetGroupInvite() || (group && (group->IsFull() || !group->IsLeader(p->GetGUID()))))
+            {
+                handler->PSendSysMessage("casttest: %s is already in another group, or %s's group is full or not led by %s: leave it first", friendTarget->GetName().c_str(), p->GetName().c_str(), p->GetName().c_str());
+                return false;
+            }
+            if (!group)
+            {
+                group = new Group();
+                if (!group->Create(p))
+                {
+                    delete group;
+                    handler->PSendSysMessage("casttest: cannot create a group for %s", p->GetName().c_str());
+                    return false;
+                }
+                sGroupMgr->AddGroup(group);
+            }
+            if (!group->AddMember(friendTarget))
+            {
+                handler->PSendSysMessage("casttest: the group refused %s", friendTarget->GetName().c_str());
+                return false;
+            }
+            group->BroadcastGroupUpdate();
+        }
+        // a spell on another player needs line of sight and range: stand the friendly target beside the caster (same map only; the test's own placement)
+        std::string friendPlacement;
+        if (friendTarget && friendTarget != p && friendTarget->GetMap() == p->GetMap())
+        {
+            // The old fixed spot (2 yards east, same Z) can be inside a wall or below the floor, and a friend that is already close can still stand behind
+            // one: line of sight (result 71) is checked from the caster, so try four spots around the caster and keep the first one the caster can see.
+            auto const hasLos = [&]() { return friendTarget->GetDistance(p) <= 4.0f && p->IsWithinLOSInMap(friendTarget); };
+            for (uint32 attempt = 0; attempt < 4 && !hasLos(); ++attempt)
+            {
+                Position const spot = p->GetNearPosition(2.0f, attempt * float(M_PI) / 2.0f);
+                friendTarget->NearTeleportTo(spot.GetPositionX(), spot.GetPositionY(), spot.GetPositionZ(), p->GetOrientation());
+                // A bot's near teleport only lands when its session acks it, and the world tick does that later: casting now would still see the old
+                // position. Close the loop here, the way PlayerbotV2 does each tick.
+                if (friendTarget->GetTeleportState() == TeleportState::WaitingForTeleportAck && friendTarget->GetSession()
+                    && Playerbot::Services::SessionMgr().IsHeadless(friendTarget->GetGUID()))
+                {
+                    WorldPacket ack(CMSG_MOVE_TELEPORT_ACK, 8 + 4 + 4);
+                    ack << friendTarget->GetGUID();
+                    ack << int32(0);
+                    ack << int32(GameTime::GetGameTimeMS());
+                    WorldPackets::Movement::MoveTeleportAck ackPacket(std::move(ack));
+                    ackPacket.Read();
+                    friendTarget->GetSession()->HandleMoveTeleportAck(ackPacket);
+                }
+            }
+            friendPlacement = Trinity::StringFormat("friend at {:.1f} yd, line of sight {}, teleport state {}", friendTarget->GetDistance(p),
+                p->IsWithinLOSInMap(friendTarget) ? "yes" : "NO", int(friendTarget->GetTeleportState()));
+        }
+        std::string error;
+        Creature* d = Playerbot::Diagnostics::Parity::SpawnProcDummy(p, 2.5f, error);
+        if (!d)
+        {
+            handler->PSendSysMessage("casttest: no dummy: %s", error.c_str());
+            return false;
+        }
+        std::string const path = sLog->GetLogsDir() + "CastTest.tsv";
+        std::ofstream out(path, std::ios::trunc);
+        if (!out)
+        {
+            d->DespawnOrUnsummon();
+            handler->PSendSysMessage("casttest: cannot write %s", path.c_str());
+            return false;
+        }
+        out << "spell\tname\tresult\tdummy_health_delta\tcaster_health_delta\tcombo_before\tcombo_after\tnew_auras_on_caster\tnew_auras_on_dummy\tmodifiers\ttargets\n";
+        std::ofstream family(sLog->GetLogsDir() + "CastTestFamily.tsv", std::ios::trunc);
+        family << "passive\tfamily\tspell\tname\tclass_mask0\tclass_mask1\tclass_mask2\tclass_mask3\tknown\n";
+        LocaleConstant const locale = sWorld->GetDefaultDbcLocale();
+        // a mounted caster fails every non-mount spell with SPELL_FAILED_NOT_MOUNTED (88): test from the ground
+        if (p->IsMounted())
+        {
+            p->Dismount();
+            p->RemoveAurasByType(SPELL_AURA_MOUNTED);
+        }
+        auto const auraIds = [](Unit const* u)
+        {
+            std::set<uint32> set;
+            for (auto const& [auraId, app] : u->GetAppliedAuras())
+                set.insert(auraId);
+            return set;
+        };
+        auto const describeNew = [&](std::set<uint32> const& before, std::set<uint32> const& after)
+        {
+            std::string text;
+            for (uint32 a : after)
+                if (!before.count(a))
+                {
+                    SpellInfo const* ai = sSpellMgr->GetSpellInfo(a, DIFFICULTY_NONE);
+                    text += Trinity::StringFormat("{}{} \"{}\"", text.empty() ? "" : ", ", a, ai && ai->SpellName ? (*ai->SpellName)[locale] : "?");
+                }
+            return text;
+        };
+        for (uint32 id : ids)
+        {
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE);
+            std::string name, result = "NO_SPELL", casterAuras, dummyAuras, mods;
+            int64 dummyDelta = 0, casterDelta = 0;
+            int32 comboBefore = 0, comboAfter = 0;
+            if (info)
+            {
+                name = info->SpellName ? std::string((*info->SpellName)[locale]) : std::string();
+                if (info->IsPassive())
+                {
+                    result = "PASSIVE";
+                    // a bot that does not have the talent would measure nothing: learn it for the measurement and drop it again afterwards
+                    bool const learnedForTest = !p->HasSpell(id) && !p->GetAura(id);
+                    if (learnedForTest)
+                    {
+                        p->LearnSpell(id, false);
+                        mods = "learned for the test; ";
+                    }
+                    // a modifier only applies through a live aura: say whether the player has it, and with what amount per effect
+                    if (Aura const* live = p->GetAura(id))
+                    {
+                        mods += "aura on the player:";
+                        for (AuraEffect const* eff : live->GetAuraEffects())
+                            mods += Trinity::StringFormat(" e{}={}", uint32(eff->GetEffIndex()), eff->GetAmount());
+                        mods += "; ";
+                    }
+                    else
+                        mods += Trinity::StringFormat("NO aura on the player (spell known: {}); ", p->HasSpell(id));
+                    for (SpellEffectInfo const& e : info->GetEffects())
+                    {
+                        if (e.ApplyAuraName != SPELL_AURA_ADD_FLAT_MODIFIER && e.ApplyAuraName != SPELL_AURA_ADD_PCT_MODIFIER)
+                            continue;
+                        SpellModOp const op = SpellModOp(e.MiscValue);
+                        uint32 inFamily = 0, named = 0;
+                        for (auto const& [knownId, ps] : p->GetSpellMap())
+                        {
+                            SpellInfo const* known = sSpellMgr->GetSpellInfo(knownId, DIFFICULTY_NONE);
+                            if (!known || known->IsPassive() || ps.state == PLAYERSPELL_REMOVED || known->SpellFamilyName != info->SpellFamilyName || !known->IsAffected(info->SpellFamilyName, e.SpellClassMask))
+                                continue;
+                            ++named;
+                            double value = e.ApplyAuraName == SPELL_AURA_ADD_PCT_MODIFIER ? 1.0 : 0.0;
+                            p->ApplySpellMod(known, op, value);
+                            mods += Trinity::StringFormat("{}op {} on {} \"{}\": {}", mods.empty() ? "" : ", ", int32(e.MiscValue), knownId,
+                                known->SpellName ? (*known->SpellName)[locale] : "?", value);
+                        }
+                        for (auto const& [knownId, ps] : p->GetSpellMap())
+                            if (SpellInfo const* known = sSpellMgr->GetSpellInfo(knownId, DIFFICULTY_NONE))
+                                if (!known->IsPassive() && ps.state != PLAYERSPELL_REMOVED && known->SpellFamilyName == info->SpellFamilyName)
+                                    ++inFamily;
+                        if (!named)
+                        {
+                            // every spell of that family the client data knows, with its class flags: the mask the talent names is compared against them by eye
+                            for (uint32 candidateId = 1; candidateId < 2000000; ++candidateId)
+                                if (SpellInfo const* candidate = sSpellMgr->GetSpellInfo(candidateId, DIFFICULTY_NONE))
+                                    if (candidate->SpellFamilyName == info->SpellFamilyName && !candidate->IsPassive() && candidate->SpellName && (*candidate->SpellName)[locale] && *(*candidate->SpellName)[locale])
+                                        family << id << '\t' << uint32(info->SpellFamilyName) << '\t' << candidateId << '\t' << (*candidate->SpellName)[locale] << '\t'
+                                            << candidate->SpellFamilyFlags[0] << '\t' << candidate->SpellFamilyFlags[1] << '\t' << candidate->SpellFamilyFlags[2] << '\t'
+                                            << candidate->SpellFamilyFlags[3] << '\t' << p->HasSpell(candidateId) << '\n';
+                            mods += Trinity::StringFormat("{}effect {} aura {} op {} mask {:#x}/{:#x}/{:#x}/{:#x} family {}: names none of the {} active spells of that family the player knows",
+                                mods.empty() ? "" : ", ", uint32(e.EffectIndex), uint32(e.ApplyAuraName), int32(e.MiscValue), e.SpellClassMask[0], e.SpellClassMask[1],
+                                e.SpellClassMask[2], e.SpellClassMask[3], uint32(info->SpellFamilyName), inFamily);
+                        }
+                    }
+                    if (learnedForTest)
+                        p->RemoveSpell(id, false, false);
+                }
+                else
+                {
+                    p->GetSpellHistory()->ResetAllCooldowns();
+                    p->GetSpellHistory()->CancelGlobalCooldown(info);
+                    if (Powers const pw = p->GetPowerType(); pw != POWER_COMBO_POINTS)
+                        p->SetPower(pw, p->GetMaxPower(pw));
+                    p->SetPower(POWER_COMBO_POINTS, 0);
+                    p->SetFacingToObject(d);
+                    std::set<uint32> const casterBefore = auraIds(p), dummyBefore = auraIds(d), friendBefore = friendTarget ? auraIds(friendTarget) : std::set<uint32>();
+                    int64 const dummyHp = d->GetHealth(), casterHp = p->GetHealth();
+                    comboBefore = p->GetPower(POWER_COMBO_POINTS);
+                    Unit* const target = friendTarget ? static_cast<Unit*>(friendTarget) :
+                        (info->IsPositive() && !info->NeedsExplicitUnitTarget() ? static_cast<Unit*>(p) : static_cast<Unit*>(d));
+                    SpellCastResult const r = p->CastSpell(target, id, CastSpellExtraArgs(TRIGGERED_NONE));
+                    result = Trinity::StringFormat("{}", int(r));
+                    comboAfter = p->GetPower(POWER_COMBO_POINTS);
+                    dummyDelta = int64(d->GetHealth()) - dummyHp;
+                    casterDelta = int64(p->GetHealth()) - casterHp;
+                    casterAuras = describeNew(casterBefore, auraIds(p));
+                    dummyAuras = describeNew(dummyBefore, auraIds(d));
+                    if (friendTarget && friendTarget != p)
+                    {
+                        std::string const friendAuras = describeNew(friendBefore, auraIds(friendTarget));
+                        casterAuras += Trinity::StringFormat("{}[on {}: {}; {}]", casterAuras.empty() ? "" : " ", friendTarget->GetName(), friendAuras.empty() ? "none" : friendAuras, friendPlacement);
+                        if (r == SPELL_CAST_OK && !friendAuras.empty() && d->IsAlive())
+                        {
+                            // measure what the aura does: a Shadow Bolt (686) hit of 200 from the dummy goes through the normal damage pipeline right now. A real
+                            // cast would only schedule the hit (projectile travel time), so the health read straight after it showed no change
+                            SpellInfo const* probe = sSpellMgr->GetSpellInfo(686, DIFFICULTY_NONE);
+                            int64 const friendHp = friendTarget->GetHealth(), casterHp2 = p->GetHealth();
+                            if (probe)
+                            {
+                                SpellNonMeleeDamage hit(d, friendTarget, probe, SpellCastVisual{}, probe->GetSchoolMask());
+                                d->CalculateSpellDamageTaken(&hit, 200, probe, BASE_ATTACK);
+                                d->DealSpellDamage(&hit, false);
+                            }
+                            mods += Trinity::StringFormat("dummy hit {} for 200 shadow: target health {}, caster health {}; ", friendTarget->GetName(),
+                                int64(friendTarget->GetHealth()) - friendHp, int64(p->GetHealth()) - casterHp2);
+                        }
+                    }
+                }
+            }
+            for (char& c : name)
+                if (c == '\t' || c == '\n' || c == '\r')
+                    c = ' ';
+            std::string targets;
+            if (info)
+                for (SpellEffectInfo const& e : info->GetEffects())
+                    if (e.IsEffect())
+                        targets += Trinity::StringFormat("{}e{} {}/{}", targets.empty() ? "" : ", ", uint32(e.EffectIndex), uint32(e.TargetA.GetTarget()), uint32(e.TargetB.GetTarget()));
+            if (friendTarget)
+                targets += Trinity::StringFormat("{}same group: {}", targets.empty() ? "" : "; ", p->GetGroup() && p->GetGroup() == friendTarget->GetGroup() ? "yes" : "NO");
+            out << Trinity::StringFormat("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", id, name, result, dummyDelta, casterDelta, comboBefore, comboAfter, casterAuras, dummyAuras, mods, targets);
+        }
+        d->DespawnOrUnsummon();
+        handler->PSendSysMessage("casttest: %s, %zu spells; lines in %s", p->GetName().c_str(), ids.size(), path.c_str());
         return true;
     }
 
@@ -3942,6 +5746,17 @@ public:
             handler->SendSysMessage(Scn::Abort() ? "Scenario aborted." : "No scenario is running.");
             return true;
         }
+        if (v == "cleanup")
+        {
+            // The test characters no running scenario holds leave the world now (the idle sweep does the same every 30 s).
+            std::string names;
+            std::uint32_t const n = Scn::LogoutIdleTestBots(&names);
+            if (n)
+                handler->PSendSysMessage("scenario cleanup: %u test character(s) logged out: %s.", n, names.c_str());
+            else
+                handler->SendSysMessage("scenario cleanup: no idle test character is online.");
+            return true;
+        }
         if (v == "run")
         {
             if (!name)
@@ -3952,7 +5767,7 @@ public:
             handler->PSendSysMessage("Scenario '%s' started. `.playerbot scenario status` shows progress; the verdict is logged as [scenario] result=.", name->c_str());
             return true;
         }
-        handler->SendSysMessage("Usage: .playerbot scenario list | run <name>[@checkpoint] | runall [name part] | runbatch [name part] | summary | status | result | abort");
+        handler->SendSysMessage("Usage: .playerbot scenario list | run <name>[@checkpoint] | runall [name part] | runbatch [name part] | summary | status | result | abort | cleanup");
         return false;
     }
 
@@ -4177,13 +5992,29 @@ public:
     // from group-completed quests / dungeons. Owner binding scopes whisper
     // commands so the player's other alts can also issue squad commands
     // (player_guid=0 = any character on the account).
-    static bool HandleSummon(ChatHandler* handler, std::string const& target_name)
+    // The rest of the line is taken whole, so a second word reaches the handler and gets its own answer instead of the core's
+    // "no detailed usage information" (`.playerbot summon First Last`, Discord 2026-10-24).
+    static bool HandleSummon(ChatHandler* handler, Tail args)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         if (!Playerbot::Services::Initialized())
-        { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
+        { handler->SendSysMessage("PlayerbotV2 not initialized."); handler->SetSentErrorMessage(true); return false; }
+        std::string target_name(args);
+        while (!target_name.empty() && (target_name.back() == ' ' || target_name.back() == '\t')) target_name.pop_back();
+        while (!target_name.empty() && (target_name.front() == ' ' || target_name.front() == '\t')) target_name.erase(target_name.begin());
         if (target_name.empty())
         {
-            handler->SendSysMessage("Usage: .playerbot summon <character_name>");
+            handler->SendSysMessage(".playerbot summon <AltName>: logs in one of your offline characters (same account) as a bot.");
+            handler->SendSysMessage("Example: .playerbot summon Myalt");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        // "Name Surname" as character select shows it, or the words joined; any letter case (TypedCharacterName).
+        target_name = TypedCharacterName(target_name);
+        if (target_name.empty())
+        {
+            handler->SendSysMessage(".playerbot summon <AltName>: logs in one of your offline characters (same account) as a bot.");
+            handler->SetSentErrorMessage(true);
             return false;
         }
         WorldSession* sess = handler->GetSession();
@@ -4192,12 +6023,14 @@ public:
             handler->SendSysMessage(
                 "`.playerbot summon` is in-game only (needs your account "
                 "context to verify alt ownership).");
+            handler->SetSentErrorMessage(true);
             return false;
         }
         Player const* me = sess->GetPlayer();
         if (!me)
         {
             handler->SendSysMessage("No player attached to your session.");
+            handler->SetSentErrorMessage(true);
             return false;
         }
 
@@ -4206,6 +6039,7 @@ public:
         {
             handler->PSendSysMessage("No character named '%s' exists.",
                                      target_name.c_str());
+            handler->SetSentErrorMessage(true);
             return false;
         }
         if (id == me->GetGUID().GetCounter())
@@ -4216,6 +6050,7 @@ public:
             handler->SendSysMessage(
                 "That's your current character. Use `.playerbot self on` "
                 "to drive your own character with the bot logic instead.");
+            handler->SetSentErrorMessage(true);
             return false;
         }
 
@@ -4226,6 +6061,7 @@ public:
         {
             handler->PSendSysMessage("'%s' has no resolvable account.",
                                      target_name.c_str());
+            handler->SetSentErrorMessage(true);
             return false;
         }
         if (target_account != my_account)
@@ -4235,38 +6071,37 @@ public:
             // all they need to know.
             handler->PSendSysMessage("'%s' is not on your account.",
                                      target_name.c_str());
+            handler->SetSentErrorMessage(true);
             return false;
         }
         // Refuse if the alt is already logged in as a live player (would
         // cause two sessions for the same GUID). The owner is using that
         // character right now and presumably doesn't want it taken over.
-        if (Player const* online = ObjectAccessor::FindConnectedPlayerByName(target_name))
+        if (Player const* online = ObjectAccessor::FindConnectedPlayer(target_guid))
         {
             handler->PSendSysMessage("'%s' is currently online (logged in by "
                                      "you or another session).",
                                      online->GetName().c_str());
+            handler->SetSentErrorMessage(true);
             return false;
         }
 
         // Per-account summon cap. Default 5 = one regular dungeon group.
-        // Counts CURRENTLY owned alts; logged-out-but-marked alts still
-        // count (they hold a worldsession + DB row at runtime). The
-        // .playerbot self attachment doesn't count against this cap
-        // because the player is using their own character, not a bot.
+        // Counts the account's alts in world as bots right now; a logged-out
+        // alt frees its place. The .playerbot self attachment doesn't count
+        // against this cap because the player is using their own character.
         const uint8 cap = Playerbot::Services::Config().max_alts_as_bots();
         if (cap == 0)
         {
             handler->SendSysMessage(
                 "Alt-summon is disabled on this realm "
                 "(PlayerbotV2.MaxAltsAsBots = 0).");
+            handler->SetSentErrorMessage(true);
             return false;
         }
-        const auto owned = Playerbot::Services::Owners().BotsOwnedBy(my_account);
-        // Filter to alts that are currently marked as bots; the binding
-        // can outlive an unmark and we don't want to double-count those.
-        size_t active_alts = 0;
-        for (Playerbot::BotId b : owned)
-            if (Playerbot::Services::Lifecycle().is_bot(b)) ++active_alts;
+        // Only this account's own characters in world as bots: companions (bot pool accounts) and alts logged out again
+        // used to count too, so an owner with five companions could never summon an alt.
+        const size_t active_alts = Playerbot::Services::SessionMgr().HeadlessCountOnAccount(my_account);
         if (active_alts >= cap)
         {
             handler->PSendSysMessage(
@@ -4274,6 +6109,7 @@ public:
                 "active as bots. Logout one (`.playerbot self off` or "
                 "`/w <alt> logout`) before summoning another.",
                 active_alts, unsigned(cap));
+            handler->SetSentErrorMessage(true);
             return false;
         }
 
@@ -4286,6 +6122,9 @@ public:
             Playerbot::Services::Lifecycle().mark_as_bot(id);
         }
         Playerbot::Services::Owners().SetOwner(id, my_account, /*player_guid=*/0u);
+        // Brought to the caller and grouped once in world, like `.bot call`; its level, spells, talents and gear stay its own
+        // (FinishCompanionSetup, IsPlayersOwnCharacter).
+        Playerbot::Services::Population().QueueCompanionSetup(id, me->GetGUID().GetCounter(), uint8(Playerbot::Role::Unknown));
 
         // Headless login. The world thread will process the async DB
         // callback that finishes the spawn; the bot enters world on the
@@ -4294,13 +6133,13 @@ public:
         if (!res.ok)
         {
             handler->PSendSysMessage("Summon failed: %s", res.reason.c_str());
+            handler->SetSentErrorMessage(true);
             return false;
         }
 
         handler->PSendSysMessage(
-            "Summoning your alt '%s' â bot-controlled bot enters world on "
-            "the next DB callback. You (and any other char on your account) "
-            "can whisper `follow`, `stop`, `engage`, `squad`, `role` to it.",
+            "Summoning your alt '%s': it logs in as a bot, comes to you and joins your group. "
+            "You (and any other char on your account) can whisper `follow`, `stop`, `engage`, `squad`, `role` to it.",
             target_name.c_str());
         return true;
     }
@@ -4327,6 +6166,7 @@ public:
     // line as a secure macro, so it works in combat).
     static bool HandleLazy(ChatHandler* handler)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         WorldSession* sess = handler->GetSession();
         if (!sess || !sess->GetPlayer())
         {
@@ -4341,6 +6181,7 @@ public:
 
     static bool HandleSelf(ChatHandler* handler, std::string const& arg)
     {
+        Playerbot::BotLanguage::LocalizedHandler localized(handler); handler = localized.Get();   // replies in the player's language
         if (!Playerbot::Services::Initialized())
         { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
         WorldSession* sess = handler->GetSession();
@@ -4372,11 +6213,10 @@ public:
                 handler->SendSysMessage("Self-bot is already attached.");
                 return true;
             }
-            // Mark + adopt to self (account-bound). On-mark code path
-            // already registers + schedules the bot logic for the online player,
-            // so a single call wires everything.
+            // Mark + adopt to self (account-bound) for this session only. A transient mark, as the add-on's self toggle does: the
+            // saved mark brought the bot logic back at every login and the player had to turn it off by hand (Session/HumanLogin.h).
             if (!is_bot)
-                Playerbot::Services::Lifecycle().mark_as_bot(id);
+                Playerbot::Services::Lifecycle().mark_as_bot_transient(id);
             Playerbot::Services::Owners().SetOwner(
                 id, sess->GetAccountId(), /*player_guid=*/ 0u);
             if (!Playerbot::Services::Registry().has(id))
@@ -4394,7 +6234,7 @@ public:
             handler->SendSysMessage(
                 "Self-bot: ON. Bot logic now drives your character. Your client "
                 "input still works â pressing movement keys interrupts the "
-                "Bot logic's move intents. Use `.playerbot self off` to detach.");
+                "Bot logic's move intents. Use `.playerbot self off` to detach; it also ends when you log out.");
             return true;
         }
         if (mode == "off")

@@ -71,6 +71,22 @@ inline std::vector<ListedActivity> ParseListedActivities(std::string_view text)
     return out;
 }
 
+// The order the dungeons are tried in for a new listed group: those with no listed group of the faction yet come first, so every
+// dungeon gets one before any gets a second; each half is shuffled. `listed` holds the activity id of each group listed for the
+// faction; `rand(n)` returns 0..n-1. The result is indices into `all`.
+template <class Rand>
+inline std::vector<size_t> ListedActivityOrder(std::vector<ListedActivity> const& all, std::vector<uint32> const& listed, Rand&& rand)
+{
+    std::vector<size_t> fresh, taken;
+    for (size_t i = 0; i < all.size(); ++i)
+        (std::ranges::find(listed, all[i].activity) == listed.end() ? fresh : taken).push_back(i);
+    for (std::vector<size_t>* half : { &fresh, &taken })
+        for (size_t i = half->size(); i > 1; --i)
+            std::swap((*half)[i - 1], (*half)[size_t(rand(uint32(i)))]);
+    fresh.insert(fresh.end(), taken.begin(), taken.end());
+    return fresh;
+}
+
 // The party size of a listed group from a player limit, held to 5-10 (raid-size listings come later); the listed dungeons carry their own size.
 constexpr uint32 kListedGroupMaxSize = 10;
 inline uint32 ListedGroupSize(uint32 mapMaxPlayers)

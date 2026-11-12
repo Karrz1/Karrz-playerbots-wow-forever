@@ -86,13 +86,22 @@ bool BotMeetsCustomizationReq(uint32 reqId, uint8 race, uint8 cls)
 // tied to a non-default OverrideArchive. Classic 1.60 (Forever) ships ChrCustomization
 // rows the client rejects (extra option 8522 on human males, newer skin choices);
 // a bot carrying one crashed the owner's client (Invalid Option ID / JamVectorDelta).
+//
+// In the 70532 data every choice the creator offers carries a requirement with
+// HasRequirements set. The rows tied to a requirement without it (req 12: option
+// 8522/8523 and the extra retail skin and hair colours; req 10: the hidden "none"
+// choices) are the ones the client rejects, so a bot never takes them.
 bool BotCanUseCustomizationReq(uint32 reqId, uint8 race, uint8 cls)
 {
     if (!BotMeetsCustomizationReq(reqId, race, cls))
         return false;
     if (ChrCustomizationReqEntry const* req = sChrCustomizationReqStore.LookupEntry(reqId))
-        if (req->GetFlags().HasFlag(ChrCustomizationReqFlag::HasRequirements) && req->OverrideArchive > 0)
+    {
+        if (!req->GetFlags().HasFlag(ChrCustomizationReqFlag::HasRequirements))
             return false;
+        if (req->OverrideArchive > 0)
+            return false;
+    }
     return true;
 }
 
@@ -112,8 +121,11 @@ bool BotCanUseChoice(ChrCustomizationChoiceEntry const* c, uint8 race, uint8 cls
 
 // Appearances of client-made (non-bot) characters, by (race, gender): the options
 // the client sends and every choice seen per option. When a race/gender has one,
-// bots pick only from it: less variety, but nothing the client can reject. Each new
-// client-made character of that race/gender widens the pool.
+// bots use only the options the client sends. Within each option a bot may take
+// any choice the data offers its race and class (BotCanUseChoice) plus any choice
+// seen on a client-made character. Choices used to come from the seen set alone,
+// so a realm with one client-made human woman gave every female human bot her
+// exact face, hair and colours.
 struct AppearanceTemplate
 {
     std::map<uint32, std::set<uint32>> choicesByOption;
@@ -140,9 +152,11 @@ void LoadAppearanceTemplates_locked()
     } while (r->NextRow());
 }
 
-std::vector<UF::ChrCustomizationChoice> RollCustomizations(uint8 race, uint8 gender, uint8 cls)
+// The options a bot of (race, gender, class) carries, each with the choices it may take, in option order.
+std::vector<std::pair<ChrCustomizationOptionEntry const*, std::vector<ChrCustomizationChoiceEntry const*>>>
+AllowedCustomizations(uint8 race, uint8 gender, uint8 cls)
 {
-    std::vector<UF::ChrCustomizationChoice> out;
+    std::vector<std::pair<ChrCustomizationOptionEntry const*, std::vector<ChrCustomizationChoiceEntry const*>>> out;
     auto const* options = sDB2Manager.GetCustomiztionOptions(race, gender);
     if (!options)
         return out;
@@ -160,10 +174,6 @@ std::vector<UF::ChrCustomizationChoice> RollCustomizations(uint8 race, uint8 gen
         }
     }
 
-    static thread_local std::mt19937 cust_rng{std::random_device{}()};
-    // Core also requires that a choice whose ChrCustomizationReq lists dependent choices (e.g. a hair
-    // colour that exists only for some hair styles) has one of them selected, so the roll is dependency-aware.
-    std::vector<CustomizationRollOption> rollOptions;
     for (ChrCustomizationOptionEntry const* opt : *options)
     {
         if (!opt)
@@ -183,12 +193,30 @@ std::vector<UF::ChrCustomizationChoice> RollCustomizations(uint8 race, uint8 gen
         if (!choices || choices->empty())
             continue;
 
+        std::vector<ChrCustomizationChoiceEntry const*> allowed;
+        for (ChrCustomizationChoiceEntry const* c : *choices)
+            if (c && ((seen && seen->count(c->ID)) || BotCanUseChoice(c, race, cls)))
+                allowed.push_back(c);
+        if (!allowed.empty())
+            out.emplace_back(opt, std::move(allowed));
+    }
+    return out;
+}
+
+std::vector<UF::ChrCustomizationChoice> RollCustomizations(uint8 race, uint8 gender, uint8 cls)
+{
+    std::vector<UF::ChrCustomizationChoice> out;
+
+    static thread_local std::mt19937 cust_rng{std::random_device{}()};
+    // Core also requires that a choice whose ChrCustomizationReq lists dependent choices (e.g. a hair
+    // colour that exists only for some hair styles) has one of them selected, so the roll is dependency-aware.
+    std::vector<CustomizationRollOption> rollOptions;
+    for (auto const& [opt, choices] : AllowedCustomizations(race, gender, cls))
+    {
         CustomizationRollOption ro;
         ro.id = opt->ID;
-        for (ChrCustomizationChoiceEntry const* c : *choices)
+        for (ChrCustomizationChoiceEntry const* c : choices)
         {
-            if (!c || !(seen ? seen->count(c->ID) != 0 : BotCanUseChoice(c, race, cls)))
-                continue;
             CustomizationRollChoice rc;
             rc.id = c->ID;
             if (ChrCustomizationReqEntry const* req = sChrCustomizationReqStore.LookupEntry(c->ChrCustomizationReqID);
@@ -198,8 +226,7 @@ std::vector<UF::ChrCustomizationChoice> RollCustomizations(uint8 race, uint8 gen
                         rc.needsOneOf.push_back(anyOf);
             ro.choices.push_back(std::move(rc));
         }
-        if (!ro.choices.empty())
-            rollOptions.push_back(std::move(ro));
+        rollOptions.push_back(std::move(ro));
     }
     for (auto const& [optionId, choiceId] : RollCustomizationChoices(rollOptions, cust_rng))
     {
@@ -212,53 +239,21 @@ std::vector<UF::ChrCustomizationChoice> RollCustomizations(uint8 race, uint8 gen
     return out;
 }
 
-// Would RollCustomizations have produced this (option, choice) set's shape?
+// Would RollCustomizations have produced this (option, choice) set's shape? A bot with no
+// customizations at all wears the bare default look (and a migration clears them to ask
+// for a re-roll), so an empty set is valid only when the race/gender has nothing to roll.
 bool IsBotAppearanceValid(uint8 race, uint8 gender, uint8 cls, std::vector<std::pair<uint32, uint32>> const& current)
 {
-    auto const* options = sDB2Manager.GetCustomiztionOptions(race, gender);
-    if (!options)
-        return current.empty();
-
-    AppearanceTemplate tmpl;
-    bool haveTemplate = false;
-    {
-        std::lock_guard lock(g_templateLock);
-        if (!g_templatesLoaded)
-            LoadAppearanceTemplates_locked();
-        if (auto itr = g_templates.find({ race, gender }); itr != g_templates.end())
-        {
-            tmpl = itr->second;
-            haveTemplate = true;
-        }
-    }
+    auto const allowed = AllowedCustomizations(race, gender, cls);
+    if (current.empty())
+        return allowed.empty();
 
     for (auto const& [optionId, choiceId] : current)
     {
-        auto optItr = std::ranges::find(*options, optionId, &ChrCustomizationOptionEntry::ID);
-        if (optItr == options->end())
+        auto optItr = std::ranges::find_if(allowed, [&](auto const& a) { return a.first->ID == optionId; });
+        if (optItr == allowed.end())
             return false;
-        std::set<uint32> const* seen = nullptr;
-        if (haveTemplate)
-        {
-            auto itr = tmpl.choicesByOption.find(optionId);
-            if (itr == tmpl.choicesByOption.end())
-                return false;
-            seen = &itr->second;
-        }
-        else if (!BotCanUseOption(*optItr, race, cls))
-            return false;
-
-        if (seen)
-        {
-            if (!seen->count(choiceId))
-                return false;
-            continue;
-        }
-        auto const* choices = sDB2Manager.GetCustomiztionChoices(optionId);
-        if (!choices)
-            return false;
-        auto choiceItr = std::ranges::find_if(*choices, [&](ChrCustomizationChoiceEntry const* c) { return c && c->ID == choiceId; });
-        if (choiceItr == choices->end() || !BotCanUseChoice(*choiceItr, race, cls))
+        if (std::ranges::none_of(optItr->second, [&](ChrCustomizationChoiceEntry const* c) { return c->ID == choiceId; }))
             return false;
     }
     return true;

@@ -8,6 +8,7 @@
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include <algorithm>
+#include <initializer_list>
 #include <array>
 
 namespace Playerbot::Classic {
@@ -47,6 +48,11 @@ constexpr SupplyRank kRebirthReagent[] = {
 
 // ---- Warlock ----
 constexpr SupplyRank kSoulShard[] = { { 6265, 10 } };
+constexpr SupplyRank kInfernalStone[]   = { { 5565, 50 } };    // Inferno
+constexpr SupplyRank kDemonicFigurine[] = { { 16583, 60 } };   // Ritual of Doom
+constexpr SupplyRank kRuneTeleport[]    = { { 17031, 20 } };   // Teleport spells
+constexpr SupplyRank kRunePortals[]     = { { 17032, 40 } };   // Portal spells
+constexpr SupplyRank kBlindingPowder[]  = { { 5530, 34 } };    // Blind
 
 // ---- Every class: vendor food and water, potions, bandages (1.12 ids) ----
 // Rank = the item's required level (bandages: the bot's First Aid at that
@@ -86,6 +92,11 @@ constexpr SupplyFamily kFamilies[] = {
     { "Gift Reagent",    CLASS_DRUID,   20, kGiftReagent },
     { "Rebirth Reagent", CLASS_DRUID,   5,  kRebirthReagent },
     { "Soul Shard",      CLASS_WARLOCK, 5,  kSoulShard },
+    { "Infernal Stone",  CLASS_WARLOCK, 5,  kInfernalStone },
+    { "Demonic Figurine", CLASS_WARLOCK, 5, kDemonicFigurine },
+    { "Rune of Teleportation", CLASS_MAGE, 10, kRuneTeleport },
+    { "Rune of Portals", CLASS_MAGE,    10, kRunePortals },
+    { "Blinding Powder", CLASS_ROGUE,   10, kBlindingPowder },
     // Open-world bots keep a small stock; raid-level (55+) bots carry what a
     // raid night needs (the owner: full potion stacks, 20 food, 40 drinks).
     { "Food",            0, 5,  kFood,          kConsumable,                     20 },
@@ -100,7 +111,8 @@ constexpr SupplyFamily kFamilies[] = {
 // Flask of the Titans 13510, Flask of Supreme Power 13512, Flask of Distilled Wisdom 13511, Elixir of Fortitude 3825,
 // Elixir of Superior Defense 13445, Elixir of the Mongoose 13452, Elixir of the Giants 9206, Greater Arcane Elixir 13454,
 // Mageblood Potion 20007, Smoked Desert Dumplings 20452, Grilled Squid 13928, Runn Tum Tuber Surprise 18254,
-// Nightfin Soup 13931, Tender Wolf Steak 18045, Greater Fire / Frost / Nature / Shadow Protection Potion 13457 / 13456 / 13458 / 13459.
+// Nightfin Soup 13931, Tender Wolf Steak 18045, Greater Fire / Frost / Nature / Shadow Protection Potion 13457 / 13456 / 13458 / 13459,
+// Hourglass Sand 19183.
 // Stock: how many a bot is topped up to before every pull (flasks, elixirs and potions 5, food 20), so a raid night does not run them out.
 constexpr RaidConsumable kTankKit[] = {
     { 13510, false, 5, true }, { 13445, false, 5 }, { 3825, false, 5 }, { 18045, true, 20 },
@@ -108,6 +120,7 @@ constexpr RaidConsumable kTankKit[] = {
     { 13459, false, 5, false, true },   // Greater Shadow Protection Potion: BWL Shadow Flame (Ebonroc, Flamegor, Nefarian)
     { 13458, false, 5, false, true },   // Greater Nature Protection Potion: AQ40 Huhuran's Poison Bolt Volley
     { 13456, false, 5, false, true },   // Greater Frost Protection Potion: Naxxramas Sapphiron
+    { 19183, false, 5, false, true },   // Hourglass Sand: the cure for Chromaggus' Brood Affliction: Bronze (RaidRules::cureItem)
 };
 constexpr RaidConsumable kMeleeKit[] = {
     { 13452, false, 5 }, { 9206, false, 5 }, { 20452, true, 20 },
@@ -115,13 +128,21 @@ constexpr RaidConsumable kMeleeKit[] = {
     { 13459, false, 5, false, true },   // Greater Shadow Protection Potion: BWL Shadow Flame (Ebonroc, Flamegor, Nefarian)
     { 13458, false, 5, false, true },   // Greater Nature Protection Potion: AQ40 Huhuran's Poison Bolt Volley
     { 13456, false, 5, false, true },   // Greater Frost Protection Potion: Naxxramas Sapphiron
+    { 19183, false, 5, false, true },   // Hourglass Sand: the cure for Chromaggus' Brood Affliction: Bronze (RaidRules::cureItem)
 };
 constexpr RaidConsumable kCasterKit[] = {
     { 13512, false, 5, true }, { 13454, false, 5 }, { 18254, true, 20 },
+    // Stocked, never drunk by the pre-pull picker (combat flag): Brilliant Wizard Oil goes on the main hand by idle:classic_weapon, the Major Mana
+    // Potion and the Dark / Demonic Rune by the fight's mana item rule (PickCombatManaItem).
+    { 20749, false, 5, false, true },   // Brilliant Wizard Oil: +36 spell damage, +1% spell crit on the weapon
+    { 13444, false, 5, false, true },   // Major Mana Potion
+    { 12662, false, 5, false, true },   // Demonic Rune
+    { 20520, false, 5, false, true },   // Dark Rune
     { 13457, false, 5, false, true },   // Greater Fire Protection Potion: drunk in the fight where the boss data orders it (Ragnaros, Geddon, Onyxia, Firemaw, Vaelastrasz)
     { 13459, false, 5, false, true },   // Greater Shadow Protection Potion: BWL Shadow Flame (Ebonroc, Flamegor, Nefarian)
     { 13458, false, 5, false, true },   // Greater Nature Protection Potion: AQ40 Huhuran's Poison Bolt Volley
     { 13456, false, 5, false, true },   // Greater Frost Protection Potion: Naxxramas Sapphiron
+    { 19183, false, 5, false, true },   // Hourglass Sand: the cure for Chromaggus' Brood Affliction: Bronze (RaidRules::cureItem)
 };
 constexpr RaidConsumable kHealerKit[] = {
     { 13511, false, 5, true }, { 20007, false, 5 }, { 13931, true, 20 },
@@ -129,6 +150,7 @@ constexpr RaidConsumable kHealerKit[] = {
     { 13459, false, 5, false, true },   // Greater Shadow Protection Potion: BWL Shadow Flame (Ebonroc, Flamegor, Nefarian)
     { 13458, false, 5, false, true },   // Greater Nature Protection Potion: AQ40 Huhuran's Poison Bolt Volley
     { 13456, false, 5, false, true },   // Greater Frost Protection Potion: Naxxramas Sapphiron
+    { 19183, false, 5, false, true },   // Hourglass Sand: the cure for Chromaggus' Brood Affliction: Bronze (RaidRules::cureItem)
 };
 constexpr RaidConsumable kHunterKit[] = {
     { 13452, false, 5 }, { 9206, false, 5 }, { 13928, true, 20 },
@@ -136,6 +158,7 @@ constexpr RaidConsumable kHunterKit[] = {
     { 13459, false, 5, false, true },   // Greater Shadow Protection Potion: BWL Shadow Flame (Ebonroc, Flamegor, Nefarian)
     { 13458, false, 5, false, true },   // Greater Nature Protection Potion: AQ40 Huhuran's Poison Bolt Volley
     { 13456, false, 5, false, true },   // Greater Frost Protection Potion: Naxxramas Sapphiron
+    { 19183, false, 5, false, true },   // Hourglass Sand: the cure for Chromaggus' Brood Affliction: Bronze (RaidRules::cureItem)
 };
 
 } // namespace
@@ -252,6 +275,29 @@ uint32 BestSupplyRank(SupplyFamily const& family, uint8 level)
         if (it->min_level <= level && sObjectMgr->GetItemTemplate(it->item))
             return it->item;
     return 0;
+}
+
+uint32 VirtualRecoveryRank(bool water, uint8 cls, uint8 level)
+{
+    SupplyFamily const* f = FindSupplyFamily(water ? "Water" : "Food");
+    return f && SupplyFamilyForClass(*f, cls) ? BestSupplyRank(*f, level) : 0;
+}
+
+bool IsVirtualRecoveryItem(uint32 item, uint8 cls, uint8 level, bool& water)
+{
+    for (bool const w : { false, true })
+    {
+        SupplyFamily const* f = FindSupplyFamily(w ? "Water" : "Food");
+        if (!f || !SupplyFamilyForClass(*f, cls))
+            continue;
+        for (SupplyRank const& r : f->ranks)
+            if (r.item == item && r.min_level <= level)
+            {
+                water = w;
+                return true;
+            }
+    }
+    return false;
 }
 
 uint32 BestAmmo(uint8 kind, uint8 level)

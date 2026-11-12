@@ -10,12 +10,14 @@
 // Openers: on a target nobody is fighting yet the rogue stealths, Saps a
 // humanoid standing next to it, then opens with Ambush (behind, dagger),
 // Cheap Shot, or Garrote (behind, before Cheap Shot is learned). Backstab
-// replaces Sinister Strike when behind the target with a dagger. "Behind"
+// replaces Sinister Strike when behind the target with a dagger; Mutilate (when learned, dagger) replaces both up to 3 combo points. "Behind"
 // is read from the target's facing in the snapshot. Poisons are kept up out
 // of combat by idle:classic_weapon (Bot/ClassicUpkeep.cpp).
+// Forever spells, in the order the wowsims/forever (MIT) rogue list uses them: Shank (off-hand stab that gives energy) on
+// cooldown below 80 energy, Death Mark (Subtlety talent finisher) at 4+ combo points.
 // Skipped: Kidney Shot, Vanish, Gouge. Feint: threat dump at 60% of the tank's threat (idea from Karrz's VMaNGOS bots).
 //
-// Priorities follow Karrz's ike3 vanilla strategies (the ike3-based playerbot code
+// Priorities follow Karrz's ike3 vanilla strategies (Karrz1/wow-1.12
 // raid10-revamp, playerbot/strategy/rogue/*Strategy.cpp, MANGOSBOT_ZERO).
 
 #include "../ApRegistry.h"
@@ -61,6 +63,9 @@ constexpr uint32 CHEAP_SHOT      = 1833;
 constexpr uint32 AMBUSH          = 8676;    // dagger, from behind
 constexpr uint32 GARROTE         = 703;     // from behind
 constexpr uint32 BACKSTAB        = 53;      // dagger, from behind
+constexpr uint32 SHANK           = 1329283; // Forever, level 24 (rank 2 1329549 at 44)
+constexpr uint32 DEATH_MARK      = 1316709; // Forever Subtlety talent (ranks 1325756-1325758)
+constexpr uint32 MUTILATE        = 399956;  // dagger, two combo points for 60 energy (1329 is the Burning Crusade id, its strike 5374 is not in the client data)
 
 constexpr uint8 POWER_ENERGY = 3;
 constexpr uint8 POWER_COMBO  = 4;
@@ -112,6 +117,13 @@ bool MainHandDagger(ApPredicateContext const& ctx)
     return t && t->GetClass() == ITEM_CLASS_WEAPON && t->GetSubClass() == ITEM_SUBCLASS_WEAPON_DAGGER;
 }
 
+bool OffHandWeapon(ApPredicateContext const& ctx)
+{
+    uint32 const entry = ctx.bot.raw().inventory.equipped[EQUIPMENT_SLOT_OFFHAND].entry;
+    ItemTemplate const* t = entry ? sObjectMgr->GetItemTemplate(entry) : nullptr;
+    return t && t->GetClass() == ITEM_CLASS_WEAPON;
+}
+
 bool Stealthed(ApPredicateContext const& ctx) { return ctx.bot.has_aura(STEALTH); }
 
 // ======================= Openers =======================
@@ -125,7 +137,7 @@ bool UnengagedVictim(ApPredicateContext const& ctx)
 
 bool ShouldStealth(ApPredicateContext const& ctx)
 {
-    if (ctx.bot.in_combat() || Stealthed(ctx) || ctx.bot.is_mounted() || !UnengagedVictim(ctx) || !Ready(ctx, STEALTH))
+    if (ctx.bot.in_combat() || Stealthed(ctx) || ctx.bot.is_mounted() || ctx.bot.owner_stealth_off() || !UnengagedVictim(ctx) || !Ready(ctx, STEALTH))
         return false;
     float const d = DistTo(ctx, *ctx.bot.victim_info());
     return d > 8.f && d < 40.f;
@@ -238,20 +250,24 @@ void DoBladeFlurry(ApPredicateContext const& ctx, BotIntentEmitter& e)
     Classic::NoteCooldownUse(ctx.bot, BLADE_FLURRY, "Blade Flurry");
 }
 
-// Slice and Dice at 1-2 combo points when it is missing; not worth it on a
-// target about to die.
-// Up with more than 3 s left: recast before it drops, not after (a gap of a GCD plus the next builder every cycle).
-static bool SliceAndDiceUp(ApPredicateContext const& ctx)
+// Slice and Dice lasts 9 s at one point and 21 s at five. See ShouldSliceAndDice for how it shares the points with Eviscerate.
+static int32 SliceAndDiceMs(ApPredicateContext const& ctx)
 {
     AuraEntry const* a = ctx.bot.find_aura(SLICE_AND_DICE);
-    return a && a->remaining.count() > 3000;
+    return a ? int32(a->remaining.count()) : 0;
 }
 
 bool ShouldSliceAndDice(ApPredicateContext const& ctx)
 {
     if (!HasLiveTarget(ctx) || Combo(ctx) < 1 || Energy(ctx) < 25) return false;
     if (VictimHpPct(ctx) < 25 && !VictimIsBossLike(ctx)) return false;
-    return (Ready(ctx, SLICE_AND_DICE) && ctx.bot.victim_in_spell_range(SLICE_AND_DICE)) && !SliceAndDiceUp(ctx);
+    if (!(Ready(ctx, SLICE_AND_DICE) && ctx.bot.victim_in_spell_range(SLICE_AND_DICE))) return false;
+    // Only a lapsed Slice and Dice is cast again, and while one is running the points go to Eviscerate: a builder gives one point per
+    // 40 energy, 0.25 a second, which Slice and Dice at its 15 s upkeep (3 points) takes entirely (damage_parity 164: Eviscerate never
+    // cast in a 180 s leg of 43 points). Five points buy 21 s, then Eviscerate takes the next five: Slice and Dice up about half the
+    // time and both finishers in use. A short fight against an ordinary mob has no five points to wait for: it starts at two.
+    if (SliceAndDiceMs(ctx) > 0) return false;
+    return Combo(ctx) >= 5 || (Combo(ctx) >= 2 && !VictimIsBossLike(ctx));
 }
 // Cast at the victim like a finishing move (the owner's PartyBotAI does the same): in the
 // Classic data a finishing move is bound to the combo target, and the self cast
@@ -289,6 +305,26 @@ bool ShouldExposeArmor(ApPredicateContext const& ctx)
 }
 void DoExposeArmor(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(EXPOSE_ARMOR, ctx.bot.victim()); }
 
+// Shank: an off-hand stab for 50% weapon damage that gives 25 energy for 5, 10 s cooldown, no combo point (the Boot Knife talent
+// may add some). The wowsims/forever list casts it on cooldown at 80 energy or less, so the energy it gives is never wasted.
+// It needs a weapon in the off hand; never from stealth, the opener goes first.
+bool ShouldShank(ApPredicateContext const& ctx)
+{
+    return HasLiveTarget(ctx) && ctx.bot.in_combat() && !Stealthed(ctx) && Energy(ctx) >= 5 && Energy(ctx) <= 80
+        && OffHandWeapon(ctx) && (Ready(ctx, SHANK) && ctx.bot.victim_in_spell_range(SHANK));
+}
+void DoShank(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(SHANK, ctx.bot.victim()); }
+
+// Death Mark: a finisher (25 energy, 10 s cooldown, 20 yd) that marks the target for 6 s, stores part of the rogue's damage on it
+// per combo point spent and deals it when the mark ends. The wowsims/forever list spends 4+ points on it ahead of the other
+// finishers; a lapsed Slice and Dice still goes first here (that rule only fires with no Slice and Dice up).
+bool ShouldDeathMark(ApPredicateContext const& ctx)
+{
+    return HasLiveTarget(ctx) && Combo(ctx) >= 4 && Energy(ctx) >= 25
+        && (Ready(ctx, DEATH_MARK) && ctx.bot.victim_in_spell_range(DEATH_MARK));
+}
+void DoDeathMark(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(DEATH_MARK, ctx.bot.victim()); }
+
 // Finisher at 5 points; at 3+ when the target is nearly dead.
 bool ShouldEviscerate(ApPredicateContext const& ctx)
 {
@@ -310,6 +346,15 @@ bool ShouldHemorrhage(ApPredicateContext const& ctx)
     return HasLiveTarget(ctx) && Energy(ctx) >= 35 && Combo(ctx) < 5 && (Ready(ctx, HEMORRHAGE) && ctx.bot.victim_in_spell_range(HEMORRHAGE));
 }
 void DoHemorrhage(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(HEMORRHAGE, ctx.bot.victim()); }
+
+// Two combo points for 60 energy, against one for 60 (Backstab) or 45 (Sinister Strike): the cheapest combo point there is, and from any side.
+// Up to 3 points so the 2 it awards never overflow 5; the last point comes from Backstab / Sinister Strike.
+bool ShouldMutilate(ApPredicateContext const& ctx)
+{
+    return HasLiveTarget(ctx) && Energy(ctx) >= 60 && Combo(ctx) <= 3 && (Ready(ctx, MUTILATE) && ctx.bot.victim_in_spell_range(MUTILATE))
+        && MainHandDagger(ctx);
+}
+void DoMutilate(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(MUTILATE, ctx.bot.victim()); }
 
 bool ShouldBackstab(ApPredicateContext const& ctx)
 {
@@ -336,11 +381,14 @@ ApRule const kRules[] = {
     { ShouldGarrote,        DoGarrote,        "classic_rogue:garrote" },
     { ShouldAdrenalineRush, DoAdrenalineRush, "classic_rogue:adrenaline_rush" },
     { ShouldBladeFlurry,    DoBladeFlurry,    "classic_rogue:blade_flurry" },
+    { ShouldShank,          DoShank,          "classic_rogue:shank" },
     { ShouldSliceAndDice,   DoSliceAndDice,   "classic_rogue:slice_and_dice" },
+    { ShouldDeathMark,      DoDeathMark,      "classic_rogue:death_mark" },
     { ShouldColdBlood,      DoColdBlood,      "classic_rogue:cold_blood" },
     { ShouldExposeArmor,    DoExposeArmor,    "classic_rogue:expose_armor" },
     { ShouldEviscerate,     DoEviscerate,     "classic_rogue:eviscerate" },
     { ShouldRiposte,        DoRiposte,        "classic_rogue:riposte" },
+    { ShouldMutilate,       DoMutilate,       "classic_rogue:mutilate" },
     { ShouldBackstab,       DoBackstab,       "classic_rogue:backstab" },
     { ShouldHemorrhage,     DoHemorrhage,     "classic_rogue:hemorrhage" },
     { ShouldSinisterStrike, DoSinisterStrike, "classic_rogue:sinister_strike" },

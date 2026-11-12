@@ -25,6 +25,10 @@ public:
     bool   is_horde()    const { return s_->identity.team == 2u; }
     uint8  cls()     const { return s_->identity.cls; }
     uint32 spec()    const { return s_->identity.spec; }
+    // The owner's pick for a slot ("prefer blessing might"; OwnerPicks.h): rank-1 spell id, 0 = the bot's own plan.
+    uint32 owner_pick(OwnerPicks::Slot slot) const { return s_->owner_picks[slot]; }
+    bool   owner_pet_off() const { return s_->owner_picks.pet_off; }
+    bool   owner_stealth_off() const { return s_->owner_picks.stealth_off; }
     uint8  gender()  const { return s_->identity.gender; }
     uint32 faction() const { return s_->identity.faction; }
     ObjectGuid guid() const { return s_->guid; }
@@ -40,6 +44,7 @@ public:
     // A heal is refused (PREVENTED_BY_MECHANIC) while stunned, feared, confused or silenced.
     bool   cannot_heal()  const { return s_->vitals.is_stunned || s_->vitals.is_feared || s_->vitals.is_confused || s_->vitals.is_silenced; }
     bool   is_pvp()       const { return s_->vitals.is_pvp; }
+    bool   pvp_wanted()   const { return s_->vitals.pvp_wanted; }
     // True when any state would block cast attempts (stun + silence + active
     // cast). Caller should still check spell-specific gates (CD, resource).
     bool   can_cast() const { return !s_->vitals.is_stunned && !s_->vitals.is_silenced &&
@@ -386,13 +391,23 @@ public:
     // threat-grab behavior. Returns nullptr if every nearby enemy is on us.
     NearbyUnit const* untaunted_enemy(float range = 30.f) const;
 
-    // ---- Threat discipline (port of Karrz's ike3-based bots group threat rules) ----
+    // ---- Threat discipline (port of Karrz's wow-1.12 group threat rules) ----
     // The attacker / nearby-enemy record for `guid` (attackers first), or null.
     NearbyUnit const* hostile_unit(ObjectGuid guid) const;
     // Group's tank as resolved by the builder (may be this bot). Empty when
     // ungrouped or no tank is on this map.
     ObjectGuid group_tank() const { return s_->combat.group_tank; }
     bool       big_raid()   const { return s_->combat.big_raid; }
+    bool       in_raid_group() const { return s_->combat.raid_group; }
+    // Raid tactics (threat discipline, the ranged slots behind the tank, the step to the tank, the raid plan): a raid map (20 and 40
+    // players) or a raid group in the open world. A raid group in a dungeon, and a 10-player raid map (UBRS), play it as a dungeon (the
+    // owner, 2026-10-28: "UBRS is a 10-man, I wouldn't classify that as a raid ... anything above 20-man, raid tactics").
+    static constexpr uint32 kRaidTacticsMinPlayers = 20;
+    bool       raid_tactics_map() const
+    {
+        return is_in_raid() && (s_->instance_ctx.max_players == 0 || s_->instance_ctx.max_players >= kRaidTacticsMinPlayers);
+    }
+    bool       raid_rules() const { return raid_tactics_map() || (in_raid_group() && !s_->instance_ctx.is_in_instance); }
     // Damage-restraint verdict for a NON-TANK group member about to damage
     // `target` (MCRaidHoldDamage): TankOpening while the tank has not yet
     // built `opening_lead` threat (or nobody has engaged the mob yet);
@@ -509,19 +524,19 @@ public:
         return seen ? lo : 100;
     }
 
-    // First trinket on-use spell that's actually ready to fire. Returns 0
-    // when the bot has no equipped on-use trinket or both are on cooldown.
-    // Trinkets live in EQUIPMENT_SLOT_TRINKET1 (13) and TRINKET2 (14); the
-    // builder pre-resolved each slot's ON_USE spell so we just probe the
-    // ready bit. InCombat fires this on cooldown to extract trinket value
-    // without per-tick ItemTemplate lookups.
-    uint32 ready_on_use_trinket() const
+    // Item entry of the first equipped trinket whose on-use spell is off cooldown; 0 when there is none. A trinket's spell is not in the
+    // spellbook, so is_ready() (which refuses an unknown spell) never passed one: no trinket of any class fired until this check
+    // (215 scorecard: no trinket in any hunter's cast list). The builder pre-resolved each slot's ON_USE spell; the cooldown is the spell's,
+    // as the core keeps an item's use cooldown under its spell. The caller uses the item (UseItemByEntry), not a spell cast.
+    uint32 ready_on_use_trinket_item() const
     {
-        constexpr uint8 TRINKET1 = 13, TRINKET2 = 14;
+        constexpr uint8 TRINKET1 = 12, TRINKET2 = 13;   // EQUIPMENT_SLOT_TRINKET1 / TRINKET2
+        if (s_->vitals.is_stunned) return 0;
         for (uint8 slot : {TRINKET1, TRINKET2})
         {
-            const uint32 sid = s_->inventory.equipped[slot].on_use_spell_id;
-            if (sid != 0 && is_ready(sid)) return sid;
+            auto const& eq = s_->inventory.equipped[slot];
+            if (eq.entry != 0 && eq.on_use_spell_id != 0 && eq.on_use_cd_ms == 0)
+                return eq.entry;
         }
         return 0;
     }

@@ -2,20 +2,28 @@
 
 #include "DamageParity.h"
 #include "ScenarioDefs.h"
+#include "PetReviveCheck.h"
 #include "../Bot/BotAI.h"
 #include "../Bot/BotRegistry.h"
 #include "../Bot/Raid/RaidEncounters.h"
+#include "../Bot/Raid/RaidFightScript.h"
 #include "../Bot/ClassicUpkeep.h"
 #include "../Bot/BotSnapshotView.h"
 #include "../Bot/Gear/OwnedGearPolicy.h"
 #include "../Group/GroupSnapshot.h"
+#include "../Api/ClassicSpec.h"
 #include "../Api/ClassicSupplies.h"
+#include "../Bot/World/HunterPetsByRace.h"
 #include "../Fleet/BotCharacterFactory.h"
 #include "../Fleet/BotIdentityRegistry.h"
 #include "../Fleet/BotPool.h"
 #include "../Fleet/BotPopulationManager.h"
 #include "../Fleet/BotSetupPipeline.h"
 #include "../Services.h"
+#include "../PlayerbotV2.h"            // Module::RouteGroupOrder: the player-led stand-in's "pull back" / "attack"
+#include "../Bot/Dungeon/DungeonScript.h"   // DungeonScriptMgr::RouteFor: the route the stand-in walks
+#include "ScenarioHuman.h"
+#include "../Fleet/OwnerCatchUp.h"
 #include "../Threading/SnapshotPublisher.h"
 #include "../Threading/TickScheduler.h"
 #include "../Session/BotSessionMgr.h"
@@ -23,7 +31,10 @@
 #include "CharacterCache.h"
 #include "Creature.h"
 #include "CreatureGroups.h"
+#include "CreatureAI.h"
+#include "GameObject.h"
 #include "GameTime.h"
+#include "GossipDef.h"
 #include "Group.h"
 #include "GroupMgr.h"
 #include "Log.h"
@@ -39,11 +50,14 @@
 #include "MotionMaster.h"
 #include "MoveSpline.h"
 #include "ObjectMgr.h"
+#include "InstanceScript.h"
+#include "GameEventSender.h"
 #include "ObjectAccessor.h"
 #include "PathGenerator.h"
 #include "Player.h"
 #include "WaypointManager.h"
 #include "PlayerbotAPI.h"
+#include "../Api/ClassicSpec.h"
 #include "PlayerbotMovement.h"
 #include "Util.h"
 #include "fmt/format.h"
@@ -75,6 +89,38 @@ namespace {
 // the same spot `.playerbot dungeontest` stages at).
 constexpr std::uint32_t kStageMap = 0;
 constexpr float kStageX = -8985.0f, kStageY = 511.0f, kStageZ = 79.8f;
+// A Horde character cannot stand in Stormwind: the city guards kill it (damage_parity_shaman 152, an Orc dead after 38 s). Its staging spot is Razor Hill,
+// a Horde town with open, flat ground around it.
+constexpr std::uint32_t kHordeStageMap = 1;
+constexpr float kHordeStageX = 340.36f, kHordeStageY = -4686.29f, kHordeStageZ = 16.54f;
+
+// The Stormwind harbour ledge killed two parity runs (a rogue fell off it, a hunter walked into the water). An Alliance parity subject stages at the
+// Northshire Abbey start instead: the human racial start (playercreateinfo), open flat ground with no water or ledge; World.cpp checks its map and vmap on boot.
+// Dungeon scenarios keep the Stormwind spot they path from.
+constexpr float kAllianceParityStageX = -8949.95f, kAllianceParityStageY = -132.493f, kAllianceParityStageZ = 83.5312f;
+
+inline void StagePoint(Player const* p, std::uint32_t& map, float& x, float& y, float& z, bool parity = false)
+{
+    if (p && p->GetTeam() == HORDE)
+    {
+        map = kHordeStageMap; x = kHordeStageX; y = kHordeStageY; z = kHordeStageZ;
+        return;
+    }
+    if (parity)
+    {
+        map = 0; x = kAllianceParityStageX; y = kAllianceParityStageY; z = kAllianceParityStageZ;
+        return;
+    }
+    map = kStageMap; x = kStageX; y = kStageY; z = kStageZ;
+}
+
+// Sends the character to its staging spot.
+inline void SendToStage(Player* p, bool parity = false)
+{
+    std::uint32_t map; float x, y, z;
+    StagePoint(p, map, x, y, z, parity);
+    ::Playerbot::BotMovement::SafeTeleport(p, map, x, y, z, 0.f, 0);
+}
 
 constexpr std::uint32_t kStepMs = 1000;                 // one staging / sampling step a second; setup is never looped on the world thread
 constexpr std::uint32_t kStageTimeoutMs = 8u * 60u * 1000u;
@@ -95,9 +141,14 @@ struct Member
     ScenarioMember def;
     std::uint64_t id = 0;
     bool role_pinned = false;
+    std::uint32_t parity_talent_tries = 0;   // damage_parity: attempts to commit the class's classic build
+    bool parity_talents = false;
+    std::uint32_t parity_pet_tries = 0;   // damage_parity hunter: attempts to give it the pet every hunter has
+    bool parity_pet = false;   // damage_parity: the classic build is committed
     bool kit_learned = false;   // the class trainer spells of the squad level are taught (LearnLevelKit)
     bool tier_geared = false;   // the raid's tier gear (RaidGearTier) and the fight's resistance gear are on (see the staging step)
     bool ready = false;
+    bool arrival_logged = false;   // LogPlace wrote where it landed on the scenario's map
 };
 
 // What one raider did from the boss's first combat second: the damage it (and its pet) dealt, and how its seconds were spent.
@@ -114,6 +165,7 @@ struct PullStat
 
 struct Run
 {
+    bool flat_ground_done = false;   // damage_parity: the flat spot the measurement runs from is chosen and remembered (Parity::NoteFlatSpot)
     ScenarioDef const* def = nullptr;
     Phase phase = Phase::Idle;
     std::vector<Member> members;
@@ -121,6 +173,7 @@ struct Run
     std::uint32_t step_acc_ms = 0;
     std::uint32_t phase_ms = 0;          // time in the current phase
     std::uint32_t run_ms = 0;            // time since the run began (what the failure timestamps count)
+    std::uint8_t place_logs = 0;         // LogPlace rounds written after the run began (1 s and 3 s in)
     bool goal_reached = false;
     std::uint32_t adds_killed = 0;   // ScenarioDef::goal_adds_needed
     std::uint32_t spared_killed = 0;   // ScenarioDef::spare_entry: dead before the goal boss
@@ -130,6 +183,13 @@ struct Run
     float boss_x = 0.f, boss_y = 0.f, boss_z = 0.f, boss_o = 0.f;
     ObjectGuid::LowType boss_spawn_id = 0;   // the creature row behind boss_x (0: a summoned boss); its waypoint path keeps the landing clear
     bool arrive_sent = false;
+    std::uint32_t landing_resend_ms = 0;  // phase_ms of the last landing teleport resend round
+    std::uint32_t start_object_used_ms = 0;   // run_ms the main tank used ScenarioDef::start_object (0: not yet)
+    std::uint32_t start_event_sent_ms = 0;    // run_ms the main tank sent ScenarioDef::start_event (0: not yet)
+    std::uint32_t start_npc_wait_ms = 0;      // run_ms ScenarioDef::start_instance_data was set and the wait for start_npc began (0: not yet)
+    std::uint32_t start_npc_done_ms = 0;      // run_ms the main tank talked to ScenarioDef::start_npc (0: not yet)
+    bool start_data_set = false;              // ScenarioDef::start_instance_data was set for a fight with no start_npc
+    std::uint32_t goal_wait_log_ms = 0;       // run_ms of the last 'waiting for the summoned boss' line
     std::uint32_t landing_log_ms = 0;     // game time of the last landing position round
     std::uint32_t landing_rounds = 0;     // rounds logged (capped)
     std::uint32_t mana_wait_log_ms = 0;   // run_ms of the last 'waiting for the healers' mana' line
@@ -146,8 +206,34 @@ struct Run
     float arrive_x = 0.f, arrive_y = 0.f, arrive_z = 0.f, arrive_o = 0.f;
     bool order_sent = false;
     std::uint32_t attack_run_ms = 0;     // run_ms of the Attack order
+    std::uint32_t newcomers_next_ms = 0;  // run_ms of the next look at the hostiles near the raid before the order (LogNewcomers)
     bool tank_probe_done = false;        // the tanks' state a few seconds into the fight was logged
+    std::uint32_t owner_skull_next_ms = 0;   // run_ms of the next look at the owner's skull (PlayOwnerSkull)
+    ObjectGuid owner_skull;                  // the enemy the runner last put the skull on
     bool stand_in_detached = false;      // the stand-in logic is off and the runner plays it
+    // ScenarioDef::player_lead: the stand-in leader's walk and orders (PlayLeader).
+    std::vector<::Playerbot::DungeonAdvice::ProgressionPoint> lead_route;
+    std::size_t lead_wp = 0;              // the route point he walks to next
+    ObjectGuid lead_pull;                 // the mob he said "pull back" on
+    std::uint32_t lead_pull_ms = 0;       // run_ms of that order
+    bool lead_attack_sent = false;        // "attack" said for this fight
+    std::uint32_t lead_wait_since_ms = 0; // run_ms the ready wait began (0: not waiting)
+    std::uint32_t lead_log_ms = 0;        // run_ms of the last [scenario_lead] line
+    std::set<ObjectGuid> lead_skipped;    // mobs a pull order never started a fight with
+    ObjectGuid lead_boss;                 // the run's boss he set out for: he goes on to him until he is dead (PlayLeader)
+    // ScenarioGoalKind::FollowRoute (PlayRoute): the leg he is on and how it goes.
+    std::size_t route_leg = 0;
+    std::uint32_t leg_start_ms = 0;       // run_ms the leg began (0: not begun)
+    std::uint32_t leg_at_ms = 0;          // run_ms he reached the leg's point (0: not yet)
+    std::uint32_t leg_progress_ms = 0;    // run_ms he last got 2 y closer to the point
+    float leg_best = 0.f;                 // his smallest distance to the point on this leg
+    bool leg_leapt = false;               // he was set down on the point (no walking route)
+    bool leg_water = false;               // a water point: the deep spot found for it when the leg began
+    float leg_wx = 0.f, leg_wy = 0.f, leg_wz = 0.f;
+    std::uint32_t leg_hold_since_ms = 0;  // run_ms the squad was with him at a point he holds (0: not holding)
+    std::map<std::uint64_t, std::uint32_t> leg_joined_ms;     // member -> run_ms it first stood with him at the point
+    std::map<std::uint64_t, std::uint32_t> leg_catch_ups;     // member -> its catch-up count when the leg began
+    std::uint32_t spot_moved = 0;        // the dps scorecard raid was moved to flat ground
     ObjectGuid group_guid;               // the squad's group: a member found in another one is put back before the run starts
     bool group_logged = false;
     bool refusal_logged = false;   // the map's refusal of the squad's entry is logged once per run
@@ -157,8 +243,8 @@ struct Run
     // Classic::RaidSupportTotal readings (tranq shots, curses removed, formation slot give-ups) when the run began.
     std::uint32_t base_tranq = 0, base_decurse = 0, base_giveup = 0;
     bool support_based = false;
-    // Playerbot.log's size once a second of the run (run_ms, bytes), the last kReportWindowMs of it: where the failure report
-    // starts reading the log.
+    // Playerbot.log's size once a second of the run (run_ms, bytes), the whole run (at most kLogMarksMax): where the failure report
+    // starts and stops reading the log.
     std::deque<std::pair<std::uint32_t, std::uintmax_t>> log_marks;
     // The creature whose first spawn the squad is moved next to before the run: a raid's boss (def->arrive_near_entry, held until the Attack)
     // or a dungeon checkpoint (`name@key`, bot-led from the first second). 0 = the squad plays from the entrance.
@@ -245,6 +331,29 @@ void StockRation(Run& run, Player* p, Ration const* table, std::size_t n)
     TC_LOG_INFO("playerbot.v2", "[scenario] {} stocked {} x{} (entry {})", p->GetName(), pick->GetName(LOCALE_enUS), kRationStack - have, pick->GetId());
 }
 
+// A scenario character is reused run after run, and every regear leaves the gear it replaced in the bags: by 0.1.23 the deadmines_full priest,
+// warrior and mage had no room for a ration ("could not carry Melon Juice"), and the priest never drank (healer_no_rest, then healer_oom).
+// Everything carried loose in the backpack and bags goes before the rations and supplies are stocked (bags themselves, quest items and the
+// equipped gear stay). Scenario characters only: this runs in the staging of a scenario squad.
+void ClearScenarioBags(Run& run, Player* p)
+{
+    std::vector<std::pair<uint8, uint8>> slots;
+    p->ForEachItem(ItemSearchLocation::Inventory, [&](Item* item)
+    {
+        ItemTemplate const* t = item->GetTemplate();
+        if (!item->IsBag() && t && t->GetClass() != ITEM_CLASS_QUEST)
+            slots.emplace_back(item->GetBagSlot(), item->GetSlot());
+        return ItemSearchCallbackResult::Continue;
+    });
+    for (auto const& [bag, slot] : slots)
+        p->DestroyItem(bag, slot, true);
+    if (!slots.empty())
+    {
+        run.stage_status += fmt::format("{}=bags_cleared({}) ", p->GetName(), slots.size());
+        TC_LOG_INFO("playerbot.v2", "[scenario] {} bags cleared: {} items", p->GetName(), slots.size());
+    }
+}
+
 void StockRations(Run& run, Player* p)
 {
     if (p->GetPowerType() == POWER_MANA)
@@ -262,7 +371,7 @@ Owned::GearMode RaidGearTier(std::string_view name)
         return Owned::GearMode::T1;
     if (name.starts_with("bwl_") || name.starts_with("aq40_"))
         return Owned::GearMode::T2;
-    if (name.starts_with("naxx_"))
+    if (name.starts_with("naxx_") || name.starts_with("dps_scorecard") || name.starts_with("support_scorecard"))
         return Owned::GearMode::T3;
     return Owned::GearMode::Match;
 }
@@ -332,7 +441,7 @@ bool StageMember(Run& run, Member& m)
     {
         LeaveGroup(p);
         p->CombatStop(true);
-        ::Playerbot::BotMovement::SafeTeleport(p, kStageMap, kStageX, kStageY, kStageZ, 0.f, 0);
+        SendToStage(p, run.def->goal == ScenarioGoalKind::Parity);
         run.stage_status += fmt::format("{}=staged ", m.def.name);
         return false;
     }
@@ -365,6 +474,18 @@ bool StageMember(Run& run, Member& m)
         return false;
     }
 
+    // A damage_parity run played as another specialization (damage_parity_warrior_fury) gets that specialization's talents before it is
+    // geared: the role above pins the class's default DPS spec, so the fury run kept the Arms talents (Mortal Strike, no Bloodthirst) and
+    // only its rotation rules were Fury's (136: Mortal Strike and Whirlwind cast, no Bloodthirst).
+    if (def.parity && def.parity_spec && ::Playerbot::Classic::GetSpecOverride(p->GetGUID()) != def.parity_spec)
+    {
+        ::Playerbot::Classic::SetSpecOverride(p, def.parity_spec);
+        ::Playerbot::API api(p);
+        api.apply_talent_build(0);
+        run.stage_status += fmt::format("{}=spec ", m.def.name);
+        return false;
+    }
+
     // Level, gear and spells through the standard setup pipeline, exactly one pipeline step per call. A character set up for another
     // level (the shared dungeon party is re-levelled for each row) has its pipeline marked done: it runs again for this level.
     if (uint32(p->GetLevel()) != def.level)
@@ -376,6 +497,10 @@ bool StageMember(Run& run, Member& m)
         // entered (127: "Scnhunter level 15, wrong level, map 0"). A character at its new level starts at zero.
         p->SetXP(0);
         p->InitTalentForLevel();
+        // GiveLevel keeps the spells too: the priest set down from the scorecard's 60 to Ragefire's 14 healed with its level-50 ranks
+        // and was out of mana in the first pulls (0.1.24 rfc_oggleflint and wc_cobrahn healer_oom).
+        if (uint32 const unlearned = ::Playerbot::API(p).unlearn_spells_above_level())
+            TC_LOG_INFO("playerbot.v2", "[scenario] {} {}: {} spells above level {} unlearned", def.name, m.def.name, unlearned, def.level);
         m.kit_learned = false;
     }
     // The pipeline's SetLevel step returns early for a bot already at the level (levelled just above, or by an earlier run), so it
@@ -391,6 +516,42 @@ bool StageMember(Run& run, Member& m)
         run.stage_status += fmt::format("{}=setup ", m.def.name);
         return false;
     }
+
+    // A damage_parity run measures the class's own build, committed before the first leg. The setup pipeline's talent step and the idle
+    // rule only commit out of combat, and the bot stands in combat with the dummy as soon as it is staged: the paladin (143) first
+    // committed its build between the t3 and t3_buffed legs, so the none/t1/t3 legs ran without Seal of Command and Vengeance.
+    if (def.parity && !m.parity_talents && m.parity_talent_tries < 20)
+    {
+        ++m.parity_talent_tries;
+        // The base scenario plays the class's own default (warrior: Arms, 71). The override of an earlier run of the same character stays in
+        // the registry: the arms run after a fury run committed the Fury build (144: spec 72, Bloodthirst and Whirlwind, no Mortal Strike).
+        ::Playerbot::Classic::SetSpecOverride(p, m.def.spec ? m.def.spec : def.parity_spec ? def.parity_spec : (p->GetClass() == CLASS_WARRIOR ? 71u : 0u));
+        if (::Playerbot::API(p).apply_talent_build(0) == ::Playerbot::Result::Ok)
+            m.parity_talents = true;
+        else if (m.parity_talent_tries == 20)
+            TC_LOG_WARN("playerbot.v2", "[scenario] {} {}: the classic build was not committed in 20 tries", def.name, m.def.name);
+        run.stage_status += fmt::format("{}=talents ", m.def.name);
+        return false;
+    }
+
+    // A hunter's pet is a fifth to a third of its damage in vanilla; a scenario hunter had none (161: pet_dps 0, no stabled pet for the call rule;
+    // the setup pipeline's pet step never ran for a reused character). Every scenario hunter gets the race's starter pet.
+    if (p->GetClass() == CLASS_HUNTER && p->GetLevel() >= 10 && !m.parity_pet && m.parity_pet_tries < 20)
+    {
+        ++m.parity_pet_tries;
+        using PetResult = ::Playerbot::API::StarterPetResult;
+        PetResult const r = ::Playerbot::API(p).grant_starter_hunter_pet(::Playerbot::V2::World::StarterHunterPetEntry(p->GetRace(), p->GetTeam() == ALLIANCE));
+        if (r != PetResult::NotNow)
+        {
+            m.parity_pet = true;
+            TC_LOG_INFO("playerbot.v2", "[scenario] {} {}: starter pet {}", def.name, m.def.name,
+                        r == PetResult::Tamed ? "tamed" : r == PetResult::HasPet ? "already there" : "unavailable (no tameable beast in this data)");
+        }
+        run.stage_status += fmt::format("{}=pet ", m.def.name);
+        return false;
+    }
+    if (m.def.spec)
+        ::Playerbot::Classic::SetSpecOverride(p, m.def.spec);   // the dps scorecard: the pipeline rolls a spec of its own, the member's pin stays
 
     // A raid scenario fields the gear the owner's raid wears for that raid (RaidGearTier: the class tier set plus raid pieces up to its item
     // level) and the resistance gear a vanilla raid dressed for the fight (ScenarioDef::resist_school). The setup pipeline's generated gear
@@ -414,6 +575,7 @@ bool StageMember(Run& run, Member& m)
     // Food and drink in the bags, as the vendor visit of a bot that had walked here would have left them: the upkeep rules
     // eat and drink between pulls only from what they carry (Deadmines run 3: no drink line from the priest at all, while
     // the tank's healer-mana gate held the pull).
+    ClearScenarioBags(run, p);
     StockRations(run, p);
 
     // The class supplies a bot's own upkeep tops up (reagents, mana and healing potions, Demonic Runes) and the party buff spells it learns
@@ -638,6 +800,67 @@ constexpr float kCheckpointClearance = 22.f;
 // a wall or a chasm is in sight (LoS) but not on the route.
 constexpr float kCheckpointPathSlack = 1.8f;
 
+// How far round the boss's spawn the clearing loads the map first (ClearRaidTrash): the room, its approaches and the patrols that walk
+// into it. A grid is 533 y across, so this loads at most the four grids round the spawn.
+constexpr float kClearGridRange = 200.f;
+
+// What the killed trash summons as it dies, and what those summons summon in turn, goes the way of the trash: the clearing stands for a
+// raid that has fought it. Zul'Gurub's Mad Servants (15111) at the Edge of Madness cast Portal of Madness (24621) on death (their world DB
+// script); each portal (15141, not selectable) summons two Mad Voidwalkers (15146) 6 s later. The clearing killed the eleven servants at the
+// landing, the portals came up after it, and about twenty voidwalkers were on the raid 11 s after it was placed (zg_grilek, zg_hazzarah,
+// zg_renataki, zg_wushoolay 1110b: 17-20 of 20 dead to Shadow Shock before the order). A summon is killed when it is hostile to the raid,
+// not one the scenario keeps (the boss, its kept entries and goal adds), and its summoner is dead or gone; a living summoner's summons
+// stand (Victor Nefarius' drakonids, a boss's adds). Run at the clearing, at the placement and every 2 s until the order, as the summons
+// of a death come on later map updates. Returns how many died.
+std::size_t KillTrashSummons(Run& run, Player* viewer)
+{
+    Map* map = viewer->GetMap();
+    if (!map)
+        return 0;
+    ScenarioDef const& d = *run.def;
+    auto const kept = [&d](uint32 entry)
+    {
+        return entry == d.arrive_near_entry || entry == d.goal_entry || (d.keep_entry && entry == d.keep_entry) ||
+               (d.keep_entry_b && entry == d.keep_entry_b) || (d.keep_entry_c && entry == d.keep_entry_c) ||
+               (d.goal_adds_needed && (entry == d.goal_adds_a || entry == d.goal_adds_b));
+    };
+    std::size_t killed = 0;
+    std::map<uint32, std::size_t> by_entry;
+    // A portal and its voidwalkers in one call: the second pass finds the voidwalkers' summoner dead.
+    for (int pass = 0; pass < 3; ++pass)
+    {
+        std::vector<Creature*> doomed;
+        for (auto const& [guid, c] : map->GetObjectsStore().Data.FindContainer<Creature>())
+        {
+            if (!c || !c->IsAlive() || c->GetSpawnId() || !c->IsHostileTo(viewer) || kept(c->GetEntry()) || c->IsDungeonBoss() || c->isWorldBoss())
+                continue;
+            TempSummon const* ts = c->ToTempSummon();
+            if (!ts || ts->GetSummonerGUID().IsEmpty() || ts->GetSummonerGUID().IsPlayer())
+                continue;
+            Unit const* summoner = ts->GetSummonerUnit();
+            if (summoner && summoner->IsAlive())
+                continue;
+            doomed.push_back(c);
+        }
+        if (doomed.empty())
+            break;
+        for (Creature* c : doomed)
+        {
+            ++by_entry[c->GetEntry()];
+            c->KillSelf(false);
+        }
+        killed += doomed.size();
+    }
+    if (killed)
+    {
+        std::string text;
+        for (auto const& [entry, n] : by_entry)
+            text += fmt::format(" {} x{}", entry, n);
+        TC_LOG_INFO("playerbot.v2", "[scenario] {} killed {} creatures summoned by dead trash:{}", d.name, killed, text);
+    }
+    return killed;
+}
+
 // A raid scenario tests the boss fight, not the trash on the way: staging kills every living hostile on the map except the goal boss
 // and the creatures formed up with him (Garr's Firesworn), so the instance stands as it does once the trash is cleared. A real kill
 // (no loot recipient, so nothing to loot) rather than a despawn: the respawn timers run as in a cleared instance. Returns how many died.
@@ -646,6 +869,29 @@ std::size_t ClearRaidTrash(Run& run, Player* viewer)
     Map* map = viewer->GetMap();
     if (!map)
         return 0;
+    // The map's spawn store holds only the creatures of loaded grids, and at this point the raid stands at the entrance: a boss far from
+    // it has its room unloaded, so nothing there was killed and the room filled with fresh trash the moment the raid landed in it
+    // (release-0130 aq20_ayamiss: "0 object(s) in the map" for Ayamiss 1200 y from the entrance; Hive'Zara Wasps and Stingers 4 y from
+    // their spawn points on the raid 11 s after the landing, then ten more at 20 s, and the raid wiped at 164 s). Load the grids round
+    // the boss's spawn first, so its room is cleared like the rest.
+    for (auto const& kv : sObjectMgr->GetAllCreatureData())
+        if (kv.second.id == run.def->arrive_near_entry && kv.second.mapId == map->GetId())
+        {
+            float const bx = kv.second.spawnPoint.GetPositionX(), by = kv.second.spawnPoint.GetPositionY();
+            map->LoadGridsInRange(bx, by, kClearGridRange);
+            TC_LOG_INFO("playerbot.v2", "[scenario] {} loaded the grids within {:.0f} y of creature {}'s spawn at {:.1f},{:.1f} before the clearing",
+                        run.def->name, kClearGridRange, run.def->arrive_near_entry, bx, by);
+        }
+    // A boss with no spawn row (Majordomo, Ragnaros: the instance script summons him) is not in the loop above. A summon creates its grid
+    // but does not load the grid's spawns, so his room was never cleared either: release-0130 mc_majordomo had a Lava Surger 26 y from the
+    // tank at the attack order and Ancient Core Hounds on the raid at 280 s, all made after the clearing had reported "none" left. Load
+    // the grids round his lair too.
+    if (run.def->lair_z != 0.f)
+    {
+        map->LoadGridsInRange(run.def->lair_x, run.def->lair_y, kClearGridRange);
+        TC_LOG_INFO("playerbot.v2", "[scenario] {} loaded the grids within {:.0f} y of creature {}'s lair at {:.1f},{:.1f} before the clearing",
+                    run.def->name, kClearGridRange, run.def->arrive_near_entry, run.def->lair_x, run.def->lair_y);
+    }
     CreatureGroup* boss_formation = nullptr;
     for (auto const& kv : map->GetCreatureBySpawnIdStore())
         if (kv.second && kv.second->GetEntry() == run.def->arrive_near_entry)
@@ -676,13 +922,18 @@ std::size_t ClearRaidTrash(Run& run, Player* viewer)
             continue;
         if (boss_formation && c->GetFormation() == boss_formation)
             continue;
-        if (other_boss(c->GetEntry()))
+        // RaidRules::bosses names one entry per encounter (it lines up with the boss route), so the other members of a council (the bug trio,
+        // the twins) are not in it: a creature of boss rank is set aside too, never killed into its encounter script. The rank, not the
+        // flags: in the world DB all five AQ40 council bosses are classification 3, but only Vem and Vek'nilash carry the dungeon boss flag.
+        if (other_boss(c->GetEntry()) || c->IsDungeonBoss() || c->isWorldBoss() ||
+            c->GetCreatureTemplate()->Classification == CreatureClassifications::Obsolete)
             set_aside.push_back(c);
         else
             doomed.push_back(c);
     }
     for (Creature* c : doomed)
         c->KillSelf(false);
+    KillTrashSummons(run, viewer);
     std::string aside;
     for (Creature* c : set_aside)
     {
@@ -714,6 +965,48 @@ std::size_t ClearRaidTrash(Run& run, Player* viewer)
         TC_LOG_INFO("playerbot.v2", "[scenario] {} living creatures left after the clearing:{}", run.def->name, text.empty() ? std::string(" none") : text);
     }
     return doomed.size();
+}
+
+// The living hostiles within kNewcomerYd of the landing before the attack order, by entry, with where each came from: a spawn row (its
+// respawn delay, which says whether a creature the clearing killed is back already) or a summon (its summoner's entry and spawn row). The
+// clearing's list covers spawn rows only: zg_grilek / zg_hazzarah / zg_renataki / zg_wushoolay 1110b had about twenty Mad Voidwalkers
+// (15146) on the raid at the landing 11 s after it was placed, 17-20 of 20 dead to Shadow Shock before the order, and neither they nor a
+// Portal of Madness (15141, whose world DB script summons them) was in that list. Logged at the placement and every 2 s until the order.
+constexpr float kNewcomerYd = 80.f;
+
+void LogNewcomers(Run& run, Player* viewer, char const* when)
+{
+    Map* map = viewer->GetMap();
+    if (!map)
+        return;
+    struct Seen { std::size_t n = 0; std::size_t combat = 0; std::string from; float x = 0, y = 0, z = 0; };
+    std::map<std::pair<uint32, std::string>, Seen> seen;
+    for (auto const& [guid, c] : map->GetObjectsStore().Data.FindContainer<Creature>())
+    {
+        if (!c || !c->IsAlive() || !c->IsHostileTo(viewer) || c->GetExactDist2d(run.arrive_x, run.arrive_y) > kNewcomerYd)
+            continue;
+        std::string from;
+        if (c->GetSpawnId())
+            from = fmt::format("spawn row {} respawn {} s", c->GetSpawnId(), c->GetRespawnDelay());
+        else if (TempSummon const* ts = c->ToTempSummon())
+        {
+            Unit const* summoner = ts->GetSummonerUnit();
+            Creature const* sc = summoner ? summoner->ToCreature() : nullptr;
+            from = sc ? fmt::format("summoned by entry {} spawn row {}", sc->GetEntry(), sc->GetSpawnId())
+                      : fmt::format("summoned by {}", ts->GetSummonerGUID().IsEmpty() ? std::string("nobody") : ts->GetSummonerGUID().ToString());
+        }
+        else
+            from = "no spawn row, not a summon";
+        Seen& s = seen[{ c->GetEntry(), from }];
+        if (!s.n) { s.x = c->GetPositionX(); s.y = c->GetPositionY(); s.z = c->GetPositionZ(); }
+        ++s.n;
+        s.combat += c->IsInCombat() ? 1u : 0u;
+    }
+    std::string text;
+    for (auto const& [key, s] : seen)
+        text += fmt::format(" [entry {} x{} in combat {} {} first at {:.1f},{:.1f},{:.1f}]", key.first, s.n, s.combat, key.second, s.x, s.y, s.z);
+    TC_LOG_INFO("playerbot.v2", "[scenario] {} hostiles within {:.0f} y of the landing {}:{}", run.def->name, kNewcomerYd, when,
+                text.empty() ? std::string(" none") : text);
 }
 
 // The goal boss stands alive in its room before the raid is placed. A boss that is dead or waiting out a respawn timer (a lock or a
@@ -794,6 +1087,56 @@ bool EnsureBossAlive(Run& run, Player* viewer)
     else if (spawn_id)
         map->Respawn(SPAWN_TYPE_CREATURE, spawn_id);
     return false;
+}
+
+// Once a second for a dungeon squad (5 or fewer): where each member stands, and the hostile creatures near them: every one in combat
+// within 30 y, and the idle ones within 25 y (the aggro reach of a level-capped pack), with whom each attacks. The bot lines never say
+// where anybody stood (rfd_glutton 0.1.27 set C: a ghoul the pull had not tagged was on the mage 4 s into the pull, and no line showed
+// whether the mage had walked into it or it had come with the pull).
+constexpr float kPosLogCombatYd = 30.f;
+constexpr float kPosLogIdleYd = 25.f;
+constexpr std::size_t kPosLogMobsMax = 16;
+
+void LogPositions(Run& run)
+{
+    if (run.members.size() > 5)
+        return;
+    std::string squad, mobs;
+    std::set<ObjectGuid> seen;
+    std::size_t mob_count = 0, mob_more = 0;
+    for (Member const& m : run.members)
+    {
+        Player* q = Find(m.id);
+        if (!q || !q->IsInWorld())
+            continue;
+        squad += fmt::format(" {}({:.1f},{:.1f},{:.1f} {:.0f}%{}{}{})", q->GetName(), q->GetPositionX(), q->GetPositionY(), q->GetPositionZ(),
+                             q->GetHealthPct(), q->IsAlive() ? "" : " dead", q->IsInCombat() ? " c" : "", q->isMoving() ? " m" : "");
+        if (!q->IsAlive())
+            continue;
+        std::list<Creature*> near;
+        q->GetCreatureListWithOptionsInGrid(near, kPosLogCombatYd, FindCreatureOptions());
+        for (Creature* c : near)
+        {
+            if (!c || !c->IsAlive() || c->IsCritter() || !c->IsHostileTo(q) || seen.count(c->GetGUID()))
+                continue;
+            if (!c->IsInCombat() && q->GetDistance(c) > kPosLogIdleYd)
+                continue;
+            seen.insert(c->GetGUID());
+            if (mob_count >= kPosLogMobsMax)
+            {
+                ++mob_more;
+                continue;
+            }
+            ++mob_count;
+            Unit* v = c->GetVictim();
+            mobs += fmt::format(" {}/{}({:.1f},{:.1f},{:.1f}{})", c->GetEntry(), c->GetGUID().GetCounter(), c->GetPositionX(), c->GetPositionY(),
+                                c->GetPositionZ(), v ? " ->" + v->GetName() : c->IsInCombat() ? std::string(" c") : std::string());
+        }
+    }
+    if (squad.empty())
+        return;
+    TC_LOG_INFO("playerbot.v2", "[scenario_pos] {} t={}s squad:{} | mobs:{}{}", run.def->name, run.run_ms / 1000u, squad,
+                mobs.empty() ? std::string(" none") : mobs, mob_more ? fmt::format(" (+{} more)", mob_more) : std::string());
 }
 
 // Where the healers are in the first seconds after the landing and what each is doing (MC Garr 2026-10-10: healers 30 y out from the
@@ -1090,6 +1433,30 @@ Player* StandIn(Run& run)
     return nullptr;
 }
 
+// Where a member stands and what moves it: on landing on the scenario's map, when the run begins, and 1 s and 3 s into it. The bots
+// of rfc_oggleflint stood 4 to 11 y west of the start point when the run began (RC7, RC8: the healer off the mesh), in RC5 on it,
+// and no line said what moved them.
+void LogPlace(Run const& run, Player* p, char const* when)
+{
+    if (!p || !p->IsInWorld())
+        return;
+    std::string rule = "none";
+    if (BotAI* ai = ::Playerbot::Services::Registry().ai(p->GetGUID().GetCounter()))
+        if (char const* r = ai->last_rule_fired())
+            rule = r;
+    MotionMaster* mm = p->GetMotionMaster();
+    std::string dest = "-";
+    if (p->movespline && !p->movespline->Finalized())
+    {
+        G3D::Vector3 const& d = p->movespline->FinalDestination();
+        dest = fmt::format("({:.1f},{:.1f},{:.1f})", d.x, d.y, d.z);
+    }
+    TC_LOG_INFO("playerbot.v2", "[scenario] {} place {} {}: ({:.1f},{:.1f},{:.1f}) map {} {:.1f} y from the start, rule {}, generator {}, "
+                "spline to {}, combat {}, stand {}", run.def->name, when, p->GetName(), p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(),
+                p->GetMapId(), p->GetMapId() == run.def->map ? p->GetExactDist2d(run.def->x, run.def->y) : -1.f, rule,
+                mm ? uint32(mm->GetCurrentMovementGeneratorType()) : 0u, dest, p->IsInCombat() ? 1 : 0, uint32(p->GetStandState()));
+}
+
 // One line per member when the run begins: class, level, armour, health, mana, whether an off-hand shield is worn, and the equipped
 // item entries by slot. A tank that takes too much damage is a gear question first (deadmines_full run 11).
 void LogGear(Run const& run)
@@ -1158,6 +1525,15 @@ void StockRaidKits(Run& run)
             continue;
         }
         Classic::RaidConsumableRole const role = Classic::RaidConsumableRoleOf(BotSnapshotView(*snap), GroupSnapshotView(*gsnap));
+        // Tranquilizing Shot is a book (a Molten Core drop) every raiding hunter of the tier has read; no trainer teaches it, so a
+        // scenario hunter never had it and the Frenzy checks (min_tranq_shots) could not pass: 0 shots in every bwl_chromaggus run.
+        constexpr std::uint32_t kTranquilizingShot = 19801;
+        if (p->GetClass() == CLASS_HUNTER && p->GetLevel() >= 60 && !p->HasSpell(kTranquilizingShot))
+        {
+            p->LearnSpell(kTranquilizingShot, false, 0, /*suppressMessaging*/ true);
+            TC_LOG_INFO("playerbot.v2", "[scenario] {} reads the Tranquilizing Shot book ({})", p->GetName(),
+                p->HasSpell(kTranquilizingShot) ? "learned" : "NOT learned: spell missing");
+        }
         ::Playerbot::API api(p);
         bool any = false;
         for (Classic::RaidConsumable const& c : Classic::RaidConsumablesFor(role))
@@ -1232,7 +1608,7 @@ void PlayStandIn(Run& run)
 {
     Player* p = StandIn(run);
     Player* tank = MainTank(run);
-    if (!p || !run.stand_in_detached || !p->IsAlive() || !tank || tank == p || p->HasUnitState(UNIT_STATE_CASTING))
+    if (!p || !run.stand_in_detached || run.def->player_lead || !p->IsAlive() || !tank || tank == p || p->HasUnitState(UNIT_STATE_CASTING))
         return;
     Unit* target = tank->IsInCombat() ? tank->GetVictim() : nullptr;
     if (!target || !target->IsAlive() || !p->IsValidAttackTarget(target))
@@ -1260,6 +1636,548 @@ void PlayStandIn(Run& run)
     if (p->GetDistance(tank) > 10.f || p->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
         if (p->GetDistance(tank) > 6.f)
             p->GetMotionMaster()->MoveFollow(tank, 3.0f);
+}
+
+// ---- A player-led run (ScenarioDef::player_lead): the stand-in leads like the owner ----
+
+// Ready to go on: everyone alive and close, health 70 % and up, mana 60 % and up (the healer's 75 %). A player waits for that, but not
+// for ever: after kLeadReadyWaitMs he goes on anyway, as the owner does.
+constexpr std::uint32_t kLeadReadyWaitMs = 60000;
+constexpr float kLeadPullYd = 30.f;        // a pack this close is pulled before he takes another step
+constexpr float kLeadGroupYd = 30.f;       // he waits for a member farther back than this
+constexpr std::uint32_t kLeadPullGiveUpMs = 15000;   // a pull order that started no fight: the mob is passed by
+constexpr float kLeadArriveYd = 12.f;                  // the pulled mob this close to him: the pull is back, he says "attack"
+constexpr std::uint32_t kLeadArriveWaitMs = 12000;    // ... or this long after the pull order, wherever the fight is
+constexpr float kLeadBossNearYd = 60.f;               // the run's boss this close: he goes to him before the next route point
+
+void LeadLog(Run& run, std::string const& line)
+{
+    TC_LOG_INFO("playerbot.v2", "[scenario_lead] {} t={}s {}", run.def->name, run.run_ms / 1000u, line);
+    run.lead_log_ms = run.run_ms;
+}
+
+// ScenarioDef::yes_fear / focus_heal_tank: the owner's orders a bot-only squad has nobody to give, put on at the start of the run and
+// taken back at its end (the squad characters are reused by the next scenario).
+void GiveSquadOrders(Run& run, bool on)
+{
+    ScenarioDef const& def = *run.def;
+    if (!def.yes_fear && !def.focus_heal_tank)
+        return;
+    std::uint64_t tank = 0;
+    for (Member const& m : run.members)
+        if (m.def.role == ScenarioRoleKind::Tank) { tank = m.id; break; }
+    for (Member const& m : run.members)
+    {
+        if (def.yes_fear)
+            ::Playerbot::Scenario::MarkYesFear(m.id, on);
+        if (def.focus_heal_tank && m.def.role == ScenarioRoleKind::Healer && tank)
+            if (BotAI* ai = ::Playerbot::Services::Registry().ai(m.id))
+                ai->set_heal_only(on ? std::vector<ObjectGuid>{ ObjectGuid::Create<HighGuid::Player>(tank) } : std::vector<ObjectGuid>{});
+    }
+    TC_LOG_INFO("playerbot.v2", "[scenario] {} squad orders {}:{}{}", def.name, on ? "given" : "taken back",
+        def.yes_fear ? " yes fear (Fear and Scare Beast allowed)" : "", def.focus_heal_tank ? " focus heal on the tank" : "");
+}
+
+// The stand-in becomes the group leader and a player for the squad's logic. Called once, after DetachStandIn.
+void TakeLead(Run& run)
+{
+    Player* p = StandIn(run);
+    if (!p || !run.def->player_lead || !run.stand_in_detached)
+        return;
+    ::Playerbot::Scenario::MarkHuman(p->GetGUID().GetCounter(), true);
+    if (Group* g = p->GetGroup(); g && g->GetLeaderGUID() != p->GetGUID())
+        g->ChangeLeader(p->GetGUID());
+    run.lead_route = ::Playerbot::Services::Dungeons().RouteFor(p->GetMapId(), uint32(p->GetMap()->GetDifficultyID()));
+    // The route point nearest the entrance is where he starts.
+    run.lead_wp = 0;
+    float best = 1e9f;
+    for (std::size_t i = 0; i < run.lead_route.size(); ++i)
+    {
+        auto const& w = run.lead_route[i];
+        float const d = p->GetExactDist(w.x, w.y, w.z);
+        if (d < best) { best = d; run.lead_wp = i; }
+    }
+    LeadLog(run, fmt::format("{} leads the group like a player: {} route points, starting at point {}", p->GetName(), run.lead_route.size(),
+                             run.lead_wp));
+}
+
+void DropLead(Run& run)
+{
+    if (!run.def->player_lead)
+        return;
+    for (Member const& m : run.members)
+        ::Playerbot::Scenario::MarkHuman(m.id, false);
+}
+
+// The nearest mob he would have to fight to walk on: alive, hostile, not fighting, in sight, within kLeadPullYd.
+Creature* NextPack(Run& run, Player* p)
+{
+    std::list<Creature*> near;
+    p->GetCreatureListWithOptionsInGrid(near, kLeadPullYd, FindCreatureOptions());
+    Creature* best = nullptr;
+    float best_d = 1e9f;
+    for (Creature* c : near)
+    {
+        if (!c || !c->IsAlive() || c->IsInCombat() || !p->IsValidAttackTarget(c) || c->IsCritter() || c->IsCivilian() ||
+            !c->IsHostileTo(p) || run.lead_skipped.count(c->GetGUID()) || !p->IsWithinLOSInMap(c))
+            continue;
+        float const d = p->GetDistance(c);
+        if (d < best_d) { best_d = d; best = c; }
+    }
+    return best;
+}
+
+// What holds him before he goes on: a member dead, far back, or low. Empty when the group is ready.
+std::string LeadNotReady(Run& run, Player* p)
+{
+    for (Member const& m : run.members)
+    {
+        Player* q = Find(m.id);
+        if (!q || q == p)
+            continue;
+        if (!q->IsAlive())
+            return q->GetName() + " is dead";
+        if (q->GetMapId() != p->GetMapId() || q->GetDistance(p) > kLeadGroupYd)
+            return q->GetName() + " is far back";
+        if (q->GetHealthPct() < 70.f)
+            return fmt::format("{} has {:.0f} % health", q->GetName(), q->GetHealthPct());
+        if (q->GetMaxPower(POWER_MANA) > 0)
+        {
+            float const mana = 100.f * float(q->GetPower(POWER_MANA)) / float(q->GetMaxPower(POWER_MANA));
+            float const need = m.def.role == ScenarioRoleKind::Healer ? 75.f : 60.f;
+            if (mana < need)
+                return fmt::format("{} has {:.0f} % mana", q->GetName(), mana);
+        }
+    }
+    return {};
+}
+
+// The owner's skull in a fight whose script lets the DPS hit only his skull (Script::Fight::skullOnly, Majordomo). In the owner's group he
+// rotates the skull himself; a bot-only squad has nobody to do it, and with no skull the DPS stand by design: release-0130 mc_majordomo
+// 8304ad94, every mage, warlock and hunter did 0 damage in the first 90 s (raid:drop_target / raid:switch_target, a new pick and a drop
+// every tick) while the healers ran dry, wipe at 476 s. Once the attack is ordered the runner plays the owner: the skull goes on an
+// engaged, living enemy of the fight, first entry of the kill order first (the Healers, then the Elites), the most hurt one in it, and
+// stays there until that enemy dies. Nothing else of the owner's plan is played (no sheep icons): the bot logic is not touched.
+void PlayOwnerSkull(Run& run)
+{
+    constexpr uint8 kSkull = 7;
+    constexpr float kFightReach = 120.f;   // the room: the fight's enemies within this of the main tank
+    if (!run.order_sent || run.run_ms < run.owner_skull_next_ms)
+        return;
+    run.owner_skull_next_ms = run.run_ms + 1000u;
+    ::Playerbot::Raid::Script::Fight const* fight = ::Playerbot::Raid::Script::FightFor(run.def->map, run.def->goal_entry);
+    if (!fight || !fight->skullOnly)
+        return;
+    Player* lead = MainTank(run);
+    if (!lead)
+        for (Member const& m : run.members)
+            if (Player* p = Find(m.id); p && p->IsAlive())
+            {
+                lead = p;
+                break;
+            }
+    Group* group = lead ? lead->GetGroup() : nullptr;
+    if (!group || !lead->GetMap())
+        return;
+    ObjectGuid const current = group->GetTargetIcon(kSkull);
+    if (!current.IsEmpty())
+        if (Creature const* c = ObjectAccessor::GetCreature(*lead, current); c && c->IsAlive())
+            return;
+    Creature* best = nullptr;
+    std::size_t bestRank = 99;
+    for (auto const& [guid, c] : lead->GetMap()->GetObjectsStore().Data.FindContainer<Creature>())
+    {
+        if (!c || !c->IsAlive() || !c->IsInCombat() || c->IsInEvadeMode() || !c->IsHostileTo(lead) || !lead->IsWithinDist(c, kFightReach))
+            continue;
+        std::size_t const rank = ::Playerbot::Raid::Script::RankOf(*fight, c->GetEntry());
+        if (rank == 99)
+            continue;
+        if (!best || rank < bestRank || (rank == bestRank && (c->GetHealthPct() < best->GetHealthPct() ||
+            (c->GetHealthPct() == best->GetHealthPct() && c->GetGUID().GetCounter() < best->GetGUID().GetCounter()))))
+        {
+            best = c;
+            bestRank = rank;
+        }
+    }
+    if (!best || best->GetGUID() == run.owner_skull)
+        return;
+    group->SetTargetIcon(kSkull, best->GetGUID(), lead->GetGUID());
+    run.owner_skull = best->GetGUID();
+    TC_LOG_INFO("playerbot.v2", "[scenario] {} the owner's skull goes on {} ({}, {}) at {:.0f} % health, {} s into the run", run.def->name,
+                best->GetName(), best->GetEntry(), best->GetGUID().GetCounter(), best->GetHealthPct(), run.run_ms / 1000u);
+}
+
+// One second of the owner leading his bots through a dungeon.
+void PlayLeader(Run& run)
+{
+    Player* p = StandIn(run);
+    if (!p || !run.def->player_lead || !run.stand_in_detached || !p->IsAlive() || p->HasUnitState(UNIT_STATE_CASTING))
+        return;
+    Group* g = p->GetGroup();
+    if (!g)
+        return;
+    Player* tank = MainTank(run);
+
+    bool fighting = false;
+    for (Member const& m : run.members)
+        if (Player* q = Find(m.id); q && q->IsAlive() && q->IsInCombat())
+            fighting = true;
+
+    if (fighting)
+    {
+        run.lead_wait_since_ms = 0;
+        Unit* target = tank && tank->IsInCombat() ? tank->GetVictim() : nullptr;
+        if (!target || !target->IsAlive() || !p->IsValidAttackTarget(target))
+        {
+            target = nullptr;
+            for (Unit* a : p->getAttackers())
+                if (a && a->IsAlive()) { target = a; break; }
+        }
+        // "attack" once the pull has come back to him, as a player says it: the tank's opener landing 20-40 y out is not that, and
+        // the leader running in on it took the damage dealers with him (rfc_oggleflint_led RC2: 14 mobs). A mob on him, a group
+        // without a tank, or a pull that never comes back (the tank fights where it is) start it too.
+        bool const arrived = target && (!tank || p->GetExactDist(target) <= kLeadArriveYd ||
+                                        target->GetVictim() == p ||
+                                        run.run_ms >= run.lead_pull_ms + kLeadArriveWaitMs);
+        if (!run.lead_attack_sent && arrived)
+        {
+            p->SetSelection(target->GetGUID());
+            ::Playerbot::V2::Module::instance().RouteGroupOrder(p, g, "attack");
+            run.lead_attack_sent = true;
+            LeadLog(run, fmt::format("says attack on {} (entry {}, {:.0f} y away)", target->GetName(), target->GetEntry(), p->GetExactDist(target)));
+        }
+        if (!run.lead_attack_sent)
+            return;   // he waits at his spot for the pull
+        if (target && p->GetVictim() != target)
+        {
+            p->Attack(target, true);
+            p->GetMotionMaster()->MoveChase(target);
+        }
+        return;
+    }
+
+    if (p->GetVictim())
+        p->AttackStop();
+    run.lead_attack_sent = false;
+
+    // A pull that is under way: wait for the fight it starts, or give the mob up.
+    if (!run.lead_pull.IsEmpty())
+    {
+        Creature* c = ObjectAccessor::GetCreature(*p, run.lead_pull);
+        if (c && c->IsAlive() && run.run_ms < run.lead_pull_ms + kLeadPullGiveUpMs)
+            return;
+        if (c && c->IsAlive())
+        {
+            run.lead_skipped.insert(run.lead_pull);
+            LeadLog(run, fmt::format("gives up on {} (entry {}): no fight {} s after the pull", c->GetName(), c->GetEntry(), kLeadPullGiveUpMs / 1000u));
+        }
+        run.lead_pull.Clear();
+    }
+
+    // Ready before the next pull or step; bounded.
+    std::string const waiting = LeadNotReady(run, p);
+    if (!waiting.empty())
+    {
+        if (run.lead_wait_since_ms == 0)
+            run.lead_wait_since_ms = run.run_ms ? run.run_ms : 1u;
+        if (run.run_ms < run.lead_wait_since_ms + kLeadReadyWaitMs)
+        {
+            p->StopMoving();
+            if (run.run_ms >= run.lead_log_ms + 10000u)
+                LeadLog(run, "waits: " + waiting);
+            return;
+        }
+        if (run.run_ms >= run.lead_log_ms + 10000u)
+            LeadLog(run, "goes on after a minute's wait: " + waiting);
+    }
+    else
+        run.lead_wait_since_ms = 0;
+
+    if (Creature* c = NextPack(run, p))
+    {
+        p->StopMoving();
+        p->SetSelection(c->GetGUID());
+        ::Playerbot::V2::Module::instance().RouteGroupOrder(p, g, "pull back");
+        run.lead_pull = c->GetGUID();
+        run.lead_pull_ms = run.run_ms;
+        LeadLog(run, fmt::format("says pull back on {} (entry {}) at {:.0f} y", c->GetName(), c->GetEntry(), p->GetDistance(c)));
+        return;
+    }
+
+    // The run's boss, once he is near or the route is done: a player who knows the dungeon goes to him. The route is the bot-led clear's
+    // corridor, not a visit to every boss (rfc_oggleflint_led 0.1.27 set B: it passes Oggleflint 31 y away and 20 y above his cave, so
+    // no pull ever reached him; the leader walked on to the route's end and stood there for two minutes). Walking at him brings him
+    // inside kLeadPullYd in sight, and NextPack above has the tank pull him and what stands with him.
+    // Once he has set out for the boss he keeps going to him: the way down can lead away first, more than kLeadBossNearYd from him
+    // (b3ca0b4b67 rfc_oggleflint_led: from 45 y above Oggleflint's cave the path went back west and down into the pit; 120 y out he
+    // went back to the route, which brought him east to 45 y again, and so on from 690 s until the time limit at 2400 s).
+    bool const route_done = run.lead_wp >= run.lead_route.size();
+    Creature* boss = nullptr;
+    if (!run.lead_boss.IsEmpty())
+    {
+        boss = ObjectAccessor::GetCreature(*p, run.lead_boss);
+        if (!boss || !boss->IsAlive())
+        {
+            boss = nullptr;
+            run.lead_boss.Clear();
+        }
+    }
+    if (!boss && run.def->goal == ScenarioGoalKind::KillCreature && run.def->goal_entry)
+        boss = p->FindNearestCreature(run.def->goal_entry, route_done ? 400.f : kLeadBossNearYd, true);
+    if (boss)
+    {
+        run.lead_boss = boss->GetGUID();
+        if (p->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE || !p->isMoving())
+        {
+            p->GetMotionMaster()->MovePoint(0, boss->GetPositionX(), boss->GetPositionY(), boss->GetPositionZ());
+            if (run.run_ms >= run.lead_log_ms + 20000u)
+                LeadLog(run, fmt::format("walks to {} (entry {}, {:.0f} y away){}", boss->GetName(), boss->GetEntry(), p->GetExactDist(boss),
+                                         route_done ? ", the route is done" : ""));
+        }
+        return;
+    }
+
+    // Walk on along the route.
+    if (route_done)
+    {
+        if (run.run_ms >= run.lead_log_ms + 30000u)
+            LeadLog(run, "is at the end of the route");
+        return;
+    }
+    auto const& w = run.lead_route[run.lead_wp];
+    if (p->GetExactDist(w.x, w.y, w.z) < 4.f)
+    {
+        ++run.lead_wp;
+        return;
+    }
+    if (p->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE || !p->isMoving())
+    {
+        p->GetMotionMaster()->MovePoint(0, w.x, w.y, w.z);
+        if (run.run_ms >= run.lead_log_ms + 20000u)
+            LeadLog(run, fmt::format("walks to route point {} of {}", run.lead_wp, run.lead_route.size()));
+    }
+}
+
+// ---- A FollowRoute run: the stand-in walks the route like a player, the squad must keep up ----
+constexpr float kRouteArriveYd = 5.f;              // he is at a point this close to it
+constexpr float kRouteGatherYd = 30.f;             // a member this close to him (3D) is with him
+constexpr std::uint32_t kRouteStallMs = 20000;     // no 2 y closer to the point in this long: he takes the jump (is set down on it)
+constexpr std::uint32_t kRouteGatherMs = 40000;    // every member must be with him this long after he reaches a point
+
+// A detached stand-in is played like a player, and a player's client swims him. He has left the bot registry, so the module's world
+// tick (UpdateSwimState for every headless bot) no longer sees him: the runner does it (lake_swim 2026-11-09: Scnrogue stood on top
+// of the lake without the swimming flag while his squad swam around him).
+void SwimStandIn(Run& run)
+{
+    if (!run.stand_in_detached)
+        return;
+    if (Player* p = StandIn(run); p && p->IsInWorld())
+        ::Playerbot::BotMovement::UpdateSwimState(p);
+}
+
+// The nearest deep water (BotMovement::SwimLevel) around (cx, cy) the stand-in can walk to: rings 8 y apart out to kWaterSearchYd.
+constexpr float kWaterSearchYd = 150.f;
+bool FindDeepWater(Player* p, float cx, float cy, float& ox, float& oy, float& oz)
+{
+    Map* m = p->GetMap();
+    if (!m)
+        return false;
+    for (float r = 0.f; r <= kWaterSearchYd; r += 8.f)
+    {
+        int const steps = r < 1.f ? 1 : 16;
+        for (int i = 0; i < steps; ++i)
+        {
+            float const a = float(i) * 6.2831853f / float(steps);
+            float const x = cx + r * std::cos(a), y = cy + r * std::sin(a);
+            m->LoadGrid(x, y);
+            float const level = m->GetWaterLevel(p->GetPhaseShift(), x, y);
+            if (level <= INVALID_HEIGHT)
+                continue;
+            float swim_z = 0.f;
+            if (!::Playerbot::BotMovement::SwimLevel(p, x, y, level, swim_z))
+                continue;
+            PathGenerator pg(p);
+            if (!::Playerbot::BotMovement::SehSafeCalculatePath(pg, x, y, swim_z) || (pg.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT)))
+                continue;
+            ox = x; oy = y; oz = swim_z;
+            return true;
+        }
+    }
+    return false;
+}
+
+void PlayRoute(Run& run)
+{
+    Player* p = StandIn(run);
+    if (!p || run.def->goal != ScenarioGoalKind::FollowRoute || !run.stand_in_detached || !p->IsAlive())
+        return;
+    std::vector<ScenarioRoutePoint> const& route = run.def->route;
+    if (run.route_leg >= route.size())
+    {
+        run.goal_reached = true;
+        return;
+    }
+    ScenarioRoutePoint w = route[run.route_leg];
+    if (!run.leg_start_ms)
+    {
+        run.leg_water = false;
+        run.leg_hold_since_ms = 0;
+        if (w.water)
+        {
+            if (!FindDeepWater(p, w.x, w.y, run.leg_wx, run.leg_wy, run.leg_wz))
+            {
+                run.monitor->NoteSetupFailure(run.run_ms, p->GetName(), fmt::format("no deep water he can walk to within {:.0f} y of {} ({:.0f},{:.0f})",
+                                                                                     kWaterSearchYd, w.label, w.x, w.y));
+                return;
+            }
+            run.leg_water = true;
+        }
+    }
+    if (run.leg_water)
+    {
+        w.x = run.leg_wx; w.y = run.leg_wy; w.z = run.leg_wz;
+    }
+    if (!run.leg_start_ms)
+    {
+        run.leg_start_ms = run.run_ms ? run.run_ms : 1u;
+        run.leg_at_ms = 0;
+        run.leg_progress_ms = run.leg_start_ms;
+        run.leg_best = p->GetExactDist(w.x, w.y, w.z);
+        run.leg_leapt = false;
+        run.leg_joined_ms.clear();
+        run.leg_catch_ups.clear();
+        for (Member const& m : run.members)
+            run.leg_catch_ups[m.id] = ::Playerbot::V2::Fleet::CatchUpCount(m.id);
+        // A walking route there, or the jump only a player can take.
+        PathGenerator pg(p);
+        ::Playerbot::BotMovement::SehSafeCalculatePath(pg, w.x, w.y, w.z);
+        G3D::Vector3 const& end = pg.GetActualEndPosition();
+        float const end_gap = std::sqrt((end.x - w.x) * (end.x - w.x) + (end.y - w.y) * (end.y - w.y) + (end.z - w.z) * (end.z - w.z));
+        bool const walkable = !(pg.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT)) && end_gap <= 4.f;
+        LeadLog(run, fmt::format("leg {} of {}: walks to {} ({:.0f},{:.0f},{:.0f}), {:.0f} y; path type {} ends {:.1f} y from it{}", run.route_leg + 1,
+                                 route.size(), w.label, w.x, w.y, w.z, run.leg_best, uint32(pg.GetPathType()), end_gap,
+                                 walkable ? "" : ": no walking route, he takes the jump"));
+        if (!walkable)
+        {
+            p->NearTeleportTo(w.x, w.y, w.z, p->GetOrientation());
+            run.leg_leapt = true;
+            return;
+        }
+    }
+
+    // A fight on the way is the group's: he fights what is on him and waits for the rest.
+    bool fighting = false;
+    for (Member const& m : run.members)
+        if (Player* q = Find(m.id); q && q->IsAlive() && q->IsInCombat())
+            fighting = true;
+    if (fighting)
+    {
+        run.leg_progress_ms = run.run_ms;
+        for (Unit* a : p->getAttackers())
+            if (a && a->IsAlive())
+            {
+                if (p->GetVictim() != a)
+                {
+                    p->Attack(a, true);
+                    p->GetMotionMaster()->MoveChase(a);
+                }
+                return;
+            }
+        p->StopMoving();
+        return;
+    }
+    if (p->GetVictim())
+        p->AttackStop();
+
+    if (!run.leg_at_ms)
+    {
+        float const d = p->GetExactDist(w.x, w.y, w.z);
+        if (d < kRouteArriveYd)
+        {
+            run.leg_at_ms = run.run_ms ? run.run_ms : 1u;
+            p->StopMoving();
+            LeadLog(run, fmt::format("is at {} after {} s ({})", w.label, (run.run_ms - run.leg_start_ms) / 1000u,
+                                     run.leg_leapt ? "set down: the jump" : "walked"));
+            return;
+        }
+        if (d < run.leg_best - 2.f)
+        {
+            run.leg_best = d;
+            run.leg_progress_ms = run.run_ms;
+        }
+        if (run.run_ms - run.leg_progress_ms >= kRouteStallMs)
+        {
+            LeadLog(run, fmt::format("no closer to {} for {} s at ({:.0f},{:.0f},{:.0f}), {:.0f} y off: he takes the jump", w.label, kRouteStallMs / 1000u,
+                                     p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(), d));
+            p->NearTeleportTo(w.x, w.y, w.z, p->GetOrientation());
+            run.leg_leapt = true;
+            run.leg_progress_ms = run.run_ms;
+            return;
+        }
+        if (p->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE || !p->isMoving())
+            p->GetMotionMaster()->MovePoint(0, w.x, w.y, w.z);
+        return;
+    }
+
+    // At the point: the squad gathers on him, walking or brought.
+    std::string missing;
+    Player* farthest = nullptr;
+    float farthest_d = 0.f;
+    for (Member const& m : run.members)
+    {
+        Player* q = Find(m.id);
+        if (!q || q == p)
+            continue;
+        bool const with = q->IsAlive() && q->GetMap() == p->GetMap() && q->GetExactDist(p) <= kRouteGatherYd;
+        if (with)
+        {
+            run.leg_joined_ms.emplace(m.id, run.run_ms);
+            continue;
+        }
+        float const d = q->GetMap() == p->GetMap() ? q->GetExactDist(p) : 99999.f;
+        BotAI* ai = ::Playerbot::Services::Registry().ai(m.id);
+        missing += fmt::format("{}{} {:.0f} y at ({:.0f},{:.0f},{:.0f}) rule={}", missing.empty() ? "" : "; ", m.def.name, d, q->GetPositionX(),
+                               q->GetPositionY(), q->GetPositionZ(), ai && ai->last_rule_fired() ? ai->last_rule_fired() : "-");
+        if (!farthest || d > farthest_d) { farthest = q; farthest_d = d; }
+    }
+    if (missing.empty() && w.hold_s)
+    {
+        // A point he holds: the squad stays with him there (in the lake: longer than a bot's breath) before he goes on.
+        if (!run.leg_hold_since_ms)
+        {
+            run.leg_hold_since_ms = run.run_ms ? run.run_ms : 1u;
+            LeadLog(run, fmt::format("holds at {} for {} s", w.label, w.hold_s));
+        }
+        if (run.run_ms - run.leg_hold_since_ms < w.hold_s * 1000u)
+            return;
+    }
+    if (missing.empty())
+    {
+        std::string walked, brought;
+        for (Member const& m : run.members)
+        {
+            if (Find(m.id) == p)
+                continue;
+            std::uint32_t const joined = run.leg_joined_ms.count(m.id) ? run.leg_joined_ms[m.id] : run.run_ms;
+            std::uint32_t const behind = joined > run.leg_at_ms ? (joined - run.leg_at_ms) / 1000u : 0u;
+            bool const was_brought = ::Playerbot::V2::Fleet::CatchUpCount(m.id) != run.leg_catch_ups[m.id];
+            (was_brought ? brought : walked) += fmt::format("{}{} (+{} s)", (was_brought ? brought : walked).empty() ? "" : ", ", m.def.name, behind);
+        }
+        LeadLog(run, fmt::format("the squad is with him at {}, {} s after he got there; walked: {}; brought (catch-up): {}", w.label,
+                                 (run.run_ms - run.leg_at_ms) / 1000u, walked.empty() ? "-" : walked, brought.empty() ? "-" : brought));
+        ++run.route_leg;
+        run.leg_start_ms = 0;
+        return;
+    }
+    if (run.run_ms - run.leg_at_ms >= kRouteGatherMs)
+    {
+        run.monitor->NoteFollowLost(run.run_ms, farthest ? farthest->GetName() : std::string(),
+                                    fmt::format("not with {} at {} {} s after he got there ({}): {}", p->GetName(), w.label, kRouteGatherMs / 1000u,
+                                                run.leg_leapt ? "he took the jump" : "he walked", missing));
+        return;
+    }
+    if (run.run_ms >= run.lead_log_ms + 10000u)
+        LeadLog(run, "waits at " + std::string(w.label) + " for: " + missing);
 }
 
 // What the owner's Attack does in a raid: the main tank is ordered onto the boss (an Engage order, the same one `attack` whispers).
@@ -1520,6 +2438,18 @@ bool IssueAttack(Run& run)
                     run.def->goal_entry, same.size(), where);
     }
     LogBuffs(run);
+    // An encounter the instance holds in progress shuts the tank's advance (gate encounter_in_progress) for the whole run: name which one
+    // (release-0130 zg_marli: the gate was shut from the first tick, before anybody had engaged anything).
+    if (InstanceMap* im = tank->GetMap()->ToInstanceMap())
+        if (InstanceScript* is = im->GetInstanceScript(); is && is->IsEncounterInProgress())
+        {
+            std::string states;
+            for (uint32 i = 0; i < is->GetEncounterCount(); ++i)
+                if (EncounterState const st = is->GetBossState(i); st == IN_PROGRESS || st == SPECIAL)
+                    states += fmt::format(" boss {} {}", i, st == IN_PROGRESS ? "IN_PROGRESS" : "SPECIAL");
+            TC_LOG_WARN("playerbot.v2", "[scenario] {} the instance holds an encounter in progress at the order:{}", run.def->name,
+                        states.empty() ? std::string(" none of its boss states (the script's own flag)") : states);
+        }
     run.order_sent = true;
     run.attack_run_ms = run.run_ms ? run.run_ms : 1u;
     LogTankProbe(run, "at the order");
@@ -1530,21 +2460,28 @@ bool IssueAttack(Run& run)
         if (BotAI* ai = ::Playerbot::Services::Registry().ai(m.id))
             if (ai->holding_position(GameTime::GetGameTimeMS()))
                 ai->exit_manual();
+    // A fight the raid opens on an add (ScenarioDef::start_add): the order is onto the nearest living one, as a raid leader marks it. Mandokir
+    // sits on his raptor immune to players until his Speaker dies; the order onto him was refused and the run failed its setup at 20 s
+    // while the raid went on to pull the Speaker itself and kill the boss (sweep-zg-0134 zg_mandokir: goal reached, setup_failed).
+    Creature* target = boss;
+    if (run.def->start_add)
+        if (Creature* add = tank->FindNearestCreature(run.def->start_add, 400.f, true))
+            target = add;
     ::Playerbot::API api(tank);
-    ::Playerbot::Result const res = api.start_attack(boss->GetGUID());
+    ::Playerbot::Result const res = api.start_attack(target->GetGUID());
     if (BotAI* ai = ::Playerbot::Services::Registry().ai(tank->GetGUID().GetCounter()))
     {
-        ai->enter_manual(BotAI::OwnerCommand::Engage, boss->GetGUID(), GameTime::GetGameTimeMS());
+        ai->enter_manual(BotAI::OwnerCommand::Engage, target->GetGUID(), GameTime::GetGameTimeMS());
         ai->release_owner_lead();
     }
     TC_LOG_INFO("playerbot.v2", "[scenario] {} ordered {} onto {} ({}) at {} s, {:.0f} y away (start_attack result {})", run.def->name,
-                tank->GetName(), boss->GetName(), run.def->goal_entry, run.run_ms / 1000u, tank->GetDistance(boss), int(res));
+                tank->GetName(), target->GetName(), target->GetEntry(), run.run_ms / 1000u, tank->GetDistance(target), int(res));
     // A target the server refuses (immune to players, not interactible) is a fault in the setup, not a fight that happens to be quiet.
     // Not when the boss is already fighting the raid: a boss script (Bot/Raid/RaidFightScript.h) owns the pull and had the DPS on it before
     // this order, and Attack on a mob the bot already fights is refused as an invalid target.
-    if (res == ::Playerbot::Result::InvalidTarget && !boss->IsInCombat())
-        run.monitor->NoteSetupFailure(run.run_ms, "", fmt::format("{} refused the attack order on {} ({}): the boss is not attackable (immune to players or not interactible)",
-                                                                   tank->GetName(), boss->GetName(), run.def->goal_entry));
+    if (res == ::Playerbot::Result::InvalidTarget && !target->IsInCombat())
+        run.monitor->NoteSetupFailure(run.run_ms, "", fmt::format("{} refused the attack order on {} ({}): the {} is not attackable (immune to players or not interactible)",
+                                                                   tank->GetName(), target->GetName(), target->GetEntry(), target == boss ? "boss" : "opening add"));
     return true;
 }
 
@@ -1554,10 +2491,17 @@ bool IssueAttack(Run& run)
 // timestamps, so the runner notes the file's size each second and reads from the mark of the window's start.
 constexpr std::uint32_t kReportWindowMs = 60u * 1000u;
 constexpr std::size_t kReportMaxLines = 500;
+// A wipe is judged at the end of the fight, long after it was lost: the window before it only shows the corpses (bwl_broodlord 256:
+// first death at 25 s, the wipe at 648 s, 7 tagged lines in the report). When a death comes before the first failure, a second
+// window reads the log from kFirstDeathLeadMs before that death to kFirstDeathTailMs after it, from its start.
+constexpr std::uint32_t kFirstDeathLeadMs = 30u * 1000u;
+constexpr std::uint32_t kFirstDeathTailMs = 15u * 1000u;
+constexpr std::size_t kLogMarksMax = 3600;
 constexpr std::string_view kReportTags[] = {
     "[raid_pull]", "[pull_back]", "[pull_gate]", "[raid_heal]", "[healer_drink]", "[healer_hold]", "[raid_tank]", "[tank_",
     "[raid_hazard]", "[raid_escape]", "[raid_fight]", "[raid_threat]", "[mark_cc]", "[mark_gate]", "[bot_death]", "[spell_dmg]",
-    "[interrupt", "[raid_school", "[mark_cc]", "[pvecoord]" };
+    "[interrupt", "[raid_school", "[mark_cc]", "[pvecoord]", "[taunt]", "[raid_retaunt]", "[catch_up]", "[owner_steps]", "[fly_with_owner]", "[follow_drop]",
+    "[scenario_lead]", "[sight_pull]", "[help_runner]" };
 
 std::string LogPath() { return sLog->GetLogsDir() + "Playerbot.log"; }
 
@@ -1568,12 +2512,13 @@ void NoteLogMark(Run& run)
     if (ec)
         return;
     run.log_marks.emplace_back(run.run_ms, size);
-    while (run.log_marks.size() > 1 && run.run_ms - run.log_marks.front().first > kReportWindowMs + 5000u)
+    while (run.log_marks.size() > kLogMarksMax)
         run.log_marks.pop_front();
 }
 
-// The tagged lines written since the mark at (or after) `from_ms`; at most the last kReportMaxLines.
-std::vector<std::string> LogLinesSince(Run const& run, std::uint32_t from_ms)
+// The tagged lines written between the mark at (or after) `from_ms` and the mark at (or after) `to_ms` (0 = to the end of the file).
+// keep_first: the first kReportMaxLines of them, else the last.
+std::vector<std::string> LogLinesBetween(Run const& run, std::uint32_t from_ms, std::uint32_t to_ms, bool keep_first)
 {
     std::vector<std::string> out;
     if (run.log_marks.empty())
@@ -1581,6 +2526,10 @@ std::vector<std::string> LogLinesSince(Run const& run, std::uint32_t from_ms)
     std::uintmax_t start = run.log_marks.back().second;
     for (auto const& [ms, off] : run.log_marks)
         if (ms >= from_ms) { start = off; break; }
+    std::uintmax_t stop = 0;
+    if (to_ms)
+        for (auto const& [ms, off] : run.log_marks)
+            if (ms >= to_ms) { stop = off; break; }
     std::ifstream in(LogPath(), std::ios::binary);
     if (!in)
         return out;
@@ -1588,9 +2537,11 @@ std::vector<std::string> LogLinesSince(Run const& run, std::uint32_t from_ms)
     std::uintmax_t const end = std::uintmax_t(in.tellg());
     if (start > end)
         start = 0;   // the file was rotated since: read what is there
+    if (!stop || stop > end || stop < start)
+        stop = end;
     in.seekg(std::streamoff(start));
     std::string line;
-    while (std::getline(in, line))
+    while (std::uintmax_t(in.tellg()) < stop && std::getline(in, line))
     {
         bool keep = false;
         for (std::string_view tag : kReportTags)
@@ -1610,9 +2561,22 @@ std::vector<std::string> LogLinesSince(Run const& run, std::uint32_t from_ms)
             line.resize(400);
         out.push_back(line);
         if (out.size() > kReportMaxLines)
+        {
+            if (keep_first)
+            {
+                out.pop_back();
+                break;
+            }
             out.erase(out.begin());
+        }
     }
     return out;
+}
+
+// The tagged lines written since the mark at (or after) `from_ms`; at most the last kReportMaxLines.
+std::vector<std::string> LogLinesSince(Run const& run, std::uint32_t from_ms)
+{
+    return LogLinesBetween(run, from_ms, 0, false);
 }
 
 struct KeySpell { std::uint32_t spell; char const* name; };
@@ -1678,6 +2642,21 @@ std::string FailureReport(Run const& run)
         text += "\n[scenario] report state " + MemberState(m);
     for (std::string const& l : LogLinesSince(run, from_ms))
         text += "\n[scenario] report log " + l;
+    // The first death, when it came before the window above: how the fight was lost, not how it ended.
+    for (ScenarioFailure const& w : run.monitor->warnings())
+    {
+        if (w.kind != ScenarioFailKind::Death)
+            continue;
+        if (w.at_ms < from_ms)
+        {
+            std::uint32_t const lead_ms = w.at_ms > kFirstDeathLeadMs ? w.at_ms - kFirstDeathLeadMs : 0;
+            text += fmt::format("\n[scenario] report first-death window={}..{} s (first death {} at {} s)", lead_ms / 1000u,
+                                (w.at_ms + kFirstDeathTailMs) / 1000u, w.bot, w.at_ms / 1000u);
+            for (std::string const& l : LogLinesBetween(run, lead_ms, w.at_ms + kFirstDeathTailMs, true))
+                text += "\n[scenario] report death-log " + l;
+        }
+        break;
+    }
     return text;
 }
 
@@ -1713,7 +2692,8 @@ void Finish(Run& run, bool timed_out, std::string const& note = {})
         // The damage_parity family: the dummy, the stat bonuses and the gear override go; a bot whose bot logic was taken off for a sweep is logged out
         // (the next staging logs it in with a fresh one).
         Parity::End();
-        if (def.parity != 1 && !run.members.empty())
+        PetRevive::End();
+        if (def.parity != 1 && def.parity != 8 && def.parity != 9 && !run.members.empty())
             ::Playerbot::Services::SessionMgr().LogoutBot(ObjectGuid::Create<HighGuid::Player>(run.members.front().id));
     }
     if (timed_out)
@@ -1743,6 +2723,8 @@ void Finish(Run& run, bool timed_out, std::string const& note = {})
                                                                    run.spared_killed, def.spare_entry, def.goal_name));
     }
 
+    if (run.goal_reached)
+        run.monitor->DemoteToWarningsOnGoal();
     bool const pass = run.monitor->passed(run.goal_reached);
     std::string text = fmt::format("[scenario] result={} name={} level={} squad={} run_s={} goal={} failures={} warnings={}",
                                    pass ? "PASS" : "FAIL", def.name, uint32(def.level), run.members.size(), run.run_ms / 1000u,
@@ -1796,6 +2778,8 @@ void Finish(Run& run, bool timed_out, std::string const& note = {})
             g_wave_failed = true;
     }
 
+    DropLead(run);
+    GiveSquadOrders(run, false);
     // A detached stand-in has no bot logic to come back: it is logged out, and the next staging logs it in with a fresh one.
     if (run.stand_in_detached)
         if (Player* si = StandIn(run))
@@ -1813,7 +2797,7 @@ void Finish(Run& run, bool timed_out, std::string const& note = {})
                 p->ResurrectPlayer(1.0f);
                 p->SpawnCorpseBones();
             }
-            ::Playerbot::BotMovement::SafeTeleport(p, kStageMap, kStageX, kStageY, kStageZ, 0.f, 0);
+            SendToStage(p, run.def->goal == ScenarioGoalKind::Parity);
         }
     // Take the run out of the list but keep it alive to the end of this function: `run` is a reference into it.
     std::unique_ptr<Run> owned;
@@ -1825,6 +2809,21 @@ void Finish(Run& run, bool timed_out, std::string const& note = {})
             break;
         }
     StartNext();
+
+    // The squad leaves the world with the run: a test character standing at the staging spot is seen by players (244: the dps
+    // scorecard's Tier 3 raid stood in Northshire after its runs, at the parity staging spot). Only the characters the run started
+    // next (runall, the next wave) or a run still going takes over stay: they are staged again at once.
+    std::set<std::string> still_used;
+    for (auto const& r : g_runs)
+        for (Member const& m : r->members)
+            still_used.insert(m.def.name);
+    std::uint32_t logged_out = 0;
+    for (Member const& m : run.members)
+        if (m.id && !still_used.count(m.def.name) && Find(m.id))
+            if (::Playerbot::Services::SessionMgr().LogoutBot(ObjectGuid::Create<HighGuid::Player>(m.id)))
+                ++logged_out;
+    if (logged_out)
+        TC_LOG_INFO("playerbot.v2", "[scenario] {}: {} squad character(s) logged out at the end of the run", def.name, logged_out);
 }
 
 void Sample(Run& run, std::vector<ScenarioSample>& out)
@@ -1851,10 +2850,24 @@ void Sample(Run& run, std::vector<ScenarioSample>& out)
         s.hp_pct = float(p->GetHealthPct());
         s.group_size = p->GetGroup() ? uint32(p->GetGroup()->GetMembersCount()) : 0u;
         if (BotAI* ai = ::Playerbot::Services::Registry().ai(m.id))
+        {
             if (char const* rule = ai->last_rule_fired())
                 s.rule = rule;
+            // A squad is a bot-led group and runs the dungeon autopilot (its tank pulls, the damage dealers hold back until the tank
+            // brings the pack). It does not stand in for a player's group: with both at once (RC8, rfc_oggleflint) the group fight sent the
+            // damage dealers 40-53 y after the tank's pull while the autopilot expected them to wait, and the tank died to the extra
+            // Earthborers they woke. The idle check reads 0 here unless a squad is ever led by a player.
+            s.group_idle_ms = ai->group_idle_ms(GameTime::GetGameTimeMS());
+        }
         if (p->GetPowerType() == POWER_MANA && p->GetMaxPower(POWER_MANA) > 0)
             s.mana_pct = 100.f * float(p->GetPower(POWER_MANA)) / float(p->GetMaxPower(POWER_MANA));
+        if (run.def->limits.water_under_ms || run.def->limits.water_flips || run.def->limits.water_noswim_ms)
+        {
+            float swim_z = 0.f;
+            s.deep_water = s.alive && ::Playerbot::BotMovement::SwimLevel(p, s.x, s.y, s.z, swim_z);
+            s.head_under = p->IsUnderWater();
+            s.swim_flag = p->HasUnitMovementFlag(MOVEMENTFLAG_SWIMMING);
+        }
         out.push_back(std::move(s));
     }
 }
@@ -1912,6 +2925,22 @@ bool BeginScenario(std::string const& full_name, int slot, std::string& error)
     run.phase = Phase::Stage;
     ScenarioLimits limits = def->limits;
     limits.expected_group = std::uint32_t(def->squad.size());
+    // A raid's box is drawn round its entrance (MakeRaidScenario), and a boss far from it stands outside: every raider was out of bounds
+    // in the landing second (release-0130 aq20_ayamiss: 20 warnings at -9669,1563, Ayamiss 1260 y from the entrance). The box also takes
+    // in the boss's room, with the same margins as round the entrance's z and 300 y across the floor.
+    if (def->arrive_near_entry && limits.bounds.enabled)
+        for (auto const& kv : sObjectMgr->GetAllCreatureData())
+            if (kv.second.id == def->arrive_near_entry && kv.second.mapId == def->map)
+            {
+                Position const& sp = kv.second.spawnPoint;
+                limits.bounds.min_x = std::min(limits.bounds.min_x, sp.GetPositionX() - 300.f);
+                limits.bounds.max_x = std::max(limits.bounds.max_x, sp.GetPositionX() + 300.f);
+                limits.bounds.min_y = std::min(limits.bounds.min_y, sp.GetPositionY() - 300.f);
+                limits.bounds.max_y = std::max(limits.bounds.max_y, sp.GetPositionY() + 300.f);
+                limits.bounds.min_z = std::min(limits.bounds.min_z, sp.GetPositionZ() - 250.f);
+                limits.bounds.max_z = std::max(limits.bounds.max_z, sp.GetPositionZ() + 250.f);
+                break;
+            }
     run.monitor = std::make_unique<ScenarioMonitor>(limits);
     run.stage_timeout_ms = kStageTimeoutMs + std::uint32_t(def->squad.size()) * kStageTimeoutPerBotMs;
     run.arrive_entry = cp ? cp->creature_entry : def->arrive_near_entry;
@@ -1978,6 +3007,56 @@ void StartNext()
 }
 
 } // namespace
+
+void MarkTestCharacters()
+{
+    // Every name a squad can carry: the catalogue's (slot 0) and the slot letters runbatch gives (StartBatch: up to eight side by side).
+    std::set<std::string> names;
+    for (ScenarioDef const& d : ScenarioCatalogue())
+        for (ScenarioMember const& sm : d.squad)
+            for (int slot = 0; slot < 8; ++slot)
+                names.insert(SquadName(sm.name, slot));
+    std::uint32_t found = 0;
+    for (std::string const& n : names)
+    {
+        ObjectGuid const g = sCharacterCache->GetCharacterGuidByName(n);
+        if (g.IsEmpty())
+            continue;
+        ::Playerbot::Pool::MarkScenarioBot(g.GetCounter());
+        ++found;
+    }
+    TC_LOG_INFO("playerbot.v2", "[scenario] {} scenario test character(s) marked (of {} catalogue names): kept out of the world pool, battleground "
+                "and Group Finder fills, and trades", found, names.size());
+}
+
+std::uint32_t LogoutIdleTestBots(std::string* names)
+{
+    // The characters a running scenario holds stay; everything else marked as a test character leaves the world.
+    std::set<std::uint64_t> in_run;
+    for (auto const& r : g_runs)
+        for (Member const& m : r->members)
+            if (m.id)
+                in_run.insert(m.id);
+    std::uint32_t n = 0;
+    for (std::uint64_t const id : ::Playerbot::Pool::ScenarioBots())
+    {
+        if (in_run.count(id))
+            continue;
+        Player* p = Find(id);
+        if (!p)
+            continue;
+        if (!::Playerbot::Services::SessionMgr().LogoutBot(p->GetGUID()))
+            continue;   // not a bot session (a GM logged into a test character himself): left alone
+        if (names)
+        {
+            if (!names->empty())
+                *names += ", ";
+            *names += p->GetName();
+        }
+        ++n;
+    }
+    return n;
+}
 
 bool Start(std::string const& name, std::string& error)
 {
@@ -2053,8 +3132,27 @@ static void TickRun(Run& run, std::uint32_t diff_ms);
 
 void Tick(std::uint32_t diff_ms)
 {
+    // The first tick (the character cache is loaded): the catalogue's characters from earlier sessions are test characters again.
+    static bool s_marked = false;
+    if (!s_marked)
+    {
+        s_marked = true;
+        MarkTestCharacters();
+    }
     if (g_runs.empty())
+    {
+        // No run: no test character belongs in the world. Whatever is still online (an aborted run, a login from elsewhere) is logged out.
+        static std::uint32_t s_idle_ms = 0;
+        s_idle_ms += diff_ms;
+        if (s_idle_ms >= 30u * 1000u)
+        {
+            s_idle_ms = 0;
+            std::string names;
+            if (std::uint32_t const n = LogoutIdleTestBots(&names))
+                TC_LOG_INFO("playerbot.v2", "[scenario] no run: {} test character(s) logged out ({})", n, names);
+        }
         return;
+    }
     // Finish() removes the run and may start the next wave: tick a copy of the list, and only runs that are still there.
     std::vector<Run*> running;
     for (auto const& r : g_runs)
@@ -2082,7 +3180,16 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
     run.step_acc_ms += diff_ms;
     run.phase_ms += diff_ms;
     if (run.phase == Phase::Run)
+    {
         run.run_ms += diff_ms;
+        if (run.place_logs < 2 && run.run_ms >= (run.place_logs ? 3000u : 1000u))
+        {
+            char const* when = run.place_logs ? "3 s in" : "1 s in";
+            ++run.place_logs;
+            for (Member const& m : run.members)
+                LogPlace(run, Find(m.id), when);
+        }
+    }
     if (run.step_acc_ms < kStepMs)
         return;
     run.step_acc_ms = 0;
@@ -2112,20 +3219,120 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
                 Finish(run, false);   // a character that cannot be made: the run cannot start
                 return;
             }
+            if (all && (run.def->parity == 8 || run.def->parity == 9))
+            {
+                // The dps scorecard: the whole raid on the staging spot, grouped, then on flat ground, then the measurement begins.
+                bool placed = true;
+                for (Member const& m : run.members)
+                {
+                    Player* p = Find(m.id);
+                    if (!p || !p->IsInWorld() || p->IsBeingTeleported())
+                    {
+                        placed = false;
+                        continue;
+                    }
+                    if (run.group_guid.IsEmpty() && (p->GetMapId() != kStageMap || p->GetDistance2d(kStageX, kStageY) > 30.f))
+                    {
+                        ::Playerbot::BotMovement::SafeTeleport(p, kStageMap, kStageX, kStageY, kStageZ, 0.f, 0);
+                        placed = false;
+                    }
+                }
+                if (!placed)
+                {
+                    if (run.phase_ms >= run.stage_timeout_ms)
+                    {
+                        run.monitor->NoteSetupFailure(run.run_ms, "", "the raid did not reach the staging spot");
+                        Finish(run, false);
+                    }
+                    return;
+                }
+                if (run.group_guid.IsEmpty())
+                {
+                    FormGroup(run);
+                    return;
+                }
+                if (!GroupSettled(run))
+                {
+                    if (run.phase_ms >= run.stage_timeout_ms + 120u * 1000u)
+                    {
+                        run.monitor->NoteSetupFailure(run.run_ms, "", "the raid group did not settle");
+                        Finish(run, false);
+                    }
+                    return;
+                }
+                Player* leader = nullptr;
+                for (Member const& m : run.members)
+                    if (m.def.role == ScenarioRoleKind::Tank)
+                        leader = Find(m.id);
+                if (!leader)
+                    leader = Find(run.members.front().id);
+                float sx = 0.f, sy = 0.f, sz = 0.f, so = 0.f;
+                if (leader && run.spot_moved == 0 && Parity::FindOpenSpot(leader, 15.0f, sx, sy, sz, so) && leader->GetExactDist(sx, sy, sz) > 1.5f)
+                {
+                    TC_LOG_INFO("playerbot.v2", "[scenario] {} measures from flat ground at {:.1f},{:.1f},{:.1f}", run.def->name, sx, sy, sz);
+                    for (Member const& m : run.members)
+                        if (Player* p = Find(m.id))
+                            ::Playerbot::BotMovement::SafeTeleport(p, kStageMap, sx, sy, sz, so, 0);
+                    run.spot_moved = 1;
+                    return;
+                }
+                std::vector<Parity::GroupMember> raid;
+                for (Member const& m : run.members)
+                {
+                    Player* p = Find(m.id);
+                    if (!p)
+                        continue;
+                    Parity::GroupMember gm;
+                    gm.player = p;
+                    gm.spec = m.def.spec;
+                    gm.label = m.def.name;
+                    gm.melee = m.def.melee;
+                    gm.role = m.def.role == ScenarioRoleKind::Tank ? 2 : m.def.role == ScenarioRoleKind::Healer ? 1 : 0;
+                    gm.scored = run.def->parity == 9 || m.def.role == ScenarioRoleKind::Dps;   // the support scorecard audits everyone
+                    raid.push_back(std::move(gm));
+                }
+                std::string error;
+                if (!Parity::BeginGroup(raid, run.def->parity_leg_s, error, run.def->parity == 9))
+                {
+                    run.monitor->NoteSetupFailure(run.run_ms, "", error.empty() ? "the raid could not begin" : error);
+                    Finish(run, false);
+                    return;
+                }
+                TC_LOG_INFO("playerbot.v2", "[scenario] {} {} bots staged and grouped, the measurement begins", run.def->name, raid.size());
+                run.phase = Phase::Parity;
+                run.phase_ms = 0;
+                return;
+            }
             if (all && run.def->parity)
             {
                 // One bot, no group, no instance: it stays where it was staged and meets a target dummy.
                 Player* subject = Find(run.members.front().id);
                 // On the open ground of the staging spot, not wherever the bot logged out.
+                std::uint32_t stage_map = kStageMap; float stage_x = kStageX, stage_y = kStageY, stage_z = kStageZ;
+                StagePoint(subject, stage_map, stage_x, stage_y, stage_z, true);
                 if (subject && run.phase_ms < 60u * 1000u &&
-                    (subject->GetMapId() != kStageMap || subject->GetDistance2d(kStageX, kStageY) > 30.f || subject->IsBeingTeleported()))
+                    (subject->GetMapId() != stage_map || subject->GetDistance2d(stage_x, stage_y) > 30.f || subject->IsBeingTeleported()))
                 {
                     if (!subject->IsBeingTeleported())
-                        ::Playerbot::BotMovement::SafeTeleport(subject, kStageMap, kStageX, kStageY, kStageZ, 0.f, 0);
+                        ::Playerbot::BotMovement::SafeTeleport(subject, stage_map, stage_x, stage_y, stage_z, 0.f, 0);
+                    return;
+                }
+                // pet_revive_hunter: no dummy, the runner plays the check itself (PetReviveCheck.h).
+                if (run.def->parity == PetRevive::kParityKind)
+                {
+                    std::string error;
+                    if (!PetRevive::Begin(subject, error))
+                    {
+                        run.monitor->NoteSetupFailure(run.run_ms, run.members.front().def.name, error.empty() ? "the bot is gone" : error);
+                        Finish(run, false);
+                        return;
+                    }
+                    run.phase = Phase::Parity;
+                    run.phase_ms = 0;
                     return;
                 }
                 // The staging spot is a ledge: a dummy 15 y ahead stands 11 y lower with no line of sight. Measure from flat ground nearby.
-                if (subject && run.phase_ms < 120u * 1000u && !subject->IsBeingTeleported())
+                if (subject && !run.flat_ground_done && run.phase_ms < 120u * 1000u && !subject->IsBeingTeleported())
                 {
                     float sx = 0.f, sy = 0.f, sz = 0.f, so = 0.f;
                     if (Parity::FindOpenSpot(subject, 15.0f, sx, sy, sz, so))
@@ -2134,16 +3341,22 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
                         {
                             TC_LOG_INFO("playerbot.v2", "[scenario] {} measures from flat ground at {:.1f},{:.1f},{:.1f} ({:.1f} y from the staging spot)", subject->GetName(), sx, sy, sz,
                                         subject->GetExactDist(sx, sy, sz));
-                            ::Playerbot::BotMovement::SafeTeleport(subject, kStageMap, sx, sy, sz, so, 0);
+                            // Once only, and remembered: each search starts from where the bot stands, so a bot nudged off the ground by its idle
+                            // rules between ticks was moved again and again, 30 y, 6 y, 24 y, down into the harbour water (162: it drowned).
+                            run.flat_ground_done = true;
+                            Parity::NoteFlatSpot(subject->GetMapId(), sx, sy, sz, so);
+                            ::Playerbot::BotMovement::SafeTeleport(subject, subject->GetMapId(), sx, sy, sz, so, 0);
                             return;
                         }
+                        run.flat_ground_done = true;
+                        Parity::NoteFlatSpot(subject->GetMapId(), sx, sy, sz, so);
                         subject->SetFacingTo(so);
                     }
                     else
                         TC_LOG_INFO("playerbot.v2", "[scenario] {}: no flat ground within 48 y of the staging spot, measuring from where it stands", subject->GetName());
                 }
                 std::string error;
-                if (!subject || !Parity::Begin(subject, Parity::Kind(run.def->parity), run.def->parity_leg_s, error))
+                if (!subject || !Parity::Begin(subject, Parity::Kind(run.def->parity), run.def->parity_leg_s, error, run.def->parity_spec))
                 {
                     run.monitor->NoteSetupFailure(run.run_ms, run.members.front().def.name, error.empty() ? "the bot is gone" : error);
                     Finish(run, false);
@@ -2177,11 +3390,20 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
         {
             bool all_in = true;
             std::string missing;   // who is not on the map and why, for the failure line
-            for (Member const& m : run.members)
+            for (Member& m : run.members)
             {
                 Player* p = Find(m.id);
-                if (p && p->IsInWorld() && p->GetMapId() == run.def->map)
+                // On the map and done teleporting: a member still finishing the entry teleport drops the landing teleport sent the next second
+                // (bwl_razorgore 4f7b18e3: Mcwarra reached the entrance one second before the landing and stayed there, 39 of 40 arrived).
+                if (p && p->IsInWorld() && p->GetMapId() == run.def->map && !p->IsBeingTeleported())
+                {
+                    if (!m.arrival_logged)
+                    {
+                        m.arrival_logged = true;
+                        LogPlace(run, p, "on landing");
+                    }
                     continue;
+                }
                 all_in = false;
                 // The first teleport of a member can be dropped (it was mid-teleport, in combat, dead, or its session was between maps):
                 // every step sends it again until it lands (Mc raid 2026-10-10: 2 of 40 never left the staging map).
@@ -2232,8 +3454,12 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
                 run.run_ms = 0;
                 BaseSupport(run);
                 DetachStandIn(run);
+                TakeLead(run);
+                GiveSquadOrders(run, true);
                 LogGear(run);
                 TC_LOG_INFO("playerbot.v2", "[scenario] {} squad is inside map {}, run begins", run.def->name, run.def->map);
+                for (Member const& m : run.members)
+                    LogPlace(run, Find(m.id), "at the run's start");
             }
             else if (run.phase_ms >= kEnterTimeoutMs)
             {
@@ -2291,12 +3517,26 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
                 LogEngagements(run, leader);
             LogLanding(run);
             std::size_t arrived = 0;
+            // A member the landing teleport did not move is sent again every 5 s, as the entry teleport is (Phase::Enter); the core drops a
+            // teleport now and then (one that comes while another is being finished).
+            bool const resend = run.phase_ms - run.landing_resend_ms >= 5000u;
+            if (resend)
+                run.landing_resend_ms = run.phase_ms;
             for (Member const& m : run.members)
             {
                 Player* p = Find(m.id);
                 if (p && p->IsInWorld() && !p->IsBeingTeleported() && p->GetMapId() == run.def->map &&
                     std::hypot(p->GetPositionX() - run.arrive_x, p->GetPositionY() - run.arrive_y) < 40.f)
                     ++arrived;
+                else if (resend && p && p->IsInWorld() && !p->IsBeingTeleported() && p->GetMapId() == run.def->map && p->IsAlive())
+                {
+                    p->GetMotionMaster()->Clear();
+                    p->StopMoving();
+                    bool const sent = ::Playerbot::BotMovement::SafeTeleport(p, run.def->map, run.arrive_x, run.arrive_y, run.arrive_z, run.arrive_o, 0);
+                    TC_LOG_INFO("playerbot.v2", "[scenario] {} {} is {:.0f} y from the landing spot at {:.1f},{:.1f},{:.1f} {} s after it was sent: landing teleport sent again ({})",
+                                run.def->name, m.def.name, std::hypot(p->GetPositionX() - run.arrive_x, p->GetPositionY() - run.arrive_y),
+                                p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(), run.phase_ms / 1000u, sent ? "accepted" : "refused");
+                }
             }
             if (arrived == run.members.size() && GroupSettled(run))
             {
@@ -2324,7 +3564,10 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
                 run.run_ms = 0;
                 BaseSupport(run);
                 if (run.checkpoint)
+                {
                     DetachStandIn(run);
+                    TakeLead(run);
+                }
                 LogGear(run);
                 if (!run.checkpoint)
                     StockRaidKits(run);
@@ -2332,6 +3575,16 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
                     TC_LOG_INFO("playerbot.v2", "[scenario] {} squad is in place at checkpoint {}, run begins", run.def->name, run.from_key);
                 else
                     TC_LOG_INFO("playerbot.v2", "[scenario] {} raid is in place, run begins; the attack is ordered at {} s", run.def->name, run.def->order_delay_ms / 1000u);
+                if (!run.checkpoint)
+                    for (Member const& m : run.members)
+                        if (Player* p = Find(m.id))
+                        {
+                            if (run.trash_cleared)
+                                KillTrashSummons(run, p);
+                            LogNewcomers(run, p, "at the placement");
+                            run.newcomers_next_ms = 2000u;
+                            break;
+                        }
             }
             else if (run.phase_ms >= kArriveTimeoutMs)
             {
@@ -2342,6 +3595,18 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
         }
         case Phase::Run:
         {
+            if (!run.checkpoint && !run.order_sent && run.newcomers_next_ms && run.run_ms >= run.newcomers_next_ms)
+            {
+                run.newcomers_next_ms += 2000u;
+                for (Member const& m : run.members)
+                    if (Player* p = Find(m.id))
+                    {
+                        if (run.trash_cleared)
+                            KillTrashSummons(run, p);
+                        LogNewcomers(run, p, fmt::format("{} s after the placement", run.run_ms / 1000u).c_str());
+                        break;
+                    }
+            }
             bool attack_due = run.def->order_attack && !run.order_sent && run.run_ms >= run.def->order_delay_ms;
             // The Attack waits for the raid's preparation first: the class buffs, blessings, flasks, elixirs and food the upkeep rules put up
             // at the landing (naxx_patchwerk 124: 40 raiders, the 20 s order came with the tanks unbuffed and nothing drunk). Bounded like
@@ -2430,6 +3695,197 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
                     attack_due = false;
                 }
             }
+            // A boss the raid fights after others (ScenarioDef::start_instance_data with no start_npc: Hakkar after the five High Priests): the
+            // instance gets their finished states at the attack, as the raid's own kills would have set them.
+            if (attack_due && !run.def->start_npc && !run.def->start_instance_data.empty() && !run.start_data_set)
+                if (Player* tank = MainTank(run))
+                {
+                    run.start_data_set = true;
+                    InstanceScript* is = tank->GetInstanceScript();
+                    std::string set;
+                    if (is)
+                        for (auto const& [type, value] : run.def->start_instance_data)
+                        {
+                            is->SetData(type, value);
+                            set += fmt::format(" {}={}", type, value);
+                        }
+                    TC_LOG_INFO("playerbot.v2", "[scenario] {} instance data set before the attack:{}", run.def->name,
+                                !set.empty() ? set : std::string(" none (no instance script)"));
+                }
+            // A fight the leader starts by talking to a creature (ScenarioDef::start_npc: Vaelastrasz's gossip, Lord Victor Nefarius's): the
+            // instance gets the earlier steps the runner skips, the main tank talks once the creature offers it, then the attack waits for the
+            // boss to turn hostile (Vaelastrasz), or for the boss the fight summons later (Nefarian) while the raid fights on its own.
+            if (attack_due && run.def->start_npc)
+            {
+                Player* tank = MainTank(run);
+                auto const hold = [&run](std::uint32_t ms)
+                {
+                    for (Member const& m : run.members)
+                        if (BotAI* ai = ::Playerbot::Services::Registry().ai(m.id))
+                            ai->enter_manual(BotAI::OwnerCommand::Hold, ObjectGuid::Empty, GameTime::GetGameTimeMS(), ms);
+                    run.monitor->NoteDeliberateWait(run.run_ms);
+                };
+                if (!run.start_npc_done_ms && tank)
+                {
+                    if (!run.start_npc_wait_ms)
+                    {
+                        run.start_npc_wait_ms = run.run_ms ? run.run_ms : 1u;
+                        InstanceScript* is = tank->GetInstanceScript();
+                        std::string set;
+                        if (is)
+                            for (auto const& [type, value] : run.def->start_instance_data)
+                            {
+                                is->SetData(type, value);
+                                set += fmt::format(" {}={}", type, value);
+                            }
+                        TC_LOG_INFO("playerbot.v2", "[scenario] {} instance data set before the start:{}", run.def->name,
+                                    !set.empty() ? set : is ? std::string(" none") : std::string(" none (no instance script)"));
+                    }
+                    Creature* npc = tank->FindNearestCreature(run.def->start_npc, 200.0f, true);
+                    bool const offers = npc && (!run.def->start_gossip_steps || npc->HasNpcFlag(UNIT_NPC_FLAG_GOSSIP));
+                    if (!offers && run.run_ms - run.start_npc_wait_ms < 60000u)
+                    {
+                        hold(5000u);
+                        attack_due = false;
+                    }
+                    else
+                    {
+                        run.start_npc_done_ms = run.run_ms ? run.run_ms : 1u;
+                        std::string how;
+                        if (!npc)
+                            how = "none alive within 200 y";
+                        else if (!npc->AI())
+                            how = "it has no script";
+                        else
+                        {
+                            if (!offers)
+                                how = "no gossip offered after 60 s, talked anyway; ";
+                            if (run.def->start_gossip_steps)
+                            {
+                                bool const hello = npc->AI()->OnGossipHello(tank);
+                                how += fmt::format("gossip {}", hello ? "opened" : "refused by the script");
+                                for (std::uint8_t step = 0; hello && step < run.def->start_gossip_steps; ++step)
+                                {
+                                    GossipMenu& menu = tank->PlayerTalkClass->GetGossipMenu();
+                                    if (menu.Empty())
+                                    {
+                                        how += fmt::format(", no option at step {}", step + 1);
+                                        break;
+                                    }
+                                    std::uint32_t const index = menu.GetMenuItems().front().OrderIndex;
+                                    std::uint32_t const menu_id = menu.GetMenuId();
+                                    npc->AI()->OnGossipSelect(tank, menu_id, index);
+                                    how += fmt::format(", option {} of menu {}", index, menu_id);
+                                }
+                            }
+                            if (run.def->start_npc_action)
+                            {
+                                npc->AI()->DoAction(run.def->start_npc_action);
+                                how += fmt::format("{}script action {}", how.empty() ? "" : ", ", run.def->start_npc_action);
+                            }
+                        }
+                        // A boss that comes later: the raid fights what the start brings (the drakonids) on its own from here, as a raid does
+                        // before its leader's Attack on the boss.
+                        if (run.def->goal_wait_ms)
+                            for (Member const& m : run.members)
+                                if (BotAI* ai = ::Playerbot::Services::Registry().ai(m.id))
+                                    if (ai->holding_position(GameTime::GetGameTimeMS()))
+                                        ai->exit_manual();
+                        TC_LOG_INFO("playerbot.v2", "[scenario] {} {} talks to creature {} to start the fight: {}", run.def->name, tank->GetName(),
+                                    run.def->start_npc, how);
+                    }
+                }
+                if (attack_due && run.start_npc_done_ms)
+                {
+                    Creature* boss = FindBoss(run);
+                    std::uint32_t const since = run.run_ms - run.start_npc_done_ms;
+                    if (run.def->goal_wait_ms)
+                    {
+                        if (!boss && since < run.def->goal_wait_ms)
+                        {
+                            run.monitor->NoteDeliberateWait(run.run_ms);
+                            if (!run.goal_wait_log_ms || run.run_ms - run.goal_wait_log_ms >= 30000u)
+                            {
+                                run.goal_wait_log_ms = run.run_ms ? run.run_ms : 1u;
+                                TC_LOG_INFO("playerbot.v2", "[scenario] {} the raid fights the start of the encounter; creature {} ({}) is not out yet, {} s after the start",
+                                            run.def->name, run.def->goal_entry, run.def->goal_name, since / 1000u);
+                            }
+                            attack_due = false;
+                        }
+                        else if (!boss)
+                            TC_LOG_WARN("playerbot.v2", "[scenario] {} creature {} is still not out {} s after the start", run.def->name,
+                                        run.def->goal_entry, since / 1000u);
+                    }
+                    else
+                    {
+                        bool const ready = boss && tank && boss->IsHostileTo(tank) && !boss->IsImmuneToPC() && !boss->IsUninteractible() &&
+                                           !boss->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE);
+                        if (!ready && since < 60000u)
+                        {
+                            hold(5000u);
+                            attack_due = false;
+                        }
+                        else if (!ready)
+                            TC_LOG_WARN("playerbot.v2", "[scenario] {} creature {} is still not hostile and attackable 60 s after the start", run.def->name,
+                                        run.def->goal_entry);
+                    }
+                }
+            }
+            // A fight the leader starts with a game object (Chromaggus' lever): the main tank uses it, then the attack waits until the boss
+            // can be attacked. The Hold stays up meanwhile.
+            if (attack_due && run.def->start_object)
+            {
+                Player* tank = MainTank(run);
+                Creature* boss = FindBoss(run);
+                if (!run.start_object_used_ms && tank)
+                {
+                    GameObject* go = tank->FindNearestGameObject(run.def->start_object, 200.0f);
+                    run.start_object_used_ms = run.run_ms ? run.run_ms : 1u;
+                    if (go)
+                        go->Use(tank);
+                    TC_LOG_INFO("playerbot.v2", "[scenario] {} {} uses game object {}{} to start the fight", run.def->name, tank->GetName(),
+                                run.def->start_object, go ? fmt::format(" at {:.1f},{:.1f},{:.1f}", go->GetPositionX(), go->GetPositionY(), go->GetPositionZ())
+                                                          : std::string(": none within 200 y"));
+                }
+                bool const locked = boss && (boss->IsUninteractible() || boss->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE) || boss->IsImmuneToPC());
+                if (locked && run.run_ms - run.start_object_used_ms < 30000u)
+                {
+                    for (Member const& m : run.members)
+                        if (BotAI* ai = ::Playerbot::Services::Registry().ai(m.id))
+                            ai->enter_manual(BotAI::OwnerCommand::Hold, ObjectGuid::Empty, GameTime::GetGameTimeMS(), 5000u);
+                    run.monitor->NoteDeliberateWait(run.run_ms);
+                    attack_due = false;
+                }
+                else if (locked)
+                    TC_LOG_WARN("playerbot.v2", "[scenario] {} creature {} is still not attackable 30 s after game object {} was used", run.def->name,
+                                run.def->goal_entry, run.def->start_object);
+            }
+            // A boss that comes out on a game event (Gahz'ranka, the Mudskunk Lure): the main tank sends it, as a player using the lure
+            // does, then the attack waits for the boss. Without it the instance script despawns him as he spawns, and the run failed its
+            // setup at the attack (release-0130 zg_gahzranka: "alive at -11675.7,-1728.9,-7.1" at the placing, not alive 22 s later).
+            if (attack_due && run.def->start_event)
+            {
+                Player* tank = MainTank(run);
+                if (!run.start_event_sent_ms && tank)
+                {
+                    run.start_event_sent_ms = run.run_ms ? run.run_ms : 1u;
+                    GameEvents::Trigger(run.def->start_event, tank, nullptr);
+                    TC_LOG_INFO("playerbot.v2", "[scenario] {} {} sends game event {} to bring out creature {}", run.def->name, tank->GetName(),
+                                run.def->start_event, run.def->goal_entry);
+                }
+                Creature* boss = FindBoss(run);
+                if (!boss && run.start_event_sent_ms && run.run_ms - run.start_event_sent_ms < 30000u)
+                {
+                    for (Member const& m : run.members)
+                        if (BotAI* ai = ::Playerbot::Services::Registry().ai(m.id))
+                            ai->enter_manual(BotAI::OwnerCommand::Hold, ObjectGuid::Empty, GameTime::GetGameTimeMS(), 5000u);
+                    run.monitor->NoteDeliberateWait(run.run_ms);
+                    attack_due = false;
+                }
+                else if (!boss && run.start_event_sent_ms)
+                    TC_LOG_WARN("playerbot.v2", "[scenario] {} creature {} is still not out 30 s after game event {} was sent", run.def->name,
+                                run.def->goal_entry, run.def->start_event);
+            }
             if (attack_due && !IssueAttack(run))
             {
                 Finish(run, false);
@@ -2441,6 +3897,13 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
                 LogTankProbe(run, "6 s into the fight");
             }
             PlayStandIn(run);
+            PlayOwnerSkull(run);
+            if (run.def->goal == ScenarioGoalKind::FollowRoute)
+                PlayRoute(run);
+            else
+                PlayLeader(run);
+            SwimStandIn(run);
+            LogPositions(run);
             LogLanding(run);
             SamplePull(run);
             if (run.run_ms < 30000u)
@@ -2481,7 +3944,7 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
                 return;
             }
             std::string failure;
-            if (Parity::Step(failure))
+            if (run.def->parity == PetRevive::kParityKind ? PetRevive::Step(failure) : Parity::Step(failure))
             {
                 if (failure.empty())
                     run.goal_reached = true;

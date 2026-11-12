@@ -5,8 +5,11 @@
 #include "../Bot/ClassTables.h"  // canonical IsTankSpec / IsHealerSpec
 #include "../Services.h"                    // Lifecycle() accessor
 #include "../Fleet/BotIdentityRegistry.h"   // is_bot definition (Services.h fwd-declares)
+#include "../Threading/SnapshotPublisher.h"  // a bot paladin's owner picks
 #include "Player.h"
+#include "Pet.h"
 #include "Group.h"
+#include "Transport.h"   // ship_guid: the member's ship or zeppelin
 #include "GameTime.h"
 #include "Unit.h"
 #include "ObjectAccessor.h"
@@ -23,6 +26,7 @@
 #include <string_view>
 #include <unordered_map>
 #include "SharedDefines.h"
+#include "Diagnostics/ScenarioHuman.h"   // Scenario::PlaysAsHuman: a player-led scenario's stand-in counts as the player
 
 namespace Playerbot {
 
@@ -286,7 +290,8 @@ std::shared_ptr<GroupSnapshot const> GroupSnapshotBuilder::Build(Player* p, Snap
         m.cls     = slot._class;
         m.subgroup = slot.group;
         m.is_bot  = Services::Initialized() &&
-                    Services::Lifecycle().is_bot(slot.guid.GetCounter());
+                    Services::Lifecycle().is_bot(slot.guid.GetCounter()) &&
+                    !Scenario::IsScenarioHuman(slot.guid.GetCounter());   // a player-led scenario's stand-in is the player
 
         // Live state from the actual Player if they're online & in-world.
         if (Player* mp = ObjectAccessor::FindConnectedPlayer(slot.guid))
@@ -301,9 +306,32 @@ std::shared_ptr<GroupSnapshot const> GroupSnapshotBuilder::Build(Player* p, Snap
             m.in_combat    = mp->IsInCombat();
             m.is_controlled = mp->HasUnitState(UNIT_STATE_FLEEING | UNIT_STATE_CONFUSED | UNIT_STATE_STUNNED);
             m.is_mounted   = mp->IsMounted();
+            m.in_flight    = mp->IsInFlight();
+            if (Transport const* ship = dynamic_cast<Transport const*>(mp->GetTransport()))
+                m.ship_guid = ship->GetGUID();
             m.is_alive     = mp->IsAlive();
             m.rez_pending  = mp->IsResurrectRequested();
             m.is_ghost     = mp->HasPlayerFlag(PLAYER_FLAGS_GHOST);
+            // A bot paladin's owner picks, from its last snapshot (one tick old at most), so the other paladins plan around them.
+            if (m.is_bot && m.cls == CLASS_PALADIN)
+                if (auto const bs = Services::Snapshots().latest(slot.guid.GetCounter()))
+                {
+                    m.owner_blessing = bs->owner_picks[OwnerPicks::Blessing];
+                    m.owner_aura     = bs->owner_picks[OwnerPicks::Aura];
+                }
+            // The member's pet, for the healers (ClassicHeal::PickPatient pet case).
+            if (Pet* pet = mp->GetPet(); pet && pet->IsInWorld())
+            {
+                m.pet_guid   = pet->GetGUID();
+                // A pet at 0 health is dead, whatever its death state still says: no heal can land on it (bwl_nefarian sweep-bwl-1109y
+                // run 1: five healers cast 47 heals in 26 s on unit 5 at 0 of 877 health, most likely a pet, while two tanks fell).
+                m.pet_alive  = pet->IsAlive() && pet->GetHealth() > 0;
+                m.pet_hp     = static_cast<int32>(pet->GetHealth());
+                m.pet_max_hp = static_cast<int32>(pet->GetMaxHealth());
+                m.pet_x      = pet->GetPositionX();
+                m.pet_y      = pet->GetPositionY();
+                m.pet_z      = pet->GetPositionZ();
+            }
             if (Unit* v = mp->GetVictim())
                 m.victim   = v->GetGUID();
             // Fallback to the SELECTED target when there's no melee victim yet.

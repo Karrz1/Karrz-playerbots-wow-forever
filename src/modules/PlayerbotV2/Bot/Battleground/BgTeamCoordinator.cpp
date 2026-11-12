@@ -33,6 +33,7 @@
 #include "Player.h"
 
 #include "BgAvPlan.h"
+#include "BgWaypointRoutes.h"
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -583,8 +584,38 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
     int alive_free = 0;
     for (auto const& m : ctx.members)
         if (m.alive && !m.assigned && !m.is_carrier) ++alive_free;
+    // AV captain first (ike3 / mod-playerbots, see below): the captain squad is reserved before the supporters are picked, so the garrisons,
+    // the brawl, Snowfall and the mine bosses only take what it leaves (BgAvPlan::CaptainReserve).
+    const uint64 commit_key = (uint64(ctx.instance_id) << 2) | uint64(ctx.team);
+    if (ctx.type_id == 1)
+    {
+        auto& died = died_ms_[commit_key];
+        for (auto const& m : ctx.members)
+            if (!m.alive) died[m.guid_low] = ctx.in_progress_ms;
+    }
+    auto const wipes_it = captain_wipes_.find(commit_key);
+    bool const captain_given_up = wipes_it != captain_wipes_.end() && BgAvPlan::CaptainGivenUp(int(wipes_it->second));
+    bool const captain_first = ctx.type_id == 1 && ctx.captain_alive && PosSet(ctx.captain_x, ctx.captain_y) && !captain_given_up;
+    // AV general push after the captain (BgAvPlan::GeneralDue): the match time the enemy captain was killed or left is kept per team;
+    // kGeneralAfterCaptainMs later the team goes for the general whatever the towers, with the same reserve and gather as the captain.
+    if (ctx.type_id == 1 && !ctx.nodes.empty() && (!ctx.captain_alive || captain_given_up))
+        captain_done_ms_.emplace(commit_key, ctx.in_progress_ms);
+    bool general_due = false;
+    if (ctx.type_id == 1 && ctx.endgame_creature_entry != 0 && PosSet(ctx.endgame_x, ctx.endgame_y))
+        if (auto const done = captain_done_ms_.find(commit_key); done != captain_done_ms_.end())
+            general_due = BgAvPlan::GeneralDue(ctx.in_progress_ms, done->second);
+    int const captain_reserve = (captain_first || general_due) ? BgAvPlan::CaptainReserve(alive_free) : 0;
+    auto supporters_left = [&]()
+    {
+        int n = 0;
+        for (auto const& m : ctx.members)
+            if (!m.assigned && m.alive && !m.is_carrier) ++n;
+        return std::max(0, n - captain_reserve);
+    };
     // The brawlers come out of the garrisons first: a bot fighting in the valley is not standing on a tower.
-    const int garrison_budget  = std::max(1, int(float(alive_free) * 0.6f * (1.0f - 0.6f * mid_share)));
+    int garrison_budget = std::max(1, int(float(alive_free) * 0.6f * (1.0f - 0.6f * mid_share)));
+    if (captain_first || general_due)
+        garrison_budget = std::min(garrison_budget, std::max(0, alive_free - captain_reserve));
     const int emergency_budget = std::max(1, (alive_free * 3) / 4);
     int spent = 0;
     // AV defender flip (mod-playerbots BGT 1919-1931): a bot already deep in the enemy half does not garrison; it keeps free for the attack.
@@ -688,6 +719,24 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
     float tx = 0.f, ty = 0.f, tz = 0.f;
     uint8  order_kind   = BgOrder::AttackNode;
     uint32 push_entry   = 0;
+    // AV node rally (set in the AV attack branch below): a bot far behind the captain waiting spot meets the squad there first
+    // (BgAvPlan::RallyFirst), and while the squad gathers (node_go false) the bots at the spot wait. Gives where `m` goes for a node at (x,y,z).
+    bool node_rally = false, node_go = true;
+    float node_stage_x = 0.f, node_stage_y = 0.f, node_stage_z = 0.f;   // the node squad's waiting spot (set with node_rally)
+    // AV assault waves (BgAvPlan::OutOfWave): while the captain / general assault is on, a squad bot that died after its wave went goes to
+    // the waiting spot (wave_x/y/z) instead, with target_entry wave_entry.
+    uint32 wave_ms = 0;
+    bool wave = false;
+    float wave_x = 0.f, wave_y = 0.f, wave_z = 0.f;
+    uint32 wave_entry = 0;
+    auto rally_dest = [&](Member const& m, float& x, float& y, float& z)
+    {
+        if (!node_rally) return;
+        float const stage_to = std::sqrt(Dist2(node_stage_x, node_stage_y, x, y));
+        bool const at_stage = Dist2(m.x, m.y, node_stage_x, node_stage_y) < 60.f * 60.f;
+        if (BgAvPlan::RallyFirst(std::sqrt(Dist2(m.x, m.y, x, y)), stage_to) || (!node_go && at_stage))
+        { x = node_stage_x; y = node_stage_y; z = node_stage_z; }
+    };
     // Push the enemy boss when LOSING (all_in) OR when the script flags the
     // push unconditional (AV: enemy reinforcements are low — the boss kill
     // ends the match regardless of node count, so push even while winning).
@@ -712,18 +761,24 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
     // genuinely crushed (score_delta < -150, i.e. about to lose — fall back to
     // defending). This is also how humans break the stall: the leading team
     // drives the captain->general kill instead of trading nodes forever.
-    const uint64 commit_key = (uint64(ctx.instance_id) << 2) | uint64(ctx.team);
     if (lead_push)
         endgame_commit_[commit_key] = ctx.in_progress_ms;
     const bool committed = endgame_commit_.find(commit_key) != endgame_commit_.end();
     if (ctx.endgame_creature_entry == 0 || ctx.score_delta < -150)
         endgame_commit_.erase(commit_key);  // endgame done / team collapsing
     if (!ctx.captain_alive)
-        { captain_go_.erase(commit_key); captain_wait_.erase(commit_key); }      // captain dead: the next assault starts from the staging spot again
+    {
+        captain_gate_.Reset(commit_key);   // captain dead: start over
+        captain_wipes_.erase(commit_key);
+        // Once per match (bot-only AV 255 had no line for it: the captain kills could only be read off the plan switching to the nodes).
+        if (ctx.type_id == 1 && !ctx.nodes.empty() && captain_down_.insert(commit_key).second)
+            TC_LOG_INFO("playerbot.v2", "[bgcoord] bg_type={} instance={} team={} enemy captain {} down at {} s", ctx.type_id, ctx.instance_id,
+                        ctx.team, ctx.team == 1 ? 11947u : 11949u, ctx.in_progress_ms / 1000u);
+    }
     const bool sticky_push = committed && ctx.endgame_creature_entry != 0 &&
                              ctx.score_delta >= -150;
     const bool push_boss = all_in || ctx.endgame_unconditional || lead_push ||
-                           sticky_push;
+                           sticky_push || general_due;
 
     // Enemy towers / bunkers still standing (AV): the general keeps their buffs, so the general push waits until they are down
     // (ike3's rule). A tower is a priority-2 script node held by the enemy that is not razed.
@@ -747,20 +802,20 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
     if (PosSet(ctx.endgame_x, ctx.endgame_y))
         for (auto const& m : ctx.members)
             if (m.alive && Dist2(m.x, m.y, ctx.endgame_x, ctx.endgame_y) < 200.f * 200.f) ++friends_near_boss;
-    bool const general_ok = BgAvPlan::GeneralPushOk(enemy_towers_up, enemy_towers_razed, own_final_gy, friends_near_boss);
+    bool const general_ok = general_due || BgAvPlan::GeneralPushOk(enemy_towers_up, enemy_towers_razed, own_final_gy, friends_near_boss);
 
     // -- AV open-field brawl (playtest 2026-10-08) -------------------------------
     // Send the brawlers (share decided above) to the fight zone as ordinary AttackNode orders. The brawl ends once
     // the push for the enemy captain/general is on (a lead, a deficit, low enemy reinforcements), so matches end.
     // The brawl also goes on while the general push is held back by standing enemy towers and no captain is left to go for.
-    bool const push_held = ctx.endgame_needs_towers && !general_ok && !(ctx.captain_alive && PosSet(ctx.captain_x, ctx.captain_y));
+    bool const push_held = ctx.endgame_needs_towers && !general_ok && !(ctx.captain_alive && PosSet(ctx.captain_x, ctx.captain_y) && !captain_given_up);
     if (mid_share > 0.f && (!push_boss || push_held))
     {
         int free_n = 0;
         for (auto const& m : ctx.members)
             if (!m.assigned && m.alive && !m.is_carrier) ++free_n;
         // The squad keeps at least 30% of the free bots so towers still fall.
-        int const to_mid = std::min(int(mid_share * float(alive_total) + 0.5f), (free_n * 7) / 10);
+        int const to_mid = std::min({ int(mid_share * float(alive_total) + 0.5f), (free_n * 7) / 10, supporters_left() });
         for (int q = 0; q < to_mid; ++q)
         {
             int const pick = PickNearest(ctx.members, BgOrder::AttackNode, ctx.fight_x, ctx.fight_y, /*healer_bias=*/0,
@@ -786,7 +841,7 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
             int free_n = 0;
             for (auto const& m : ctx.members)
                 if (!m.assigned && m.alive && !m.is_carrier) ++free_n;
-            int const k = BgAvPlan::SnowfallDetail(free_n, ctx.in_progress_ms);
+            int const k = std::min(BgAvPlan::SnowfallDetail(free_n, ctx.in_progress_ms), supporters_left());
             for (int q = 0; q < k; ++q)
             {
                 int const pick = PickNearest(ctx.members, BgOrder::AttackNode, n.x, n.y, /*healer_bias=*/+1, /*allow_carrier=*/false);
@@ -800,7 +855,7 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
     // AV mine bosses (ike3 mine-boss objective): a few bots kill the boss of every mine the team does not own. Not during the push.
     if (!push_boss || push_held)
         for (auto const& kt : ctx.kill_targets)
-            for (int q = 0; q < 3; ++q)
+            for (int q = 0; q < 3 && supporters_left() > 0; ++q)
             {
                 int const pick = PickNearest(ctx.members, BgOrder::PushEndgame, kt.x, kt.y, /*healer_bias=*/+1, /*allow_carrier=*/false);
                 if (pick < 0) break;
@@ -810,31 +865,35 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
 
     // ike3 / mod-playerbots: the captain comes first. Non-supporters (ike3 60-80 %) or 90 % of everyone (mod-playerbots) walk to the enemy
     // captain while it lives, gathering at the staging spot first; the towers follow once it is down. So the captain squad starts without
-    // the lead / deficit trigger the general push needs.
-    bool const captain_first = ctx.type_id == 1 && ctx.captain_alive && PosSet(ctx.captain_x, ctx.captain_y);
-    if ((push_boss || captain_first) && ctx.captain_alive && PosSet(ctx.captain_x, ctx.captain_y))
+    // the lead / deficit trigger the general push needs (captain_first, decided with the supporter budget above).
+    if ((push_boss || captain_first) && ctx.captain_alive && PosSet(ctx.captain_x, ctx.captain_y) && !captain_given_up)
     {
         // Captain: the squad gathers at the staging spot and goes in together once five of the team stand there (ike3: engage once 5
         // attackers are at the waiting spot). The decision latches until the captain is dead.
         bool go = true;
         if (PosSet(ctx.captain_stage_x, ctx.captain_stage_y))
         {
-            if (captain_go_.find(commit_key) == captain_go_.end())
+            bool wiped = false;
+            go = AvAssaultGo(ctx, captain_gate_, commit_key, ctx.captain_stage_x, ctx.captain_stage_y, { { ctx.captain_x, ctx.captain_y } },
+                             free_count, "captain", wiped);
+            if (wiped)
             {
-                int at_stage = 0;
-                for (auto const& m : ctx.members)
-                    if (m.alive && Dist2(m.x, m.y, ctx.captain_stage_x, ctx.captain_stage_y) < 60.f * 60.f) ++at_stage;
-                uint32 const waited_since = captain_wait_.emplace(commit_key, ctx.in_progress_ms).first->second;
-                uint32 const waited = ctx.in_progress_ms >= waited_since ? ctx.in_progress_ms - waited_since : 0u;
-                if (BgAvPlan::CaptainGather(at_stage, false, waited)) captain_go_[commit_key] = ctx.in_progress_ms;
+                uint32 const wipes = ++captain_wipes_[commit_key];
+                TC_LOG_INFO("playerbot.v2", "[bgcoord] bg_type={} instance={} team={} captain assault wiped ({} of {}){}", ctx.type_id,
+                            ctx.instance_id, ctx.team, wipes, BgAvPlan::kCaptainMaxAssaults,
+                            BgAvPlan::CaptainGivenUp(int(wipes)) ? ", captain left, towers next" : ", gathering again");
             }
-            go = captain_go_.find(commit_key) != captain_go_.end();
         }
         if (go)
         {
             tx = ctx.captain_x; ty = ctx.captain_y; tz = ctx.captain_z;
             order_kind = BgOrder::PushEndgame;
             push_entry = ctx.captain_creature_entry;
+            if (auto const went = captain_gate_.go.find(commit_key); went != captain_gate_.go.end())
+            {
+                wave = true; wave_ms = went->second;
+                wave_x = ctx.captain_stage_x; wave_y = ctx.captain_stage_y; wave_z = ctx.captain_stage_z;
+            }
         }
         else
         {
@@ -844,9 +903,80 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
     }
     else if (push_boss && general_ok && PosSet(ctx.endgame_x, ctx.endgame_y))
     {
-        tx = ctx.endgame_x; ty = ctx.endgame_y; tz = ctx.endgame_z;
-        order_kind = BgOrder::PushEndgame;
-        push_entry = ctx.endgame_creature_entry;
+        // AV: the squad gathers at our graveyard nearest the general (BgAvPlan::GeneralStageGraveyard; without one, kGeneralStageBack
+        // yards short of him on the route in) and goes into his room together, the captain's gather / go / regroup cycle. Walking in as
+        // they came, the bots met the enemy team and the keep's guards one at a time.
+        bool go = true;
+        float sx = 0.f, sy = 0.f, sz = 0.f;
+        bool staged = false;
+        // The enemy graveyard the push takes on its way (BgAvPlan::GeneralRouteGraveyard), nullptr when the general is next.
+        BgNodeState const* step_gy = nullptr;
+        if (ctx.type_id == 1)
+        {
+            std::vector<BgAvPlan::GyView> gy;
+            std::vector<BgNodeState const*> gy_nodes;
+            for (auto const& n : ctx.nodes)
+                if (!n.is_destroyed && NodePriorityFor(ctx, n) == 0)
+                {
+                    gy.push_back({ n.x, n.y, n.owner_team == ctx.team, n.is_contested });
+                    gy_nodes.push_back(&n);
+                }
+            int const pick = BgAvPlan::GeneralStageGraveyard(gy, ctx.endgame_x, ctx.endgame_y);
+            if (pick >= 0)
+            {
+                sx = gy_nodes[pick]->x; sy = gy_nodes[pick]->y; sz = gy_nodes[pick]->z;
+                staged = true;
+            }
+            else
+                staged = BgRoutes::ApproachPoint(uint16(ctx.type_id), ctx.home_x, ctx.home_y, ctx.home_z, ctx.endgame_x, ctx.endgame_y,
+                                                 ctx.endgame_z, BgAvPlan::kGeneralStageBack, sx, sy, sz);
+            int const step = BgAvPlan::GeneralRouteGraveyard(gy, pick, ctx.home_x, ctx.home_y, ctx.endgame_x, ctx.endgame_y, enemy_team);
+            if (step >= 0)
+                step_gy = gy_nodes[step];
+        }
+        if (staged)
+        {
+            bool wiped = false;
+            std::pair<float, float> const target = step_gy ? std::make_pair(step_gy->x, step_gy->y) : std::make_pair(ctx.endgame_x, ctx.endgame_y);
+            go = AvAssaultGo(ctx, general_gate_, commit_key, sx, sy, { target }, free_count, "general", wiped);
+            if (wiped)
+                TC_LOG_INFO("playerbot.v2", "[bgcoord] bg_type={} instance={} team={} general assault wiped, gathering again", ctx.type_id,
+                            ctx.instance_id, ctx.team);
+            if (auto const went = general_gate_.go.find(commit_key); go && went != general_gate_.go.end())
+            {
+                wave = true; wave_ms = went->second;
+                wave_x = sx; wave_y = sy; wave_z = sz;
+                wave_entry = ctx.endgame_creature_entry;   // keeps the push's route round a living captain, as on the graveyard steps
+            }
+        }
+        if (go && step_gy)
+        {
+            // Take the graveyard: an ordinary node assault order, so the squad clicks the banner and holds it while it turns. It carries
+            // the general's entry (only PushEndgame reads it as a kill target) so the bots keep the general push's route round a living
+            // captain (State_Idle BgRouteMove): from Snowfall the plain route to Iceblood Graveyard passes 62 yd from Galvangar.
+            tx = step_gy->x; ty = step_gy->y; tz = step_gy->z;
+            order_kind = BgOrder::AttackNode;
+            push_entry = ctx.endgame_creature_entry;
+            uint64 const step_sig = uint64(uint32(int32(tx))) << 32 | uint32(int32(ty));
+            uint64& last_step = general_step_[commit_key];
+            if (last_step != step_sig)
+            {
+                last_step = step_sig;
+                TC_LOG_INFO("playerbot.v2", "[bgcoord] bg_type={} instance={} team={} general push takes the graveyard at ({:.0f},{:.0f}) first",
+                            ctx.type_id, ctx.instance_id, ctx.team, tx, ty);
+            }
+        }
+        else if (go)
+        {
+            tx = ctx.endgame_x; ty = ctx.endgame_y; tz = ctx.endgame_z;
+            order_kind = BgOrder::PushEndgame;
+            push_entry = ctx.endgame_creature_entry;
+        }
+        else
+        {
+            tx = sx; ty = sy; tz = sz;
+            order_kind = BgOrder::AttackNode;
+        }
     }
     else
     {
@@ -902,6 +1032,39 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
                 if (rank == 0) { tx = n.x; ty = n.y; tz = n.z; best_cost = 0.f; }
                 ++rank;
             }
+            // Node rally: the captain is dead or left (or the push waits for the towers), so the squads for these nodes go in together
+            // from the captain waiting spot, the same gather / go / regroup cycle as the captain assault (AvAssaultGo). The squad is the
+            // bots that would rally (far behind the spot, or standing at it); bots already nearer the nodes go straight in.
+            // The waiting spot is on the near side of the first node (BgAvPlan::kNodeRallyBack back along the recorded route from the
+            // home base), not the captain's: bot-only AV 257, after Balinda died the Horde gathered at her spot (28,-303), which lies
+            // beyond its target Stonehearth Bunker, so every bot walked alone past Commander Randolph and the bunker's bowmen
+            // (71 Horde deaths to them in 21 minutes) and the Horde sent 2 node assaults to the Alliance's 10. For the Alliance on
+            // Iceblood Tower the spot comes out where Galvangar's was, (-492,-187).
+            node_stage_x = ctx.captain_stage_x; node_stage_y = ctx.captain_stage_y; node_stage_z = ctx.captain_stage_z;
+            if (!split_cands.empty())
+                BgRoutes::ApproachPoint(uint16(ctx.type_id), ctx.home_x, ctx.home_y, ctx.home_z, split_cands[0].x, split_cands[0].y,
+                                        split_cands[0].z, BgAvPlan::kNodeRallyBack, node_stage_x, node_stage_y, node_stage_z);
+            if (!split_cands.empty() && PosSet(node_stage_x, node_stage_y))
+            {
+                node_rally = true;
+                std::vector<std::pair<float, float>> targets;
+                for (auto const& c : split_cands) targets.emplace_back(c.x, c.y);
+                int squad = 0;
+                for (auto const& m : ctx.members)
+                {
+                    if (m.assigned || !m.alive || m.is_carrier) continue;
+                    if (Dist2(m.x, m.y, node_stage_x, node_stage_y) < 60.f * 60.f) { ++squad; continue; }
+                    for (auto const& c : split_cands)
+                        if (BgAvPlan::RallyFirst(std::sqrt(Dist2(m.x, m.y, c.x, c.y)),
+                                                 std::sqrt(Dist2(node_stage_x, node_stage_y, c.x, c.y))))
+                            { ++squad; break; }
+                }
+                bool wiped = false;
+                node_go = AvAssaultGo(ctx, node_gate_, commit_key, node_stage_x, node_stage_y, targets, squad, "node", wiped);
+                if (wiped)
+                    TC_LOG_INFO("playerbot.v2", "[bgcoord] bg_type={} instance={} team={} node assault wiped, gathering again", ctx.type_id,
+                                ctx.instance_id, ctx.team);
+            }
         }
         if (split_cands.size() >= 2 && ctx.nodes.size() >= 4)
         {
@@ -938,7 +1101,9 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
                     auto prev = orders_.find(m.guid_low);
                     if (prev == orders_.end() || prev->second.kind != BgOrder::AttackNode || prev->second.squad != 1) continue;
                     if (Dist2(prev->second.x, prev->second.y, c.x, c.y) >= kStickyRadius * kStickyRadius) continue;
-                    AssignOrder(m.guid_low, BgOrder::AttackNode, c.x, c.y, c.z, ObjectGuid::Empty, /*squad=*/1, /*target_entry=*/0);
+                    float dx = c.x, dy = c.y, dz = c.z;
+                    rally_dest(m, dx, dy, dz);
+                    AssignOrder(m.guid_low, BgOrder::AttackNode, dx, dy, dz, ObjectGuid::Empty, /*squad=*/1, /*target_entry=*/0);
                     m.assigned = true;
                     ++kept;
                 }
@@ -947,7 +1112,9 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
                     int const pick = PickNearest(ctx.members, BgOrder::AttackNode, c.x, c.y, /*healer_bias=*/+1,
                                                  /*allow_carrier=*/false);
                     if (pick < 0) return;
-                    AssignOrder(ctx.members[pick].guid_low, BgOrder::AttackNode, c.x, c.y, c.z,
+                    float dx = c.x, dy = c.y, dz = c.z;
+                    rally_dest(ctx.members[pick], dx, dy, dz);
+                    AssignOrder(ctx.members[pick].guid_low, BgOrder::AttackNode, dx, dy, dz,
                                 ObjectGuid::Empty, /*squad=*/1, /*target_entry=*/0);
                     ctx.members[pick].assigned = true;
                 }
@@ -987,7 +1154,9 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
                 int const pick = PickNearest(ctx.members, BgOrder::AttackNode, c.x, c.y, /*healer_bias=*/+1,
                                              /*allow_carrier=*/false);
                 if (pick < 0) break;
-                AssignOrder(ctx.members[pick].guid_low, BgOrder::AttackNode, c.x, c.y, c.z,
+                float dx = c.x, dy = c.y, dz = c.z;
+                rally_dest(ctx.members[pick], dx, dy, dz);
+                AssignOrder(ctx.members[pick].guid_low, BgOrder::AttackNode, dx, dy, dz,
                             ObjectGuid::Empty, /*squad=*/1, /*target_entry=*/0);
                 ctx.members[pick].assigned = true;
             }
@@ -1015,10 +1184,116 @@ void BgTeamCoordinator::PlanNodeRace(TeamPlanContext& ctx)
     for (auto& m : ctx.members)
     {
         if (m.assigned || !m.alive || m.is_carrier) continue;
-        AssignOrder(m.guid_low, order_kind, tx, ty, tz, ObjectGuid::Empty,
+        if (wave && OutOfWave(commit_key, m.guid_low, wave_ms))
+        {
+            AssignOrder(m.guid_low, BgOrder::AttackNode, wave_x, wave_y, wave_z, ObjectGuid::Empty, /*squad=*/1, /*target_entry=*/wave_entry);
+            m.assigned = true;
+            continue;
+        }
+        float dx = tx, dy = ty, dz = tz;
+        rally_dest(m, dx, dy, dz);   // only set for the AV node attack
+        AssignOrder(m.guid_low, order_kind, dx, dy, dz, ObjectGuid::Empty,
                     /*squad=*/1, /*target_entry=*/push_entry);
         m.assigned = true;
     }
+}
+
+bool BgTeamCoordinator::OutOfWave(uint64 key, uint64 guid, uint32 wave_ms) const
+{
+    auto const team = died_ms_.find(key);
+    if (team == died_ms_.end()) return false;
+    auto const it = team->second.find(guid);
+    return it != team->second.end() && BgAvPlan::OutOfWave(true, it->second, wave_ms);
+}
+
+// AV assault gate, shared by the captain squad and the node rally (see the header). A wiped assault lets go of the latch: the bots coming
+// back from the graveyard gather at the waiting spot again instead of running in one at a time, and the time cap starts over.
+bool BgTeamCoordinator::AvAssaultGo(TeamPlanContext const& ctx, AvGate& gate, uint64 key, float stage_x, float stage_y,
+                                    std::vector<std::pair<float, float>> const& targets, int squad, char const* what, bool& wiped)
+{
+    wiped = false;
+    if (targets.empty()) return true;
+    float stage_to_target = 1e30f;
+    uint64 sig = 1469598103934665603ull;
+    for (auto const& t : targets)
+    {
+        stage_to_target = std::min(stage_to_target, std::sqrt(Dist2(stage_x, stage_y, t.first, t.second)));
+        sig = (sig ^ (uint64(uint32(int32(t.first))) << 32 | uint32(int32(t.second)))) * 1099511628211ull;
+    }
+    if (auto const went = gate.go.find(key); went != gate.go.end())
+    {
+        // The latched squad moved on to a new target (a node taken): the walk there gets its grace again.
+        if (auto const ts = gate.targets.find(key); ts == gate.targets.end() || ts->second != sig)
+        {
+            went->second = ctx.in_progress_ms;
+            gate.targets[key] = sig;
+        }
+        float const r2 = BgAvPlan::kCaptainSquadRadius * BgAvPlan::kCaptainSquadRadius;
+        int near_target = 0;
+        for (auto const& m : ctx.members)
+        {
+            if (!m.alive || OutOfWave(key, m.guid_low, went->second)) continue;
+            for (auto const& t : targets)
+            {
+                float const d2 = Dist2(m.x, m.y, t.first, t.second);
+                // Near a target, or a squad bot (not a garrison or other supporter, those are assigned by now) still on its way in.
+                if (d2 < r2 || (!m.assigned && BgAvPlan::OnTheWay(std::sqrt(d2), stage_to_target))) { ++near_target; break; }
+            }
+        }
+        uint32 const since_go = ctx.in_progress_ms >= went->second ? ctx.in_progress_ms - went->second : 0u;
+        if (BgAvPlan::CaptainAssaultBroken(near_target, since_go, BgAvPlan::AssaultGraceMs(stage_to_target)))
+        {
+            gate.go.erase(went);
+            gate.targets.erase(key);
+            gate.count.erase(key);
+            gate.rise.erase(key);
+            gate.wait[key] = ctx.in_progress_ms;
+            wiped = true;
+        }
+        else
+        {
+            // The bots back from the graveyard gather at the waiting spot and go in as the next wave (BgAvPlan::WaveReinforce).
+            int back = 0;
+            for (auto const& m : ctx.members)
+                if (m.alive && OutOfWave(key, m.guid_low, went->second) && Dist2(m.x, m.y, stage_x, stage_y) < 60.f * 60.f) ++back;
+            uint32& last_back = gate.count.emplace(key, 0u).first->second;
+            uint32& rise_ms = gate.rise.emplace(key, ctx.in_progress_ms).first->second;
+            if (uint32(back) > last_back) rise_ms = ctx.in_progress_ms;
+            last_back = uint32(back);
+            if (BgAvPlan::WaveReinforce(back, ctx.in_progress_ms >= rise_ms ? ctx.in_progress_ms - rise_ms : 0u))
+            {
+                went->second = ctx.in_progress_ms;
+                gate.count.erase(key);
+                gate.rise.erase(key);
+                TC_LOG_INFO("playerbot.v2", "[bgcoord] bg_type={} instance={} team={} {} assault: next wave of {} goes from the waiting spot",
+                            ctx.type_id, ctx.instance_id, ctx.team, what, back);
+            }
+        }
+    }
+    if (gate.go.find(key) == gate.go.end())
+    {
+        int at_stage = 0;
+        for (auto const& m : ctx.members)
+            if (m.alive && Dist2(m.x, m.y, stage_x, stage_y) < 60.f * 60.f) ++at_stage;
+        uint32 const waited_since = gate.wait.emplace(key, ctx.in_progress_ms).first->second;
+        uint32 const waited = ctx.in_progress_ms >= waited_since ? ctx.in_progress_ms - waited_since : 0u;
+        uint32& last_count = gate.count.emplace(key, 0u).first->second;
+        uint32& rise_ms = gate.rise.emplace(key, ctx.in_progress_ms).first->second;
+        if (uint32(at_stage) > last_count) rise_ms = ctx.in_progress_ms;
+        last_count = uint32(at_stage);
+        uint32 const since_arrival = ctx.in_progress_ms >= rise_ms ? ctx.in_progress_ms - rise_ms : 0u;
+        if (BgAvPlan::CaptainGather(at_stage, false, waited, squad, since_arrival))
+        {
+            gate.go[key] = ctx.in_progress_ms;
+            gate.targets[key] = sig;
+            gate.wait.erase(key);
+            gate.count.erase(key);
+            gate.rise.erase(key);
+            TC_LOG_INFO("playerbot.v2", "[bgcoord] bg_type={} instance={} team={} {} assault goes: {} at the waiting spot, squad {}",
+                        ctx.type_id, ctx.instance_id, ctx.team, what, at_stage, squad);
+        }
+    }
+    return gate.go.find(key) != gate.go.end();
 }
 
 // Match a live node against the script's static node list to read its
@@ -1140,6 +1415,9 @@ void BgTeamCoordinator::Update(uint32 now_ms)
         Battleground* bg = p->GetBattleground();
         if (!bg || bg->isArena()) return;
         if (bg->GetStatus() != STATUS_IN_PROGRESS) return;
+        // The battleground id alone is not presence: a bot whose port failed kept it in the open world, took an order slot and died in
+        // Redridge all match (WSG 2026-10-24). Only bots on the battleground's map play its plan.
+        if (!bg->FindBgMap() || p->FindMap() != bg->FindBgMap()) return;
         const uint8 team_u8 = p->GetEffectiveTeam() == ALLIANCE ? 1 : 2;
         const uint64 key = (uint64(bg->GetInstanceID()) << 2) | team_u8;
         Bucket& b = buckets[key];
@@ -1199,8 +1477,7 @@ void BgTeamCoordinator::Update(uint32 now_ms)
         ctx.enemy_flag_z = adv.enemy_flag_z;
         ctx.own_flag_x = adv.own_flag_x; ctx.own_flag_y = adv.own_flag_y;
         ctx.own_flag_z = adv.own_flag_z;
-        ctx.home_x = adv.home_base_x; ctx.home_y = adv.home_base_y;
-        ctx.home_z = adv.home_base_z;
+        ctx.home_x = adv.home_base_x; ctx.home_y = adv.home_base_y; ctx.home_z = adv.home_base_z;
         ctx.endgame_x = adv.endgame_target_x; ctx.endgame_y = adv.endgame_target_y;
         ctx.endgame_z = adv.endgame_target_z;
         ctx.endgame_unconditional  = adv.endgame_unconditional;
@@ -1234,7 +1511,7 @@ void BgTeamCoordinator::Update(uint32 now_ms)
             // own zone), Stonehearth GY on the Alliance side of the valley, Iceblood GY on the Horde side. Coordinates are the AV
             // script's banner spawns.
             struct Spot { float x, y, z; };
-            Spot const kSpots[] = { { ctx.fight_x, ctx.fight_y, ctx.fight_z }, { 73.7f, -426.0f, 61.0f }, { -612.5f, -397.0f, 61.0f } };
+            Spot const kSpots[] = { { ctx.fight_x, ctx.fight_y, ctx.fight_z }, { 77.8f, -404.7f, 46.9f }, { -612.5f, -397.0f, 61.0f } };
             uint32 const spot = (ref->bg.in_progress_ms / (5u * 60u * 1000u) + b.instance_id) % 3u;
             if (spot != 0u)
             { ctx.fight_x = kSpots[spot].x; ctx.fight_y = kSpots[spot].y; ctx.fight_z = kSpots[spot].z; }
@@ -1364,6 +1641,23 @@ void BgTeamCoordinator::Update(uint32 now_ms)
         it = buckets.count(it->first) ? std::next(it) : endgame_commit_.erase(it);
     for (auto it = mid_state_.begin(); it != mid_state_.end();)
         it = buckets.count(it->first) ? std::next(it) : mid_state_.erase(it);
+    for (auto it = captain_wipes_.begin(); it != captain_wipes_.end();)
+        it = buckets.count(it->first) ? std::next(it) : captain_wipes_.erase(it);
+    for (auto it = captain_down_.begin(); it != captain_down_.end();)
+        it = buckets.count(*it) ? std::next(it) : captain_down_.erase(it);
+    for (auto it = captain_done_ms_.begin(); it != captain_done_ms_.end();)
+        it = buckets.count(it->first) ? std::next(it) : captain_done_ms_.erase(it);
+    for (auto it = general_step_.begin(); it != general_step_.end();)
+        it = buckets.count(it->first) ? std::next(it) : general_step_.erase(it);
+    for (auto it = died_ms_.begin(); it != died_ms_.end();)
+        it = buckets.count(it->first) ? std::next(it) : died_ms_.erase(it);
+    for (AvGate* gate : { &captain_gate_, &node_gate_, &general_gate_ })
+        for (auto* m : { &gate->go, &gate->wait, &gate->count, &gate->rise })
+            for (auto it = m->begin(); it != m->end();)
+                it = buckets.count(it->first) ? std::next(it) : m->erase(it);
+    for (AvGate* gate : { &captain_gate_, &node_gate_, &general_gate_ })
+        for (auto it = gate->targets.begin(); it != gate->targets.end();)
+            it = buckets.count(it->first) ? std::next(it) : gate->targets.erase(it);
     last_dump_ = dump.str();
     if (last_dump_.empty())
         last_dump_ = "no active bot battleground teams";

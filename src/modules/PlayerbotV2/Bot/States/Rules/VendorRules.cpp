@@ -32,6 +32,8 @@
 #include "UnitDefines.h"   // UNIT_NPC_FLAG_VENDOR / _REPAIR
 
 #include "World/WorldMetadata.h"
+#include "Bot/TownErrandConfig.h"
+#include "Bot/World/ZonePicker.h"
 #include "Services.h"
 #include "Travel/RepairVendorIndex.h"
 #include "Travel/QuestHubDatabase.h"
@@ -81,7 +83,13 @@ bool ChunkedWalkToward(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& em
     // Near + not stalled + not blocked: emit the FULL waypoint so PathGenerator
     // navmesh-routes the last leg (curving around canals/walls/through doors)
     // rather than a straight chunk that can climb a ledge.
-    if (dist <= 60.0f && strikes == 0 && s.path_blocked_count() == 0)
+    // In a capital the full move reaches further (Playerbot.World.Town.SmoothWalk): a city's streets are meshed end to end, and each
+    // 35 y chunk ended in a stop, so a bot crossing the city ran, stopped and turned every few seconds. A navmesh route of up to 60
+    // points goes out as one spline (PlayerbotAPI MoveAlongRoute).
+    float full_leg = 60.0f;
+    if (::Playerbot::V2::TownErrand::Cfg().smooth_walk && ::Playerbot::V2::World::IsVanillaCapitalZone(s.zone_id()))
+        full_leg = std::max(full_leg, ::Playerbot::V2::TownErrand::Cfg().smooth_walk_yards);
+    if (dist <= full_leg && strikes == 0 && s.path_blocked_count() == 0)
     {
         emit.move_to(tx, ty, tz, /*run*/ true);
         ai.set_last_rule_fired(tag);
@@ -829,7 +837,9 @@ bool BagsFullRecoverFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView 
 // anti-freeze, i.e. keep questing, until cross-map routing is added here).
 bool CapitalBagRunGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32 now_ms)
 {
-    if (s.in_combat() || s.is_casting() || s.raw().movement.is_mounted) return false;
+    // A bot that has a target or is being attacked is in a fight whatever its combat flag says (the flag drops between casts on a target that does
+    // not hit back); the walk would cancel the next cast (205 fire mage: 25 s of a 180 s leg).
+    if (s.in_combat() || s.is_casting() || s.raw().movement.is_mounted || !s.victim().IsEmpty() || s.attackers_count() > 0) return false;
     if (s.in_group() || s.is_in_dungeon() || s.in_battleground()) return false;
     // Unreachable-city back-off: a prior in-city walk gave up (navmesh gap at the
     // banker/AH cluster). Yield to questing for the cooldown so the bot levels off

@@ -78,4 +78,66 @@ namespace Playerbot::BgTargetPick
             return none;
         return best->guid;
     }
+
+    // Whether the open-engage rule may start a fight with this creature: only one that already fights this bot, its pet or a teammate
+    // (`friends`: guids of the friendly units around the bot), or the creature the bot's order names (`order_entry`, 0 = none).
+    // Bot-only AV 253: bots on the march opened on every creature within the 40 yd AV aggro range (ike3's range is for enemy PLAYERS):
+    // 822 openings on creatures that were not in combat, 68 of them on Korrak the Bloodrager (113k HP, 1.8-2.3k a hit), who killed 79
+    // bots one at a time, and the rams, wolves, harpies and garrison guards beside the roads split every squad on its way.
+    template <class Unit, class Guid, class Friends>
+    bool CreatureWorthOpening(Unit const& u, Guid const& me, Guid const& pet, Friends const& friends, uint32_t order_entry)
+    {
+        if (order_entry != 0 && u.entry == order_entry)
+            return true;
+        Guid const none{};
+        if (u.victim == none)
+            return false;
+        if (u.victim == me || (!(pet == none) && u.victim == pet))
+            return true;
+        for (auto const& f : friends)
+            if (f.guid == u.victim)
+                return true;
+        return false;
+    }
+
+    // The creature that is hitting this bot in melee (an attacker whose victim is `me`, alive and fightable, within kBesetRange), nearest
+    // first; nullptr when none. Walking on does not shake it: the creature runs as fast as the bot and hits it in the back.
+    // Bot-only AV 255: 298 of the 884 deaths had the in-combat march to the ordered boss (combat:bg_push_endgame_advance) as their last
+    // rule, with the killer 2-5 yd away: 97 in Coldtooth Mine to the Whitewhisker kobolds (one bot died at the same spot 20 times on the
+    // way to the mine boss), 23 each to the Frostwolf Warriors and Mine Layers at Iceblood, 15 to Commander Randolph.
+    constexpr float kBesetRange = 10.0f;
+    template <class Unit, class Guid>
+    Unit const* BesetBy(Guid const& me, float bx, float by, std::vector<Unit> const& attackers)
+    {
+        Unit const* best = nullptr;
+        float best_d = kBesetRange * kBesetRange;
+        for (Unit const& u : attackers)
+        {
+            if (u.is_player || !(u.victim == me) || u.hp <= 0 || u.untargetable || u.is_pacified || u.cannot_reach) continue;
+            float const dx = u.x - bx, dy = u.y - by, d = dx * dx + dy * dy;
+            if (d <= best_d) { best_d = d; best = &u; }
+        }
+        return best;
+    }
+
+    // The enemy player attacking this bot (an attacker that is a player, its victim `me`, alive and fightable, not held by a friendly
+    // CC, within kShotByRange), nearest first; nullptr when none. A pusher fights back before the march goes on, as BesetBy does for
+    // creatures. Bot-only AV 264: after both general pushes went, 152 of the 290 deaths to players had the march
+    // (combat:bg_push_endgame_advance) as their last rule: the two squads met on the river road under Iceblood Tower and walked past each
+    // other, shot from 0-40 yd (136 of the 152), and neither got past Iceblood in 28 minutes.
+    constexpr float kShotByRange = 40.0f;
+    template <class Unit, class Guid>
+    Unit const* ShotBy(Guid const& me, float bx, float by, std::vector<Unit> const& attackers)
+    {
+        Unit const* best = nullptr;
+        float best_d = kShotByRange * kShotByRange;
+        for (Unit const& u : attackers)
+        {
+            if (!u.is_player || !(u.victim == me) || u.hp <= 0 || u.untargetable || u.is_pacified || u.cannot_reach || u.is_cc_locked)
+                continue;
+            float const dx = u.x - bx, dy = u.y - by, d = dx * dx + dy * dy;
+            if (d <= best_d) { best_d = d; best = &u; }
+        }
+        return best;
+    }
 }
