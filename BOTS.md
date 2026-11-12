@@ -43,7 +43,7 @@ cmake -S . -B build -DSERVERS=1 -DSCRIPTS=static -DBUILD_PLAYERBOT_V2=1
 cmake --build build --config RelWithDebInfo --target worldserver
 ```
 
-Status: compile-checked on Linux (GCC 13, Ninja, Release, static scripts): `-DBUILD_PLAYERBOT_V2=1` and `-DBUILD_PLAYERBOT_V2=0` both build and link `worldserver` and the binaries start. Not compiled on Windows in exactly this combination; our own tree (the same code plus files left out here) builds and runs on Windows (Visual Studio 2022, MySQL 8.4) and was played on client 70338.
+Status: compile-checked on Linux (GCC 13, Ninja, Release, static scripts): `-DBUILD_PLAYERBOT_V2=1` and `-DBUILD_PLAYERBOT_V2=0` both build and link `worldserver` and the binaries start. Not compiled on Windows in exactly this combination; our own tree (the same code plus files left out here) builds and runs on Windows (Visual Studio 2022, MySQL 8.4) and is played on client 70888 (WoW Forever 0.1.35).
 
 ## Enable
 
