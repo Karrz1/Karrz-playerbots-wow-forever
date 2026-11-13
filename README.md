@@ -25,6 +25,10 @@ If you already have the game client and just want to play on a server that runs 
 
 It shows the news and patch notes of the latest release, the realm status and a Servers tab (add a friend's server, see `repack/JOIN-A-FRIEND.md` in the zip), and remembers your game folder (the folder that contains `Wow.exe` and `_forever_`). It changes nothing outside that folder; a server that is not on your own PC needs one hosts-file line, which it asks Windows permission for.
 
+- **Your own server, or a server you built yourself:** use the same launcher to connect; it writes the server key into the game every time. If the login server stops because `trinity.actual.battle.net` is not in the hosts file, the launcher says so and shows the fix.
+- **ForeverLauncher users:** ForeverLauncher is retired. This launcher takes over your ForeverLauncher servers, game folder and language on its first start.
+- **Linux (Wine/Proton, Steam Deck):** the same `WoWForeverLauncher.exe` works under Wine/Proton from 0.1.36 on. There is no separate Linux version.
+
 ## Players: get the add-on
 
 The add-on adds a window with one button per class and role, so you can add a bot to your group, give orders and pull.
