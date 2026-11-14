@@ -45,12 +45,22 @@ namespace Playerbot::Raid {
         r.avoidEnemy.push_back({ 12017, 22.0f, Who::Healer });
         // Nefarian (11583): Shadow Flame 22539 and Cleave 20691 to the front (classic_boss_nefarian.cpp:314,341). Tail Lash 23364 behind
         // him: melee stand at his sides.
-        r.avoidFrontal.push_back({ 11583, 25.0f, 55.0f, Who::NonTank });
+        // Shadow Flame reaches 45 yards (its spell data, printed on every death to it: "radius=45"), not the 25 the cone had: of 134 bots it
+        // killed in the Nefarian sweeps from 1109w to 0136-r8, 62 stood 25-46 y from him (12 of 22 in the 0136 sweeps), outside the
+        // cone the bots stepped out of (healers at their hold, casters at work, bots walking). 46 = the 45 and a step for his size. The
+        // drakes cast the same spell; their 24 y cone lost nobody to it in these sweeps, so it stays.
+        r.avoidFrontal.push_back({ 11583, 46.0f, 55.0f, Who::NonTank });
         r.avoidFrontal.push_back({ 11583, 20.0f, 45.0f, Who::NonTank, 180.0f });
         // His tank puts his front away from the raid: with no rule he faced whoever he walked at, and with no tank on him he walked into the
         // camp (bwl_nefarian 1110a run 1: Shadow Flame killed three casters standing on the camp 9 y in front of him, Cleave and his swings
         // the healers at their post).
         r.faceAway.push_back({ 11583 });
+        // Phase three (under 20%, classic_boss_nefarian.cpp: Raise Drakonid 23362): the Drakonid Bones (gameobject 179804) of phase one rise as
+        // Bone Constructs, about 40 of them, each on a random raider. The one pass of the 0136 sweeps (sweep-bwl-0136-2) had the spare tanks
+        // standing where the drakonids had died: the constructs rose next to them and the area taunts took 41 loose ones to 3 in three
+        // seconds, 34 of 40 were still up with him at 2%. In r10 and r11 the spare tanks stood elsewhere (in r11 on Nefarian, 0014) and 11-12 of 12
+        // healers died within 50 s of the rise. From 25% the spare tanks walk to the bones; the guard ends at 20%, where the rise begins.
+        r.guardRise.push_back({ 11583, 179804, 25.0f, 20.0f });
         // Corrupted Infernal (14668, warlock call): Immolation 20153 burns everything close; casters and healers stay off it (ike3).
         r.avoidEnemy.push_back({ 14668, 10.0f, Who::Ranged });
         r.avoidEnemy.push_back({ 14668, 10.0f, Who::Healer });
@@ -76,9 +86,15 @@ namespace Playerbot::Raid {
         // A tank goes after a loose drakonid within 15 yards and brings it back; one further out (a new one still coming in from its door
         // after its random raider) it waits for at its slot (TankSpotFor).
         constexpr float kNefCampX = -7552.0f, kNefCampY = -1236.0f, kNefHealY = -1245.0f, kNefFloorZ = 476.8f;
-        r.tankSpot.push_back({ 10162, 14263, 23.0f, 18.0f, true, kNefCampX, kNefCampY, 100.0f, { 14261u, 14262u, 14264u, 14265u, 14302u } });
-        r.stand.push_back({ 10162, Who::Ranged, kNefCampX, kNefCampY, kNefFloorZ, 6.0f, false, 0 });
-        r.stand.push_back({ 10162, Who::Healer, kNefCampX, kNefHealY, kNefFloorZ, 6.0f, false, 0 });
+        // The arc and the two posts are phase one's: they end when Nefarian lands (endEnemy 11583). Victor goes invisible and rooted at the
+        // landing but stays in the fight (classic_boss_victor_nefarius.cpp, phase2), so with him as the only gate the layout outlived its
+        // phase: bwl_nefarian 1111j, the tank holding Nefarian walked back to its arc slot 59-86 times a run after the landing and held him
+        // there, 23 y from the ranged camp and about 26 y from the healers' post, at the edge of his Shadow Flame (25 y); the posts kept the
+        // casters and healers there (236 "leave cone" moves, 46 Tail Lash stuns and 47 Bellowing Roar fears in 75 s of run 1's phase 3, and 9
+        // of its deaths after the landing to Shadow Flame, Cleave and Tail Lash, at the camp and the post).
+        r.tankSpot.push_back({ 10162, 14263, 23.0f, 18.0f, true, kNefCampX, kNefCampY, 100.0f, { 14261u, 14262u, 14264u, 14265u, 14302u }, 11583 });
+        r.stand.push_back({ 10162, Who::Ranged, kNefCampX, kNefCampY, kNefFloorZ, 6.0f, false, 0, 100.0f, 0.0f, 0, 11583 });
+        r.stand.push_back({ 10162, Who::Healer, kNefCampX, kNefHealY, kNefFloorZ, 6.0f, false, 0, 100.0f, 0.0f, 0, 11583 });
         // Their priorities and dispels are in the data file.
     }
 } // namespace Playerbot::Raid

@@ -11,6 +11,7 @@
 
 #include "Define.h"
 #include "ObjectGuid.h"
+#include "Bot/Quest/QuestRefusal.h"
 #include <chrono>
 #include <string>
 #include <vector>
@@ -20,6 +21,7 @@ class Player;
 class Unit;
 class Aura;
 class Group;
+class GameObject;
 
 namespace Playerbot {
 
@@ -169,6 +171,13 @@ public:
     // rejoin rule waits for a slot instead of walking a full instance's entrance.
     uint32 last_instance_full_map() const { return last_instance_full_map_; }
     void   clear_instance_full_map() { last_instance_full_map_ = 0; }
+    // Why the last accept_quest / accept_shared_quest was refused (None after an accept that went through), and the quest it was
+    // for, so the executor can tell the player who ordered it (Bot/Quest/QuestRefusal.h).
+    QuestRefusal last_quest_refusal() const { return last_quest_refusal_; }
+    uint32 last_quest_refusal_quest() const { return last_quest_refusal_quest_; }
+    // The first of the server's own accept gates `quest_id` fails for this bot right now (CanTakeQuest, then the quest log and
+    // the bag room CanAddQuest checks), None when it could take it. No message reaches the bot's client. World thread.
+    QuestRefusal why_cant_take_quest(uint32 quest_id) const;
     static char const* CastFailName(uint32 code);
 
     // Why a mount spell would draw nothing on the client, nullptr when its model resolves: the display the aura picks (Mount
@@ -754,6 +763,10 @@ public:
     // the GO's UsableMounted flag. Returns InvalidTarget when the GO isn't
     // in interact range.
     Result use_game_object(ObjectGuid go);
+    // An herb or ore vein (a chest locked by Herbalism or Mining), reached through use_game_object: casts the bot's gathering spell
+    // on it as a player's right-click does, or takes its loot once the spell has opened it. InvalidTarget when the bot lacks the
+    // skill, the skill level or the spell.
+    Result gather_node(GameObject* node);
 
     // ---- Quest --------------------------------------------------------
     // Accept the given quest from the named quest-giver (Creature, GameObject,
@@ -1167,6 +1180,8 @@ private:
     Player* p_;
     uint32  last_cast_fail_ = 0;   // see last_cast_fail()
     uint32  last_instance_full_map_ = 0;   // see last_instance_full_map()
+    QuestRefusal last_quest_refusal_ = QuestRefusal::None;   // see last_quest_refusal()
+    uint32  last_quest_refusal_quest_ = 0;
 };
 
 } // namespace Playerbot

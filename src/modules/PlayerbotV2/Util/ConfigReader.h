@@ -337,6 +337,8 @@ public:
     bool behavior_pull_back()           const { return bhv_pull_back_; }
     bool behavior_tank_ranged_weapon()  const { return bhv_tank_ranged_weapon_; }
     bool behavior_ammo_supply()         const { return bhv_ammo_supply_; }
+    // Playerbot.Behavior.SellOutclassedGear: a vendor visit also sells soulbound gear the bot has outgrown (Api/OutclassedGear.h).
+    bool behavior_sell_outclassed_gear() const { return bhv_sell_outclassed_gear_; }
     bool behavior_raid_gear()           const { return bhv_raid_gear_; }
     bool gear_raid_enchants()           const { return gear_raid_enchants_; }
     bool behavior_accept_owner_trade()  const { return bhv_accept_owner_trade_; }
@@ -492,6 +494,9 @@ public:
     // Playerbot.Behavior.InvitePassingPlayers: 1 = a world bot may send a group invite to a real player who walks past (old way);
     // 0 (default) = only to other bots. A player still gets an invite by whispering "invite" to the bot.
     bool behavior_invite_passing_players() const { return bhv_invite_passing_players_; }
+    // Playerbot.Behavior.InvitePassingBots: 1 (default) = a world bot may form a pickup group with another world bot standing near it;
+    // 0 = it does not. With both InvitePassing* keys at 0 no world bot sends an unasked invite (GitHub #345).
+    bool behavior_invite_passing_bots() const { return bhv_invite_passing_bots_; }
     // Playerbot.World.GateDuels.*: pairs of world bots duelling outside the capitals' gates (Fleet/GateDuels.h)
     bool   gate_duels_enable()          const { return gate_duels_enable_; }
     // Playerbot.World.Questing: 1 = world bots pick up and do quests on their own; 0 (default) = they grind mobs and roam, and quest only
@@ -686,6 +691,7 @@ private:
     bool   bhv_pull_back_            = true;
     bool   bhv_tank_ranged_weapon_   = true;
     bool   bhv_ammo_supply_          = true;
+    bool   bhv_sell_outclassed_gear_ = true;
     bool   bhv_raid_gear_            = true;
     bool   gear_raid_enchants_       = true;
     bool   bhv_accept_owner_trade_   = true;
@@ -762,6 +768,7 @@ private:
     bool   bhv_social_emotes_        = true;
     bool   bhv_polite_world_bots_    = true;
     bool   bhv_invite_passing_players_ = false;
+    bool   bhv_invite_passing_bots_ = true;
     bool   world_questing_           = false;
     bool   kindness_enable_          = true;
     uint32 kindness_buff_cd_ms_      = 900000u;

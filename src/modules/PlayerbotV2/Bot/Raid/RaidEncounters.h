@@ -108,7 +108,8 @@ struct Spread { uint32_t enemy; float radius; Who who; float hpMax = 100.0f; flo
 // needOtherEnemy: when not 0, this other entry must also be alive and fighting (e.g. Golemagg's Core Ragers).
 // needVictimIsMe: only when the enemy is attacking this bot - the <needOtherEnemy> creature when one is given, else <enemy>.
 struct Stand { uint32_t enemy; Who who; float x, y, z; float tolerance; bool needVictimIsMe; uint32_t needOtherEnemy; float hpMax = 100.0f; float hpMin = 0.0f;
-              uint8_t share = 0; };   // share 1 / 2: only the even / odd numbered of the members this rule matches (by guid order), so one rule list can split e.g. the off-tanks between two posts
+              uint8_t share = 0;      // share 1 / 2: only the even / odd numbered of the members this rule matches (by guid order), so one rule list can split e.g. the off-tanks between two posts
+              uint32_t endEnemy = 0; };   // the post ends once this enemy is in the fight (EnemyInFight): a phase's layout that the next phase must not keep
 
 // While <enemy> is alive and fighting, a member carrying <aura> stands <distance> yards from the enemy's live position
 // along the fixed world bearing <bearing> (radians) and holds within <tolerance> (Thaddius' Positive / Negative Charge
@@ -235,7 +236,10 @@ struct OnlyAttackers { uint32_t enemy; Who who; };
 
 // A matching bot carrying <aura> pauses its rotation while the aura lasts (Nefarian's priest call: every heal the priest
 // casts hurts its target). Elected jobs (dispels) and movement still run.
-struct HoldByAura { uint32_t aura; Who who; };
+// still: the aura watches the bot and kills it if it moves or gains threat (Mandokir's Threatening Gaze): no move, no job, no swing
+// either, and a running cast is stopped. The bot checks its own auras every tick for it, so the hold starts with the aura, not with the
+// next plan.
+struct HoldByAura { uint32_t aura; Who who; bool still = false; };
 
 // While <enemy> is in the fight, matching bots remove <aura> from themselves at once (Nefarian's paladin call: Blessing of
 // Protection stops a tank or a melee from attacking).
@@ -272,8 +276,9 @@ struct FaceAway { uint32_t enemy; float hpMax = 100.0f; float hpMin = 0.0f; floa
 // fixed: the row is centred on the world point (x, y) and runs along rowDeg (world bearing), whatever the raid does; the anchor only has to be
 // alive and in the fight. A fixed rule with reach > 0 is an arc instead: every slot <reach> yards from (x, y), neighbours <spacing> apart, the
 // middle of the arc on bearing rowDeg (a camp at (x, y) then has every tank's pile at the same distance). also: further entries whose holders share the one row (adds of any colour), so no two tanks get the same slot.
+// endEnemy: the row ends once this enemy is in the fight (EnemyInFight), as Stand::endEnemy.
 struct TankSpot { uint32_t anchor; uint32_t enemy; float reach; float spacing; bool fixed = false; float x = 0.0f, y = 0.0f, rowDeg = 0.0f;
-                  std::vector<uint32_t> also = {}; };
+                  std::vector<uint32_t> also = {}; uint32_t endEnemy = 0; };
 inline bool InTankSpot(TankSpot const& rule, uint32_t entry)
 {
     return entry == rule.enemy || std::find(rule.also.begin(), rule.also.end(), entry) != rule.also.end();
@@ -282,6 +287,12 @@ inline bool InTankSpot(TankSpot const& rule, uint32_t entry)
 // While <enemy> is alive and fighting, matching bots stand in the sector behind it: <halfAngleDeg> either side of the line
 // straight behind where it faces, between <minDist> and <maxDist> yards. A bot outside walks to the nearest such spot on its
 // own side. Pair with FaceAway so the tank decides which way "behind" is.
+// While <boss> is alive and fighting in the hp window and at least three <bones> (a gameobject: what an add leaves where it died) lie
+// within kGuardRiseScan of him, the raid's tanks that do not hold him stand among those bones, each on its own cluster (the densest one
+// left, <reach> yards round): when the bones rise they rise next to a tank, inside its area taunt (Nefarian: the Drakonid Bones of phase
+// one rise as Bone Constructs under 20%). The boss is forbidden to those tanks while they guard. The window ends where the rise begins.
+struct GuardRise { uint32_t boss; uint32_t bones; float hpMax; float hpMin; float reach = 10.0f; };
+
 struct StandBehind { uint32_t enemy; Who who; float minDist; float maxDist; float halfAngleDeg; float hpMax = 100.0f; float hpMin = 0.0f; };
 
 // While <enemy> is alive and fighting (in the hp window), matching bots stand on its flank: <halfAngleDeg> either side of the line
@@ -349,6 +360,7 @@ struct RaidRules
     std::vector<FaceAway> faceAway;
     std::vector<TankSpot> tankSpot;
     std::vector<StandBehind> standBehind;
+    std::vector<GuardRise> guardRise;
     std::vector<StandFlank> standFlank;
     std::vector<ResistPotion> resistPotion;
     std::vector<CarrierPotion> carrierPotion;

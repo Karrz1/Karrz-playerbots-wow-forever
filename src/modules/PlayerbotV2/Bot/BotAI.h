@@ -408,6 +408,11 @@ public:
     // zone past the threshold.
     uint32 hearth_zone() const { return hearth_zone_; }
     void   set_hearth_zone(uint32 z) { hearth_zone_ = z; }
+    // The bot has lived in this zone long enough to make it home and is not bound here yet.
+    bool   hearth_rebind_due(uint32 zone_id) const
+    {
+        return zone_id != 0 && hearth_zone_ != zone_id && ms_in_zone(zone_id) >= kHearthRebindThresholdMs;
+    }
 
     // Once-per-session calendar RSVP gate. Bots auto-accept all pending
     // calendar invites a single time per BotAI lifetime so raid sign-ups
@@ -549,6 +554,11 @@ public:
     // Owner "aoe off" (AoeDeny.h): no spell that hits more than one enemy until "aoe on". Mirrored into the snapshot.
     bool       aoe_denied() const { return aoe_denied_; }
     void       set_aoe_denied(bool b) { aoe_denied_ = b; }
+    // Owner "gather on" (GatheringRules.cpp): a bot in its owner's group picks the herbs and ore veins near it as it follows,
+    // with the gathering skills it has, until "gather off". Memory only. Written by the whisper handler (world thread), read by
+    // the idle rules on the bot's worker.
+    bool       gather_ordered() const { return gather_ordered_.load(std::memory_order_relaxed); }
+    void       set_gather_ordered(bool b) { gather_ordered_.store(b, std::memory_order_relaxed); }
     // Owner "focus heal <name>, <name>": a healer heals only these players (and itself) until "focus heal off". Empty = everyone.
     // Memory only. Written by the whisper handler (world thread), copied into the snapshot by the builder.
     std::vector<ObjectGuid> heal_only() const { std::lock_guard<std::mutex> lk(heal_only_mtx_); return heal_only_; }
@@ -3450,6 +3460,8 @@ private:
     bool           corpse_recovery_emitted_ = false;
     uint32         ghost_since_ms_   = 0;
     uint32         swimming_since_ms_ = 0;
+    uint32         underwater_since_ms_ = 0;
+    uint32         underwater_seen_ms_ = 0;
     ObjectGuid     stuck_chase_victim_;
     uint16         stuck_chase_ticks_ = 0;
     ObjectGuid     last_taxi_discover_fm_;
@@ -3581,6 +3593,7 @@ private:
     uint8          last_train_level_ = 0;
     bool           aoe_preference_   = false;
     bool           aoe_denied_       = false;
+    std::atomic<bool> gather_ordered_{false};
     mutable std::mutex      heal_only_mtx_;
     std::vector<ObjectGuid> heal_only_;
     OwnerPicks::Picks owner_picks_;
@@ -5193,6 +5206,20 @@ public:
     {
         return swimming_since_ms_ != 0
             && (now_ms - swimming_since_ms_) > kSwimStuckTimeoutMs;
+    }
+    // How long the bot's head has been under water (idle:surface_to_breathe), on the snapshot clock (published_at_ms) as
+    // update_swim_state is. A sighting more than 5 s after the last one starts a new dive. Returns the time under so far, 0 when not.
+    uint32 note_underwater(bool under, uint32 now_ms)
+    {
+        if (!under)
+        {
+            underwater_since_ms_ = 0;
+            return 0;
+        }
+        if (underwater_since_ms_ == 0 || now_ms - underwater_seen_ms_ > 5000u)
+            underwater_since_ms_ = now_ms ? now_ms : 1u;
+        underwater_seen_ms_ = now_ms;
+        return now_ms - underwater_since_ms_;
     }
 
     // Per-target start_attack lockout. When idle:quest_batch:kill (or any

@@ -384,7 +384,9 @@ Playerbot.World.Kindness.HelpCooldownSec = 180
 
 # Leave real players their mobs: a world bot (no owner, not led by a player) does not open on a mob within CampRadius yards of a real
 # player it is not grouped with, nor, while that player is within QuestRadius yards, on a mob his open kill or collect quests need. It
-# also skips a grind spot a player stands in. Mobs that attack the bot are still fought. Counters in the [world] line (share_mobs).
+# also skips a grind spot a player stands in. It opens on no elite or rare at all (rare beasts stay for hunters to tame), not even
+# one in its path, and does not come to finish one that is fighting somebody else. Mobs that attack the bot are still fought.
+# The kindness help above never comes against the beast a hunter is taming. Counters in the [world] line (share_mobs).
 # Enable = 0 switches it off.
 Playerbot.World.ShareMobs.Enable = 1
 Playerbot.World.ShareMobs.CampRadius = 35
@@ -791,6 +793,12 @@ Playerbot.DamageParity.AllLegs = 0
 #                     is pointed at them, whenever the stock drops under 30% (1000 = 300). Out of combat, bots only,
 #                     5 min between tries. Hunter pet food is untouched. Off: nothing restocks ammo.
 Playerbot.Behavior.AmmoSupply = 1
+#   SellOutclassedGear  a vendor visit (and the bag clearing a bot does with no vendor near) also sells soulbound weapons and armor
+#                     the bot has outgrown: every slot the piece could go in already holds one of the same kind that scores at
+#                     least 5% higher for its class and spec and has at least its item level. Never epics, quest or account-bound
+#                     pieces, a piece still tradeable to the group, shirts, tabards, or anything while resistance gear is worn or
+#                     inside an instance. Off: such pieces stay in the bags (greys and unusable soulbound pieces are sold as before).
+Playerbot.Behavior.SellOutclassedGear = 1
 Playerbot.Behavior.Formation = 1
 Playerbot.Behavior.DistanceOrder = 1
 Playerbot.Behavior.OwnerMainTank = 1
@@ -972,6 +980,9 @@ Playerbot.Behavior.PoliteWorldBots = 1
 #                     walks past within 30 yd. 0 (default) = world bots only invite other bots; a player who wants a bot in
 #                     his group invites it himself (or whispers "invite" to it).
 Playerbot.Behavior.InvitePassingPlayers = 0
+#   InvitePassingBots 1 (default) = a world bot (as above) may invite another world bot near it to a pickup group. 0 = it
+#                     does not. With both InvitePassing keys at 0 no world bot sends an invite nobody asked for.
+Playerbot.Behavior.InvitePassingBots = 1
 #   QuestAccept       a companion (a bot grouped with its owner) quests with him like a party member: it accepts a quest
 #                     its group shares with it, and when its owner takes a quest from an NPC beside it, it walks up to the
 #                     same NPC and takes the quest too. Off: shared quests are not auto-accepted, no follow-the-owner accept.
@@ -1503,7 +1514,7 @@ Playerbot.Chatter.BotCooldownMs   = 60000
 #   HistoryMinutes   a conversation quiet for this long is forgotten and the next line starts fresh.
 #   Language         "auto" = answer in the player's language (a line in Cyrillic is answered in Russian); a language name
 #                    ("Russian", "German", ...) = always that language. Small models write English best; llama3.2 does
-#                    not officially support Russian, so for Russian players gemma3:4b or qwen2.5:3b are the better pick.
+#                    not officially support Russian, so for Russian players gemma4 or qwen3.5 are the better pick.
 #   ExtraPrompt      text added to every request's instructions (style, server name, ...).
 Playerbot.ChatModel.Enable          = 0
 Playerbot.ChatModel.Whispers        = 1
@@ -1734,3 +1745,15 @@ Playerbot.ClassicTalents.ApplyOnLogin = 0
 #        Default:     250
 
 Playerbot.ClassicTalents.WalkBudgetMs = 250
+
+#
+#    Playerbot.ClassicTalents.RowsPerTab
+#        Description: The bots' own talent builds keep the talent frame's row rule: a row opens with 5 points per row above it in the
+#                     same tab, as Wowhead's Forever calculator and a player's talent frame require. The Forever trait data opens a row
+#                     by the points spent in any of the three tabs, and without this the bots held talents a player cannot pick
+#                     (an Arms warrior's Anger Management on 9 Arms points) and Wowhead dropped them from the bots' "talents link".
+#                     0 = rows open by the points in any tab, as before. A build the owner gives ("change talents <link>") always
+#                     keeps the rule.
+#        Default:     1
+
+Playerbot.ClassicTalents.RowsPerTab = 1

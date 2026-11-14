@@ -187,6 +187,7 @@ void ConfigReader::apply_from_loaded_config()
     bhv_pull_back_            = c.GetBoolDefault("Playerbot.Behavior.PullBack", true, true);
     bhv_tank_ranged_weapon_   = c.GetBoolDefault("Playerbot.Behavior.TankRangedWeapon", true, true);
     bhv_ammo_supply_          = c.GetBoolDefault("Playerbot.Behavior.AmmoSupply", true, true);
+    bhv_sell_outclassed_gear_ = c.GetBoolDefault("Playerbot.Behavior.SellOutclassedGear", true, true);
     bhv_raid_gear_            = c.GetBoolDefault("Playerbot.Behavior.RaidGear", true, true);
     gear_raid_enchants_       = c.GetBoolDefault("Playerbot.Gear.RaidEnchants", true, true);
     bhv_accept_owner_trade_   = c.GetBoolDefault("Playerbot.Behavior.AcceptOwnerTrade", true, true);
@@ -354,6 +355,7 @@ void ConfigReader::apply_from_loaded_config()
     bhv_social_emotes_        = c.GetBoolDefault("Playerbot.Behavior.SocialEmotes", true, true);
     bhv_polite_world_bots_    = c.GetBoolDefault("Playerbot.Behavior.PoliteWorldBots", true, true);
     bhv_invite_passing_players_ = c.GetBoolDefault("Playerbot.Behavior.InvitePassingPlayers", false, true);
+    bhv_invite_passing_bots_    = c.GetBoolDefault("Playerbot.Behavior.InvitePassingBots", true, true);
     world_questing_           = c.GetBoolDefault("Playerbot.World.Questing", false, true);
     kindness_enable_          = c.GetBoolDefault("Playerbot.World.Kindness.Enable", true, true);
     kindness_buff_cd_ms_      = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.Kindness.BuffCooldownSec", 900, true), 60, 86400)) * 1000u;

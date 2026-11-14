@@ -1112,7 +1112,8 @@ struct PositionState
 // In The World") are never accepted and gate the whole racial starter chain.
 struct QuestTurnIn { ObjectGuid giver; uint32 quest_id; bool auto_accept = false; };
 // Bag-item that starts a not-yet-accepted quest.
-struct StartingItem { uint32 item_entry; uint32 quest_id; };
+// item_guid: the item in the bags, the quest giver an accept names (API::accept_quest takes a quest from an item as from an NPC).
+struct StartingItem { uint32 item_entry; uint32 quest_id; ObjectGuid item_guid; };
 // World quest discovery row. type 0=offer, 1=turn-in.
 struct WorldQuestEntry
 {
@@ -1582,12 +1583,21 @@ struct NearbyObject
     // GO_DESTRUCTIBLE_DESTROYED state. Lets the BG siege-vehicle fire rule
     // skip already-breached IoC/SoTA gates instead of casting at rubble.
     bool       is_destroyed  = false;
+    // An herb or ore vein on Classic is a chest locked by a skill (Lock.db2 LOCKTYPE_HERBALISM / LOCKTYPE_MINING), not a type-50
+    // gathering node: the skill (182 / 186) and the level the lock asks for, 0 for any other object. gather_ready: spawned and
+    // closed (GO_READY), so not picked and not being picked.
+    uint16     gather_skill  = 0;
+    uint16     gather_req    = 0;
+    bool       gather_ready  = false;
 };
 struct NearbyObjectsState
 {
     std::vector<NearbyObject> nearby_objects;
+    // The object whose loot window the bot has open (Player::GetLootGUID), empty when none or a corpse: an herb or vein the
+    // gathering spell just opened waits here for the bot to take its loot.
+    ObjectGuid loot_open;
 
-    void reset() { nearby_objects.clear(); }
+    void reset() { nearby_objects.clear(); loot_open = ObjectGuid::Empty; }
 };
 
 // Instance context. is_in_instance covers everything except open-world.
@@ -1659,6 +1669,9 @@ struct EnvironmentState
     float water_escape_x       = 0.0f;
     float water_escape_y       = 0.0f;
     float water_escape_z       = 0.0f;
+    // Swim-deep water around the bot (BotSnapshotBuilder DeepWaterBearings): bit i set = deep water 10 or 25 y out on the bearing
+    // i * 45 degrees (0 = +x, counter-clockwise, as std::atan2). idle:wander steps on a dry bearing.
+    uint8 deep_water_bearings  = 0;
 
     void reset() { *this = EnvironmentState{}; }
 };
@@ -1860,6 +1873,10 @@ struct DeathState
     // 0 = none resolved (not a ghost, same map, or no trigger on this map).
     uint32 ghost_portal_at_id       = 0;
     float  ghost_portal_x = 0.f, ghost_portal_y = 0.f, ghost_portal_z = 0.f;
+    // Ghost outside the dungeon or raid that holds its corpse, and crossing the entrance would not bring it to that corpse: the
+    // instance the server would put it in is none (it would create a new one: the run ended, the group is gone) or is loaded and
+    // has no corpse of this bot. State_Dead takes the spirit healer then instead of making a new instance for one ghost.
+    bool   corpse_instance_gone     = false;
 
     void reset() { *this = DeathState{}; }
 };
@@ -2057,6 +2074,8 @@ struct CastState
     // Heal is in-flight on member A but member B dropped to 15% HP,
     // bot cancels and re-aims rather than letting B die mid-cast.
     ObjectGuid current_cast_target;
+    // Game object GUID this cast is aimed at (an herb or vein the gathering spell opens), Empty otherwise.
+    ObjectGuid current_cast_object;
     // ID of the most recent spell the bot SUCCESSFULLY cast (set by
     // the IntentVisitor on CastSpellIntent → Result::Ok). Drives the
     // Monk Windwalker Combo Strikes mastery — repeating the same

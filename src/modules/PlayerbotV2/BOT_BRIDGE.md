@@ -196,8 +196,9 @@ that API works too (LM Studio, Open WebUI, a model on a second PC; `--url`, `--m
   chat_in says `swearing`, otherwise it is masked the way the game's filter does (`f***`); `--no-swearing` masks it always.
 - An answer waits as long as a person needs to type it (`--no-typing-delay` turns that off), with now and then a small typo.
 - When the model isn't running or is too slow, the bot gets a short fixed answer.
-Which model fits which PC (Low llama3.2:3b, Medium llama3.1:8b, High qwen2.5:14b, no graphics card llama3.2:1b, all free) is
-in the player guide (`BOT_BRIDGE_PLAYERS.txt`).
+Which model fits which PC (Low lfm3:1.7b, Medium llama3.1:8b, High gemma4:12b, no graphics card llama3.2:1b, all free; Qwen
+3.5, more Gemma 4 and others in the launcher's Model list; each tier's pick and its chat test score are at the top of the list) is in the player guide (`BOT_BRIDGE_PLAYERS.txt`); the list is
+`tools/bot_bridge_models.txt` (models.txt in the repack).
 - Thinking models are asked to answer at once (`reasoning_effort: "none"`; a service that refuses the field is asked
   without it). Left to think, they spend the whole answer on hidden reasoning and the content comes back empty.
 Options: `--url`, `--model`, `--key`, `--workers` (model calls at once, default 2), `--timeout`, `--no-actions`, `--no-swearing`,

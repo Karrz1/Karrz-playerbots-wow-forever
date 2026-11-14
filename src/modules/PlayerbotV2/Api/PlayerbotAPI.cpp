@@ -16,6 +16,7 @@
 #include "ClassicBotSkills.h"
 #include "Travel/ReachMemory.h"
 #include "ClassicSpec.h"
+#include "TalentCode.h"
 #include "ClassicTalentBuilds.h"
 #include "ClassicSupplies.h"
 #include "Bot/ClassicUpkeep.h"
@@ -24,6 +25,9 @@
 #include "Bot/Raid/ShieldRules.h"
 #include "Diagnostics/DamageParity.h"
 #include "BotItemScorer.h"
+#include "OutclassedGear.h"
+#include "Bot/BotAI.h"
+#include "Bot/BotRegistry.h"
 #include "Player.h"
 #include "Corpse.h"
 #include "Log.h"
@@ -4107,7 +4111,51 @@ Result API::stop_attack(bool clear_ghost_combat)
     // gating) stop reading a fight that doesn't exist. Guarded on the
     // attacker list so a bot in a REAL fight can never combat-drop: with
     // live attackers their refs re-establish combat instantly anyway.
-    if (clear_ghost_combat && p_->getAttackers().empty() && p_->IsInCombat())
+    // A creature the bot is in combat with that is alive and still has the bot, a group member or one of their pets as its victim is a
+    // running fight, even while it cannot be attacked: the bot's scan of the fight lists attackable enemies only. zg_thekal 0136-1: at
+    // 1% Thekal, Lor'Khan and Zath feign death (uninteractible, lying dead, still in combat with the raid), the scan found nobody fighting
+    // the group, and 17 of 20 raiders dropped their combat with the trio 1 s later, 134 times each over 25 min. The trio never rose
+    // as Thekal's tiger, and the raid stood at the trio's corpses until the scenario timed out (the 0134 pass ran into the same clear
+    // but lived).
+    Unit* fightStillOn = nullptr;
+    Unit* fightVictim = nullptr;
+    if (clear_ghost_combat && p_->IsInCombat())
+        for (auto const& [guid, ref] : p_->GetCombatManager().GetPvECombatRefs())
+        {
+            Unit* const other = ref->GetOther(p_);
+            Unit* const victim = other && other->IsAlive() ? other->GetVictim() : nullptr;
+            if (!victim)
+                continue;
+            Player* const victimPlayer = victim->GetCharmerOrOwnerPlayerOrPlayerItself();
+            if (victimPlayer && (victimPlayer == p_ || p_->IsInSameRaidWith(victimPlayer)))
+            {
+                fightStillOn = other;
+                fightVictim = victim;
+                break;
+            }
+        }
+    if (fightStillOn)
+    {
+        static std::mutex sMutex;
+        static std::unordered_map<uint64, uint32> sLast;
+        uint32 const now = getMSTime();
+        bool log = false;
+        {
+            std::lock_guard<std::mutex> lock(sMutex);
+            if (sLast.size() > 4096)
+                sLast.clear();
+            uint32& last = sLast[p_->GetGUID().GetCounter()];
+            if (!last || now - last >= 10000u)
+            {
+                last = now ? now : 1u;
+                log = true;
+            }
+        }
+        if (log)
+            TC_LOG_INFO("playerbot.v2", "[ghost_combat] {} keeps its combat: {} ({}) is alive and fights {}{}", p_->GetName(), fightStillOn->GetName(),
+                fightStillOn->GetEntry(), fightVictim->GetName(), p_->IsValidAttackTarget(fightStillOn) ? "" : " (cannot be attacked now)");
+    }
+    else if (clear_ghost_combat && p_->getAttackers().empty() && p_->IsInCombat())
     {
         TC_LOG_INFO("playerbot.v2",
             "[ghost_combat] {} clearing wedged combat state (no victim, no attackers)",
@@ -6344,6 +6392,111 @@ static bool BotShouldVendorBoeGreen(Player* p, Item* it, ItemTemplate const* tmp
     return true;
 }
 
+// The kind of piece an inventory type is, for comparing a bag piece with a worn one (OutclassedGear.h): a two-hander is not
+// compared with a one-hander, a shield not with an off-hand weapon, a relic not with a bow.
+static int OutclassKind(uint32 inv_type)
+{
+    switch (inv_type)
+    {
+        case INVTYPE_2HWEAPON:                                   return 1;
+        case INVTYPE_WEAPON: case INVTYPE_WEAPONMAINHAND:
+        case INVTYPE_WEAPONOFFHAND:                              return 2;
+        case INVTYPE_SHIELD:                                     return 3;
+        case INVTYPE_HOLDABLE:                                   return 4;
+        case INVTYPE_RANGED: case INVTYPE_RANGEDRIGHT:
+        case INVTYPE_THROWN:                                     return 5;
+        case INVTYPE_RELIC:                                      return 6;
+        case INVTYPE_CHEST: case INVTYPE_ROBE:                   return 7;
+        default:                                                 return 100 + int(inv_type);
+    }
+}
+
+// A soulbound piece in the bags that what the bot wears outclasses in every slot it could go in (Api/OutclassedGear.h). Never a
+// piece a group mate could still be handed (the loot trade window), a quest item, an heirloom or account-bound piece, an epic,
+// a shirt or a tabard; never while raid resistance gear or the Onyxia cloak is worn (the own pieces wait in the bags then) or in
+// an instance. Playerbot.Behavior.SellOutclassedGear.
+static bool BotOutclassedBagGear(Player* p, Item* it, ItemTemplate const* tmpl)
+{
+    if (!p || !it || !tmpl || !Services::Config().behavior_sell_outclassed_gear())
+        return false;
+    uint32 const cls = tmpl->GetClass();
+    if (cls != ITEM_CLASS_WEAPON && cls != ITEM_CLASS_ARMOR)
+        return false;
+    if (!it->IsSoulBound() || it->IsBOPTradeable() || it->IsRefundable())
+        return false;
+    uint32 const quality = tmpl->GetQuality();
+    if (quality > ITEM_QUALITY_RARE || quality == ITEM_QUALITY_POOR)
+        return false;
+    uint32 const bonding = tmpl->GetBonding();
+    if (bonding == BIND_QUEST || bonding == BIND_BNET_ACCOUNT || bonding == BIND_BNET_ACCOUNT_UNTIL_EQUIPPED ||
+        bonding == BIND_WOW_ACCOUNT || tmpl->GetStartQuest() != 0)
+        return false;
+    uint32 const inv = tmpl->GetInventoryType();
+    if (inv == INVTYPE_BODY || inv == INVTYPE_TABARD || inv == INVTYPE_NON_EQUIP || inv == INVTYPE_BAG)
+        return false;
+    if (p->GetMap() && p->GetMap()->Instanceable())
+        return false;
+    if (BotAI const* ai = Services::Registry().ai(p->GetGUID().GetCounter()))
+        if (ai->resist_gear_school() != 0 || ai->fight_cloak())
+            return false;
+    if (p->CanUseItem(tmpl) != EQUIP_ERR_OK)
+        return false;   // cannot wear it: IsBagRot's own soulbound branch
+
+    // The slots it could go in, as Player::FindEquipSlot lists them.
+    uint8 slots[2] = { NULL_SLOT, NULL_SLOT };
+    switch (inv)
+    {
+        case INVTYPE_HEAD:      slots[0] = EQUIPMENT_SLOT_HEAD; break;
+        case INVTYPE_NECK:      slots[0] = EQUIPMENT_SLOT_NECK; break;
+        case INVTYPE_SHOULDERS: slots[0] = EQUIPMENT_SLOT_SHOULDERS; break;
+        case INVTYPE_CHEST:
+        case INVTYPE_ROBE:      slots[0] = EQUIPMENT_SLOT_CHEST; break;
+        case INVTYPE_WAIST:     slots[0] = EQUIPMENT_SLOT_WAIST; break;
+        case INVTYPE_LEGS:      slots[0] = EQUIPMENT_SLOT_LEGS; break;
+        case INVTYPE_FEET:      slots[0] = EQUIPMENT_SLOT_FEET; break;
+        case INVTYPE_WRISTS:    slots[0] = EQUIPMENT_SLOT_WRISTS; break;
+        case INVTYPE_HANDS:     slots[0] = EQUIPMENT_SLOT_HANDS; break;
+        case INVTYPE_FINGER:    slots[0] = EQUIPMENT_SLOT_FINGER1; slots[1] = EQUIPMENT_SLOT_FINGER2; break;
+        case INVTYPE_TRINKET:   slots[0] = EQUIPMENT_SLOT_TRINKET1; slots[1] = EQUIPMENT_SLOT_TRINKET2; break;
+        case INVTYPE_CLOAK:     slots[0] = EQUIPMENT_SLOT_BACK; break;
+        case INVTYPE_WEAPON:
+            slots[0] = EQUIPMENT_SLOT_MAINHAND;
+            if (p->CanDualWield())
+                slots[1] = EQUIPMENT_SLOT_OFFHAND;
+            break;
+        case INVTYPE_2HWEAPON:
+        case INVTYPE_WEAPONMAINHAND: slots[0] = EQUIPMENT_SLOT_MAINHAND; break;
+        case INVTYPE_WEAPONOFFHAND:
+        case INVTYPE_SHIELD:
+        case INVTYPE_HOLDABLE:  slots[0] = EQUIPMENT_SLOT_OFFHAND; break;
+        case INVTYPE_RANGED:
+        case INVTYPE_RANGEDRIGHT:
+        case INVTYPE_THROWN:
+        case INVTYPE_RELIC:     slots[0] = EQUIPMENT_SLOT_RANGED; break;
+        default:                return false;
+    }
+
+    int const kind = OutclassKind(inv);
+    Gear::WornInSlot worn[2];
+    size_t n = 0;
+    for (uint8 slot : slots)
+    {
+        if (slot == NULL_SLOT)
+            continue;
+        Gear::WornInSlot& w = worn[n++];
+        Item const* cur = p->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        ItemTemplate const* ct = cur ? cur->GetTemplate() : nullptr;
+        if (!ct)
+            continue;   // empty: the bag piece would be a gain
+        w.empty = false;
+        // A worn one-hander (or off-hand weapon) is the same kind as a bag one-hander in either hand.
+        w.same_kind = OutclassKind(ct->GetInventoryType()) == kind;
+        w.score = Gear::ScoreItemForBot(ct, p);
+        w.item_level = cur->GetItemLevel(p);
+    }
+    return Gear::IsOutclassed(Gear::ScoreItemForBot(tmpl, p), it->GetItemLevel(p), worn, n);
+}
+
 // Bag rot: what a bot sells at a vendor, and what it clears for room when no vendor is near (API::make_room).
 // Greys, trade goods for a profession the bot lacks, soulbound gear it cannot wear and, when bags are tight, outgrown BoE greens.
 static bool IsBagRot(Player* p, Item* it, ItemTemplate const* tmpl, bool bags_tight)
@@ -6398,6 +6551,11 @@ static bool IsBagRot(Player* p, Item* it, ItemTemplate const* tmpl, bool bags_ti
     // for items BotShouldVendorBoeGreen clears (all upgrade / quest /
     // heirloom / account-bound protections enforced inside).
     else if (bags_tight && BotShouldVendorBoeGreen(p, it, tmpl))
+    {
+        return true;
+    }
+    // (5) Soulbound gear the bot has outgrown: what it wears beats it in every slot it could go in (BotOutclassedBagGear).
+    else if (BotOutclassedBagGear(p, it, tmpl))
     {
         return true;
     }
@@ -6989,6 +7147,71 @@ Result API::gossip_select_by_index(ObjectGuid npc, uint32 order_index)
     return Result::Ok;
 }
 
+namespace
+{
+// Takes everything the bot may take from an object's open loot (a chest, a quest object, a gathered herb or ore vein) and
+// releases it as the client's loot release does. A headless bot has no client to send CMSG_LOOT_ITEM, so without this the
+// object stays open with its items inside (quest 28715, 2026-05-20).
+void TakeGameObjectLoot(Player* p, GameObject* obj, ObjectGuid go_guid)
+{
+    Loot* loot = obj->GetLootForPlayer(p);
+    if (!loot)
+        return;
+    if (!loot->isLooted() || !loot->items.empty() || loot->gold != 0)
+    {
+        ObjectGuid lootOwnerGuid = loot->GetOwnerGUID();
+        for (uint8 slot = 0; slot < loot->items.size(); ++slot)
+        {
+            // Same FFA fix as API::loot_corpse: chests are FFA, so a looted item's state lives in the per-player ffaItem, not the
+            // shared it->is_looted; without checking it the bot re-loots the chest every tick and the GO never reaches
+            // GO_JUST_DEACTIVATED.
+            NotNormalLootItem* ffaItem = nullptr;
+            LootItem* it = loot->LootItemInSlot(slot, p, &ffaItem);
+            if (!it || it->is_looted || it->is_blocked) continue;
+            if (ffaItem && ffaItem->is_looted) continue;
+            p->StoreLootItem(lootOwnerGuid, slot, loot);
+        }
+        if (loot->gold > 0)
+        {
+            p->ModifyMoney(loot->gold);
+            loot->gold = 0;
+        }
+    }
+    // The real release, as API::loot_corpse does: SendLootRelease alone is only a packet, so a looted chest or quest object
+    // stayed opened (GO_ACTIVATED) and never despawned or respawned; every player who clicked it later got an empty window
+    // (Discord 2026-10-27).
+    WorldSession* sess = p->GetSession();
+    if (sess && p->GetLootGUID() == go_guid)
+        sess->DoLootRelease(loot);
+    else
+        p->SendLootRelease(go_guid);
+}
+
+// The bot's spell that opens a lock of this kind (Herbalism 2366 for LOCKTYPE_HERBALISM, Mining 2575 for LOCKTYPE_MINING): the
+// spell a player's right-click on an herb or vein casts. Of several ranks the one with the largest bonus to the lock skill
+// (Spell::CanOpenLock adds the effect's value to the skill), 0 when the bot knows none.
+uint32 OpenLockSpellFor(Player const* p, int32 lockIndex)
+{
+    uint32 best = 0;
+    float bestBonus = -1.0f;
+    for (auto const& [sid, ps] : p->GetSpellMap())
+    {
+        if (ps.state == PLAYERSPELL_REMOVED || ps.disabled || !ps.active)
+            continue;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(sid, DIFFICULTY_NONE);
+        if (!si || si->IsPassive())
+            continue;
+        for (SpellEffectInfo const& eff : si->GetEffects())
+            if (eff.IsEffect(SPELL_EFFECT_OPEN_LOCK) && eff.MiscValue == lockIndex && eff.BasePoints > bestBonus)
+            {
+                best = sid;
+                bestBonus = eff.BasePoints;
+            }
+    }
+    return best;
+}
+}
+
 Result API::use_game_object(ObjectGuid go_guid)
 {
     if (!p_) return Result::Other;
@@ -7253,7 +7476,7 @@ Result API::use_game_object(ObjectGuid go_guid)
     // and Use() skips that lock. Bots walking past emptied every herb and ore node in the open world with no skill at all, so players
     // found none (Discord 2026-11-09). A bot never opens one of these by a plain click.
     if (obj->GetGoType() == GAMEOBJECT_TYPE_CHEST && Playerbot::ChestNeedsSkill(obj->GetGOInfo()))
-        return Result::InvalidTarget;
+        return gather_node(obj);
     // Mounted-restriction check from HandleGameObjectUseOpcode: most GOs
     // refuse interaction while mounted unless flagged UsableMounted.
     if (p_->IsMounted() && !obj->GetGOInfo()->IsUsableMounted())
@@ -7366,60 +7589,96 @@ Result API::use_game_object(ObjectGuid go_guid)
 
     obj->Use(p_);
 
-    // Auto-loot for lootable GO types (CHEST, GOOBER with loot, etc.).
-    // GameObject::Use opens the loot window server-side (m_loot is
-    // populated, GO state transitions to ACTIVATED) but for headless
-    // bots Ã¢Â€Â” and for self-bot logic bots without auto-loot enabled Ã¢Â€Â” there's
-    // no client to send CMSG_LOOT_ITEM. The chest stays open with the
-    // items inside untaken, the quest objective never progresses, and
-    // the bot moves on or hearths after stuck-detection.
-    // Verified 2026-05-20 on "Demonic Thieves" (quest 28715): Uraimus
-    // opened the orc bonfire GO but never took the demonic ID stub
-    // off it, got stuck on the objective.
-    //
-    // Mirrors API::loot_corpse: walk loot.items, store each. Skip the
-    // group / master-loot path (chests are FFA by default Ã¢Â€Â” TC's
-    // ROLL_NEED_BEFORE_GREED and master-loot apply only to creature
-    // corpses).
-    if (Loot* loot = obj->GetLootForPlayer(p_))
-    {
-        if (!loot->isLooted() || !loot->items.empty() || loot->gold != 0)
-        {
-            ObjectGuid lootOwnerGuid = loot->GetOwnerGUID();
-            for (uint8 slot = 0; slot < loot->items.size(); ++slot)
-            {
-                // Same FFA fix as API::loot_corpse: chests are FFA, so a looted
-                // item's state lives in the per-player ffaItem, not the shared
-                // it->is_looted Ã¢Â€Â” without checking it the bot re-loots the chest
-                // every tick and the GO never reaches GO_JUST_DEACTIVATED.
-                NotNormalLootItem* ffaItem = nullptr;
-                LootItem* it = loot->LootItemInSlot(slot, p_, &ffaItem);
-                if (!it || it->is_looted || it->is_blocked) continue;
-                if (ffaItem && ffaItem->is_looted) continue;
-                p_->StoreLootItem(lootOwnerGuid, slot, loot);
-            }
-            if (loot->gold > 0)
-            {
-                p_->ModifyMoney(loot->gold);
-                loot->gold = 0;
-            }
-        }
-        // The real release, as API::loot_corpse does: SendLootRelease alone is only a packet, so a looted chest or quest object
-        // stayed opened (GO_ACTIVATED) and never despawned or respawned; every player who clicked it later got an empty window
-        // (Discord 2026-10-27).
-        WorldSession* sess = p_->GetSession();
-        if (sess && p_->GetLootGUID() == go_guid)
-            sess->DoLootRelease(loot);
-        else
-            p_->SendLootRelease(go_guid);
-    }
+    // Auto-loot for lootable GO types (CHEST, GOOBER with loot, etc.): GameObject::Use opens the loot window server-side, and a
+    // headless bot has no client to take the items (TakeGameObjectLoot).
+    TakeGameObjectLoot(p_, obj, go_guid);
     return Result::Ok;
+}
+
+// An herb or ore vein (a chest whose lock needs Herbalism or Mining): what a player's right-click does. The first call casts the
+// gathering spell on it (Spell::EffectOpenLock checks the skill, the Mining Pick and the node, then opens its loot for the bot and
+// gives the skill-up); a call while that loot is open takes it. Never a plain Use(), which skips the lock: bots without the skill
+// emptied every node in the open world that way (Discord 2026-11-09). Locks the bot has no skill or spell for stay closed.
+Result API::gather_node(GameObject* obj)
+{
+    ObjectGuid const go_guid = obj->GetGUID();
+    if (p_->GetLootGUID() == go_guid)
+    {
+        TakeGameObjectLoot(p_, obj, go_guid);
+        TC_LOG_INFO("playerbot.v2", "[gather] {} looted entry={}", p_->GetName(), obj->GetEntry());
+        return Result::Ok;
+    }
+    if (obj->getLootState() != GO_READY)
+        return Result::InvalidTarget;   // being gathered by someone, or already picked
+    LockEntry const* lock = sLockStore.LookupEntry(obj->GetGOInfo()->GetLockId());
+    if (!lock)
+        return Result::InvalidTarget;
+    for (uint8 i = 0; i < MAX_LOCK_CASE; ++i)
+    {
+        if (lock->Type[i] != LOCK_KEY_SKILL)
+            continue;
+        SkillType const skill = SkillByLockType(LockType(lock->Index[i]));
+        if (skill != SKILL_HERBALISM && skill != SKILL_MINING)
+            continue;
+        if (p_->GetSkillValue(skill) == 0 || p_->GetSkillValue(skill) < lock->Skill[i])
+            continue;
+        uint32 const spell = OpenLockSpellFor(p_, lock->Index[i]);
+        if (!spell)
+            continue;
+        if (p_->IsNonMeleeSpellCast(false))
+            return Result::Locked;
+        if (p_->IsMounted())
+            p_->RemoveAurasByType(SPELL_AURA_MOUNTED);
+        // The cast has a cast time and the core refuses it while the bot moves (SPELL_FAILED_MOVING: 28 of 29 casts in r10 12 Nov,
+        // the bot still on the detour's spline as it reached the node). A player stops at the herb: the bot stands, its movers
+        // dropped so none re-splines it under the cast, and a walking flag left from the spline is cleared.
+        stop_movement(/*clear_generators*/ true);
+        ClearStaleMoveFlags(p_);
+        if (!p_->HasInArc(static_cast<float>(M_PI), obj))
+            p_->SetFacingToObject(obj, true);
+        SpellCastResult const r = p_->CastSpell(obj, spell, false);
+        TC_LOG_INFO("playerbot.v2", "[gather] {} cast {} on entry={} skill {} {}/{} result={}", p_->GetName(), spell, obj->GetEntry(),
+            uint32(skill), uint32(p_->GetSkillValue(skill)), uint32(lock->Skill[i]), uint32(r));
+        return r == SPELL_CAST_OK ? Result::Ok : Result::ServerRefused;
+    }
+    return Result::InvalidTarget;
 }
 
 // ---- Quest ---------------------------------------------------------------
 
+QuestRefusal API::why_cant_take_quest(uint32 quest_id) const
+{
+    if (!p_) return QuestRefusal::Other;
+    Quest const* q = sObjectMgr->GetQuestTemplate(quest_id);
+    if (!q) return QuestRefusal::Other;
+    // CanTakeQuest's own gates, in its order, each asked without a message to the bot's client.
+    if (DisableMgr::IsDisabledFor(DISABLE_TYPE_QUEST, quest_id, p_))  return QuestRefusal::Disabled;
+    if (!p_->SatisfyQuestStatus(q, false))
+        return p_->GetQuestStatus(quest_id) == QUEST_STATUS_REWARDED ? QuestRefusal::Done : QuestRefusal::OnIt;
+    if (!p_->SatisfyQuestExclusiveGroup(q, false))  return QuestRefusal::OtherChoice;
+    if (!p_->SatisfyQuestClass(q, false))           return QuestRefusal::Class;
+    if (!p_->SatisfyQuestRace(q, false))            return QuestRefusal::Race;
+    if (!p_->SatisfyQuestMinLevel(q, false))        return QuestRefusal::LowLevel;
+    if (!p_->SatisfyQuestMaxLevel(q, false))        return QuestRefusal::HighLevel;
+    if (!p_->SatisfyQuestSkill(q, false))           return QuestRefusal::Skill;
+    if (!p_->SatisfyQuestReputation(q, false))      return QuestRefusal::Reputation;
+    if (!p_->SatisfyQuestDependentQuests(q, false)) return QuestRefusal::Prerequisite;
+    if (!p_->SatisfyQuestTimed(q, false))           return QuestRefusal::Timed;
+    if (!p_->SatisfyQuestDay(q, false) || !p_->SatisfyQuestWeek(q, false) ||
+        !p_->SatisfyQuestMonth(q, false) || !p_->SatisfyQuestSeasonal(q, false))
+        return QuestRefusal::NotAgainYet;
+    if (!p_->SatisfyQuestConditions(q, false))      return QuestRefusal::Conditions;
+    if (!p_->SatisfyQuestExpansion(q, false))       return QuestRefusal::Expansion;
+    if (!p_->CanTakeQuest(q, false))                return QuestRefusal::Other;   // a gate added to CanTakeQuest later
+    if (!p_->SatisfyQuestLog(false))                return QuestRefusal::LogFull;
+    if (!p_->CanAddQuest(q, false))                 return QuestRefusal::BagsFull;
+    return QuestRefusal::None;
+}
+
 Result API::accept_quest(ObjectGuid quest_giver, uint32 quest_id)
 {
+    last_quest_refusal_ = QuestRefusal::None;
+    last_quest_refusal_quest_ = quest_id;
     if (!p_) return Result::Other;
     Quest const* quest = sObjectMgr->GetQuestTemplate(quest_id);
     if (!quest)
@@ -7427,11 +7686,13 @@ Result API::accept_quest(ObjectGuid quest_giver, uint32 quest_id)
         TC_LOG_INFO("playerbot.v2",
             "[accept_quest] {} reject quest={} reason=template_missing",
             "?", quest_id);
+        last_quest_refusal_ = QuestRefusal::Other;
         return Result::NotKnown;
     }
 
-    auto log_reject = [&](char const* why)
+    auto log_reject = [&](char const* why, QuestRefusal refusal)
     {
+        last_quest_refusal_ = refusal;
         TC_LOG_INFO("playerbot.v2",
             "[accept_quest] {} reject quest={} lvl={} reason={}",
             p_->GetName(), quest_id, uint32(p_->GetLevel()), why);
@@ -7447,10 +7708,10 @@ Result API::accept_quest(ObjectGuid quest_giver, uint32 quest_id)
         object = ObjectAccessor::GetObjectByTypeMask(*p_, quest_giver,
                     TYPEMASK_UNIT | TYPEMASK_GAMEOBJECT | TYPEMASK_ITEM);
     }
-    if (!object)                                        { log_reject("giver_not_found");      return Result::InvalidTarget; }
-    if (quest_giver.IsPlayer())                         { log_reject("player_giver_unsupp");  return Result::Other; }
-    if (!object->hasQuest(quest_id))                    { log_reject("giver_lost_relation");  return Result::InvalidTarget; }
-    if (!p_->CanInteractWithQuestGiver(object))         { log_reject("out_of_range");         return Result::OutOfRange; }
+    if (!object)                                        { log_reject("giver_not_found", QuestRefusal::NoGiver);     return Result::InvalidTarget; }
+    if (quest_giver.IsPlayer())                         { log_reject("player_giver_unsupp", QuestRefusal::Other);   return Result::Other; }
+    if (!object->hasQuest(quest_id))                    { log_reject("giver_lost_relation", QuestRefusal::NoGiver); return Result::InvalidTarget; }
+    if (!p_->CanInteractWithQuestGiver(object))         { log_reject("out_of_range", QuestRefusal::OutOfRange);     return Result::OutOfRange; }
     // Junk-quest accept-gate (R2, defense-in-depth). A quest with ZERO
     // objectives AND no creature/GO turn-in NPC is structurally unfinishable
     // and unturnable Ã¢Â€Â” accepting it parks the bot forever (current_quest_id=0
@@ -7463,11 +7724,11 @@ Result API::accept_quest(ObjectGuid quest_giver, uint32 quest_id)
         auto ce = sObjectMgr->GetCreatureQuestInvolvedRelationReverseBounds(quest_id);
         auto ge = sObjectMgr->GetGOQuestInvolvedRelationReverseBounds(quest_id);
         if (ce.begin() == ce.end() && ge.begin() == ge.end())
-        { log_reject("no_ender_or_objectives");  return Result::Locked; }
+        { log_reject("no_ender_or_objectives", QuestRefusal::Unfinishable);  return Result::Locked; }
     }
-    if (!p_->CanTakeQuest(quest, true))                 { log_reject("cant_take_quest");      return Result::Locked; }
-    if (!p_->SatisfyQuestLog(false))                    { log_reject("quest_log_full");       return Result::InventoryFull; }
-    if (!p_->CanAddQuest(quest, true))                  { log_reject("src_item_no_bag_space"); return Result::InventoryFull; }
+    if (!p_->CanTakeQuest(quest, true))                 { log_reject("cant_take_quest", why_cant_take_quest(quest_id)); return Result::Locked; }
+    if (!p_->SatisfyQuestLog(false))                    { log_reject("quest_log_full", QuestRefusal::LogFull);          return Result::InventoryFull; }
+    if (!p_->CanAddQuest(quest, true))                  { log_reject("src_item_no_bag_space", QuestRefusal::BagsFull);  return Result::InventoryFull; }
 
     p_->AddQuestAndCheckCompletion(quest, object);
     p_->PlayerTalkClass->SendCloseGossip();
@@ -8043,15 +8304,20 @@ Result API::equip_item(uint8 from_bag, uint8 from_slot, uint8 to_slot)
 
 Result API::accept_shared_quest()
 {
+    last_quest_refusal_ = QuestRefusal::None;
+    last_quest_refusal_quest_ = 0;
     if (!p_) return Result::Other;
     const ObjectGuid sender_guid = p_->GetPlayerSharingQuest();
     const uint32 quest_id = p_->GetSharedQuestID();
-    if (sender_guid.IsEmpty() || quest_id == 0) return Result::Locked;
+    // The share ran out (or was answered already) between the order and this tick.
+    if (sender_guid.IsEmpty() || quest_id == 0) { last_quest_refusal_ = QuestRefusal::NoGiver; return Result::Locked; }
+    last_quest_refusal_quest_ = quest_id;
     Quest const* quest = sObjectMgr->GetQuestTemplate(quest_id);
-    if (!quest) { p_->ClearQuestSharingInfo(); return Result::NotKnown; }
+    if (!quest) { p_->ClearQuestSharingInfo(); last_quest_refusal_ = QuestRefusal::Other; return Result::NotKnown; }
     Player* sender = ObjectAccessor::FindConnectedPlayer(sender_guid);
     if (!p_->CanTakeQuest(quest, false) || !p_->CanAddQuest(quest, false))
     {
+        last_quest_refusal_ = why_cant_take_quest(quest_id);
         TC_LOG_INFO("playerbot.v2", "[quest_share] {} cannot take shared quest {} from {} (CanTake={} CanAdd={})",
             p_->GetName(), quest_id, sender ? sender->GetName() : std::string("?"),
             p_->CanTakeQuest(quest, false), p_->CanAddQuest(quest, false));
@@ -8624,6 +8890,155 @@ static std::vector<TraitEdgeEntry const*> const& TraitEdgesInto(int32 nodeId)
     return itr != byRight.end() ? itr->second : none;
 }
 
+// Every talent with points in a row its tab has opened (5 points per row above it in the same tab), as Wowhead's calculator and a
+// player's talent frame require. TraitMgr::ValidateConfig lets Forever talents through on fewer (T4, 11-12: an Arms bot held Anger
+// Management on 9 points above it, a mage Arcane Subtlety with no point in the top row), and Wowhead dropped those from the bots'
+// links. True when the class has no tab layout (nothing to check against).
+// Playerbot.ClassicTalents.RowsPerTab = 0 turns the check off for our builds: the Forever trees of 70790-70862 have one trait currency
+// for all three tabs, so the game opens a row by the points spent in any tab, and the builds were made for that (ClassicTalentBuilds.cpp).
+// A code the owner gives always keeps the rule (Wowhead does).
+template <typename Entries>
+static bool TalentRowsOpen(Player const* p, Entries const& entries, bool ownerCode = false)
+{
+    static bool const rowsPerTab = sConfigMgr->GetBoolDefault("Playerbot.ClassicTalents.RowsPerTab", true, true);
+    if (!rowsPerTab && !ownerCode)
+        return true;
+    std::vector<std::vector<::Playerbot::Classic::TalentSlot>> const* tabs = ::Playerbot::Classic::GetTalentTabs(p);
+    if (!tabs)
+        return true;
+    std::vector<std::vector<uint8_t>> points;
+    ::Playerbot::Classic::TalentCode::Layout layout;
+    for (auto const& tab : *tabs)
+    {
+        std::vector<uint8_t>& held = points.emplace_back();
+        std::vector<::Playerbot::Classic::TalentCode::Slot>& slots = layout.emplace_back();
+        for (::Playerbot::Classic::TalentSlot const& slot : tab)
+        {
+            int32 rank = 0;
+            for (auto const& e : entries)
+                if (e.TraitNodeID == slot.TraitNodeID && e.TraitNodeEntryID == slot.TraitNodeEntryID)
+                    rank = e.Rank;
+            held.push_back(uint8_t(std::clamp<int32>(rank, 0, 9)));
+            slots.push_back({ uint8(std::clamp<int32>(slot.MaxRanks, 0, 9)), slot.row });
+        }
+    }
+    return ::Playerbot::Classic::TalentCode::RowsOpen(points, layout);
+}
+
+// The owner's own build, a Wowhead Forever talent calculator code ("change talents <link>", Classic::SetTalentCode): learned as
+// written in place of ours. The ranks are bought in TalentCode::LevellingOrder (the tab with most points first, row by row), so a
+// bot below 60 fills its main tab first and each new level's point goes on down the build. Like the build walk below, a bot whose
+// level, code and ranks are what its last walk left is not walked again.
+static Result ApplyTalentCode(Player* p, UF::TraitConfig const& active, std::string const& code)
+{
+    namespace TCode = ::Playerbot::Classic::TalentCode;
+    std::vector<std::vector<::Playerbot::Classic::TalentSlot>> const* tabs = ::Playerbot::Classic::GetTalentTabs(p);
+    TCode::Parsed const parsed = TCode::Parse(code);
+    if (!tabs || !parsed.ok())
+        return Result::NotKnown;
+    TCode::Layout layout;
+    for (auto const& tab : *tabs)
+    {
+        std::vector<TCode::Slot>& slots = layout.emplace_back();
+        for (::Playerbot::Classic::TalentSlot const& slot : tab)
+            slots.push_back({ uint8(std::clamp<int32>(slot.MaxRanks, 0, 9)), slot.row });
+    }
+    TCode::Check const check = TCode::Validate(parsed, layout);
+    if (!check.ok())
+        return Result::InvalidTarget;
+
+    auto const heldRanks = [](auto const& entries)
+    {
+        std::map<std::pair<int32, int32>, int32> ranks;
+        for (auto const& e : entries)
+            if (e.Rank > 0)
+                ranks[{ e.TraitNodeID, e.TraitNodeEntryID }] = e.Rank;
+        return ranks;
+    };
+    auto const countRanks = [](std::map<std::pair<int32, int32>, int32> const& ranks)
+    {
+        uint32 n = 0;
+        for (auto const& [node, rank] : ranks)
+            n += uint32(rank);
+        return n;
+    };
+    struct CodeWalk { uint8 level; size_t code; uint32 ranks; };
+    static std::mutex s_lock;
+    static std::unordered_map<uint64, CodeWalk> s_walked;
+    uint64 const key = p->GetGUID().GetCounter();
+    size_t const codeHash = std::hash<std::string>{}(code);
+    uint32 const heldNow = countRanks(heldRanks(active.Entries));
+    {
+        std::lock_guard lock(s_lock);
+        if (auto itr = s_walked.find(key); itr != s_walked.end() && itr->second.level == uint8(p->GetLevel()) && itr->second.code == codeHash
+            && itr->second.ranks == heldNow)
+            return Result::Ok;
+    }
+
+    // From the free (granted) ranks only: the old talents go, as a respec would take them.
+    WorldPackets::Traits::TraitConfig cfg(active);
+    std::erase_if(cfg.Entries, [](WorldPackets::Traits::TraitEntry const& e) { return e.GrantedRanks == 0; });
+    for (WorldPackets::Traits::TraitEntry& e : cfg.Entries)
+        e.Rank = 0;
+
+    static uint32 const walkBudgetMs = sConfigMgr->GetIntDefault("Playerbot.ClassicTalents.WalkBudgetMs", 250, true);
+    uint32 const startMs = getMSTime();
+    uint32 validations = 0;
+    std::vector<TCode::Step> const steps = TCode::LevellingOrder(parsed);
+    // Walk the steps again until a pass buys nothing: a talent whose prerequisite sits to its right in the same row opens on the next pass.
+    for (bool progress = true; progress && getMSTimeDiff(startMs, getMSTime()) <= walkBudgetMs; )
+    {
+        progress = false;
+        for (TCode::Step const& step : steps)
+        {
+            ::Playerbot::Classic::TalentSlot const& slot = (*tabs)[step.tab][step.slot];
+            auto itr = std::ranges::find_if(cfg.Entries, [&](WorldPackets::Traits::TraitEntry const& e)
+            {
+                return e.TraitNodeID == slot.TraitNodeID && e.TraitNodeEntryID == slot.TraitNodeEntryID;
+            });
+            if (itr == cfg.Entries.end())
+            {
+                WorldPackets::Traits::TraitEntry& added = cfg.Entries.emplace_back();
+                added.TraitNodeID = slot.TraitNodeID;
+                added.TraitNodeEntryID = slot.TraitNodeEntryID;
+                itr = std::prev(cfg.Entries.end());
+            }
+            int32 const target = std::min<int32>(step.ranks, slot.MaxRanks - itr->GrantedRanks);
+            while (itr->Rank < target)
+            {
+                ++itr->Rank;
+                ++validations;
+                if (TraitMgr::ValidateConfig(cfg, p) != TraitMgr::LearnResult::Ok || !TalentRowsOpen(p, cfg.Entries, true))
+                {
+                    --itr->Rank;
+                    break;
+                }
+                progress = true;
+            }
+            if (!itr->Rank && !itr->GrantedRanks)
+                cfg.Entries.erase(itr);
+        }
+    }
+    TraitMgr::ValidateConfig(cfg, p);   // leave the config in its validated state (subtree caches)
+
+    auto const want = heldRanks(cfg.Entries);
+    uint32 const placed = countRanks(want);
+    bool const already = want == heldRanks(active.Entries);
+    TC_LOG_INFO("playerbot.api", "[API::talents] {} L{} talent code {} ({}/{}/{}): {} of {} points {} ({} validations, {} ms)", p->GetName(),
+        uint32(p->GetLevel()), code, check.perTab.size() > 0 ? check.perTab[0] : 0, check.perTab.size() > 1 ? check.perTab[1] : 0,
+        check.perTab.size() > 2 ? check.perTab[2] : 0, placed, check.total, already ? "already in place" : "committed", validations,
+        getMSTimeDiff(startMs, getMSTime()));
+    if (!already)
+        p->UpdateTraitConfig(std::move(cfg), 0, /*withCastTime*/ false);
+    {
+        std::lock_guard lock(s_lock);
+        if (s_walked.size() > 8192)
+            s_walked.clear();
+        s_walked[key] = { uint8(p->GetLevel()), codeHash, placed };
+    }
+    return placed > 0 ? Result::Ok : Result::Locked;
+}
+
 Result API::apply_classic_talents()
 {
     if (!p_) return Result::Other;
@@ -8631,6 +9046,10 @@ Result API::apply_classic_talents()
 
     UF::TraitConfig const* active = p_->GetTraitConfig(p_->m_activePlayerData->ActiveCombatTraitConfigID);
     if (!active) return Result::NotKnown;
+
+    // The owner gave it a build of its own: that one, not ours.
+    if (std::string const code = ::Playerbot::Classic::GetTalentCode(p_->GetGUID()); !code.empty())
+        return ApplyTalentCode(p_, *active, code);
 
     uint32 const spec = ::Playerbot::Classic::EffectiveSpecId(p_);
     auto const build = ::Playerbot::Classic::GetTalentBuild(p_->GetClass(), spec);
@@ -8663,6 +9082,9 @@ Result API::apply_classic_talents()
         // build lists. A build definition that changed (talent names corrected to Forever's nodes) or a spec pinned by a scenario fails this
         // and the bot is walked once; a pick the class trees have no node for cannot be held and does not count against the bot.
         bool holdsBuild = held > 0 && int32(held) >= points;
+        // A bot walked before the row rule (TalentRowsOpen) may hold talents in rows its tab has not opened: walked once more.
+        if (holdsBuild && !TalentRowsOpen(p_, active->Entries))
+            holdsBuild = false;
         if (holdsBuild)
         {
             UF::TraitConfig const* activeCfg = p_->GetTraitConfig(p_->m_activePlayerData->ActiveCombatTraitConfigID);
@@ -8755,7 +9177,11 @@ Result API::apply_classic_talents()
     auto const validate = [&]
     {
         ++validations;
-        return TraitMgr::ValidateConfig(cfg, p_);
+        TraitMgr::LearnResult const result = TraitMgr::ValidateConfig(cfg, p_);
+        // The rows as a player's talent frame opens them, which the game's check does not hold Forever talents to.
+        if (result == TraitMgr::LearnResult::Ok && !TalentRowsOpen(p_, cfg.Entries))
+            return TraitMgr::LearnResult::NotEnoughTalentsInPrimaryTree;
+        return result;
     };
 
     // A talent below another is refused until a parent node is filled to its maximum (ValidateConfig), and a build that takes a

@@ -52,6 +52,7 @@
 #include "SpellMgr.h"
 #include "SpellHistory.h"
 #include "Map.h"
+#include "MapManager.h"
 #include "InstanceScript.h"
 #include "PhaseShift.h"
 #include "InstanceScenario.h"
@@ -1467,6 +1468,45 @@ bool CachedLosCheck(Player const* p, Unit const* t, uint32 now_ms)
     return los;
 }
 
+// Swim-deep water on 8 bearings around the bot, for idle:wander. A wander step went into a lake or a river, idle:water_escape walked
+// the bot out, the next wander step went back in: r10 12 Nov, 10 wander <> water_escape flips. Sampled 10 y and 25 y out (the wander
+// step is 15-35 y), at the bot's height + 2 y so a lake below a slope is found too; ankle-deep water at the edge does not count.
+// Up to 16 liquid lookups (a vmap ray each), so the answer is kept per bot until it has moved 8 y or 20 s have passed. thread_local
+// like the LoS memo: each map's bots build on one worker.
+uint8 DeepWaterBearings(Player const* p, Map* m, uint32 now_ms)
+{
+    if (!m || m->Instanceable())
+        return 0;
+    struct Entry { uint32 at_ms; uint32 map; float x, y; uint8 mask; };
+    thread_local std::unordered_map<uint64, Entry> s_cache;
+    if (s_cache.size() > 16384)
+        s_cache.clear();
+    float const x = p->GetPositionX(), y = p->GetPositionY(), z = p->GetPositionZ();
+    uint64 const key = p->GetGUID().GetCounter();
+    auto it = s_cache.find(key);
+    if (it != s_cache.end() && it->second.map == p->GetMapId() && now_ms - it->second.at_ms < 20000u
+        && (it->second.x - x) * (it->second.x - x) + (it->second.y - y) * (it->second.y - y) < 8.0f * 8.0f)
+        return it->second.mask;
+    constexpr float kSwimDepth = 1.5f;
+    uint8 mask = 0;
+    for (uint8 i = 0; i < 8; ++i)
+    {
+        float const a = float(i) * float(M_PI) / 4.0f;
+        for (float const d : { 10.0f, 25.0f })
+        {
+            LiquidData ld{};
+            if (m->GetLiquidStatus(p->GetPhaseShift(), x + std::cos(a) * d, y + std::sin(a) * d, z + 2.0f, {}, &ld) != LIQUID_MAP_NO_WATER
+                && ld.level - ld.depth_level > kSwimDepth)
+            {
+                mask |= uint8(1u << i);
+                break;
+            }
+        }
+    }
+    s_cache[key] = { now_ms, p->GetMapId(), x, y, mask };
+    return mask;
+}
+
 // ---- Ground-hazard classifiers (raid / dungeon generic avoidance) ----
 // A ground effect is worth leaving when the spell HURTS whoever stands in
 // it: a direct damage effect, an aura dealing periodic damage, or a periodic
@@ -1939,6 +1979,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 }
             }
         }
+        snap->environment.deep_water_bearings = DeepWaterBearings(p, lqmap, snap->published_at_ms);
     }
     // Riding skill: 0 if no riding learned. Drives the auto-mount rule's
     // "do we have any usable mount" gate. Use SKILL_RIDING (762).
@@ -2182,6 +2223,16 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             if (Map* cmap = corpse->FindMap())
                 snap->death.corpse_instance_id = cmap->GetInstanceId();
         }
+        // A ghost outside the instance holding its corpse: is that instance still the one it would enter? MapManager answers with
+        // the instance a player of this group (or alone) is put in, 0 when it would get a new one.
+        if (snap->death.is_ghost && snap->death.corpse_map_id != p->GetMapId())
+            if (MapEntry const* cme = sMapStore.LookupEntry(snap->death.corpse_map_id); cme && cme->IsDungeon())
+            {
+                uint32 const enter_id = sMapMgr->FindInstanceIdForPlayer(snap->death.corpse_map_id, p);
+                Map const* enter_map = enter_id ? sMapMgr->FindMap(snap->death.corpse_map_id, enter_id) : nullptr;
+                // An instance that is not loaded is read back from the database with its corpses when entered: that is fine.
+                snap->death.corpse_instance_gone = enter_id == 0 || (enter_map && !enter_map->GetCorpseByPlayer(p->GetGUID()));
+            }
         // Corpse → graveyard distance. Cache key is the corpse position;
         // it doesn't change while the corpse is in the world, so we reuse
         // the cached distance until either (a) the bot moves the corpse
@@ -2997,6 +3048,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                             BotSnapshot::StartingItem si{};
                             si.item_entry = ii.entry;
                             si.quest_id   = start_qid;
+                            si.item_guid  = item->GetGUID();
                             snap->quest_discovery.quest_starting_items.push_back(si);
                         }
                     }
@@ -3909,6 +3961,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             const int32 rem            = casting->GetRemainingCastTime();
             snap->cast.current_cast_remaining = Ms{rem > 0 ? rem : 0};
             snap->cast.current_cast_target   = casting->m_targets.GetUnitTargetGUID();
+            snap->cast.current_cast_object   = casting->m_targets.GetGOTargetGUID();
             break;
         }
     }
@@ -8163,6 +8216,8 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                   [](auto const& a, auto const& b) { return a.first < b.first; });
         if (by_dist.size() > MAX_OBJECTS) by_dist.resize(MAX_OBJECTS);
 
+        // An object's loot the bot has open (an herb or vein its gathering spell opened): the gather rule takes it.
+        snap->world_objects.loot_open = p->GetLootGUID().IsGameObject() ? p->GetLootGUID() : ObjectGuid::Empty;
         snap->world_objects.nearby_objects.reserve(by_dist.size());
         for (auto const& [_, go] : by_dist)
         {
@@ -8195,6 +8250,21 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             if (n.go_type == GAMEOBJECT_TYPE_DESTRUCTIBLE_BUILDING)
                 n.is_destroyed =
                     go->GetDestructibleState() == GO_DESTRUCTIBLE_DESTROYED;
+            // Herb / ore vein: a chest whose lock asks for Herbalism or Mining (the gathering rules, GatheringRules.cpp).
+            if (n.go_type == GAMEOBJECT_TYPE_CHEST)
+                if (LockEntry const* lock = sLockStore.LookupEntry(go->GetGOInfo()->GetLockId()))
+                    for (uint8 li = 0; li < MAX_LOCK_CASE; ++li)
+                    {
+                        if (lock->Type[li] != LOCK_KEY_SKILL)
+                            continue;
+                        SkillType const sk = SkillByLockType(LockType(lock->Index[li]));
+                        if (sk != SKILL_HERBALISM && sk != SKILL_MINING)
+                            continue;
+                        n.gather_skill = uint16(sk);
+                        n.gather_req   = lock->Skill[li];
+                        n.gather_ready = go->isSpawned() && go->getLootState() == GO_READY;
+                        break;
+                    }
             // Pre-resolve teleport destination for SPELLCASTER GOs.
             // Type 22 stores its triggered spell in spellCaster.spell.
             // The spell's destination is in the spell_target_position
