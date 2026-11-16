@@ -83,6 +83,9 @@ struct Line
     bool reagent = false;        // a reagent of a recipe the bot knows: a gift from the owner or a group mate, so "trade them to me and ask again" works
     bool later = false;          // gear the bot may wear but only a few levels from now: a gift from the owner or a group mate, kept until then
                                  // (Gremloc 11-08: a group mate's piece above the bot's level was bought at the vendor price)
+    bool supply = false;         // a potion, elixir, flask, food or drink, weapon oil or stone, or bandage the bot can use itself: a gift
+                                 // from the owner or a group mate (Karrz 11-16: five Brilliant Mana Oil handed to his healer were met
+                                 // with "i'll give you 10s for that")
 };
 
 struct View
@@ -142,14 +145,14 @@ struct Action
 inline bool AllGifts(std::vector<Line> const& v)
 {
     for (Line const& l : v)
-        if (!l.upgrade && !l.reagent && !l.later) return false;
+        if (!l.upgrade && !l.reagent && !l.later && !l.supply) return false;
     return true;
 }
 
 inline bool AnyGift(std::vector<Line> const& v)
 {
     for (Line const& l : v)
-        if (l.upgrade || l.reagent || l.later) return true;
+        if (l.upgrade || l.reagent || l.later || l.supply) return true;
     return false;
 }
 
@@ -202,7 +205,7 @@ inline Action Decide(View const& v)
         return {};
     }
 
-    // Gear that is an upgrade, or reagents for a recipe the bot knows, from the owner or a group mate: a gift.
+    // Gear that is an upgrade, reagents for a recipe the bot knows, or supplies it uses itself, from the owner or a group mate: a gift.
     if (v.gift_partner && AllGifts(v.his) && v.mine.empty() && v.my_money == 0)
     {
         if (!v.his_accepted || v.my_accepted) return {};
@@ -232,7 +235,7 @@ inline char const* SayText(Say s)
         case Say::CantAfford:   return "i can't afford that, my purse is too light";
         case Say::WorthNothing: return "sorry, i've no use for that";
         case Say::NoRoom:       return "sorry, my bags are full";
-        case Say::OneWay:       return "one thing at a time please: gear i need is a gift, everything else i buy";
+        case Say::OneWay:       return "one thing at a time please: gear and supplies i need are a gift, everything else i buy";
         case Say::OrderGone:    return "sorry, i no longer have that one";
         default:                return "";
     }

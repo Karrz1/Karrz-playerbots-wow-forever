@@ -37,6 +37,8 @@
 #include "Player.h"
 #include "QuestDef.h"
 #include "RBAC.h"
+#include "TradeData.h"
+#include "TradePackets.h"
 #include "World.h"
 #include "WorldSession.h"
 
@@ -1148,6 +1150,24 @@ void HandleAltsReq(uint32 client_seq, WorldSession* sess)
 }
 
 // ----------------------------------------------------------------------------
+// PLATES — combat-only enemy nameplates for the sender's own client (Player::SetCombatPlateFilter): NPCs outside his, his pet's or
+// his group's fight show their plain name, the ones fighting get their health bar. Any player may ask (no bot needed).
+//
+// Wire:  PLATES|1     PLATES|0
+// Reply: PLATES_RESP|<1|0>   (what will be in force from the player's next update)
+// ----------------------------------------------------------------------------
+void HandlePlatesReq(uint32 client_seq, WorldSession* sess, std::vector<std::string> const& fields)
+{
+    Player* me = sess ? sess->GetPlayer() : nullptr;
+    if (!me)
+        return;
+    bool const on = !fields.empty() && fields[0] == "1";
+    me->SetCombatPlateFilter(on);
+    TC_LOG_DEBUG("playerbot.v2", "[combat_plates] {} turns combat-only nameplates {}", me->GetName(), on ? "on" : "off");
+    SendFields(sess, client_seq, "PLATES_RESP", { on ? "1" : "0" });
+}
+
+// ----------------------------------------------------------------------------
 // SELF — addon counterpart to `.playerbot self on|off|status`. Attaches
 // or detaches the V2 bot logic to the issuing player's OWN character. Mirrors
 // HandleSelf in cs_playerbot_v2.cpp 1:1; keep these two paths in lock-step
@@ -1657,6 +1677,10 @@ void DispatchAssembled(WorldSession* sess, uint32 seq,
     {
         HandleAltsReq(seq, sess);
     }
+    else if (mtype == "PLATES")
+    {
+        HandlePlatesReq(seq, sess, fields);
+    }
     else if (mtype == "SUMMON")
     {
         HandleSummon(seq, sess, fields);
@@ -1688,6 +1712,89 @@ void DispatchAssembled(WorldSession* sess, uint32 seq,
 // ============================================================================
 // Public entry — called from the PlayerScript::OnChat hook.
 // ============================================================================
+// ============================================================================
+// Trading with a bot (ForeverBots_Trade.lua, `.bot trade <seq hex> <what you see>`).
+// The stock Trade button sends the offer state the client last heard of. A bot
+// answers an offer in the same moment (puts its side in, changes it, accepts),
+// so the click often carries an older state and the server answers "the trade
+// has changed", click after click. Right after the stock click the add-on sends
+// what the window shows: both sides' money and the item and count in each of the
+// six traded slots. When that is exactly what the window holds now, the player's
+// accept runs with the bot's current state; when it is not, nothing is accepted
+// (the player has not seen the new offer) and the add-on says to look again.
+//   TRADE_RESP|done      accepted for the player (the normal accept ran)
+//   TRADE_RESP|already   the stock click was accepted already
+//   TRADE_RESP|changed   the window is not what the player saw
+//   TRADE_RESP|none      no window with a bot (a trade with a player keeps the stock click only)
+// Answers always go as hidden system lines: alone, the client gets no add-on
+// whisper through (Net.lua), and this request usually comes from a solo player.
+// ============================================================================
+namespace {
+
+void SendTradeAnswer(WorldSession* sess, uint32 seq, std::string_view what)
+{
+    char head[24];
+    std::snprintf(head, sizeof(head), "%s|%08x|1|1|", kProtoVersion, seq);
+    std::string body = std::string(kSysMarker) + head + "TRADE_RESP|" + std::string(what);
+    WorldPackets::Chat::Chat sys;
+    sys.Initialize(CHAT_MSG_SYSTEM, LANG_UNIVERSAL, nullptr, nullptr, body);
+    sess->SendPacket(sys.Write());
+}
+
+// One side as the add-on writes it: money, then entry and count of traded slots 1-6 (0:0 for an empty slot).
+std::string TradeSideText(TradeData const* side)
+{
+    std::string out = std::to_string(side->GetMoney());
+    for (uint8 i = 0; i < TRADE_SLOT_TRADED_COUNT; ++i)
+    {
+        Item const* item = side->GetItem(TradeSlots(i));
+        out += ":" + std::to_string(item ? item->GetEntry() : 0u) + ":" + std::to_string(item ? item->GetCount() : 0u);
+    }
+    return out;
+}
+
+} // anonymous
+
+void BotTradeRequest(Player* player, uint32 seq, std::string const& seen)
+{
+    WorldSession* sess = player ? player->GetSession() : nullptr;
+    if (!sess)
+        return;
+
+    TradeData* mine = player->GetTradeData();
+    Player* bot = mine ? mine->GetTrader() : nullptr;
+    TradeData* theirs = bot ? bot->GetTradeData() : nullptr;
+    // only a window between this player and a bot: a trade with a player keeps the client's own accept and its state check
+    if (!theirs || theirs->GetTrader() != player || !Services::Initialized() || !Services::SessionMgr().IsHeadless(bot->GetGUID()))
+    {
+        SendTradeAnswer(sess, seq, "none");
+        return;
+    }
+
+    if (mine->IsAccepted())
+    {
+        SendTradeAnswer(sess, seq, "already");
+        return;
+    }
+
+    // what the player saw: the bot's side first, then the player's own
+    if (seen != TradeSideText(theirs) + ":" + TradeSideText(mine) || mine->IsInAcceptProcess() || theirs->IsInAcceptProcess())
+    {
+        TC_LOG_DEBUG("playerbot.v2", "[bot_trade] {} with {}: window changed since the click", player->GetName(), bot->GetName());
+        SendTradeAnswer(sess, seq, "changed");
+        return;
+    }
+
+    // The player's own accept with the bot's current state: every other check of a normal accept still runs (distance, money,
+    // bag room, items still there), and the bot finishes on its side as after a click.
+    WorldPacket packet(CMSG_ACCEPT_TRADE);
+    packet << uint32(theirs->GetServerStateIndex());
+    WorldPackets::Trade::AcceptTrade accept(std::move(packet));
+    accept.Read();
+    sess->HandleAcceptTradeOpcode(accept);
+    SendTradeAnswer(sess, seq, "done");
+}
+
 bool OnAddonWhisper(Player* sender, Player* /*receiver*/,
                     std::string const& prefix, std::string const& body)
 {
@@ -1741,6 +1848,7 @@ bool OnAddonWhisper(Player* sender, Player* /*receiver*/,
             && mtype != "LOGOUT_REQ"
             && mtype != "SELF"
             && mtype != "PING"
+            && mtype != "PLATES"
             && mtype != "LFG_REQ"
             && mtype != "POP_REQ"
             && mtype != "ASSIGN_REQ")

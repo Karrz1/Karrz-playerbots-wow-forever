@@ -5,6 +5,7 @@
 
 #pragma once
 #include "ClassicBuffLedger.h"
+#include "ResistGear.h"   // KeepFightCloak (gear_slot_held)
 
 #include "IdleWatch.h"
 #include "Dungeon/TankStill.h"
@@ -483,6 +484,17 @@ public:
     // equip-upgrade rule leaves the worn pieces alone, as for the resistance gear.
     bool   fight_cloak() const { return fight_cloak_; }
     void   set_fight_cloak(bool v) { fight_cloak_ = v; }
+    // Whether an equip rule must leave this equipment slot alone: every slot while the resistance gear is on, the back slot while the
+    // Onyxia Scale Cloak is. The own piece in the bags scores higher than the worn swap piece, so any score-based equip rule would put
+    // it straight back on (dev realm 2026-11-13: idle:dungeon_auto_equip took the cloak off again within seconds, and the raid pulled
+    // Nefarian in its own cloaks). The worn Onyxia Scale Cloak in Blackwing Lair is held whoever put it on (Classic::KeepFightCloak): a
+    // bot with no owner never runs the cloak rule, and a scenario raid's cloak (ScenarioDef::wear_entry) came off the same way
+    // (bwl_nefarian 2026-11-14: Mchealpa and Mcmaged died of the 22682 burn, with no "wears the Onyxia Scale Cloak" line from Shadow Flame).
+    bool   gear_slot_held(uint8 slot, uint32 map_id, uint32 worn_entry) const
+    {
+        return resist_gear_school_ != 0 ||
+               (slot == 14 /*EQUIPMENT_SLOT_BACK*/ && (fight_cloak_ || ::Playerbot::Classic::KeepFightCloak(map_id, worn_entry)));
+    }
 
     // Mailbox-open hesitation slot.
     uint32 pending_mail_open_at_ms() const { return pending_mail_open_at_ms_; }
@@ -845,6 +857,39 @@ public:
     // out of a dungeon run: those stay out while the owner leads with a follow order too.
     bool           dungeon_run_engaged() const { return dungeon_run_mode_ == DungeonRunMode::Active; }
 
+    // "Tank leads" (the owner's "lead on|pause|off", `.bot lead`, the ForeverBots Lead button): in a 5-man dungeon a human in the
+    // group normally leads and the bots follow him (human_lead_hold). With the lead on, the bot tank leads instead, as in a group of
+    // bots alone: it walks the route, pulls pack by pack and goes boss to boss, and the player follows. It still waits for the
+    // healer's and the casters' mana (PullManaGate), for the dead, and for the player when he is dead, outside or over
+    // kTankLeadPlayerHoldYd away. Paused: the lead stays with the tank, which starts no new pull and walks no further until "lead on".
+    // In a raid group on a raid map the main tank leads the trash the same way, but stops before each boss: it stands where it would
+    // pull from and waits until the player pulls himself or says "go" (tank_lead_boss_wait / tank_lead_boss_go; Karrz 2026-11-14).
+    // Ends on its own when the bot leaves the dungeon (update_dungeon_autopilot_hold). Every bot of the group holds it: the tank
+    // leads, the rest stay on the tank and fight its pulls. Written by the chat handler (world thread), read by the bot worker.
+    enum class TankLead : uint8 { Off = 0, On = 1, Paused = 2 };
+    static constexpr float kTankLeadPlayerHoldYd = 60.0f;
+    static constexpr uint32 kTankLeadLeaveMs = 10000;   // outside the dungeon this long (not a loading-screen blink): the lead ends
+    TankLead tank_lead() const { return TankLead(tank_lead_.load(std::memory_order_relaxed)); }
+    // Returns true when the value changed.
+    bool set_tank_lead(TankLead m) { return tank_lead_.exchange(uint8(m), std::memory_order_relaxed) != uint8(m); }
+    bool tank_lead_engaged() const { return tank_lead() != TankLead::Off; }
+    // The bot is in a 5-man dungeon, or in a raid group on a raid map, with the lead on (or paused): the human hold, the human-led
+    // passivity and the human-led mana exemption do not apply. A party that is not a raid group on a raid map is not led
+    // (raid_map_party_hold keeps it on its owner).
+    bool tank_leads_here(BotSnapshotView const& s) const;
+    // Raid lead, the boss stop: the entry of the boss the leading tank stands before (0: none), written by the tank's worker and read by
+    // the chat handler, which answers "go" with the pull; and the entry the player said "go" for, which lets that one pull through.
+    // Both are cleared once the boss fight starts, so a wipe stops again at the same boss.
+    uint32 tank_lead_boss_wait() const { return tank_lead_boss_wait_.load(std::memory_order_relaxed); }
+    void   set_tank_lead_boss_wait(uint32 entry) { tank_lead_boss_wait_.store(entry, std::memory_order_relaxed); }
+    uint32 tank_lead_boss_go() const { return tank_lead_boss_go_.load(std::memory_order_relaxed); }
+    void   set_tank_lead_boss_go(uint32 entry) { tank_lead_boss_go_.store(entry, std::memory_order_relaxed); }
+    // The reason the leading tank last told the group it waits ("mana", "you", ...) and when, so it says it once per hold
+    // (States: the advance gate). Bot worker only.
+    char const* tank_lead_said() const { return tank_lead_said_; }
+    uint32      tank_lead_said_ms() const { return tank_lead_said_ms_; }
+    void        note_tank_lead_said(char const* why, uint32 now_ms) { tank_lead_said_ = why; tank_lead_said_ms_ = now_ms; }
+
     // Owner "follow" order: the owner leads, so the bot follows its owner and defends, and the
     // dungeon autopilot stands down until the owner says attack / assist / tank / pull / resume /
     // run (or follow stop), or engages a mob himself. Unlike the 30s manual-mode window it lasts
@@ -857,7 +902,11 @@ public:
     // follow the owner and defend. Recomputed each tick (update_dungeon_autopilot_hold).
     bool raid_map_party_hold() const { return raid_map_party_hold_; }
     bool dungeon_autopilot_suspended() const
-    { return owner_follow_order() || owner_passive() || fallback_active() || pull_back_active() || raid_map_party_hold_ || human_lead_hold_ || owner_hold_; }
+    { return owner_follow_order() || (owner_passive() && !defensive_tank_lead()) || fallback_active() || pull_back_active() || raid_map_party_hold_ ||
+             human_lead_hold_ || owner_hold_; }
+    // The owner's Defensive stance (OwnerStance::Passive, the ForeverBots start setting) while the tank leads the dungeon: the lead is
+    // his order to go, so the autopilot runs and the bots fight the tank's pulls. The full Passive (NoFight) still stops everything.
+    bool defensive_tank_lead() const { return tank_leads_now_ && owner_stance() == OwnerStance::Passive; }
     // Owner stance (panel Aggressive / Passive toggle, whisper and group words "passive" / "aggressive"), kept per bot until
     // changed (the group order reaches every bot of the group):
     //   Auto       - passive when a human leads the group inside an instance, otherwise the bot's own autonomy;
@@ -892,6 +941,7 @@ public:
     {
         if (owner_no_fight()) return true;   // no order window opens the full Passive
         if (owner_order_window_open()) return false;
+        if (tank_leads_now_) return false;   // "lead on": the tank's pulls are the group's fights (Defensive and Auto alike)
         OwnerStance const st = owner_stance();
         return st == OwnerStance::Passive || (st == OwnerStance::Auto && human_led_instance);
     }
@@ -1031,7 +1081,8 @@ public:
     // Owner "use <object>" (BotCommandParser): walk to this game object and use it once (an altar, brazier, lever, orb); the
     // bot then stays put, so a ritual's channel is not broken by a follow. Written by the chat handler (world thread), run by
     // the bot worker (idle:owner_use); same mutex as the fallback. Ends on use, death, map change or after 30 s.
-    struct OwnerUseOrder { bool set = false; uint32 map = 0; ObjectGuid go; float x = 0.f, y = 0.f, z = 0.f; uint32 set_ms = 0; };
+    // ritual: taken by idle:ritual_join, not ordered - used only while the snapshot still picks this bot, and no Stay after it.
+    struct OwnerUseOrder { bool set = false; uint32 map = 0; ObjectGuid go; float x = 0.f, y = 0.f, z = 0.f; uint32 set_ms = 0; bool ritual = false; };
     bool owner_use_active() const { return owner_use_active_.load(std::memory_order_relaxed); }
     OwnerUseOrder owner_use_order() const
     { std::lock_guard<std::mutex> lk(fallback_mtx_); return owner_use_; }
@@ -3633,6 +3684,14 @@ private:
     bool           owner_hold_            = false;   // an owner Stay / Hold is on: the autopilot walks nobody (update_dungeon_autopilot_hold)
     bool           human_lead_hold_       = false;   // see human_lead_hold()
     uint32         human_seen_ms_         = 0;       // last tick a leading human was in range (0 = never)
+    std::atomic<uint8> tank_lead_{0};                // TankLead
+    std::atomic<uint32> tank_lead_boss_wait_{0};     // see tank_lead_boss_wait()
+    std::atomic<uint32> tank_lead_boss_go_{0};       // see tank_lead_boss_go()
+    uint32         tank_lead_inside_ms_   = 0;       // last tick inside a 5-man dungeon while the lead was on (0 = not yet)
+    uint32         tank_lead_away_ms_     = 0;       // first tick outside it since (0 = inside); the lead ends after kTankLeadLeaveMs
+    char const*    tank_lead_said_        = nullptr; // see tank_lead_said()
+    bool           tank_leads_now_        = false;   // tank_leads_here() as of this tick (update_dungeon_autopilot_hold); bot worker
+    uint32         tank_lead_said_ms_     = 0;
     BgRunMode      bg_run_mode_           = BgRunMode::Off;
     // Edge-tracker for BG entry/exit. Auto-activate fires on the
     // false→true transition of `in_battleground()`, not while the bot

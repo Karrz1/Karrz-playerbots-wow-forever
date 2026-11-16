@@ -27,10 +27,14 @@
 #include "Position.h"
 #include "PathLiquid.h"
 
+#include <cstddef>
+
+class Map;
 class Player;
 class Unit;
 class PathGenerator;
 struct LiquidData;   // declared in MapDefines.h (included transitively in the .cpp)
+enum ZLiquidStatus : uint32;   // MapDefines.h
 // WorldLocation is declared in Position.h (included above) as `class WorldLocation : public Position`.
 
 namespace Playerbot::BotMovement {
@@ -104,6 +108,39 @@ bool ProbeGround(Player* p, float x, float y, float zHint, float& out);
 // live navmesh); never call from an bot worker.
 bool NearestNavPoint(Player* p, float tx, float ty, float tz,
                      float hxy, float hz, Position& out);
+
+// Snapshot builds that run beside other builds of the SAME map must not load grids: a grid load adds creatures and navmesh
+// tiles while the other threads are reading them. While a ScopedDeferGridLoads is alive on a thread, EnsureGridForQuery
+// hands a grid that is not loaded yet to the world thread (LoadDeferredGrids, after the build barrier) and returns false, so
+// the caller has no answer for this build and gets the real one on the next build. Without the scope it loads the grid at
+// once and returns true, exactly as before.
+class ScopedDeferGridLoads
+{
+public:
+    ScopedDeferGridLoads();
+    ~ScopedDeferGridLoads();
+    ScopedDeferGridLoads(ScopedDeferGridLoads const&) = delete;
+    ScopedDeferGridLoads& operator=(ScopedDeferGridLoads const&) = delete;
+private:
+    bool previous_;
+};
+// Bot logic threads (the rule worker pool, AiWorkerPool) run their rules while the map threads update. For the life of a
+// ScopedBotLogicThread, EnsureGridForQuery never touches the map: it hands the grid to the world thread and returns true, so
+// the search runs on the tiles that are loaded now. The worker pool sets it once per thread, next to a
+// MMAP::ScopedThreadNavMeshQuery (own navmesh queries, searches under the navmesh read lock).
+class ScopedBotLogicThread
+{
+public:
+    ScopedBotLogicThread();
+    ~ScopedBotLogicThread();
+    ScopedBotLogicThread(ScopedBotLogicThread const&) = delete;
+    ScopedBotLogicThread& operator=(ScopedBotLogicThread const&) = delete;
+private:
+    bool previous_;
+};
+bool EnsureGridForQuery(Map* m, float x, float y);
+// World thread only, after the build barrier: loads the grids the builds asked for. Returns how many requests it handled.
+size_t LoadDeferredGrids();
 
 // Strict line-of-sight check used by ballistic moves (jump, charge).
 // Returns true if the straight line from src to dst is clear of static
@@ -189,8 +226,21 @@ enum class LiquidVerdict : uint8
     Dry,       // no liquid at the point — plain walkable ground
     Wadeable,  // liquid present but the bot's head stays above it (wade / water-walk)
     Swim,      // bot would be fully submerged for its collision height (drowns)
-    Hazard,    // magma or slime — lethal on contact
+    Hazard,    // a liquid that hurts there (LiquidHurts)
 };
+
+// The liquid in `ld` can hurt a player, the way the core applies liquids: magma burns (the lava damage of Player::HandleDrowning, or the
+// liquid's own spell), any other liquid only through a harmful spell on its LiquidType row (Unit::UpdateLiquidStatusOnPositionChange).
+// Slime has no damage of its own: the core's slime damage is switched off (Player.cpp, UNDERWATER_INSLIME).
+bool LiquidCanHurt(LiquidData const& ld);
+
+// The liquid in `ld` hurts a player whose liquid status is `st` (from the same Map::GetLiquidStatus probe). Magma: whenever it is there
+// at all, as before (the callers that care test contact themselves). A liquid's spell: only once the player is in it, IN_WATER or
+// UNDER_WATER, which is when Unit::UpdateLiquidStatusOnPositionChange casts it (IsInWater); on the surface it does nothing.
+// naxx_thaddius 1114g / 1115a: Thaddius' room has a sheet of Naxxramas - Slime (liquid type 21, spell 28801) lying on its floor at
+// z 292.8, so a bot on the floor stands on its surface (WATER_WALK). 1262 moves to the floor were refused as "Magma", the tanks
+// could not reach Stalagg and Feugen, and in 1500 s nobody standing on that floor took any damage from it.
+bool LiquidHurts(LiquidData const& ld, ZLiquidStatus st);
 
 // Classify the liquid at destination point (x,y,z) for `p`. See LiquidVerdict.
 // Optionally returns the raw LiquidData (level / depth_level / type_flags /

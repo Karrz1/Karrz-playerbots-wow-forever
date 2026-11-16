@@ -128,6 +128,15 @@ PlayerbotV2.ParallelSnapshotBuild = 1
 # the world thread also participates, so effective parallelism is this + 1.
 # Pool is sized once at first use (not hot-reloadable). HR-no.
 PlayerbotV2.SnapshotBuildThreads = 0
+# Also split the bots of ONE open-world map (Eastern Kingdoms, Kalimdor, ...)
+# over the build pool, so a busy continent uses all cores instead of one.
+# A group's bots always build on the same thread; dungeons, raids,
+# battlegrounds and arenas are never split. While split, each thread paths
+# with its own navmesh query and a build never loads a grid itself (the world
+# thread loads it right after the build). Needs ParallelSnapshotBuild = 1.
+# Read every tick (live-flippable via config reload). HR-yes.
+# DEFAULT 0 (one thread per map, as before) until it is measured on dev.
+PlayerbotV2.SnapshotBuildSplitMap = 0
 
 #-----------------------------------------------------------------------------
 # Population (defaults; override per realm)
@@ -243,8 +252,9 @@ Playerbot.World.Moving.LeadSec = 25
 Playerbot.World.Moving.LeadMin = 130
 Playerbot.World.Moving.SpawnFactor = 2
 Playerbot.World.Moving.DespawnBehindYards = 450
-# Share (%) of bots placed in a town (capital) that stay there for 20-40 min, using trainers, AH, bank and vendors.
-Playerbot.World.TownPct = 100
+# Share (%) of bots placed in a town (capital) that stay there for 45-90 min, using trainers, AH, bank and vendors. The rest run
+# errands for a while and then leave by the city gate to quest or grind, so the city has people coming and going.
+Playerbot.World.TownPct = 50
 # World-wide filler: 1 = the MaxBots budget not needed for the bubble around players is filled with bots all over
 # the world (pool bots log in where they last were; new ones are set up and sent to a leveling town of their
 # level). Far bots run on the cheap activity tiers. They are only logged out (farthest first) to make room for the
@@ -347,6 +357,9 @@ Playerbot.World.Town.LingerMaxSec = 12
 Playerbot.World.Town.SpotCap = 5
 Playerbot.World.Town.InnCap = 4
 Playerbot.World.Town.MailboxCap = 2
+# Most bots put down at one meeting place of a capital (the bank, the auction house, the inn) when they arrive; past it a newcomer is put
+# elsewhere in the district. 0 = no cap (the area cap below still holds).
+Playerbot.World.Town.HubCap = 6
 # The share of the city's bots that rest at the inn (8% by day, 20% in the evening, 35% at night) is scaled by this percent.
 Playerbot.World.Town.InnSharePct = 50
 # 1 = the city gate is one of the places (once the gate-duel driver has found it).
@@ -459,7 +472,7 @@ Playerbot.World.JumpGraceSec = 20
 # Most world bots within AreaRadius yards of one another: placement refuses a spot that is full and a pass moves the extras of a crowd
 # next to the nearest player (0 = no cap). Outdoors and in a capital.
 Playerbot.World.AreaCapOutdoors = 14
-Playerbot.World.AreaCapTown = 40
+Playerbot.World.AreaCapTown = 15
 # The same in a start zone (Camp Narache, Deathknell, ...), where every new character has the same camp and the same quest giver (0 = AreaCapOutdoors).
 Playerbot.World.AreaCapStart = 10
 Playerbot.World.AreaRadius = 45
@@ -483,9 +496,16 @@ Playerbot.World.TravelSoakLegSeconds = 1200
 # Player interaction
 #-----------------------------------------------------------------------------
 
-# Auto-accept invites: none | friends_or_higher | guild_or_higher | anyone
+# Whose group invite a bot takes: anyone (default) | guild | friends | none
+#   anyone   every player's invite (as before this key)
+#   guild    players on the bot's friend list and members of its guild
+#   friends  players on the bot's friend list (whisper the bot "addfriend <name>")
+#   none     no player's invite
+# The bot's owner and game masters are always answered, and the bots' own invites (pickup groups, listed bot groups, the
+# dungeon finder) are not touched. A turned-down invite is logged as "[group_invite] <bot> declines <player>".
+# (The old Playerbot.Interact.AutoAcceptInvites was never read and is not read now.)
 # HR-yes
-Playerbot.Interact.AutoAcceptInvites = friends_or_higher
+Playerbot.Interact.AcceptInvitesFrom = anyone
 
 # Bot relinquishes leadership on player join.
 # HR-yes
@@ -581,6 +601,15 @@ Playerbot.Raid.Callouts = 1
 # (a line not back within 2.5 s is said the fixed way). At most one leader line every 20 s (mild) or 10 s (harsh).
 #   0 = off, 1 = mild (teasing), 2 = harsh (a leader who freaks out at every mishap)
 Playerbot.Raid.Banter = 1
+
+# A raid of more than 15 talks like a crowd of players (Bot/Raid/RaidVoice.h): the bots' own chatter (loot, a death, a ready check)
+# with one line for the whole raid at a time, a few gg and grats after a kill, talk on the run back after a wipe and the leader's
+# rebuff call, a line now and then between pulls, and the raid leader bot saying what the next boss does when a player walks up to
+# it (Molten Core, Onyxia, Blackwing Lair). Only in a raid with a real player in it. With the bot bridge answering chat the
+# program may word the lines (a line not back within 2.5 s is said the fixed way).
+#   0 = off (the bots stay quiet in a big raid except Callouts and Banter, as before 0.1.37), 1 = normal, 2 = chatty
+#   (normal: one chatter line per raid every 30 s, between pulls a line every 2 to 3 minutes; chatty: twice as often)
+Playerbot.Raid.Talk = 1
 
 # A resurrection a bot casts on you is accepted for you after 3 s without an answer (the 70205 client shows no accept popup).
 Playerbot.Raid.AutoAcceptOwnerRez = 1
@@ -982,6 +1011,8 @@ Playerbot.Behavior.PoliteWorldBots = 1
 Playerbot.Behavior.InvitePassingPlayers = 0
 #   InvitePassingBots 1 (default) = a world bot (as above) may invite another world bot near it to a pickup group. 0 = it
 #                     does not. With both InvitePassing keys at 0 no world bot sends an invite nobody asked for.
+#                     Such a pickup group counts toward MaxBots and breaks up again after 10 to 20 minutes, or sooner once
+#                     none of its bots is within DespawnRadius of a player (the spawner then logs them out as usual).
 Playerbot.Behavior.InvitePassingBots = 1
 #   QuestAccept       a companion (a bot grouped with its owner) quests with him like a party member: it accepts a quest
 #                     its group shares with it, and when its owner takes a quest from an NPC beside it, it walks up to the

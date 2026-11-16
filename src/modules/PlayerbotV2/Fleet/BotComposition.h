@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "Define.h"
 #include <cstdint>
 #include <string>
 

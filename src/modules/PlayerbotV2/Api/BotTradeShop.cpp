@@ -149,6 +149,29 @@ bool IsForLater(Player const* bot, ItemTemplate const* t)
     return bot->CanUseItem(t, /*skipRequiredLevelCheck*/ true) == EQUIP_ERR_OK;
 }
 
+bool IsOwnSupply(Player const* bot, ItemTemplate const* t)
+{
+    if (!bot || !t || t->GetClass() != ITEM_CLASS_CONSUMABLE)
+        return false;
+    switch (t->GetSubClass())
+    {
+        case ITEM_SUBCLASS_POTION:
+        case ITEM_SUBCLASS_ELIXIR:
+        case ITEM_SUBCLASS_FLASK:
+        case ITEM_SUBCLASS_FOOD_DRINK:
+        case ITEM_SUBCLASS_ITEM_ENHANCEMENT:
+        case ITEM_SUBCLASS_BANDAGE:
+            break;
+        default:
+            return false;
+    }
+    bool on_use = false;
+    for (ItemEffectEntry const* eff : t->Effects)
+        if (eff->TriggerType == ITEM_SPELLTRIGGER_ON_USE && eff->SpellID > 0)
+            on_use = true;
+    return on_use && bot->CanUseItem(t) == EQUIP_ERR_OK;
+}
+
 bool IsUpgrade(Player* bot, ItemTemplate const* t)
 {
     if (!bot || !t || (t->GetClass() != ITEM_CLASS_WEAPON && t->GetClass() != ITEM_CLASS_ARMOR)) return false;
@@ -417,6 +440,7 @@ std::vector<BotTrade::Line> Lines(Player* bot, TradeData* side, bool mark_upgrad
             l.upgrade = IsUpgrade(bot, t);
             l.reagent = IsRecipeReagent(bot, items[i]->GetEntry());
             l.later = !l.upgrade && IsForLater(bot, t);
+            l.supply = IsOwnSupply(bot, t);
             l.value = BotTrade::PaidUnitPrice(unit[i], t->GetSellPrice(), l.upgrade) * items[i]->GetCount();
         }
         out.push_back(l);

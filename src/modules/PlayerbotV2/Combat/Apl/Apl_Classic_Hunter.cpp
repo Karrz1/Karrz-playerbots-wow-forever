@@ -143,9 +143,22 @@ bool ShouldTrueshotAura(ApPredicateContext const& ctx)
 }
 void DoTrueshotAura(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(TRUESHOT_AURA); }
 
+// A pet in an active slot that died and whose body is gone: saved with 0 health. While one is, the core refuses Call Pet for every
+// active pet ("your pet is dead", Spell::CheckCast) and only Revive Pet works, with no pet in the world to target.
+bool ActivePetDead(ApPredicateContext const& ctx)
+{
+    for (auto const& sp : ctx.bot.stable_pets())
+        if (sp.slot_kind == 0 && sp.creature_id != 0 && sp.dead)
+            return true;
+    return false;
+}
+
 bool ShouldCallPet(ApPredicateContext const& ctx)
 {
     if (ctx.bot.in_combat() || !ctx.bot.pet_guid().IsEmpty() || ctx.bot.owner_pet_off() || Classic::LoneWolfKeepsPetAway(ctx.bot)) return false;
+    // A dead pet whose body despawned left the guid empty, so the bot cast Call Pet again and again and the core refused each one
+    // (Discord, 2026-11-14); Revive Pet below brings it back instead.
+    if (ActivePetDead(ctx)) return false;
     if (!Ready(ctx, CALL_PET)) return false;
     for (auto const& sp : ctx.bot.stable_pets())
         if (sp.slot_kind == 0 && sp.creature_id != 0)
@@ -156,9 +169,11 @@ void DoCallPet(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(CALL_PET
 
 bool ShouldRevivePet(ApPredicateContext const& ctx)
 {
-    // Only when a pet existed and died; an empty guid means never tamed. Not while the owner keeps the pet away ("pet off").
-    return !ctx.bot.owner_pet_off() && !Classic::LoneWolfKeepsPetAway(ctx.bot) && !ctx.bot.pet_guid().IsEmpty() && !ctx.bot.has_pet()
-        && Ready(ctx, REVIVE_PET);
+    // Only when a pet existed and died: its body still lies there (a guid but no living pet), or the body is gone and the pet is
+    // saved dead in an active slot (no guid any more). Not while the owner keeps the pet away ("pet off").
+    if (ctx.bot.owner_pet_off() || Classic::LoneWolfKeepsPetAway(ctx.bot) || ctx.bot.has_pet()) return false;
+    if (ctx.bot.pet_guid().IsEmpty() && !ActivePetDead(ctx)) return false;
+    return Ready(ctx, REVIVE_PET);
 }
 void DoRevivePet(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(REVIVE_PET); }
 

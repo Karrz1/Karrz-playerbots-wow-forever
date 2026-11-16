@@ -3,6 +3,7 @@
 #include "../BotSnapshot.h"
 #include "Log.h"
 
+#include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>

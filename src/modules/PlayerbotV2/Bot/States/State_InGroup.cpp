@@ -101,14 +101,14 @@ static void AnswerReadyCheck(BotAI& ai, BotSnapshotView const& snapshot, GroupSn
             if (why)
             {
                 if (snapshot.is_alive())
-                    emit.say(why);
+                    BotChatter::SayToGroup(emit, snapshot, why);
             }
             else if (ready)
             {
                 // Now and then a plain "ready" in chat, like a person (Playerbot.Behavior.PartyBanter).
                 std::string line = BotChatter::BanterLine(BotChatter::Banter::Ready, ai, snapshot);
                 if (!line.empty())
-                    emit.say(std::move(line));
+                    BotChatter::SayToGroup(emit, snapshot, std::move(line));
             }
             ai.set_ready_check_acked(true);
             ai.set_last_rule_fired("ingroup:ready_check_ack");
@@ -767,7 +767,9 @@ void DispatchInGroup(BotAI& ai,
     // (the defend-member step below). Stance Passive, or Auto in an instance a human leads (BotAI::passive_now); an attack / pull
     // order opens a 15 s window in which it fights.
     // Led by a player (his companion, or a world bot he invited) and no stance picked: Passive, in the open world too.
-    const bool auto_passive = (snapshot.is_in_instance() && !group.leader_is_bot()) || snapshot.is_led_by_player();
+    // Not while the tank leads the dungeon ("lead on"): the bots fight the tank's pulls as in a group of bots alone.
+    const bool auto_passive = !ai.tank_leads_here(snapshot) &&
+                              ((snapshot.is_in_instance() && !group.leader_is_bot()) || snapshot.is_led_by_player());
     const bool owner_passive_stance = ai.passive_now(auto_passive);
     // The player is fighting: his bots fight with him (the owner, 2026-10-27: "bots should always fight if you're fighting"). Passive
     // only keeps a bot from STARTING a fight; once the human leader is in combat, the leader's target and every mob on a group member
@@ -792,7 +794,7 @@ void DispatchInGroup(BotAI& ai,
     // seconds the window never closed and the whole assist chain ran, the tank opening on mobs 32-43 y away).
     // Once the group fights, the window limits nothing: the owner pressing Attack through a pull kept his rogue and cat druid on his own
     // target only, and a warlock's is a spell's, not a melee victim; they stood beside him (UBRS 2026-10-28 22:10, Attack every 4-8 s).
-    const bool passive_kind = ai.owner_passive() ||
+    const bool passive_kind = (ai.owner_passive() && !ai.defensive_tank_lead()) ||
                               (ai.owner_stance() == BotAI::OwnerStance::Auto && auto_passive);
     const bool window_limited = !owner_passive_stance && passive_kind && !group_fight_on;
     // A Passive bot the group's fight released joins only that fight (GroupControl::LeaderFightMayJoin): his target, a mob near him,

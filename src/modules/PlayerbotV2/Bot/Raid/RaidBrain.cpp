@@ -8,10 +8,12 @@
 
 #include "RaidBrain.h"
 #include "Api/BotLanguage.h"
+#include "Api/ClassicSpec.h"
 #include "DispelWorth.h"
 #include "RaidBrainInternal.h"
 #include "RaidBanter.h"
 #include "RaidCallouts.h"
+#include "RaidVoice.h"
 #include "../BotBridge.h"
 #include "RaidEncounters.h"
 #include "RaidGeometry.h"
@@ -300,6 +302,7 @@ void SetIdleHostiles(Plan const& plan, Player* ref)
 // (Escape, Clearest, Usable), so a bot leaving a breath corridor takes the next way out instead of the nearest one, which for Onyxia's
 // north-south breath is the cave mouth and its whelps; ApplyKeepOut is the clamp for the moves that name a point (role spots, flanks).
 std::vector<Circle> g_keepOut;
+constexpr float kKeepOutScanYards = 120.0f;   // the creatures round the main tank checked against the keep-out circles (PublishTargets)
 
 void SetKeepOut(Plan const& plan)
 {
@@ -1726,7 +1729,7 @@ bool MagmaAt(Map* map, PhaseShift const& phase, float x, float y, float z, float
     ZLiquidStatus const st = map->GetLiquidStatus(phase, x, y, z, map_liquidHeaderTypeFlags::AllLiquids, &ld);
     if (!(st & MAP_LIQUID_STATUS_IN_CONTACT))
         return false;
-    if (!ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) && !ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Slime))
+    if (!BotMovement::LiquidHurts(ld, st))
         return false;
     surfaceZ = ld.level;
     return true;
@@ -2861,9 +2864,37 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             if (off <= 4.0f)
                 return;
             float sz = 0.0f;
-            if (!Usable(bot, spot->GetPositionX(), spot->GetPositionY(), spot->GetPositionZ(), sz))
-                continue;
             uint32_t& logged = g_guardRiseLog[bot->GetGUID().GetCounter()];
+            // The bones lie on the fight's floor, a fixed place (no sight line or fight-area test), and the guard must get there before the
+            // rise (urgent: the routine probe budget of a 40-player plan ran out first). The bone's own spot can sit on a clutter of
+            // objects the navmesh leaves out: the ring 3 y round it is as good, the area taunt reaches 10 y. bwl_nefarian 2026-11-14 11:55:
+            // two of three spare tanks could not use their bone and never moved.
+            float gx = spot->GetPositionX(), gy = spot->GetPositionY();
+            bool usable = Usable(bot, gx, gy, spot->GetPositionZ(), sz, /*urgent*/ true, /*hazard*/ false, /*fixedPlace*/ true);
+            int why = g_usableWhy;
+            for (int k = 0; !usable && k < 8; ++k)
+            {
+                float const a = float(k) * float(M_PI) / 4.0f;
+                float const rx = spot->GetPositionX() + 3.0f * std::cos(a), ry = spot->GetPositionY() + 3.0f * std::sin(a);
+                if (Usable(bot, rx, ry, spot->GetPositionZ(), sz, /*urgent*/ true, /*hazard*/ false, /*fixedPlace*/ true))
+                {
+                    usable = true;
+                    gx = rx;
+                    gy = ry;
+                }
+            }
+            if (!usable)
+            {
+                // Said, so a spare tank that never reaches the bones is seen (bwl_nefarian 2026-11-14 11:04: one of three guarded).
+                if (now - logged >= 10000)
+                {
+                    logged = now;
+                    TC_LOG_INFO("playerbot.v2.raid", "[raid_guard_rise] {} cannot stand on the {} bones at ({:.0f},{:.0f}) nor 3 y round them, {:.0f} y "
+                                "off: the spot is not usable (reason {}, last {}) ({} at {:.0f}%)", bot->GetName(), dead.size(), spot->GetPositionX(),
+                                spot->GetPositionY(), off, why, g_usableWhy, boss->GetName(), boss->GetHealthPct());
+                }
+                continue;
+            }
             if (now - logged >= 10000)
             {
                 logged = now;
@@ -2871,7 +2902,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                             bot->GetName(), dead.size(), rule.bones, spot->GetPositionX(), spot->GetPositionY(), off, boss->GetName(),
                             boss->GetHealthPct());
             }
-            SetMove(out, spot->GetPositionX(), spot->GetPositionY(), sz, "guard rise");
+            SetMove(out, gx, gy, sz, "guard rise");
             return;
         }
 
@@ -3083,12 +3114,32 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                     index = count;
                 ++count;
             }
-            float const depth = std::max(rule.maxDist - rule.minDist, 1.0f);
+            // A late boss the DPS keep off (Nefarian as he lands, LateBossHeld): the melee wait in the ranged band of the same wedge, out of his
+            // swings and Cleave, until his tank holds him and has turned him; then they walk in to their own band.
+            float minDist = rule.minDist, maxDist = rule.maxDist;
+            if (Matches(Who::Melee, self, plan.mainTank) && LateBossHeld(enemy->GetGUID().GetCounter()))
+            {
+                minDist = std::max(minDist, 23.0f);
+                maxDist = std::max(maxDist, 29.0f);
+            }
+            // A bot already in the wedge stays where it is. Its slot index counts the members on its side, which changes every time one
+            // of them steps out of a cone or crosses over, and without this check the slot moved and the bot walked again every 4 s:
+            // Karrz's dev raid 2026-11-14 15:40-15:42, the mage Gorham took 20 "flank boss" steps in 80 s, every one cut his Frostbolt
+            // short, and he did nothing for two minutes at full mana.
+            {
+                float const dBot = Dist2D(ex, ey, bot->GetPositionX(), bot->GetPositionY());
+                float const offBot = std::fabs(geo::NormalizeAngle(geo::Bearing(ex, ey, bot->GetPositionX(), bot->GetPositionY()) - eo));
+                if (dBot >= minDist && dBot <= maxDist && offBot >= centre - half && offBot <= centre + half &&
+                    !(!circles.empty() && InsideAny(circles, bot->GetPositionX(), bot->GetPositionY(), 0.5f)) &&
+                    !InAnyLiveCone(rules, plan, self, enemy, bot->GetPositionX(), bot->GetPositionY()))
+                    break;
+            }
+            float const depth = std::max(maxDist - minDist, 1.0f);
             uint32_t const rows = std::clamp(uint32_t(std::ceil(depth / 5.0f)), 1u, 4u);
             uint32_t const cols = std::max(1u, (count + rows - 1) / rows);
             uint32_t const row = index % rows, col = index / rows;
             float const angle = centre - half + (float(col) + 0.5f) / float(cols) * 2.0f * half;
-            float const dist = rule.minDist + (float(row) + 0.5f) / float(rows) * depth;
+            float const dist = minDist + (float(row) + 0.5f) / float(rows) * depth;
             float const slotAngle = eo + side * angle;
             // A slot is only a slot where nothing would move the bot out again: no hazard circle, no whelp-cave circle (a move that ends in one is
             // pushed out to its rim, which at her spawn spot put the casters in front of her) and no cone as she faces right now
@@ -3107,7 +3158,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                 for (float sign : { -1.0f, 1.0f })
                 {
                     float const d = dist + sign * 2.0f * float(k);
-                    if (d >= rule.minDist && d <= rule.maxDist && validAt(d, px, py))
+                    if (d >= minDist && d <= maxDist && validAt(d, px, py))
                     {
                         found = true;
                         break;
@@ -3187,6 +3238,8 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                 other = enemy;
         }
         if (!boss)
+            continue;
+        if (rule.maxFromEnemy > 0.0f && Dist2D(boss->GetPositionX(), boss->GetPositionY(), rule.x, rule.y) > rule.maxFromEnemy)
             continue;
         if (rule.needOtherEnemy ? !other : (rule.needVictimIsMe && boss->GetVictim() != bot))
             continue;
@@ -3608,6 +3661,23 @@ void ElectBerserkerDance(Election& e)
 
 // Melee soak (Patchwerk's Hateful Strike): the matching bots keep attacking the enemy in melee so they stay among its top
 // threat and soak the strike instead of a DPS. Never the main tank, at most rule.count bots, lowest guid first.
+constexpr float kSoakReach = 20.0f;         // a soaker this close to the enemy is in his melee (Patchwerk's reach is long)
+constexpr float kSoakThreatShare = 0.9f;    // a melee DPS stays under this share of the lowest soaker's threat
+
+// The bots that soak for <rule>: never the main tank, at most rule.count, lowest guid first (plan.members is sorted by guid).
+std::vector<Player*> MeleeSoakers(Plan const& plan, MeleeSoak const& rule)
+{
+    std::vector<Player*> out;
+    for (Member const& m : plan.members)
+    {
+        if (out.size() >= rule.count)
+            break;
+        if (m.bot && m.p != plan.mainTank && m.p->IsAlive() && Matches(rule.who, m, plan.mainTank))
+            out.push_back(m.p);
+    }
+    return out;
+}
+
 void PublishMeleeSoak(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders)
 {
     for (MeleeSoak const& rule : plan.rules->meleeSoak)
@@ -3615,20 +3685,45 @@ void PublishMeleeSoak(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& order
         {
             if (enemy->GetEntry() != rule.enemy)
                 continue;
-            uint32_t taken = 0;
-            for (Member const& m : plan.members)
-            {
-                if (taken >= rule.count)
-                    break;
-                if (!m.bot || m.p == plan.mainTank || !Matches(rule.who, m, plan.mainTank))
-                    continue;
-                auto it = orders.find(m.p->GetGUID().GetCounter());
-                if (it == orders.end())
-                    continue;
-                it->second.attack_target = enemy->GetGUID();
-                ++taken;
-            }
+            for (Player* p : MeleeSoakers(plan, rule))
+                if (auto it = orders.find(p->GetGUID().GetCounter()); it != orders.end())
+                    it->second.attack_target = enemy->GetGUID();
         }
+}
+
+// A melee DPS on a melee-soak enemy stays under the threat of the soakers in his reach, with no timed release: the strike takes the
+// highest-health player in melee among his top four on threat (classic_boss_patchwerk.cpp DoHatefulStrike), and a melee DPS held at the
+// main tank's threat was one of those four. naxx_patchwerk 1115f/1115g: 31 and 36 of the raid died to Hateful Strike, rogues and warriors
+// among the first, at 12-20k a strike. True when this bot is held (out.hold_target set).
+bool HoldUnderSoakers(Plan const& plan, Member const& m, Unit* target, RaidOrder& o)
+{
+    if (!plan.rules || m.ranged || m.healer || m.tank)
+        return false;
+    for (MeleeSoak const& rule : plan.rules->meleeSoak)
+    {
+        if (target->GetEntry() != rule.enemy)
+            continue;
+        std::vector<Player*> const soakers = MeleeSoakers(plan, rule);
+        if (std::find(soakers.begin(), soakers.end(), m.p) != soakers.end())
+            return false;
+        float lowest = -1.0f;
+        for (Player* s : soakers)
+            if (s->IsWithinDistInMap(target, kSoakReach))
+            {
+                float const t = target->GetThreatManager().GetThreat(s);
+                lowest = lowest < 0.0f ? t : std::min(lowest, t);
+            }
+        if (lowest < 0.0f)
+            return false;   // no soaker in his reach: nothing to stay under (the strike goes to whoever is there either way)
+        float myThreat = target->GetThreatManager().GetThreat(m.p);
+        if (Pet* pet = m.p->GetPet())
+            myThreat = std::max(myThreat, target->GetThreatManager().GetThreat(pet));
+        if (myThreat < lowest * kSoakThreatShare)
+            return false;
+        o.hold_target = target->GetGUID();
+        return true;
+    }
+    return false;
 }
 
 bool MechanicsMove(Plan const& plan, Member const& self, uint32_t now, RaidOrder& out)
@@ -3977,6 +4072,29 @@ uint8_t MemberDamageSchools(Member const& m, Player* mainTank)
     }
 }
 
+// The school(s) of a caster's main nuke, by its spec. MemberDamageSchools counts every school the class has, so a frost mage still
+// "can hurt" a Blue Drakonid (400 frost) with fire and arcane, but its rotation is Frostbolt and its talents back frost: Karrz noticed in
+// his 11-14 pulls that one drakonid colour took far less from him than the other. Phase 1 resistances (creature_template_resistance,
+// VMaNGOS): Blue 14261 frost 400 (arcane 100), Green 14262 nature 400, Bronze 14263 arcane 400, Red 14264 fire 400, Black 14265 fire and
+// shadow 400, Chromatic 14302 250 in every magic school.
+uint8_t MemberMainSchools(Member const& m, Player* mainTank)
+{
+    if (!Matches(Who::Caster, m, mainTank))
+        return MemberDamageSchools(m, mainTank);
+    switch (::Playerbot::Classic::EffectiveSpecId(m.p))
+    {
+        case 62:  return uint8_t(SPELL_SCHOOL_MASK_ARCANE);                           // Arcane mage: Arcane Missiles
+        case 63:  return uint8_t(SPELL_SCHOOL_MASK_FIRE);                             // Fire mage: Fireball, Scorch
+        case 64:  return uint8_t(SPELL_SCHOOL_MASK_FROST);                            // Frost mage: Frostbolt
+        case 265: case 266: case 267:
+                  return uint8_t(SPELL_SCHOOL_MASK_SHADOW);                           // every warlock: Shadow Bolt
+        case 258: return uint8_t(SPELL_SCHOOL_MASK_SHADOW);                           // Shadow priest: Mind Blast, Mind Flay
+        case 102: return uint8_t(SPELL_SCHOOL_MASK_NATURE | SPELL_SCHOOL_MASK_ARCANE); // Balance druid: Wrath, Starfire
+        case 262: return uint8_t(SPELL_SCHOOL_MASK_NATURE);                           // Elemental shaman: Lightning Bolt
+        default:  return MemberDamageSchools(m, mainTank);
+    }
+}
+
 // Forbidden targets and the fallback a DPS bot attacks instead.
 void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, ObjectGuid coordFocus)
 {
@@ -4025,6 +4143,23 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
         for (Unit* enemy : plan.enemies)
             if (enemy->GetEntry() == rule.enemy && SpareNow(rule, enemy->GetHealthPct(), gateAlive))
                 forbiddenAll.push_back(enemy->GetGUID());
+    }
+    // Nobody attacks an idle creature inside a keep-out circle (RaidRules::keepOut: Kel'Thuzad's alcoves, Onyxia's cave mouths): a shot, a
+    // DoT or an area spell there wakes the pack round it (Kel'Thuzad's alcove adds attack whoever hits them, SpellHit in classic_kt_p1AddAI).
+    // naxx_kelthuzad 1114f: with the raid kept out of the alcoves, a warlock still had both Abominations and four Soldiers of one alcove on
+    // him 6 s in, and from 24 s on 20-30 adds were loose. An engaged one is fought wherever it is: the adds the script sends at the raid
+    // cross the circles on their way in, and the Soldiers have to die before they arrive. naxx_kelthuzad 1114g, with every creature in the
+    // circles forbidden: the Soldiers walked in at 100%, Dark Blast killed 18 and the raid wiped at 103 s.
+    if (!g_keepOut.empty() && !plan.members.empty())
+    {
+        Player* const scout = plan.mainTank ? plan.mainTank : plan.members.front().p;
+        std::list<Creature*> near;
+        FindCreatureOptions alive;
+        alive.IsAlive = FindCreatureAliveState::Alive;
+        scout->GetCreatureListWithOptionsInGrid(near, kKeepOutScanYards, alive);
+        for (Creature* c : near)
+            if (c->IsHostileTo(scout) && !c->IsEngaged() && InsideAny(g_keepOut, c->GetPositionX(), c->GetPositionY(), 0.0f))
+                forbiddenAll.push_back(c->GetGUID());
     }
     auto const trailsHolder = [&packHolders](Unit* enemy)
     {
@@ -4098,7 +4233,13 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
         {
             if (rule.enemy != enemy->GetEntry() || !Matches(rule.who, m, plan.mainTank))
                 continue;
-            if (rule.gateEnemy)
+            if (rule.gateEnemy == rule.enemy)
+            {
+                // Gated on itself: this one enemy's own health (Gluth's Zombie Chows once Decimate has left them at 5%, not a fresh one).
+                if (!InPhase(enemy, rule.hpMax, rule.hpMin))
+                    continue;
+            }
+            else if (rule.gateEnemy)
             {
                 bool gated = false;
                 for (Unit* gate : plan.enemies)
@@ -4320,6 +4461,8 @@ void PublishThreatHolds(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& ord
                 if (!vm || !vm->tank)
                     continue;   // it is already hitting a non-tank: everybody fights
             }
+        if (HoldUnderSoakers(plan, m, target, o))
+            continue;
         float tankThreat = 0.0f;
         bool tankNear = false;
         for (Member const& t : plan.members)
@@ -4598,6 +4741,174 @@ void WipeBanter(Group* group, Map* map, std::string const& firstDead, std::strin
     }
 }
 
+// ---------------------------------------------------------------------------
+// The raid's voice (RaidVoice.h, Playerbot.Raid.Talk): a raid of more than 15 with a real player in it talks like a crowd. The kill
+// crowd, the run back after a wipe, a line now and then between pulls, and the leader's word on the next boss.
+// ---------------------------------------------------------------------------
+
+RaidTalk TalkNow() { return RaidTalkFromConfig(Services::Config().raid_talk()); }
+
+bool VoicedRaid(Group const* group)
+{
+    return group && group->GetMembersCount() > kRaidVoiceGroupSize && TalkNow() != RaidTalk::Off && GroupHasHuman(group);
+}
+
+// A line of the raid's voice (not a mistake): the program may word it like the banter (raid_line, `what` the moment), else the
+// fixed `text` at `delayMs`. `ask` false: the fixed line only (the leader's boss brief is information, never reworded).
+void QueueVoice(Group* group, Player* bot, char const* what, std::string const& detail, std::string const& text, bool leader,
+                uint32_t delayMs, uint32_t now, bool ask = true)
+{
+    if (text.empty() || !bot || g_banterQueue.size() >= 64)
+        return;
+    uint64 const id = ask ? BotBridge::AskRaidLine(bot, what, detail, text, "mild", leader ? "raid leader" : "raider", delayMs, kModelWaitMs) : 0;
+    g_banterQueue.push_back({ now + (id ? std::max(delayMs, kModelWaitMs) : delayMs), group->GetGUID(), bot->GetGUID(), text, id });
+    TC_LOG_INFO("playerbot.v2.raid", "[raid_voice] {} ({}{}): {}{}", bot->GetName(), what, leader ? ", leader" : "", text,
+        id ? " (asked the program first)" : "");
+}
+
+// The group's bots on `map` other than `except`, in random order (`aliveOnly`: the living only).
+std::vector<Player*> VoiceCrowd(Group* group, Map* map, Player const* except, bool aliveOnly)
+{
+    std::vector<Player*> out;
+    for (GroupReference const& ref : group->GetMembers())
+        if (Player* m = ref.GetSource(); m && m != except && m->IsInWorld() && m->GetMap() == map && (!aliveOnly || m->IsAlive()) &&
+                                         Services::Lifecycle().is_bot(m->GetGUID().GetCounter()))
+            out.push_back(m);
+    for (size_t i = out.size(); i > 1; --i)
+        std::swap(out[i - 1], out[urand(0, uint32(i - 1))]);
+    return out;
+}
+
+// After a kill: besides the leader's line (RaidBanter BossDown), a few raiders say gg / grats, and a few cheer.
+void KillCrowd(Group* group, Map* map, std::string const& boss, uint32_t now)
+{
+    if (!VoicedRaid(group) || !map)
+        return;
+    RaidVoiceTuning const t = VoiceTuning(TalkNow());
+    std::vector<Player*> const crowd = VoiceCrowd(group, map, BanterLeader(group, map), true);
+    size_t const speakers = std::min<size_t>(crowd.size(), urand(1, t.killCrowd));
+    std::string const detail = "your raid just killed " + (boss.empty() ? std::string("the boss") : boss) + "; say something short in raid chat";
+    uint32_t at = urand(2500, 4000);
+    for (size_t i = 0; i < speakers; ++i)
+    {
+        QueueVoice(group, crowd[i], "kill_crowd", detail, std::string(KillLine(urand(0, 63))), false, at, now);
+        at += urand(1500, 4000);
+    }
+    size_t const cheers = std::min<size_t>(crowd.size(), speakers + urand(2, 4));
+    for (size_t i = speakers; i < cheers; ++i)
+        crowd[i]->HandleEmoteCommand(EMOTE_ONESHOT_CHEER);
+}
+
+// After a wipe: a few raiders talk on the run back (repair, rez, rebuff), and the leader calls the rebuff.
+void RunBackVoice(Group* group, Map* map, std::string const& boss, uint32_t now)
+{
+    if (!VoicedRaid(group) || !map)
+        return;
+    RaidVoiceTuning const t = VoiceTuning(TalkNow());
+    Player* leader = BanterLeader(group, map);
+    std::vector<Player*> const crowd = VoiceCrowd(group, map, leader, false);
+    size_t const speakers = std::min<size_t>(crowd.size(), urand(1, t.runBackCrowd));
+    std::string const at_boss = boss.empty() ? std::string() : " on " + boss;
+    uint32_t at = urand(9000, 13000);
+    for (size_t i = 0; i < speakers; ++i)
+    {
+        QueueVoice(group, crowd[i], "run_back", "your raid wiped" + at_boss + " and is running back to try again; say something short",
+            std::string(RunBackLine(urand(0, 63))), false, at, now);
+        at += urand(4000, 9000);
+    }
+    if (leader)
+        QueueVoice(group, leader, "rebuff_call", "the raid wiped" + at_boss + "; tell everyone to resurrect, rebuff and try again",
+            std::string(LeaderRebuffLine(urand(0, 63))), true, at + urand(2000, 5000), now);
+}
+
+// Per raid (group, map): when it last fought, and when somebody next says something between pulls.
+struct VoiceClock { uint32_t lastFight = 0; uint32_t nextIdle = 0; uint32_t nextBriefScan = 0; uint32_t seen = 0; };
+std::unordered_map<uint64_t, VoiceClock> g_voiceClock;
+BossBriefGate g_bossBrief;
+
+uint32_t IdleGap(RaidVoiceTuning const& t) { return urand(t.idleGapMs * 7 / 10, t.idleGapMs * 13 / 10); }
+
+// The creatures a leader explains besides the map's bosses: Lord Victor Nefarius, who starts Nefarian's fight.
+constexpr uint32_t kBriefExtras[] = { 10162 };
+
+// Between pulls (the plan pass out of combat): a line now and then, and the leader's word on a boss a player walks up to.
+void VoiceBetweenPulls(uint64_t key, Group* group, Plan const& plan, Map* map, uint32_t now)
+{
+    if (!VoicedRaid(group) || !map)
+        return;
+    RaidVoiceTuning const t = VoiceTuning(TalkNow());
+    VoiceClock& c = g_voiceClock[key];
+    c.seen = now;
+    if (!c.nextIdle)
+        c.nextIdle = now + IdleGap(t);
+    if (!c.lastFight)
+        c.lastFight = now;
+
+    // The next boss: a real player within 60 y of one that is alive and not fighting. Looked for every 3 s.
+    if (int32_t(now - c.nextBriefScan) >= 0)
+    {
+        c.nextBriefScan = now + 3000;
+        for (Member const& m : plan.members)
+        {
+            if (m.bot || !m.p)
+                continue;
+            auto const brief = [&](uint32_t entry)
+            {
+                Creature* boss = m.p->FindNearestCreature(entry, 60.0f, true);
+                if (!boss || boss->IsInCombat() || !g_bossBrief.Allow(plan.groupLow, entry, t, now))
+                    return false;
+                if (Player* leader = BanterLeader(group, map))
+                    QueueVoice(group, leader, "boss_brief", {}, std::string(BossBrief(entry)), true, urand(800, 1600), now, /*ask=*/false);
+                return true;
+            };
+            bool said = false;
+            for (uint32_t entry : plan.rules->bosses)
+                if ((said = brief(entry)))
+                    break;
+            if (!said && plan.mapId == 469)
+                for (uint32_t entry : kBriefExtras)
+                    if ((said = brief(entry)))
+                        break;
+            if (said)
+            {
+                c.nextIdle = std::max(c.nextIdle, now + t.idleQuietMs);   // no small talk over the brief
+                return;
+            }
+        }
+    }
+
+    // Small talk: once the raid has been out of combat a while, about every idleGapMs; now and then the leader instead.
+    if (now - c.lastFight < t.idleQuietMs || int32_t(now - c.nextIdle) < 0)
+        return;
+    c.nextIdle = now + IdleGap(t);
+    Player* leader = BanterLeader(group, map);
+    if (leader && urand(0, 3) == 0)
+    {
+        QueueVoice(group, leader, "between_pulls", "the raid is resting between pulls; say something short to get them ready for the next one",
+            std::string(LeaderIdleLine(urand(0, 63))), true, urand(0, 1500), now);
+        return;
+    }
+    std::vector<Player*> const crowd = VoiceCrowd(group, map, leader, true);
+    if (!crowd.empty())
+        QueueVoice(group, crowd.front(), "between_pulls", "your raid is resting between pulls in " + std::string(map->GetMapName()) +
+            "; say something short a raider would say now", std::string(IdleLine(urand(0, 63))), false, urand(0, 1500), now);
+}
+
+// The plan pass in combat: the raid is fighting.
+void VoiceFighting(uint64_t key, uint32_t now)
+{
+    if (auto it = g_voiceClock.find(key); it != g_voiceClock.end())
+        it->second.lastFight = it->second.seen = now;
+    else if (TalkNow() != RaidTalk::Off)
+        g_voiceClock[key] = { now, 0, 0, now };
+}
+
+void ForgetVoiceClocks(uint32_t now)
+{
+    for (auto it = g_voiceClock.begin(); it != g_voiceClock.end();)
+        it = now - it->second.seen > 600000 ? g_voiceClock.erase(it) : std::next(it);
+}
+
 // Per raid group: what the banter watches between plan passes.
 struct BanterWatch
 {
@@ -4715,6 +5026,7 @@ struct PullLog
     uint32_t startMs = 0, lastSeenMs = 0;
     uint32_t startAlive = 0, groupSize = 0;
     uint32_t aliveLast = 0;   // raiders alive at the last plan pass of the pull (the end line is written 4 s later, often after the squad left the map)
+    uint32_t aliveLow = 0;    // the fewest raiders alive at any plan pass of the pull (a wipe's low point, before ghosts revive and come back)
     // seenDead: its corpse was seen. A mob that merely left the map (evade and despawn after a wipe) is not a kill (n32 mc_majordomo: the
     // eight adds despawned at 89-99 % health and the line read "killed=8/9").
     struct Mob { uint32_t entry; std::string name; bool boss; bool seenDead = false; int32_t lastPct = 100; };
@@ -4969,6 +5281,7 @@ void TrackPull(uint64_t key, Group* group, detail::Plan const& plan, Map* map, u
         pl.groupLow = plan.groupLow;
         pl.startMs = now_ms;
         pl.startAlive = uint32_t(plan.members.size());
+        pl.aliveLow = pl.startAlive;
         pl.groupSize = group->GetMembersCount();
         ResetHealStats();
         ManaLedgerReset();
@@ -4976,6 +5289,7 @@ void TrackPull(uint64_t key, Group* group, detail::Plan const& plan, Map* map, u
     }
     pl.lastSeenMs = now_ms;
     pl.aliveLast = uint32_t(plan.members.size());
+    pl.aliveLow = std::min(pl.aliveLow, pl.aliveLast);
     for (Member const& m : plan.members)
         IncomingWatch(m.p->GetGUID().GetCounter(), m.tank);
     for (GroupReference const& gref : group->GetMembers())
@@ -5122,9 +5436,13 @@ void EndQuietPulls(uint32_t now_ms)
         // A wipe is raiders dead, not raiders gone: a scenario that ends at its death limit takes the squad out of the map, and a raid that
         // left the instance is no wipe either (onyxia_full / mc_geddon n7 2026-10-14: six deaths, run over, "alive=0/40 wipe").
         bool const mostDead = pl.deaths * 4 >= pl.startAlive * 3;
+        // The raid at its lowest, not at the end: dead bots revive and are ported back to the group within seconds, so 4 s after the last
+        // pass the map held 25 of 40 alive again after a wipe that left 2 standing (dev BWL Nefarius 2026-11-13 22:29: deaths=39,
+        // "alive=25/40 result=reset", and nobody said a word about the wipe).
+        bool const raidFell = std::min(alive, pl.aliveLow) * 4 <= pl.startAlive;
         // The boss dead is a kill even with its adds still standing (Garr's Firesworn, Ragnaros' Sons of Flame): the left list names them.
         bool const bossKilled = bosses > 0 && bossesDead == bosses;
-        char const* result = killed == pl.engaged.size() || bossKilled ? "kill" : ((alive * 4 <= pl.startAlive && mostDead) || humanDeadNoneAlive ? "wipe" : "reset");
+        char const* result = killed == pl.engaged.size() || bossKilled ? "kill" : ((raidFell && mostDead) || humanDeadNoneAlive ? "wipe" : "reset");
         // The raid leader's word on it, and after a wipe the others' (RaidBanter). A group of 15 or fewer has the companions' own
         // wipe and kill lines (PartyBanter) instead.
         if (Group* bg = sGroupMgr->GetGroupByGUID(ObjectGuid::Create<HighGuid::Party>(pl.groupLow));
@@ -5135,13 +5453,24 @@ void EndQuietPulls(uint32_t now_ms)
                 if (mob.boss && bossName.empty())
                     bossName = mob.name;
             if (bossKilled)
+            {
                 LeaderReacts(bg, map, Mishap::BossDown, pl.firstDead, bossName, now_ms);
+                KillCrowd(bg, map, bossName, now_ms);
+            }
             else if (std::strcmp(result, "wipe") == 0)
+            {
                 WipeBanter(bg, map, pl.firstDead, bossName, now_ms);
+                RunBackVoice(bg, map, bossName, now_ms);
+            }
         }
-        TC_LOG_INFO("playerbot.v2.raid", "[raid_encounter] ts={} map={} group={} pull end: result={} dur={}s killed={}/{} alive={}/{} deaths={} | {}{}{}",
+        // A wipe on a boss: the leader explains it again on the way back in (RaidVoice.h).
+        if (std::strcmp(result, "wipe") == 0)
+            for (auto const& [guid, mob] : pl.engaged)
+                if (mob.boss)
+                    g_bossBrief.Wiped(pl.groupLow, mob.entry);
+        TC_LOG_INFO("playerbot.v2.raid", "[raid_encounter] ts={} map={} group={} pull end: result={} dur={}s killed={}/{} alive={}/{} low={} deaths={} | {}{}{}",
             uint64_t(GameTime::GetGameTime()), pl.mapId, pl.groupLow, result, (pl.lastSeenMs - pl.startMs) / 1000, killed,
-            uint32_t(pl.engaged.size()), alive, pl.startAlive, pl.deaths, PullLabel(pl), left.empty() ? "" : " | left: ", left);
+            uint32_t(pl.engaged.size()), alive, pl.startAlive, pl.aliveLow, pl.deaths, PullLabel(pl), left.empty() ? "" : " | left: ", left);
         // Healer throughput of the pull: heal casts per minute per healer (a healer missing from the list cast nothing).
         uint32_t healersCast = 0;
         std::string const healStats = TakeHealStats(uint32_t((pl.lastSeenMs - pl.startMs) / 1000), healersCast);
@@ -5306,7 +5635,8 @@ void SayCallout(Player* bot, RaidOrder const& o, uint32_t now_ms)
     f.move_reason = o.move && o.move_reason ? o.move_reason : "";
     f.hold_rotation = o.hold_rotation;
     f.use_object = !o.use_object.IsEmpty();
-    if (o.cast_kind == RaidOrder::CastKind::Taunt || o.cast_kind == RaidOrder::CastKind::CrowdControl)
+    if (o.cast_kind == RaidOrder::CastKind::Taunt || o.cast_kind == RaidOrder::CastKind::CrowdControl ||
+        o.cast_kind == RaidOrder::CastKind::Purge)
     {
         Unit const* target = o.cast_target.IsEmpty() ? nullptr : ObjectAccessor::GetUnit(*bot, o.cast_target);
         if (target)
@@ -5316,7 +5646,20 @@ void SayCallout(Player* bot, RaidOrder const& o, uint32_t now_ms)
         if (o.cast_kind == RaidOrder::CastKind::CrowdControl)
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(o.cast_spell, DIFFICULTY_NONE))
                 f.long_cc = info->GetMaxDuration() >= 15000;
+        // A purge is called on a boss only (Flamegor's frenzy, Chromaggus' enrage): on trash it would be every few seconds.
+        if (o.cast_kind == RaidOrder::CastKind::Purge)
+            f.purge = target && target->ToCreature() && IsBossCreature(target->ToCreature());
     }
+    // Out of sight: dropping a stacking debuff (Firemaw's Flame Buffet) when the bot carries the rule's aura, else hiding from a
+    // breath (Chromaggus).
+    if (f.move_reason == "break sight")
+        if (RaidRules const* rules = RulesForMap(bot->GetMapId()))
+            for (BreakSight const& rule : rules->breakSight)
+                if (rule.aura && bot->HasAura(rule.aura))
+                {
+                    f.sight_aura = SpellNameOf(rule.aura);
+                    break;
+                }
     if (f.move_reason == "carrier run")
         if (RaidRules const* rules = RulesForMap(bot->GetMapId()))
             for (CarrierRun const& rule : rules->carrierRun)
@@ -5327,7 +5670,9 @@ void SayCallout(Player* bot, RaidOrder const& o, uint32_t now_ms)
                 }
 
     Callout const c = PickCallout(f);
-    if (!g_callouts.Allow(group->GetGUID().GetCounter(), bot->GetGUID().GetCounter(), c.kind, c.group_wide, now_ms))
+    // The same sheep or tranq on the same target is called once for the raid, whichever bot casts it.
+    std::string_view const subject = c.kind == CalloutKind::CrowdControl || c.kind == CalloutKind::Tranq ? std::string_view(f.target) : std::string_view();
+    if (!g_callouts.Allow(group->GetGUID().GetCounter(), bot->GetGUID().GetCounter(), c.kind, c.group_wide, now_ms, subject))
         return;
     ChatMsg type = group->isRaidGroup()
         ? (group->IsLeader(bot->GetGUID()) ? CHAT_MSG_RAID_LEADER : CHAT_MSG_RAID)
@@ -5601,6 +5946,7 @@ void Brain::Update(uint32_t now_ms)
     LogDeadHumanReleaseState(now_ms);
     EndAbandonedEncounters(now_ms);
     SayDueBanter(now_ms);
+    ForgetVoiceClocks(now_ms);
 
     // Bucket bots on raid maps that have rules by (group, map).
     struct Bucket { Group* group = nullptr; uint32_t mapId = 0; uint64_t refBot = 0; Player* ref = nullptr; };
@@ -5711,9 +6057,11 @@ void Brain::Update(uint32_t now_ms)
         {
             FillRaidRoles(key, plan, now_ms);
             WarnBeforePull(plan, b.ref->GetMap(), now_ms);
+            VoiceBetweenPulls(key, b.group, plan, b.ref->GetMap(), now_ms);
             MechanicsPrePull(plan, next, dump, now_ms);
             continue;
         }
+        VoiceFighting(key, now_ms);
 
         dump << plan.rules->name << " group " << b.group->GetGUID().GetCounter() << ": " << plan.members.size() << " members, "
              << plan.enemies.size() << " enemies\n";
@@ -5867,6 +6215,8 @@ void Brain::Update(uint32_t now_ms)
         ElectPurges(e, CoordinatorFocus(plan.groupLow, plan.mapId));
         ElectCrowdControl(e, tankTargets, CoordinatorFocus(plan.groupLow, plan.mapId));
         PublishTargets(plan, next, CoordinatorFocus(plan.groupLow, plan.mapId));
+        if (plan.mapId == 533)
+            NaxxPostTargets(plan, next);
         if (std::vector<EnemySchools> hints = SchoolHints(plan, dump); !hints.empty())
             nextSchools[FocusKey(plan.groupLow, plan.mapId)] = std::move(hints);
         if (!plan.ruleFocus.IsEmpty())

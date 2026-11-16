@@ -69,6 +69,7 @@
 #include "Fleet/OwnerRegistry.h"
 #include "Bot/Gear/OwnedGearPolicy.h"
 #include "Bot/BotAI.h"
+#include "Bot/BotCommandParser.h"   // ApplyLeadOrder for `.bot lead`
 #include "Bot/Formation.h"
 #include "Bot/BotIntentEmitter.h"
 #include "Threading/IntentQueue.h"
@@ -691,6 +692,8 @@ public:
             { "add",           HandleBotAdd,        rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "lfg",           HandleBotLfg,        rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "dungeon",       HandleBotDungeon,    rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            // Every player: `.bot lead [on|pause|off]` hands the lead of a 5-man dungeon to the caller's tank bot and back.
+            { "lead",          HandleBotLead,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "call",          HandleBotCall,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             // Every player: brings the caller's own bots only (`.bot summon all|saved|<bot name>`).
             { "summon",        HandleBotSummon,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No },
@@ -704,6 +707,8 @@ public:
             { "unsave",        HandleBotUnsave,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "delete",        HandleBotDelete,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "list",          HandleBotList,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            // Every player: the ForeverBots trade window (accept a bot's offer as seen). Sent by the add-on, not typed.
+            { "trade",         HandleBotTrade,      rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "language",      HandleBotLanguage,   rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "world",         HandleBotWorld,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             // GM only: how many world bots the realm has (Off / Low / Medium / High), set in game until the next restart (the launcher's Bots setting decides at every start).
@@ -810,6 +815,22 @@ public:
         return true;
     }
 
+    // `.bot trade <seq hex> <what the window shows>`: right after the stock Trade click, the ForeverBots trade window sends what it
+    // shows, and a trade with a bot is accepted when that is still exactly the offer (AddonControl::BotTradeRequest). Alone the
+    // add-on sends it as a whisper to the player's own name from the click: a dot command runs before any whisper is made, so
+    // nothing is sent to anyone. The answer is a hidden TRADE_RESP frame, never plain text.
+    static bool HandleBotTrade(ChatHandler* handler, std::string seqHex, std::string seen)
+    {
+        WorldSession* sess = handler->GetSession();
+        Player* me = sess ? sess->GetPlayer() : nullptr;
+        if (!me || seqHex.empty() || seqHex.size() > 8 || seqHex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+            return true;   // quiet: only the add-on sends this
+        if (seen.empty() || seen.size() > 230 || seen.find_first_not_of("0123456789:") != std::string::npos)
+            return true;
+        Playerbot::V2::AddonControl::BotTradeRequest(me, uint32(std::strtoul(seqHex.c_str(), nullptr, 16)), seen);
+        return true;
+    }
+
     // ---- .bot: one-step companions ------------------------------------------------------------------------------
 
     static Playerbot::Role ParseRoleWord(std::string const& token, bool& ok)
@@ -872,6 +893,19 @@ public:
     // .bot about: the name of the bots, so it shows in the command list and `.bot` help
     // .bot language [auto|en|ru]: the language your bots answer you in (whispers, group chat, these command replies). auto, the start
     // setting, follows the game client's language; the choice is kept per account (Api/BotLanguage.h).
+    // .bot lead [on|pause|off]: the "Tank leads" switch (BotCommandParser::ApplyLeadOrder, the same as the party words "lead on" /
+    // "lead pause" / "lead off" and the ForeverBots Lead button). On: in a 5-man dungeon the caller's tank bot leads (walks the route,
+    // pulls pack by pack, waits for mana and for the caller, boss to boss) and the caller follows. Pause: it holds where it stands.
+    // Off: the caller leads again. Ends by itself when the group leaves the dungeon.
+    static bool HandleBotLead(ChatHandler* handler, Optional<std::string> word)
+    {
+        WorldSession* session = handler->GetSession();
+        Player* player = session ? session->GetPlayer() : nullptr;
+        if (!player)
+            return false;
+        return Playerbot::BotCommandParser::ApplyLeadOrder(player, word ? "lead " + *word : std::string("lead"), "command");
+    }
+
     static bool HandleBotLanguage(ChatHandler* handler, Optional<std::string> word)
     {
         namespace Lang = Playerbot::BotLanguage;
@@ -1363,7 +1397,7 @@ public:
         if (!Playerbot::V2::Gear::Owned::ParseGearMode(ToLowerAscii(*mode_arg), mode))
         { handler->SendSysMessage("Modes: match, best, bis, t1, t2, t3."); return false; }
         std::string reply;
-        bool const ok = Playerbot::Services::Population().SetOwnerGearMode(account, uint8(mode), reply);
+        bool const ok = Playerbot::Services::Population().SetOwnerGearMode(account, uint8(mode), reply, sess->GetPlayer());
         handler->SendSysMessage(reply.c_str());
         return ok;
     }
@@ -2973,13 +3007,15 @@ public:
             handler->SendSysMessage("PlayerbotV2 not initialized.");
             return false;
         }
-        // ConfigReader::reload re-reads playerbot.conf via sConfigMgr. HR-yes
+        // ConfigReader::reload re-reads every config file via sConfigMgr
+        // (worldserver.conf, playerbot.conf, worldserver.conf.d). HR-yes
         // keys take effect immediately on next read; HR-no keys are cached
         // by the subsystems that consumed them at init and won't update
         // until a worldserver restart. See playerbot.conf.dist for the per-
         // key HR tag.
         const bool ok = Playerbot::Services::Config().reload();
         handler->PSendSysMessage("playerbot.conf reload: %s", ok ? "ok" : "failed (see server log)");
+        handler->PSendSysMessage("%s", Playerbot::Services::Config().effective_summary().c_str());
         return true;
     }
 

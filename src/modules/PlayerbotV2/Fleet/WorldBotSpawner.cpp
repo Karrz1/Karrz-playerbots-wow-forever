@@ -58,6 +58,8 @@
 #include "GameTime.h"
 #include "DatabaseEnv.h"
 #include "Group.h"
+#include "GroupMgr.h"
+#include "PickupGroups.h"
 #include "Log.h"
 #include "DB2Stores.h"
 #include "DB2Structure.h"
@@ -271,7 +273,8 @@ void WorldBotSpawner::LoadConfig()
     // Default (-1) is 45% of the machine's RAM, so a small PC stops adding filler bots before it swaps; 0 = no limit.
     int32 const rss_cfg = sConfigMgr->GetIntDefault("Playerbot.World.RssBudgetMb", -1, true);
     c.rss_budget_mb    = rss_cfg >= 0 ? uint32(rss_cfg) : uint32(PhysicalRamMb() * 45u / 100u);
-    c.town_pct         = std::min<uint32>(100, uint32(sConfigMgr->GetIntDefault("Playerbot.World.TownPct", 100, true)));
+    c.town_pct         = std::min<uint32>(100, uint32(sConfigMgr->GetIntDefault("Playerbot.World.TownPct", 50, true)));
+    c.town_hub_cap     = uint32(std::clamp<int64>(sConfigMgr->GetIntDefault("Playerbot.World.Town.HubCap", 6, true), 0, 100));
     c.city_spawn_per_tick = uint32(sConfigMgr->GetIntDefault("Playerbot.World.CitySpawnPerTick", 0, true));
     c.seed_roster      = sConfigMgr->GetBoolDefault("Playerbot.World.SeedRoster", false, true);
     c.seed_in_flight   = std::max<uint32>(1, uint32(sConfigMgr->GetIntDefault("Playerbot.World.SeedInFlight", 8, true)));
@@ -305,7 +308,7 @@ void WorldBotSpawner::LoadConfig()
     }
     c.pool_max         = uint32(sConfigMgr->GetIntDefault("Playerbot.World.PoolMax", std::max<uint32>(c.max_bots * 4, 200), true));
     c.area_cap_outdoors = uint32(std::clamp<int64>(sConfigMgr->GetIntDefault("Playerbot.World.AreaCapOutdoors", 14, true), 0, 500));
-    c.area_cap_town    = uint32(std::clamp<int64>(sConfigMgr->GetIntDefault("Playerbot.World.AreaCapTown", 40, true), 0, 500));
+    c.area_cap_town    = uint32(std::clamp<int64>(sConfigMgr->GetIntDefault("Playerbot.World.AreaCapTown", 15, true), 0, 500));
     c.area_cap_start   = uint32(std::clamp<int64>(sConfigMgr->GetIntDefault("Playerbot.World.AreaCapStart", 10, true), 0, 500));
     c.area_radius      = std::clamp(sConfigMgr->GetFloatDefault("Playerbot.World.AreaRadius", 45.0f, true), 15.0f, 200.0f);
     c.pool_horde_pct   = std::clamp<uint32>(uint32(sConfigMgr->GetIntDefault("Playerbot.World.PoolHordePct", 50, true)), 5, 95);
@@ -576,17 +579,18 @@ std::string WorldBotSpawner::Report() const
             pool += Trinity::StringFormat(" {}/{}", pool_counts_.alliance[b], pool_counts_.horde[b]);
         line += Trinity::StringFormat(" | pool A/H per bracket{} cap {}", pool, PoolBracketCap(cfg_.pool_max));
     }
-    line += Trinity::StringFormat(" | place calls={} none={} rejected no_ground={} water={} no_nav={} lava={} no_path={} area_full={} enemy_town={}",
+    line += Trinity::StringFormat(" | place calls={} none={} rejected no_ground={} water={} no_nav={} lava={} no_path={} area_full={} enemy_town={} town_spot_full={}",
         n_place_calls_, n_place_none_, n_place_reject_[0], n_place_reject_[1], n_place_reject_[2], n_place_reject_[3], n_place_reject_[4], n_place_reject_[5],
-        n_place_reject_[6]);
+        n_place_reject_[6], n_place_reject_[7]);
     {
         uint32 riders = 0;
         for (auto const& [k, t] : motion_)
             if (t.m.moving) ++riders;
         line += Trinity::StringFormat(" | moving riders={} placed_ahead={} woken_ahead={} left_behind={}", riders, n_moving_placed_, n_moving_woken_, n_left_behind_);
     }
-    line += Trinity::StringFormat(" | split world={} (cap {}) tied_up={} (group/BG/instance) owned={} (companions) soak_anchors={} evicted_for_room={} | walked_in={} walked_out={} leaving={} idle_swaps={}",
-        ambient_online_, cfg_.max_bots, tied_online_, owned_online_, soak_anchors_, n_evicted_, n_arrived_walking_, n_left_walking_, leaving_.size(), n_idle_swaps_);
+    line += Trinity::StringFormat(" | split world={} (cap {}) tied_up={} (group/BG/instance, not pickup groups) owned={} (companions) soak_anchors={} evicted_for_room={} | walked_in={} walked_out={} leaving={} idle_swaps={} pickup_groups={} (broken up {})",
+        ambient_online_, cfg_.max_bots, tied_online_, owned_online_, soak_anchors_, n_evicted_, n_arrived_walking_, n_left_walking_, leaving_.size(), n_idle_swaps_,
+        PickupGroups::Table().size(), n_pickup_broken_);
     {
         auto& tl = ::Playerbot::V2::TownLife::Counters();
         line += Trinity::StringFormat(" | town_life inn_ticks={} inn_walk={} inn_none={} inn_stuck={} mailbox_ticks={} duels={} campfires={} lfg_calls={} idle_strikes town={} field={} gate_duels={} gate_challenges={} errands={} errand_gave_up={} inn_full={} mailbox_full={} player_nudges={}",
@@ -973,14 +977,15 @@ std::unordered_map<uint32, uint32> WorldBotSpawner::AwakeByZone(Anchor const& a)
     return out;
 }
 
-// Lava or slime under (x, y, z): ground a resident must never stand on, whatever the navmesh says about the surface below it.
+// A liquid that hurts under (x, y, z) (BotMovement::LiquidHurts): ground a resident must never stand on, whatever the navmesh says
+// about the surface below it.
 static bool InMagma(Map* map, PhaseShift const& phase, float x, float y, float z)
 {
     LiquidData ld;
     ZLiquidStatus const st = map->GetLiquidStatus(phase, x, y, z, {}, &ld);
     if (!(st & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER | LIQUID_MAP_WATER_WALK)))
         return false;
-    return ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) || ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Slime);
+    return BotMovement::LiquidHurts(ld, st);
 }
 
 // A complete navmesh path from `from` (standing where it is) to (x, y, z). A map without a mesh gives no verdict: reachable.
@@ -1282,12 +1287,27 @@ bool WorldBotSpawner::PlaceNear(Player* bot, Player* anchor)
                         pick = alt;
                 }
             Spot const& h = *pick;
-            if (in_town) { probe_z = h.z; hub = h; at_hub = true; }
-            float const a = frand(0.0f, 2.0f * float(M_PI));
-            float const rr = frand(0.0f, h.r);
-            x = h.x + std::cos(a) * rr;
-            y = h.y + std::sin(a) * rr;
-            dist = Dist2D(x, y, anchor->GetPositionX(), anchor->GetPositionY());
+            // A capital's meeting places are few (a bank's or an auction house's worth of NPCs: the Trade District has two) and every
+            // spot took bots up to the area cap, so the whole city crowd stood in one heap by the auction house (Karrz, test realm
+            // 0.1.36, Stormwind and Ironforge). Town.HubCap bots at most around one; past it this try takes a spot on the ring instead,
+            // and the town errands spread the residents over the city from there.
+            if (in_town && cfg_.town_hub_cap && crowd_at(h) >= cfg_.town_hub_cap)
+            {
+                ++n_place_reject_[7];
+                float const ang = frand(0.0f, 2.0f * float(M_PI));
+                dist = frand(ring_min, ring_max);
+                x = anchor->GetPositionX() + std::cos(ang) * dist;
+                y = anchor->GetPositionY() + std::sin(ang) * dist;
+            }
+            else
+            {
+                if (in_town) { probe_z = h.z; hub = h; at_hub = true; }
+                float const a = frand(0.0f, 2.0f * float(M_PI));
+                float const rr = frand(0.0f, h.r);
+                x = h.x + std::cos(a) * rr;
+                y = h.y + std::sin(a) * rr;
+                dist = Dist2D(x, y, anchor->GetPositionX(), anchor->GetPositionY());
+            }
         }
         else if (riding)
         {
@@ -1564,6 +1584,7 @@ void WorldBotSpawner::DriveDespawn(uint32 now_ms, std::vector<Anchor> const& anc
     uint32 all_bots = 0;
     uint32 owned_bots = 0;   // companions and a player's own bots: never part of the world cap
     uint32 tied_bots = 0;    // ambient bots in a group, instance or battleground: not part of the world cap either
+    std::unordered_map<uint64, PickupGroups::Seen> pickup_seen;   // the bots' own pickup groups seen this pass
     Services::Registry().for_each([&](BotId id, BotRegistryEntry const&)
     {
         ObjectGuid const g = ObjectGuid::Create<HighGuid::Player>(id);
@@ -1571,16 +1592,31 @@ void WorldBotSpawner::DriveDespawn(uint32 now_ms, std::vector<Anchor> const& anc
         if (!p || !p->IsInWorld()) return;
         ++all_bots;
         if (!owner_.IsAmbientBot(id, p)) { ++owned_bots; return; }
+        // Two world bots' own pickup group (Fleet/PickupGroups.h) is world population: its members count toward the world cap and the
+        // group breaks up below once none of them is near a player (GitHub #345: these pairs piled up "tied up" until memory ran out).
+        Group const* const grp = p->GetGroup();
+        uint64 const pickup_id = grp && PickupGroups::Has(grp->GetGUID().GetCounter()) ? grp->GetGUID().GetCounter() : 0;
+        PickupGroups::Seen* const pickup = pickup_id ? &pickup_seen[pickup_id] : nullptr;
         // Bots queued for / inside a battleground, in a group or in an instance are not part of the open-world population.
-        if (p->InBattleground() || p->InBattlegroundQueue() || p->GetGroup()
+        if (p->InBattleground() || p->InBattlegroundQueue() || (grp && !pickup)
             || (p->GetMap() && (p->GetMap()->IsDungeon() || p->GetMap()->IsBattlegroundOrArena())))
         {
+            if (pickup) pickup->busy = true;
             ++tied_bots;
             return;
         }
         ++ambient;
-        if (pending_.contains(uint64(id)) || seeding_.contains(uint64(id)) || leaving_.contains(uint64(id))) return;
-        if (::Playerbot::V2::Travel::SoakBoard::Instance().Has(uint64(id))) return;   // a soak runner is far from every anchor on purpose
+        if (pickup && (p->IsInCombat() || p->IsBeingTeleported())) pickup->busy = true;
+        if (pending_.contains(uint64(id)) || seeding_.contains(uint64(id)) || leaving_.contains(uint64(id)))
+        {
+            if (pickup && !leaving_.contains(uint64(id))) pickup->busy = true;   // still being placed: its distance says nothing yet
+            return;
+        }
+        if (::Playerbot::V2::Travel::SoakBoard::Instance().Has(uint64(id)))   // a soak runner is far from every anchor on purpose
+        {
+            if (pickup) pickup->busy = true;
+            return;
+        }
 
         // Distance to the nearest anchor on the bot's own map.
         float nearest = 1e9f;
@@ -1620,6 +1656,7 @@ void WorldBotSpawner::DriveDespawn(uint32 now_ms, std::vector<Anchor> const& anc
             emptied = !place_seen_ms_.contains(::Playerbot::V2::Fleet::PlaceKey(p->GetMapId(), bot_zone));
         // A misfit goes as an orphan does: a level 25 human priest in Deathknell takes the new player's mobs (PC 26 Oct).
         bool const orphan = nearest > cfg_.despawn_radius || misfit || trail || emptied;
+        if (pickup && !orphan) pickup->near_player = true;
         // A bot behind the player (past ActivityRadius, inside DespawnRadius) can be recycled early when the world cap is full and a
         // player's bubble still lacks bots; otherwise only orphans go.
         if (!orphan && nearest <= cfg_.activity_radius)
@@ -1642,6 +1679,23 @@ void WorldBotSpawner::DriveDespawn(uint32 now_ms, std::vector<Anchor> const& anc
     all_online_ = all_bots;
     owned_online_ = owned_bots;
     tied_online_ = tied_bots;
+
+    // A pickup group with nobody near a player breaks up; its bots are then far world bots, logged out by the next passes.
+    for (auto const& [gid, seen] : pickup_seen)
+    {
+        if (!PickupGroups::BreakUpForDistance(seen)) continue;
+        Group* const g = sGroupMgr->GetGroupByGUID(ObjectGuid::Create<HighGuid::Party>(gid));
+        PickupGroups::Forget(gid);
+        if (!g) continue;
+        // A player who joined it made it his group: it stays (the group hygiene forgets it as a pickup group too).
+        bool player_in = false;
+        for (Group::MemberSlot const& slot : g->GetMemberSlots())
+            if (!Services::Lifecycle().is_bot(slot.guid.GetCounter())) { player_in = true; break; }
+        if (player_in) continue;
+        TC_LOG_INFO("playerbot.v2", "[group_hygiene] disbanding bot pickup group {} reason=no-player-near ({} members)", gid, g->GetMembersCount());
+        g->Disband();
+        ++n_pickup_broken_;
+    }
 
     // The bubbles' shortfall: how many bots the players' targets still lack.
     uint32 deficit = 0;

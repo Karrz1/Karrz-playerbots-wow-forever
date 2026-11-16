@@ -211,6 +211,12 @@ own prompt and checks, without a server: `python bot_bridge_eval.py --model qwen
 Each update and each tier model is run against it; the result file keeps every answer. Real lines that went wrong are added
 as new cases.
 
+Own AI service (optional, off by default): `api.txt` in the BotBridge folder or next to the program (the same `url = `,
+`model = `, `key = ` lines; the repack ships it empty, from `tools/bot_bridge_api.txt`) makes that service the MAIN one instead
+of the local Ollama, its model over `--model`. `--url` on the command line wins over the file. The launcher's AI BOTS tab
+writes it for "Service: My own AI service"; "Service: My own program" turns the bridge and actions on and starts no program, for
+a player's own code on these files. program.log says "your own AI service from api.txt: MODEL at URL".
+
 Backup service (optional, off by default): a second OpenAI-style service the player sets up, in `backup.txt` next to
 the program (`url = `, `model = `, `key = `; the repack ships it empty, from `tools/bot_bridge_backup.txt`) or with the
 `--backup-*` options. It answers a player's line only when the local model is not running, fails or times out, or is so
@@ -218,7 +224,8 @@ busy that the player would get the quick fixed line; then that line goes to that
 talk with each other and channel posts never use it. program.log says "backup service answers (why; N so far)".
 
 In the repack both programs, this guide, the player guide (`BOT_BRIDGE_PLAYERS.txt`, as `README.txt`) and
-`tools/bot_bridge_models.txt` (as `models.txt`) and `tools/bot_bridge_backup.txt` (as `backup.txt`) are in `repack\bot-bridge\`. The launcher's AI BOTS tab (`repack/launcher/AiBots.cs`,
+`tools/bot_bridge_models.txt` (as `models.txt`), `tools/bot_bridge_backup.txt` (as `backup.txt`) and `tools/bot_bridge_api.txt`
+(as `api.txt`) are in `repack\bot-bridge\`. The launcher's AI BOTS tab (`repack/launcher/AiBots.cs`,
 `AiBotsTab.cs`) runs the program for players: it takes its tiers from `models.txt`, keeps its choice in `config\ai-bots.txt`,
 writes the bridge lines into the player's `zz-9-local.conf`, and starts the program with the launcher's own Python
 (`ai-bots\python`, python.org's embeddable package, SHA-256 checked against python.org's own list) whenever the realm runs;

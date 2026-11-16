@@ -319,6 +319,11 @@ void ElevatorIndex::EnsureLedges(uint64_t spawn_id, Player* p)
         // Derive OUTSIDE the lock — the navmesh query (NearestNavPoint) can
         // LoadGrid + findNearestPoly, and we must not stall an bot worker's
         // LedgeFor read for that duration.
+        // A same-map parallel build may not load the stop's grid itself: the
+        // world thread loads it after the build, and the ledge is derived on
+        // a later build instead of being stored as "no ledge" for good.
+        if (!Playerbot::BotMovement::EnsureGridForQuery(p->GetMap(), s.x, s.y))
+            continue;
         LedgeRec rec;
         Position out;
         if (Playerbot::BotMovement::NearestNavPoint(

@@ -36,6 +36,7 @@
 #include "Map.h"
 #include "MapManager.h"
 #include "PhasingHandler.h"
+#include "TerrainMgr.h"
 #include "SpreadSpot.h"
 #include "GrindSpot.h"
 #include "ObjectMgr.h"
@@ -44,8 +45,11 @@
 #include "../../Travel/QuestHubDatabase.h"
 #include "../ChannelTalk.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <deque>
+#include <string>
 #include <vector>
 
 namespace Playerbot::V2::World {
@@ -281,11 +285,13 @@ std::vector<ResolvedTown> const& VanillaTowns()
         std::vector<ResolvedTown> out;
         LocaleConstant const locale = ::World::instance()->GetDefaultDbcLocale();   // sWorld would resolve to this namespace
         std::string missing;
+        uint32 wanted = 0;
         for (VanillaTown const& t : kVanillaTowns)
         {
             for (bool side : { true, false })
             {
                 if (side ? !t.alliance : !t.horde) continue;
+                ++wanted;
                 TaxiNodesEntry const* found = nullptr;
                 for (TaxiNodesEntry const* node : sTaxiNodesStore)
                 {
@@ -303,8 +309,41 @@ std::vector<ResolvedTown> const& VanillaTowns()
                 out.push_back({ &t, side, found->Pos.X, found->Pos.Y, found->Pos.Z, found->Facing });
             }
         }
-        TC_LOG_INFO("playerbot.v2", "[ZonePicker] Classic: {} vanilla town flight points resolved{}{}",
-            uint32(out.size()), missing.empty() ? "" : "; not in TaxiNodes: ", missing);
+        // Client data in another language only (a server that extracted ruRU, say): none of the English names above match, the town list
+        // came out (nearly) empty and the bots had no levelling towns to be sent to. Then every flight point on the two continents that
+        // stands in a vanilla levelling zone (1.12 range above level 10, not a capital) is a town of that zone, found by the zone of its
+        // position; its name stays as the data has it. Only when most named rows were not found, so a realm with English data keeps
+        // exactly the list above. Thanks to PlayDargoon (Sakhwoow/WoWForever eb1d92afb), whose fix this follows.
+        uint32 by_zone = 0;
+        if (out.size() * 2 < wanted)
+        {
+            static std::deque<VanillaTown> zone_towns;   // the rows must outlive this list: ResolvedTown points at them
+            static std::deque<std::string> zone_names;
+            for (TaxiNodesEntry const* node : sTaxiNodesStore)
+            {
+                if (!node || (node->ContinentID != 0 && node->ContinentID != 1)) continue;
+                bool const to_alliance = NodeShownTo(node, true);
+                bool const to_horde = NodeShownTo(node, false);
+                if (!to_alliance && !to_horde) continue;
+                uint32 const zone = sTerrainMgr.GetZoneId(PhasingHandler::GetEmptyPhaseShift(), node->ContinentID, node->Pos.X, node->Pos.Y, node->Pos.Z);
+                uint8 lo = 0, hi = 0;
+                if (!VanillaZoneLevelRange(zone, lo, hi) || hi <= 10 || IsVanillaCapitalZone(zone)) continue;
+                bool const known = std::any_of(out.begin(), out.end(), [&](ResolvedTown const& r)
+                    { return r.town->map == node->ContinentID && r.x == node->Pos.X && r.y == node->Pos.Y; });
+                if (known) continue;   // a named row above already has this node
+                zone_names.emplace_back(node->Name[locale] && *node->Name[locale] ? node->Name[locale] : "flight point");
+                zone_towns.push_back({ zone_names.back().c_str(), uint16(node->ContinentID), std::max<uint8>(lo, 10), hi, to_alliance, to_horde });
+                VanillaTown const* town = &zone_towns.back();
+                for (bool side : { true, false })
+                {
+                    if (side ? !to_alliance : !to_horde) continue;
+                    out.push_back({ town, side, node->Pos.X, node->Pos.Y, node->Pos.Z, node->Facing });
+                    ++by_zone;
+                }
+            }
+        }
+        TC_LOG_INFO("playerbot.v2", "[ZonePicker] Classic: {} vanilla town flight points resolved ({} found by zone){}{}",
+            uint32(out.size()), by_zone, missing.empty() ? "" : "; named rows not in TaxiNodes: ", missing);
         return out;
     }();
     return towns;

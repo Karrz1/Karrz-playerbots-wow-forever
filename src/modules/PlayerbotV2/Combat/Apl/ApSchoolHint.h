@@ -40,6 +40,15 @@ inline PveOrder::SchoolHint const* VictimHint(ApPredicateContext const& ctx)
     return ctx.bot.raw().pve_order.school_hint_for(ctx.bot.victim());
 }
 
+// True when the victim's hint avoids the school of `spell`. The emitter refuses such a cast anyway; a rotation that picks one main
+// spell (a mage's nuke) asks first, so it picks a spell of another school instead of falling through to its weakest filler
+// (bwl_nefarian, dev realm 2026-11-13: six fire mages on Red Drakonids cast Arcane Explosion and Shoot, never Frostbolt).
+inline bool VictimAvoids(ApPredicateContext const& ctx, uint32 spell)
+{
+    PveOrder::SchoolHint const* h = VictimHint(ctx);
+    return h && h->avoid_mask && (BotIntentEmitter::SpellSchoolMaskOf(spell, 0) & h->avoid_mask) != 0;
+}
+
 // Preferred schools on the victim that are not also avoided (a school in
 // both masks counts as avoided) and that the bot can cast at all (Shadowform
 // locks out holy: a holy preference then is no preference, and the normal

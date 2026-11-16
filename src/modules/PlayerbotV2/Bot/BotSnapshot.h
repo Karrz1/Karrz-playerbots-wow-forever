@@ -1589,6 +1589,10 @@ struct NearbyObject
     uint16     gather_skill  = 0;
     uint16     gather_req    = 0;
     bool       gather_ready  = false;
+    // RITUAL (type 18) without an owner (the Altar of the Keepers / of Archaedas in Uldaman, the Blackrock Altar in UBRS): true when
+    // a person in the bot's group has used it, it still needs more users, and this bot is one of the group's bots picked to fill the
+    // missing places (in guid order, the same pick in every bot's snapshot), so no more bots go than places are open.
+    bool       ritual_join   = false;
 };
 struct NearbyObjectsState
 {
@@ -1731,6 +1735,7 @@ struct StablePet
     uint8  level = 0;
     uint8  slot_kind = 0;            // 0=active, 1=stabled, 2=unslotted
     uint8  slot_index = 0;
+    bool   dead = false;             // saved with 0 health: died, and its body is gone (only Revive Pet brings it back)
 };
 struct PetState
 {
@@ -1837,6 +1842,11 @@ struct SocialEventsState
     uint8      group_invite_leader_level = 0;
     bool       group_invite_leader_is_real = false;
     bool       group_invite_leader_privileged = false;   // a GM, or the owner of some bot: skips the world bot's level rule
+    // Who the inviting player is to this bot (Playerbot.Interact.AcceptInvitesFrom, Bot/InvitePolicy.h).
+    bool       group_invite_leader_owner = false;        // the bot's owner (its account)
+    bool       group_invite_leader_gm = false;
+    bool       group_invite_leader_friend = false;       // on the bot's friend list
+    bool       group_invite_leader_guildmate = false;
 
     void reset() { *this = SocialEventsState{}; }
 };

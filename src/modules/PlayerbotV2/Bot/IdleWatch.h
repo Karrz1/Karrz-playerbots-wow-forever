@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <initializer_list>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>

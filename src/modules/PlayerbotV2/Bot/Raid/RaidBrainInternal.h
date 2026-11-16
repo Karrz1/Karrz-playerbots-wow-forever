@@ -84,6 +84,8 @@ bool TauntImmune(Unit const* enemy);
 void EnemySchoolMasks(Unit* enemy, Unit const* caster, uint8_t& prefer, uint8_t& avoid, uint8_t* reflect = nullptr);
 Unit const* SchoolReferenceCaster(Plan const& plan);
 uint8_t MemberDamageSchools(Member const& m, Player* mainTank);
+// The school(s) of a caster's main nuke by its spec (a frost mage: frost); MemberDamageSchools for everybody else.
+uint8_t MemberMainSchools(Member const& m, Player* mainTank);
 
 // One election round for a plan: no two bots get the same job.
 struct Election
@@ -111,11 +113,15 @@ void MechanicsPrePull(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& order
 void NaxxPrePull(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, std::ostringstream& dump);
 
 bool NaxxMechanicsMove(Plan const& plan, Member const& self, uint32_t now, RaidOrder& out);
+// After PublishTargets on map 533: per-bot target limits a scripted mechanic sets (Thaddius' platform split).
+void NaxxPostTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders);
 void NaxxMechanicsElect(Election& e, uint32_t now);
 void BwlMechanicsElect(Election& e, uint32_t now);
 void BwlPrePull(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, std::ostringstream& dump, uint32_t now);
 // A boss fight script (RaidFightScript.h): after the rule passes, overwrites the DPS bots' target and start wait for the scripted boss.
 void ApplyFightScript(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, uint32_t now, std::ostringstream& dump);
+// A boss that joined the fight late (Nefarian's landing) and that the DPS still keep off until a tank has held it (RaidFightScript.cpp).
+bool LateBossHeld(uint64_t enemyGuidLow);
 // Zul'Gurub (RaidMechanics_ZG.cpp): the enemy a scripted fight's DPS must kill now whatever the kill order says (a Son of Hakkar before Blood
 // Siphon; nullptr = none), and the movement the fight needs (the raid gathers on that Son as it dies).
 Unit* ZgForcedFocus(Plan const& plan, uint32_t now);

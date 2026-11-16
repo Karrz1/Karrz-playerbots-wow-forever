@@ -828,6 +828,18 @@ constexpr uint32 kSpotHoldMs = 30000u;   // a claim not renewed for this long la
 
 namespace TE = ::Playerbot::V2::TownErrand;
 
+// Quest work in reach keeps a bot from the town's errands and shows, so the quest rules can do it. A bot in its town time (profession
+// mode: every bot the spawner places in a capital, Playerbot.World.TownPct) has those rules switched off (quest accept, hub walk, goal
+// pursuit, far travel), so for it the quest work never comes and nothing else may run either: it stood where it was placed, by the
+// bank or the auction house, until the idle watch walked it to the next bank or auction house (Karrz, test realm 0.1.36: a heap of
+// idle bots and their pets in the Stormwind Trade District and in Ironforge). Nearly every world bot in a city has quest work by this
+// test (a quest giver in scan range, or the leveling zone it is to travel to). A turn-in still comes first for it: idle:quest_turnin
+// runs far above the town rules and is not held by profession mode.
+static bool QuestWorkFirst(BotSnapshotView const& s, BotAI const& ai, uint32 now_ms)
+{
+    return !ai.in_profession_mode(now_ms) && s.has_actionable_quest();
+}
+
 // One line per bot and outcome every five minutes, so a soak shows which bots reached the inn and which found no innkeeper (the counters
 // above are bot-ticks and a few bots dominate them).
 static void InnLog(BotSnapshotView const& s, char const* what, float x, float y)
@@ -881,7 +893,7 @@ bool InnRestGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, 
     if (!V2::TownLife::TakesPart(s.bot_id(), 1u, s.published_at_ms(), pct, 15u * 60u * 1000u)) return false;
     if (!s.is_alive() || s.in_combat() || s.is_casting() || s.has_owner_character() || s.in_group()) return false;
     if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground() || s.raw().movement.is_mounted) return false;
-    return s.enemies_within(40.0f) == 0 && !s.has_actionable_quest();
+    return s.enemies_within(40.0f) == 0 && !QuestWorkFirst(s, ai, s.published_at_ms());
 }
 
 bool InnRestFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32 now_ms)
@@ -945,7 +957,7 @@ constexpr float kMailboxSearchYards = 120.0f;
 constexpr float kMailboxStandYards = 2.5f;
 constexpr uint32 kMailboxWindowMs = 90u * 1000u;
 
-bool MailboxGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+bool MailboxGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32)
 {
     if (!TownLifeEnabled()) return false;
     if (!::Playerbot::V2::World::IsVanillaCapitalZone(s.zone_id())) return false;
@@ -953,7 +965,7 @@ bool MailboxGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uin
     if (!V2::TownLife::TakesPart(s.bot_id(), 5u, s.published_at_ms(), 4u, kMailboxWindowMs)) return false;
     if (!s.is_alive() || s.in_combat() || s.is_casting() || s.has_owner_character() || s.in_group()) return false;
     if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground() || s.raw().movement.is_mounted) return false;
-    return s.enemies_within(40.0f) == 0 && !s.has_actionable_quest();
+    return s.enemies_within(40.0f) == 0 && !QuestWorkFirst(s, ai, s.published_at_ms());
 }
 
 bool MailboxFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32 now_ms)
@@ -1175,7 +1187,7 @@ bool TownErrandGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const
     if (s.has_owner_character() || s.in_group() || s.on_transport()) return false;
     if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground()) return false;
     if (s.raw().social_events.has_duel_request || s.duel_in_progress()) return false;
-    if (s.has_actionable_quest() || Classic::RecoverBeforeWalking(s)) return false;   // quest work in reach, or hurt / mid-meal / dry
+    if (QuestWorkFirst(s, ai, now_ms) || Classic::RecoverBeforeWalking(s)) return false;   // quest work in reach, or hurt / mid-meal / dry
     return s.enemies_within(30.0f) == 0;
 }
 
@@ -1261,7 +1273,7 @@ bool TownDuelGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
     if (!V2::TownLife::TakesPart(s.bot_id(), 2u, s.published_at_ms(), 6u, 20u * 60u * 1000u)) return false;
     if (!s.is_alive() || s.in_combat() || s.is_casting() || s.has_owner_character() || s.in_group()) return false;
     if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground() || s.raw().movement.is_mounted || s.is_moving()) return false;
-    if (s.hp_pct() < 90 || s.level() < 6 || s.enemies_within(40.0f) > 0 || s.has_actionable_quest()) return false;
+    if (s.hp_pct() < 90 || s.level() < 6 || s.enemies_within(40.0f) > 0 || QuestWorkFirst(s, ai, s.published_at_ms())) return false;
     if (s.raw().social_events.has_duel_request || s.duel_in_progress()) return false;
     uint32 const now = s.published_at_ms();
     if (ai.last_town_show_ms() && now - ai.last_town_show_ms() < 15u * 60u * 1000u) return false;

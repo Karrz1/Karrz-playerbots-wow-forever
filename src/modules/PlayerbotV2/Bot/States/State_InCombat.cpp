@@ -772,6 +772,12 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
         return ThreatHold::ShieldUp;
     }
 
+    // An add the encounter's DPS burn down without a tank (RaidRules::noTank: Molten Core's Lava Spawn, Kel'Thuzad's Soldiers of the
+    // Frozen Wastes) is never held for one: no tank comes for it, so a hold only waits while it reaches its raider. naxx_kelthuzad 1114e:
+    // the Soldiers, each sent at a random raider to blow up on arrival, were held "loose on member, tank in reach" by the melee and the
+    // ranged alike, and the raid did 0 damage a second for the first 18 s of phase 1.
+    if (s.is_in_raid() && Raid::NoTank(s.map_id(), u->entry)) return ThreatHold::None;
+
     if (s.is_in_raid() && LooseRaidEliteOnMember(s, *u, g) && !LooseHoldExpired(s, target, Raid::Retaunts(s.map_id(), u->entry)))
     {
         if (RaidLogDue(RaidLogKey(s, RaidLogKind::ThreatHold), s.published_at_ms(), 5000u))
@@ -883,7 +889,7 @@ ThreatHold EvaluateThreatHold(BotAI& ai, BotSnapshotView const& s, ObjectGuid ta
         h = ThreatHold::None;
     }
     if (h == ThreatHold::OverThreat && past_hard_limit && !s.is_in_raid() && s.is_in_dungeon() && g && !g->leader_is_bot() &&
-        LedHardHoldExpired(s, target))
+        !ai.tank_leads_here(s) && LedHardHoldExpired(s, target))
     {
         if (RaidLogDue(RaidLogKey(s, RaidLogKind::ThreatHold), s.published_at_ms(), 5000u))
             TC_LOG_INFO("playerbot.v2",
@@ -1246,7 +1252,7 @@ bool RangedMeleedDefense(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView 
 // to go), it stops when the target is at 95%+ or missing less than 30% of
 // the heal's expected amount (ClassicHeal::ExpectedHeal, bonus healing
 // included). Before that window only a target already at full health with
-// nothing hitting it is stopped (another healer landed first: the healer is
+// nothing hitting it, and never a tank, is stopped (another healer landed first: the healer is
 // freed at once). After a cancel the rotation leaves that patient alone for
 // ClassicHeal::kCancelLockoutMs (an emergency excepted) and the tank pre-heal
 // waits as long, so a cancelled cast is not restarted at once; at most one
@@ -1271,8 +1277,11 @@ bool CancelOverheal(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView const
     if (!p.valid || p.max_hp <= 0 || p.hp <= 0) return false;
     const int64 deficit = p.max_hp - p.hp;
     const bool final_window = rem <= kWindowMaxMs;
+    // A tank is never stopped early: it is full for a moment between a boss's hits, and a heal let run lands into the next one
+    // (naxx_patchwerk 1115h: four "already full" cancels on one tank with 0.7-2.1 s left, each followed by a lockout on that tank,
+    // while Hateful Strike and his swings took it from 100% to 79% and lower again within the second).
     const bool cancel = final_window ? (p.actual_pct >= 95 || float(deficit) < amount * 0.30f)
-                                     : (deficit <= 0 && p.incoming <= 0);
+                                     : (!p.tank && deficit <= 0 && p.incoming <= 0);
     if (!cancel) return false;
     const uint32 now = s.published_at_ms();
     if (!RaidLogDue(RaidLogKey(s, RaidLogKind::CancelHeal), now, 1500u)) return false;
@@ -1425,6 +1434,11 @@ struct CombatIdleProbe
     {
         BotAI::CombatIdleState& st = ai.combat_idle();
         uint32 const now = s.published_at_ms();
+        if (s.is_alive() && s.is_in_raid() && ai.effective_role(s) == Role::Healer)
+        {
+            HealerIdle(st, now);
+            return;
+        }
         bool const dps = s.is_alive() && ai.effective_role(s) == Role::Dps;
         bool const melee = IsMeleeSpec(s.cls(), s.spec());
         // A swing or an Auto Shot is an action no intent shows, and "victim in reach" or "auto-repeat flag set" is not proof it lands: the 225
@@ -1474,6 +1488,43 @@ struct CombatIdleProbe
             s.name(), rule ? rule : derived, rule ? " / " : "", rule ? derived : "", idle_ms / 1000.f,
             v.IsEmpty() ? std::string("none") : (u ? std::to_string(u->entry) + "/" : std::string()) + std::to_string(v.GetCounter()),
             dist, u ? int(u->in_los) : 0, int(s.is_moving()), has_mana ? s.power_pct(0) : -1);
+    }
+
+    // [heal_idle_reason]: the same streak for a raid healer, counted only while somebody in its reach is hurt (under 80%). The Naxxramas runs of
+    // 2026-11-15 had 12 healers cast 3-15 heals a minute each (naxx_patchwerk 1115a: 3.3 a minute while Hateful Strike killed the soakers), and
+    // no line said what held them: the rule that fired, or what the snapshot shows (the hurt member out of sight or range, moving, out of mana).
+    void HealerIdle(BotAI::CombatIdleState& st, uint32 now) const
+    {
+        NearbyUnit const* hurt = s.lowest_hp_friend();
+        int const hurt_pct = hurt ? int((int64(hurt->hp) * 100) / std::max<int64>(1, hurt->max_hp)) : 100;
+        bool const acting = emit.combat_action_count() != actions_before || s.is_casting() || s.gcd_active();
+        if (acting || hurt_pct >= 80)
+        {
+            st.idle_since_ms = 0;
+            return;
+        }
+        if (st.idle_since_ms == 0)
+        {
+            st.idle_since_ms = now ? now : 1u;
+            return;
+        }
+        uint32 const idle_ms = now - st.idle_since_ms;
+        if (idle_ms < 3000u || (st.logged_ms != 0 && now - st.logged_ms < 10000u))
+            return;
+        st.logged_ms = now ? now : 1u;
+        float bx, by, bz; s.position(bx, by, bz);
+        float const dx = hurt->x - bx, dy = hurt->y - by, dz = hurt->z - bz;
+        float const dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        char const* derived =
+            !hurt->in_los              ? "hurt member out of LoS" :
+            dist > 40.f                ? "hurt member out of range" :
+            s.is_moving()              ? "moving" :
+            s.power_pct(0) < 10        ? "OOM" :
+                                         "no rule acted";
+        char const* rule = ai.rule_fire_seq() != rules_before ? ai.last_rule_fired() : nullptr;
+        TC_LOG_INFO("playerbot.v2", "[heal_idle_reason] {} not healing because {}{}{} ({:.1f}s) lowest={} {}% dist={:.1f} los={} moving={} mana={}",
+            s.name(), rule ? rule : derived, rule ? " / " : "", rule ? derived : "", idle_ms / 1000.f,
+            hurt->guid.GetCounter(), hurt_pct, dist, int(hurt->in_los), int(s.is_moving()), s.power_pct(0));
     }
 };
 
@@ -4864,6 +4915,12 @@ void DispatchInCombat(BotAI& ai,
     // force it for pre-L10. At L10 specs unlock their full talent rows;
     // we flip back to the spec rotation cleanly on ding.
     uint32 rotation_spec = snapshot.level() < 10 ? 0u : snapshot.spec();
+    // A Classic healer is the exception: every Classic healing class has its heal from level 1 (Lesser Heal, Healing Touch, Healing
+    // Wave, Holy Light) and the Classic healer rotations ask for each spell before they cast it, while spec 0 is the damage rotation
+    // of the druid, shaman and paladin. A healer companion under 10 of those classes never healed its owner in a fight, only after
+    // it (idle:ooc_heal goes by role), and the owner died beside it (Discord, vempire_ghost, 0.1.36).
+    if (IsVanillaRealm() && snapshot.level() < 10 && ai.effective_role(snapshot) == Role::Healer)
+        rotation_spec = IsHealerSpec(snapshot.cls(), uint16(snapshot.spec())) ? snapshot.spec() : HealerSpecForClass(snapshot.cls());
     // A tank-spec bot the raid's tank roster does not need plays its class's
     // melee DPS rotation (same gear, no tank threat): Arms, Retribution, cat.
     if (snapshot.raw().pve_order.active && snapshot.raw().pve_order.raid_dps_tank &&

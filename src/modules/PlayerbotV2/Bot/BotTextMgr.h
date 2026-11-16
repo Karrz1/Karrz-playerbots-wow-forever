@@ -196,9 +196,14 @@ enum class Banter : uint8 { Ready, Wipe, Thanks, Ouch, BossKill };
 // bot worker: the line to say now for `kind`, or empty (gates / roll / cooldown said no). The caller emits it.
 // Handed to the bot bridge's program like GreetLine (empty, *to_program set).
 std::string BanterLine(Banter kind, BotAI& ai, BotSnapshotView const& s, bool* to_program = nullptr);
+// The bot's own line to its group: raid chat in a raid of more than 15 (Bot/Raid/RaidVoice.h; party chat there only reaches the
+// bot's sub-group, so the player rarely saw it), party chat otherwise.
+void SayToGroup(BotIntentEmitter& em, BotSnapshotView const& s, std::string text);
+// Playerbot.Raid.Talk is on: a raid of more than 15 hears the bots' own chatter (one line for the whole raid at a time).
+bool RaidTalkOn();
 // A boss (IsBossCreature, Bot/BossCheck.h) died to `killer`: the player who gets the credit, also when a pet, totem or
 // charmed unit of theirs landed the last hit. Called from Module::OnDeath, the boss-kill moment. One nearby companion of the killer's group may say "gg" and one may bow (the killer is a real player,
-// "the owner finished the boss") or cheer.
+// "the owner finished the boss") or cheer. A raid of more than 15 has its own kill crowd (RaidBrain, Bot/Raid/RaidVoice.h).
 void OnBossKilled(Player* killer, Creature* boss);
 
 // ---- per-tick speech (bot worker; snapshot data only; emits at most one ChatIntent per tick) ----

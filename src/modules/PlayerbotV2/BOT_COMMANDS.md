@@ -60,6 +60,7 @@ The `.bot` commands for your own bots work for every account, no GM needed; each
 | `.bot add <class> [tank\|healer\|dps] [race] [male\|female]` | Creates a companion bound to you, levels it to you, teaches spells, sets role/talents/gear, brings it over and groups it. The role is kept across relog and `.bot call`. |
 | `.bot lfg [tank\|healer\|dps]` | Fills the missing tank / healer / damage places of your group (1 tank, 1 healer, 3 damage) with level-matched companions, now. The word is your own role. The Group Finder does the same on its own: post a dungeon listing and, if nobody joins within `Playerbot.Lfg.BotFillSeconds` (default 180), the missing roles are filled. |
 | `.bot dungeon [list \| <name\|any> [tank\|healer\|dps] \| leave \| cancel]` | Dungeon finder. `.bot dungeon any` (a random 5-player dungeon for your level) or `.bot dungeon <word>` (`rfc`, `vc`/`dm` Deadmines, `smgy`, `smlib`, `dme`, `strat`, `ubrs`...; `.bot dungeon list` shows them): the missing tank / healer / damage places are filled with your companions at your level, and once the group is complete (at most 90 s) you are put inside the dungeon's door and your bots are brought after you. Real players in your group get a summon. `.bot dungeon leave` takes you back to where you queued, bots follow; `cancel` stops a queue still forming. Only the group leader queues. `Playerbot.Lfg.Finder.Enable` turns it off. |
+| `.bot lead [on\|pause\|off]` | Tank leads: in a 5-man dungeon or a raid your tank bot leads and you follow (in a raid it stops before each boss for you) (the same as `lead on` / `lead pause` / `lead off` in party chat and the Orders tab's Tank leads button). See section 8. |
 | `.bot call <name\|all>` | Brings back a companion (logs it in, joins your group). `all` = your saved roster plus every bot in your group. |
 | `.bot summon <name\|all\|saved>` | Every player, own bots only: `.bot summon all` brings only the bots that are in your group right now (it never logs anyone in), `.bot summon saved` your saved roster plus the grouped bots (logging them in), `.bot summon <name>` one of your companions. Any other name: "You can only summon your own bots". The GM `.summon` (other players) is unchanged and stays GM-only. |
 | `.bot goto <name>` | Every player, own bots only (companions and summoned alts): takes you to that bot, the other way round from `.bot summon`. Not in combat, dead or on a flight path, and not into or out of a battleground or arena. Into a dungeon or raid only when the bot is in your group, and the dungeon's own entry rules still apply. The GM `.appear` stays GM-only. |
@@ -68,6 +69,7 @@ The `.bot` commands for your own bots work for every account, no GM needed; each
 | `.bot dismiss <name\|all>` | Removes it from your group and logs it out. Gear is kept. |
 | `.bot delete <name>` | Deletes the character for good (the addon asks first). Only bots made for you: one of your own characters summoned as a bot (`.playerbot summon`) is refused with a pointer to `.bot dismiss`. |
 | `.bot list` | Your companions, online or not (`saved` marks roster ones). |
+| `.bot trade <seq> <what you see>` | Sent by the ForeverBots add-on right after you click Trade in a trade window with a bot, never typed. When the window still holds what you saw (money and items on both sides), your accept goes through with the bot's current state, so one click is enough; when the bot changed its offer, nothing is accepted and the add-on asks you to look again. Trades with players are not touched. |
 | `.bot regear <name\|all>` | Re-rolls the equipment of online companions so they do not all wear the same pieces. Better pieces they wear stay; replaced ones go to the bags. |
 | `.bot world` | Status of the world-bot spawner (Playerbot.World.*), console too. |
 | `.bot population [off\|low\|medium\|high\|file]` | How many world bots the realm has, GM only, until the next restart (the launcher's Bots setting, `Bots.Size`, decides at every start; the add-on has no World bots tab since 0.6.13). Applies right away (a step down logs the world bots out first). It wins over `Bots.Size` and `Playerbot.World.Enable` until then; `file` hands back to the config files. No word: what it is now. Console too. |
@@ -165,7 +167,7 @@ from the bot.
 | `loot` | yes | yes | Need before greed with the usual etiquette (human gets first claim). `Raveni: need before greed, the usual rules`. |
 | `loot all` | yes | yes | The bot rolls for itself on every drop and takes every corpse item, greys included. `Raveni: looting everything, greys included, and rolling for myself`. Memory only (resets on relog). |
 | `gather on\|off` (bare `gather` toggles), `gather_all on\|off` | yes | no | On: while it follows you, out of combat, the bot picks the herbs and ore veins near it (25 yards from it, 30 from you) with its own Herbalism or Mining, as a player does: it casts the gathering spell, needs the skill level the node asks for and a Mining Pick for ore, gets the skill-ups and keeps what it picks. `Raveni: Gather: ON (herbs)`. Off (the default): it leaves them for you. `gather_all` sets every bot of the group. Memory only; `clearprefs` turns it off. World bots with the skills pick the nodes they walk past on their own. |
-| `use <object name or id>` | yes | yes | Uses a dungeon object near the bot: an altar, brazier, lever or orb (`use altar`, `use brazier`). The bot walks to the nearest match within 30 yards, uses it once and then stays there until you say `follow`. For an object that needs several people, such as the Blackrock Altar in Upper Blackrock Spire (three), click it yourself and send it to two bots by name: `;Raveni:use altar`, `;Doran:use altar`. Nothing matching: `no 'altar' within 30 yards of me`. |
+| `use <object name or id>` | yes | yes | Uses a dungeon object near the bot: an altar, brazier, lever or orb (`use altar`, `use brazier`). The bot walks to the nearest match within 30 yards, uses it once and then stays there until you say `follow`. For an object that needs several people, such as the Blackrock Altar in Upper Blackrock Spire or the Altar of Archaedas and the Altar of the Keepers in Uldaman (three each), just click it yourself: the bots of your group within 30 yards fill the missing places on their own. You can still send bots by name: `;Raveni:use altar`, `;Doran:use altar`. Nothing matching: `no 'altar' within 30 yards of me`. |
 
 ### Gear and economy by whisper (selected NPC needed)
 
@@ -280,6 +282,21 @@ A group chat order reaches every bot of yours; to address only some, whisper the
   `worldserver.conf` to let a player enter without one. A party (non-raid) group of companions in a raid map
   follows you and defends and does not run the raid autopilot (`OwnerFollowHold`).
 - `follow` suspends the dungeon autopilot until you say `attack`, `pull` or `resume`.
+- **Tank leads** (`lead on`, `lead pause`, `lead off` in party chat, `.bot lead [on|pause|off]`, or the Orders tab's Tank leads
+  button: click on/off, right-click pause): in a 5-man dungeon you normally lead and the bots follow you. With the lead on your
+  tank bot leads instead, as it does in a group of bots alone: it walks the dungeon's route, pulls pack by pack (a big pack is
+  pulled back to the group, the mage holds one of it first), goes boss to boss, and the others fight its pulls even in the
+  Defensive stance. Before every pull and every step on it waits until nobody is dead, everyone has 70 % health, the healer is
+  near and has drunk to the pull mark, the other mana users (you too) have drunk, and you are inside, alive and within 60 yards;
+  in party chat it says `waiting for mana` or `waiting for you`. `lead pause` holds it where it stands (it still fights what
+  comes); `go` (also `lead on`, `вперед`) goes on. `lead off`, or leaving the dungeon, gives the lead back to you. `follow`,
+  `stay`, `hold` and `come` (the buttons too) pause the lead and do their own thing; `go` picks it up again. `go` is the lead's
+  word only while the lead is on or paused. It needs one of your bots in the tank role.
+  In a raid group on a raid map the main tank (the raid frame's Main Tank mark, else a tank bot of yours) leads the trash the
+  same way, but stops before every boss where it would pull from and says `the boss is next: pull it when you are ready, or
+  say go`. Pull the boss yourself and the raid fights it as usual, or say `go` and the tank pulls it (still after the mana and
+  the dead). After a wipe it stops again at the same boss. A party that is not a raid group on a raid map is not led: convert
+  it to a raid first.
 
 ## 9. Battleground behaviour
 
@@ -330,7 +347,7 @@ World bots are ambient characters with no owner (`Playerbot.World.Enable = 1` sp
 - **Politeness** (`PoliteWorldBots`): a trade request is cancelled with "sorry, nothing to trade"; a group
   invite is declined with a short whisper unless the bot is free to group; a duel from a stranger is accepted about
   one time in three when the levels are within 5 and nothing is fighting, otherwise declined with a whisper.
-  Invites: `Playerbot.Interact.AutoAcceptInvites` (`none`, `friends_or_higher`, `guild_or_higher`, `anyone`).
+  Whose invites: `Playerbot.Interact.AcceptInvitesFrom` (`anyone`, `guild`, `friends`, `none`); the owner and GMs are always answered.
 - **No invites to passers-by** (`InvitePassingPlayers` 0): a world bot never sends a group invite to a real player who
   walks past; it only invites other bots. A player invites the bot himself (or whispers `invite` to it). 1 = the old way (invites players within 30 yards).
 - Companion banter (`PartyBanter`): a short lowercase line now and then on ready check, wipe, rez, death, boss
@@ -392,7 +409,7 @@ Defaults are those of `conf/playerbot.conf.dist`. Behaviour switches are read wh
 `Playerbot.Gear.MaxTier` (1), `Playerbot.Gear.RaidIlvlCap` (0).
 
 **Social and world (default)**: `BotWhisperable` 1, `WorldBotSayReply` 1, `PoliteWorldBots` 1, `InvitePassingPlayers` 0, `PartyBanter` 1,
-`SocialEmotes` 1, `Fidget` 1, `Playerbot.Chatter.Enabled` 1, `Playerbot.Interact.AutoAcceptInvites` friends_or_higher,
+`SocialEmotes` 1, `Fidget` 1, `Playerbot.Chatter.Enabled` 1, `Playerbot.Interact.AcceptInvitesFrom` anyone,
 `Playerbot.Interact.AutoLeaderHandover` 1, `Playerbot.World.Enable` 0 (`MaxBots` 100, `BotsPerPlayer` 25,
 `ActivityRadius` 300, `FriendlyPct` 100), `Playerbot.Population.TotalTarget` 0.
 
@@ -409,6 +426,7 @@ The module logs nothing unless `Logger.playerbot.v2=3` is set. Grep the server l
 |---|---|
 | `[owner_order]` | Every order a bot receives: source (whisper, party), raw text, resulting order state; unrecognised or refused (not the owner) lines are throttled per bot. Start here when a bot "ignores" you. |
 | `[pull_back]` | Which tank was chosen for a pull back and why; every other bot holds. |
+| `[tank_lead]` | Tank leads: who turned it on, paused or off and for how many bots, the tank waiting for the player (`waits for X: 75y behind`), the lead ending when the bot left the dungeon. With `[tank_advance] ... blocked gate=` for the other holds. |
 | `[fallback]` | A bot's rally slot and rank when it falls back, and its arrival. |
 | `[assign]` | Icon assignments: the raw order, the stored result. |
 | `[formation]` | Slot, owner position and distance, action taken (rate limited). |

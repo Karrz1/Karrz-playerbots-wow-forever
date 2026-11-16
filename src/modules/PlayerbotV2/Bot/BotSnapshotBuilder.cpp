@@ -1697,6 +1697,58 @@ struct SnapRecyclePool
     }
 };
 
+// A RITUAL game object without an owner (Altar of the Keepers 130511 and Altar of Archaedas 133234 in Uldaman, the Blackrock Altar in
+// UBRS) fires its spell once `ritual.casters` different players of one group have used it. A person playing with bots cannot fill
+// the other places: the bots never used it, so Archaedas and the Stone Keepers never woke (Discord 1570946298532601866, 0.1.35).
+// True when a person in `p`'s group has used `go`, places are still open, and `p` is one of the group's bots picked to fill them.
+// Map update thread: the object is on the bot's map, so its user set is read on the thread that changes it.
+static bool RitualNeedsBot(Player const* p, GameObject const* go)
+{
+    GameObjectTemplate const* info = go->GetGOInfo();
+    if (!info || !go->GetOwnerGUID().IsEmpty() || info->ritual.casters < 2)
+        return false;   // a warlock's summoning portal (owned) is the warlock's call; one-user rituals need nobody
+    uint32 const used = go->GetUniqueUseCount();
+    if (used == 0 || used >= info->ritual.casters || go->IsUniqueUser(p->GetGUID()) || p->IsInCombat() || !p->IsAlive())
+        return false;
+    Group const* g = p->GetGroup();
+    if (!g)
+        return false;
+    bool person_started = false;
+    for (ObjectGuid const& user : go->GetUniqueUsers())
+    {
+        Player const* u = ObjectAccessor::GetPlayer(*go, user);
+        if (u && Scenario::PlaysAsHuman(u) && g->IsMember(user))
+        {
+            person_started = true;
+            break;
+        }
+    }
+    if (!person_started)
+        return false;
+    // The group's bots within reach that could fill a place, in guid order: every bot of the group computes the same order, so
+    // exactly the missing number go. Not by distance - the bots following the person keep moving, and a pick that changed with
+    // their steps would send a second bot for a place the first is already walking to. A bot that has used it leaves the list
+    // and the open count drops by one with it.
+    constexpr float kReach = 30.0f;
+    std::vector<ObjectGuid::LowType> candidates;
+    for (GroupReference const& ref : g->GetMembers())
+    {
+        Player const* m = ref.GetSource();
+        if (!m || m->GetMap() != go->GetMap() || Scenario::PlaysAsHuman(m) || !m->IsAlive() || m->IsInCombat()
+            || go->IsUniqueUser(m->GetGUID()))
+            continue;
+        if (m->GetExactDist(go) > kReach)
+            continue;
+        candidates.push_back(m->GetGUID().GetCounter());
+    }
+    std::sort(candidates.begin(), candidates.end());
+    uint32 const open = info->ritual.casters - used;
+    for (uint32 i = 0; i < candidates.size() && i < open; ++i)
+        if (candidates[i] == p->GetGUID().GetCounter())
+            return true;
+    return false;
+}
+
 SnapRecyclePool& RecyclePool()
 {
     // thread_local — one pool per worker thread (and the world thread when
@@ -1935,15 +1987,13 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 {}, &ld)
             : ZLiquidStatus(0);
         const bool in_liquid = (liquid & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER)) != 0;
-        const bool is_magma = (ld.type_flags & map_liquidHeaderTypeFlags::Magma) != map_liquidHeaderTypeFlags::NoWater;
-        const bool is_slime = (ld.type_flags & map_liquidHeaderTypeFlags::Slime) != map_liquidHeaderTypeFlags::NoWater;
-        // Underwater (water-specific) only when the head is submerged AND
-        // the liquid is real water — not magma. A naked bot in lava also
-        // has feet wet, but it's burning, not drowning.
-        snap->environment.is_underwater = (liquid & LIQUID_MAP_UNDER_WATER) != 0
-                            && !is_magma && !is_slime;
+        const bool hurts = BotMovement::LiquidHurts(ld, liquid);
+        // Underwater (drowning) only when the head is submerged in a liquid
+        // that does not hurt. A naked bot in lava also has feet wet, but
+        // it's burning, not drowning.
+        snap->environment.is_underwater = (liquid & LIQUID_MAP_UNDER_WATER) != 0 && !hurts;
         // The core burns on any contact, floor within a tenth of the surface included (WATER_WALK): the Majordomo dais.
-        snap->environment.is_in_damaging_liquid = (liquid & MAP_LIQUID_STATUS_IN_CONTACT) != 0 && (is_magma || is_slime);
+        snap->environment.is_in_damaging_liquid = (liquid & MAP_LIQUID_STATUS_IN_CONTACT) != 0 && hurts;
         if (snap->environment.is_underwater && lqmap)
             snap->environment.water_surface_z = lqmap->GetWaterLevel(
                 p->GetPhaseShift(), p->GetPositionX(), p->GetPositionY());
@@ -1951,7 +2001,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             snap->environment.water_surface_z = 0.0f;
 
         // Open-world water-escape FOCUS target (FIX #12). When the bot is in real
-        // swim-water (not magma/slime), resolve the nearest DRY navmesh footing
+        // swim-water (a liquid that does not hurt), resolve the nearest DRY navmesh footing
         // so idle:water_escape can drive straight to it and PREEMPT all other
         // movement until the bot is on land — breaking the Stormwind-harbor
         // oscillation where the water-exit recovery pulls the bot to shore while
@@ -1959,7 +2009,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         // water/magma (dry footing only) and is SEH-guarded for the world thread;
         // gated on in-water so only swimming bots pay the navmesh query.
         snap->environment.water_escape_valid = false;
-        if (in_liquid && !is_magma && !is_slime)
+        if (in_liquid && !hurts)
         {
             Position exit{};
             if (Playerbot::BotMovement::NearestNavPoint(
@@ -2841,8 +2891,18 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             snap->social_events.group_invite_leader_level   = leader->GetLevel();
             snap->social_events.group_invite_leader_is_real = !(leader->GetSession() && leader->GetSession()->IsBot());
             if (WorldSession const* ls = leader->GetSession(); ls && !ls->IsBot())
+            {
                 snap->social_events.group_invite_leader_privileged =
                     ls->GetSecurity() >= SEC_GAMEMASTER || !Services::Owners().BotsOwnedBy(ls->GetAccountId()).empty();
+                uint32 const owner_account = Services::Owners().GetOwner(snap->bot_id).account_id;
+                snap->social_events.group_invite_leader_owner = owner_account != 0 && owner_account == ls->GetAccountId();
+                snap->social_events.group_invite_leader_gm = ls->GetSecurity() >= SEC_GAMEMASTER;
+                // The bot's own friend list only, as for the duel friend flag above: this may run on a snapshot worker, and the player's
+                // list is his session's to change at any moment. HasFriend does not change the list (TC's declaration is not const).
+                if (PlayerSocial* social = const_cast<Player*>(p)->GetSocial())
+                    snap->social_events.group_invite_leader_friend = social->HasFriend(leader->GetGUID());
+                snap->social_events.group_invite_leader_guildmate = p->GetGuildId() != 0 && p->GetGuildId() == leader->GetGuildId();
+            }
         }
     }
     // Skip a dead victim — Player::GetVictim() can stay set for a tick after
@@ -4027,6 +4087,29 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 snap->combat.group_tank = mp->GetGUID();
         }
     }
+    // Healer victim seeding. A grouped healer in a dungeon or raid never opens on a mob itself (State_InCombat holds it at
+    // combat:raid_healer_hold instead of start_attack, which would drag it into melee and threat), so it had no victim and every
+    // damage rule of its rotation (wand, Smite, Wrath, Lightning Bolt; all gated on HasLiveTarget) stood idle while the group was
+    // healthy: voldemargreed, SFK 2026-11-13, "healers just stand around waiting for someone's health to drop". In combat with no
+    // victim and no hostile selection it takes the tank's victim, the group's kill target: no Attack, no chase, only the target its
+    // ranged rules aim at. Heals keep their own targets and their priority (the damage rules wait until everyone is above 90 %).
+    if (snap->combat.victim.IsEmpty() && p->IsInCombat() && !snap->combat.group_tank.IsEmpty() &&
+        snap->combat.group_tank != p->GetGUID() && p->GetMap()->Instanceable() && !p->GetMap()->IsBattlegroundOrArena())
+    {
+        Role const role = (bot_ai && bot_ai->role_override() != Role::Unknown) ? bot_ai->role_override() : snap->group.my_role;
+        if (role == Role::Healer)
+            if (Player const* tank = ObjectAccessor::GetPlayer(*p, snap->combat.group_tank))
+                if (Unit const* mob = tank->GetVictim();
+                    mob && mob->IsAlive() && mob->IsInMap(p) && p->IsValidAttackTarget(mob) && !mob->HasBreakableByDamageCrowdControlAura())
+                {
+                    snap->combat.victim = mob->GetGUID();
+                    snap->combat.victim_pos_known = true;
+                    snap->combat.victim_x = mob->GetPositionX();
+                    snap->combat.victim_y = mob->GetPositionY();
+                    snap->combat.victim_z = mob->GetPositionZ();
+                    snap->combat.victim_reach = mob->GetCombatReach();
+                }
+    }
     Pet const* threat_pet = p->GetPet();
     auto fill_threat = [&](NearbyUnit& u, Unit* t)
     {
@@ -4504,7 +4587,11 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         snap->auras.own_auras_index.push(snap->auras.own_auras[i].spell_id, i);
     snap->auras.own_auras_index.finalize();
 
+    // The snapshot's victim, not only the melee one: a seeded victim (a ranged attacker's selection, a healer's tank target, above)
+    // needs its auras too, or "is my Shadow Word: Pain on it" read no and the dot was cast again every tick.
     Unit* victim = p->GetVictim();
+    if (!snap->combat.victim.IsEmpty() && (!victim || victim->GetGUID() != snap->combat.victim))
+        victim = ObjectAccessor::GetUnit(*p, snap->combat.victim);
     Unit* tu = nullptr;
     if (!snap->combat.current_target.IsEmpty() && snap->combat.current_target != snap->guid)
         tu = ObjectAccessor::GetUnit(*p, snap->combat.current_target);
@@ -8205,7 +8292,10 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 // the bot out of damage range. We DO want non-hostile
                 // traps in nearby_objects too (some quest scripts trigger
                 // off them), so the type passes the filter unconditionally.
-                t == GAMEOBJECT_TYPE_TRAP;
+                t == GAMEOBJECT_TYPE_TRAP           ||
+                // RITUAL (18): an altar that needs several users (Uldaman's two altars, the UBRS Blackrock Altar). The group's
+                // bots fill the places a person in the group leaves open (ritual_join below).
+                t == GAMEOBJECT_TYPE_RITUAL;
             if (!useful) continue;
             const float dx = go->GetPositionX() - p->GetPositionX();
             const float dy = go->GetPositionY() - p->GetPositionY();
@@ -8245,6 +8335,8 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             n.x = go->GetPositionX();
             n.y = go->GetPositionY();
             n.z = go->GetPositionZ();
+            if (n.go_type == GAMEOBJECT_TYPE_RITUAL)
+                n.ritual_join = RitualNeedsBot(p, go);
             // Destructible gate breach state (IoC / SoTA) so the siege-fire
             // rule skips already-down gates and advances to the next line.
             if (n.go_type == GAMEOBJECT_TYPE_DESTRUCTIBLE_BUILDING)
@@ -10735,6 +10827,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             sp.level       = info.Level;
             sp.slot_kind   = 0;  // active
             sp.slot_index  = i;
+            sp.dead        = info.Health == 0;
             snap->pet.stable_pets.push_back(std::move(sp));
         }
         for (uint8 i = 0; i < stable->StabledPets.size(); ++i)

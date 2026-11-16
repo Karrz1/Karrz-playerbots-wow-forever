@@ -22,6 +22,7 @@
 
 #include "Creature.h"
 #include "GameObject.h"
+#include "GameTime.h"
 #include "Log.h"
 #include "Map.h"
 #include "PathGenerator.h"
@@ -35,6 +36,9 @@
 #include <algorithm>
 #include <cmath>
 #include <list>
+#include <span>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace Playerbot::Raid::detail {
 
@@ -707,20 +711,545 @@ void ElectGothikSides(Election& e)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Thaddius: Stalagg and Feugen on their platforms
+// ---------------------------------------------------------------------------
+// The two adds stand on platforms at z 312 (classic_boss_thaddius.cpp ClassicThadAddPositions); Thaddius' own walkway (z 303) lies between
+// them, cut off by the slime pit and a 15 y wall up to each platform (terrainprofile 2026-11-15). The platforms are reached from the room's
+// door (Thaddius Door, 3421.9,-3017.5,295.6: complete paths of 103 y), and from one platform to the other is a 194 y walk round. Each
+// add must stay within 60 y of its Tesla Coil or the coil shocks the raid, and Magnetic Pull swaps the two tanks every 20.5 s. So the raid
+// splits as a Classic raid does: tanks, healers, ranged and melee alternate between the two platforms before the pull, and in phase one each
+// non-tank fights on its own platform only. naxx_thaddius 1115c, staged on his walkway: the tanks had no path up (Incomplete, 0.5 y of
+// progress), Stalagg and Feugen killed the casters who got up, and the raid wiped at 0/5.
+constexpr uint32_t kStalagg  = 15929;
+constexpr uint32_t kFeugen   = 15930;
+constexpr float    kThadRoom = 150.0f;      // a member this close to Stalagg is in the room
+constexpr float    kThadOtherAddMin = 45.0f;   // a side spot keeps at least this far from the other add (the platforms are about 85 y apart)
+constexpr float    kThadSpotTol = 5.0f;     // a ranged or healer within this of its spot holds there
+constexpr float    kThadMeleeOffSide = 45.0f;   // a melee further than this from its own add is on the wrong platform
+
+enum : uint8_t { kThadSideStalagg = 1, kThadSideFeugen = 2 };
+
+struct ThadSpot { uint32_t instance = 0; uint8_t side = 0; float x = 0, y = 0, z = 0; };
+std::unordered_map<uint64_t, ThadSpot> g_thadSpot;                     // bot -> its side and spot
+std::unordered_map<uint64_t, std::pair<bool, Position>> g_thadAnchor;  // (instance << 2 | side) -> anchor found?
+
+uint32_t ThadAddEntry(uint8_t side) { return side == kThadSideStalagg ? kStalagg : kFeugen; }
+
+// The side's anchor: a floor point on the add's platform at the side's distance from it, in its sight, far from the other add and reachable
+// on foot from where `bot` stands. Stalagg's side stands 24 y off (outside his reach before the pull, inside every spell's after it);
+// Feugen's 33 y, outside his Static Field (28135, 30 y: the mana of everyone nearer burns).
+bool ThadAnchor(Player* bot, Creature* add, Creature* other, uint8_t side, Position& out)
+{
+    uint64_t const key = (uint64_t(bot->GetInstanceId()) << 2) | side;
+    auto it = g_thadAnchor.find(key);
+    if (it != g_thadAnchor.end())
+    {
+        out = it->second.second;
+        return it->second.first;
+    }
+    static constexpr float kStalaggRadii[] = { 24.0f, 21.0f, 27.0f, 18.0f };
+    static constexpr float kFeugenRadii[]  = { 33.0f, 35.0f, 31.0f };
+    std::span<float const> const radii = side == kThadSideStalagg ? std::span<float const>(kStalaggRadii) : std::span<float const>(kFeugenRadii);
+    // From the back of the platform (the bearing away from the other add) round to the front.
+    float const back = other->GetAbsoluteAngle(add);
+    for (float radius : radii)
+        for (int step = 0; step <= 12; ++step)
+            for (int sign : { 1, -1 })
+            {
+                if (step == 0 && sign < 0)
+                    continue;
+                float const a = back + float(sign * step) * float(M_PI) / 12.0f;
+                float const x = add->GetPositionX() + radius * std::cos(a);
+                float const y = add->GetPositionY() + radius * std::sin(a);
+                float const z = bot->GetMap()->GetHeight(bot->GetPhaseShift(), x, y, add->GetPositionZ() + 3.0f, true, 8.0f);
+                if (z <= INVALID_HEIGHT + 1.0f || std::fabs(z - add->GetPositionZ()) > 2.5f)
+                    continue;   // off the platform
+                if (other->GetExactDist2d(x, y) < kThadOtherAddMin || !add->IsWithinLOS(x, y, z + 2.0f))
+                    continue;
+                PathGenerator path(bot);
+                if (!path.CalculatePath(x, y, z, false) || (path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE)))
+                    continue;
+                G3D::Vector3 const end = path.GetActualEndPosition();
+                if ((end.x - x) * (end.x - x) + (end.y - y) * (end.y - y) > 3.0f * 3.0f || std::fabs(end.z - z) > 3.0f)
+                    continue;
+                out.Relocate(x, y, z);
+                g_thadAnchor[key] = { true, out };
+                TC_LOG_INFO("playerbot.v2.raid", "[raid] Thaddius: {} side spot ({:.1f},{:.1f},{:.1f}), {:.0f} y from the add, path {:.0f} y from {}",
+                            side == kThadSideStalagg ? "Stalagg's" : "Feugen's", x, y, z, radius, path.GetPathLength(), bot->GetName());
+                return true;
+            }
+    g_thadAnchor[key] = { false, Position() };
+    TC_LOG_WARN("playerbot.v2.raid", "[raid] Thaddius: no reachable spot on {} platform from {} at ({:.1f},{:.1f},{:.1f})",
+                side == kThadSideStalagg ? "Stalagg's" : "Feugen's", bot->GetName(), bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ());
+    return false;
+}
+
+// 0 tank, 1 healer, 2 ranged, 3 melee: each kind is split evenly between the platforms.
+uint8_t ThadKind(Member const& m) { return m.tank ? 0 : m.healer ? 1 : m.ranged ? 2 : 3; }
+
+void NaxxPrePullThaddius(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, std::ostringstream& dump)
+{
+    Player* first = plan.members.front().p;
+    Creature* stalagg = first->FindNearestCreature(kStalagg, 250.0f, true);
+    Creature* feugen = first->FindNearestCreature(kFeugen, 250.0f, true);
+    if (!stalagg || !feugen || stalagg->IsInCombat() || feugen->IsInCombat())
+        return;
+    bool inRoom = false;
+    for (Member const& m : plan.members)
+        if (m.p->GetExactDist2d(stalagg) < kThadRoom)
+            inRoom = true;
+    if (!inRoom)
+        return;
+    uint32_t const instance = first->GetInstanceId();
+    // Count what each side already has (bots given a side before, humans by the add they stand nearer), then give the rest, kind by kind,
+    // to the side with fewer of their kind. The main tank goes to Stalagg's: the raid opens on him (ScenarioDefs naxx_thaddius OpensOn).
+    uint32_t count[4][3] = {};
+    auto const sideOf = [&](Member const& m) -> uint8_t
+    {
+        if (!m.bot)
+            return m.p->GetExactDist2d(stalagg) <= m.p->GetExactDist2d(feugen) ? kThadSideStalagg : kThadSideFeugen;
+        auto it = g_thadSpot.find(m.p->GetGUID().GetCounter());
+        return it != g_thadSpot.end() && it->second.instance == instance ? it->second.side : 0;
+    };
+    for (Member const& m : plan.members)
+        if (uint8_t const side = sideOf(m))
+            ++count[ThadKind(m)][side];
+    uint32_t index = 0;
+    for (Member const& m : plan.members)
+    {
+        if (!m.bot)
+            continue;
+        ++index;
+        uint64_t const low = m.p->GetGUID().GetCounter();
+        ThadSpot& spot = g_thadSpot[low];
+        if (spot.instance != instance || !spot.side)
+        {
+            uint8_t const kind = ThadKind(m);
+            uint8_t side;
+            if (m.p == plan.mainTank)
+                side = kThadSideStalagg;
+            else
+                side = count[kind][kThadSideFeugen] < count[kind][kThadSideStalagg] ? kThadSideFeugen : kThadSideStalagg;
+            Creature* add = side == kThadSideStalagg ? stalagg : feugen;
+            Creature* other = side == kThadSideStalagg ? feugen : stalagg;
+            Position anchor;
+            if (!ThadAnchor(m.p, add, other, side, anchor))
+            {
+                g_thadSpot.erase(low);
+                continue;
+            }
+            ++count[kind][side];
+            // A small ring around the anchor, a different place per bot, on the platform's floor.
+            float const angle = float(index) * 2.4f;
+            float const radius = 2.0f + float(index % 4) * 1.5f;
+            float x = anchor.GetPositionX() + radius * std::cos(angle);
+            float y = anchor.GetPositionY() + radius * std::sin(angle);
+            float z = m.p->GetMap()->GetHeight(m.p->GetPhaseShift(), x, y, anchor.GetPositionZ() + 2.0f, true, 6.0f);
+            if (z <= INVALID_HEIGHT + 1.0f || std::fabs(z - anchor.GetPositionZ()) > 2.0f || !add->IsWithinLOS(x, y, z + 2.0f))
+            {
+                x = anchor.GetPositionX();
+                y = anchor.GetPositionY();
+                z = anchor.GetPositionZ();
+            }
+            spot = { instance, side, x, y, z };
+        }
+        RaidOrder& o = orders[low];
+        o.active = true;
+        o.prepull = true;
+        SetMove(o, spot.x, spot.y, spot.z, spot.side == kThadSideStalagg ? "thaddius: Stalagg's platform" : "thaddius: Feugen's platform");
+    }
+    dump << "  Thaddius split: Stalagg tanks " << count[0][kThadSideStalagg] << " healers " << count[1][kThadSideStalagg] << " ranged "
+         << count[2][kThadSideStalagg] << " melee " << count[3][kThadSideStalagg] << " | Feugen tanks " << count[0][kThadSideFeugen] << " healers "
+         << count[1][kThadSideFeugen] << " ranged " << count[2][kThadSideFeugen] << " melee " << count[3][kThadSideFeugen] << "\n";
+}
+
+// This bot's side in phase one (Stalagg or Feugen up and fighting), with its own add (nullptr when that one is down for good) and the other.
+// False outside phase one and for a bot the split never gave a side.
+bool ThadPhaseOneSide(Plan const& plan, Player* bot, ThadSpot const*& spot, Unit*& own, Unit*& other)
+{
+    own = other = nullptr;
+    bool any = false;
+    auto it = g_thadSpot.find(bot->GetGUID().GetCounter());
+    if (it == g_thadSpot.end() || it->second.instance != bot->GetInstanceId() || !it->second.side)
+        return false;
+    spot = &it->second;
+    for (Unit* enemy : plan.enemies)
+    {
+        if (enemy->GetEntry() != kStalagg && enemy->GetEntry() != kFeugen)
+            continue;
+        any = true;
+        (enemy->GetEntry() == ThadAddEntry(spot->side) ? own : other) = enemy;
+    }
+    return any;
+}
+
+// Phase one: a ranged or healer bot holds its spot on its own platform; a melee on the wrong platform walks back; tanks go where Magnetic
+// Pull throws them and are left alone.
+bool ThaddiusSideMove(Plan const& plan, Member const& self, RaidOrder& out)
+{
+    if (!self.bot || self.tank)
+        return false;
+    ThadSpot const* spot = nullptr;
+    Unit* own = nullptr;
+    Unit* other = nullptr;
+    if (!ThadPhaseOneSide(plan, self.p, spot, own, other))
+        return false;
+    Player* bot = self.p;
+    if (!self.ranged && !self.healer)
+    {
+        float const ownX = own ? own->GetPositionX() : spot->x, ownY = own ? own->GetPositionY() : spot->y;
+        if (bot->GetExactDist2d(ownX, ownY) <= kThadMeleeOffSide)
+            return false;
+        return SetMove(out, spot->x, spot->y, spot->z, "thaddius: back to own platform");
+    }
+    if (own)
+        out.post_enemy = own->GetGUID();
+    if (bot->GetExactDist2d(spot->x, spot->y) <= kThadSpotTol && std::fabs(bot->GetPositionZ() - spot->z) < 3.0f)
+    {
+        out.at_post = true;
+        return true;
+    }
+    return SetMove(out, spot->x, spot->y, spot->z, "thaddius: own platform");
+}
+
+// ---------------------------------------------------------------------------
+// Gluth
+// ---------------------------------------------------------------------------
+// He eats every Zombie Chow within 15 y for 5% of his health (DoSearchZombieChow, classic_boss_gluth.cpp), and his own body is that wide:
+// he hits from 17.7 y (naxx_gluth 1115e: Mctankwb died at 3319,-3106 with him at 3311,-3122). A tank that leads him into a corner from in
+// front leaves him 17 y short of it, on the raid's side: in 1115e his tank stood on the north-east post and he stood 19 y from the camp,
+// ate the chows that came to the raid and killed it once his tank fell. So his tank drags him toward the east wall, then steps back past
+// him to the camp side, inside his reach, where he does not follow. One more tank stands beside the holder for the Mortal Wound swap; the
+// rest take the chows at two posts by the spawns, away from him, inside the healers' 40 y.
+// The step back is anchored on the spot where he stopped, not on his live position: in naxx_gluth 1115f a spot 10 y from his live centre
+// moved with every step he took, his tank walked him from the east wall to 6 y from the camp and back four times in 45 s ("drag" and
+// "camp side" in turn), and it died there. The drag spot is within 43 y of the camp: 1115f's, 57 y off, left the tank out of heal reach.
+constexpr uint32_t kGluth          = 15932;
+constexpr uint32_t kZombieChow     = 16360;
+constexpr float    kGluthCampX     = 3290.0f, kGluthCampY = -3110.0f;   // RaidEncounterData_NAXX.cpp: the ranged and healer rows
+constexpr float    kGluthDragX     = 3330.0f, kGluthDragY = -3125.0f;   // by the east wall, 43 y from the camp, 65-80 y from the chow spawns
+constexpr float    kGluthFloorZ    = 297.8f;
+constexpr float    kGluthArrived   = 20.0f;   // he stands this close to the drag spot: where he stands now is his spot
+// He left the east wall: farther than this from the drag spot, drag him again. Not a distance from the spot where he stopped: he steps
+// after his tank by up to its 10 y step, and at 12 y from that spot (0085) the step itself sent the tank back to the wall, every few
+// seconds (naxx_gluth 1115h: the holder moved 62 of 90 s between the wall and its step, 15 white hits and no Sunder in 90 s at 86 rage,
+// and every DPS stood 26-29 s in the threat hold under it). He settles within 20 y of the drag spot and his tank stands 10 y past him:
+// even on top of his tank he is within 30 y of it.
+constexpr float    kGluthLeftWall  = 32.0f;
+constexpr float    kGluthTankStep  = 10.0f;   // the holder stands this far from his spot toward the camp (his reach is 17.7)
+constexpr float    kGluthSwapSide  = 5.0f;    // the swap tank stands this far beside the holder's spot
+constexpr float    kGluthSpotTol   = 3.0f;
+constexpr float    kGluthChowTol   = 5.0f;
+constexpr uint32_t kGluthStaleMs   = 10000;   // an anchor not looked at for this long belongs to an earlier pull
+constexpr uint32_t kGluthDragHoldMs = 15000;  // the longest the DPS wait for the drag (the holder runs 50-70 y with him at its back)
+struct GluthPost { float x, y; };
+constexpr GluthPost kGluthChowPosts[] = {
+    { 3288.0f, -3148.0f },   // south: 30 y from spawn 3267.9,-3172.1, 41 y from 3308.3,-3185.8, 38 y from the camp
+    { 3265.0f, -3136.0f },   // west: 13 y from spawn 3253.2,-3132.3, 36 y from the camp
+};
+struct GluthAnchor { uint32_t seen = 0; bool settled = false; float x = 0.f, y = 0.f; uint32_t drag_since = 0; bool drag_timed_out = false; };
+std::unordered_map<uint64_t, GluthAnchor> g_gluthAnchor;   // Gluth's guid -> where he stopped by the east wall
+
+Unit* FindGluth(Plan const& plan)
+{
+    for (Unit* enemy : plan.enemies)
+        if (enemy->GetEntry() == kGluth && enemy->IsAlive())
+            return enemy;
+    return nullptr;
+}
+
+// His spot, once he has come to the east wall: where he stopped, settled while he stays within kGluthLeftWall of the drag spot.
+GluthAnchor& GluthSpot(Unit* gluth, uint32_t now)
+{
+    GluthAnchor& a = g_gluthAnchor[(uint64_t(gluth->GetInstanceId()) << 32) ^ gluth->GetGUID().GetCounter()];
+    if (!a.seen || now - a.seen > kGluthStaleMs)
+        a = GluthAnchor{};
+    a.seen = now ? now : 1u;
+    float const gx = gluth->GetPositionX(), gy = gluth->GetPositionY();
+    if (a.settled && Dist2D(gx, gy, kGluthDragX, kGluthDragY) > kGluthLeftWall)
+        a.settled = false;
+    if (!a.settled && Dist2D(gx, gy, kGluthDragX, kGluthDragY) <= kGluthArrived)
+    {
+        a.settled = true;
+        a.x = gx;
+        a.y = gy;
+    }
+    return a;
+}
+
+// The tank holding him (nullptr while he is on nobody or on a non-tank: the pick-up is the tank brain's), the tank kept beside it for the
+// swap, and this tank's chow post (index into kGluthChowPosts, -1 for the holder and the swap tank).
+enum class GluthJob : uint8_t { None, Holder, Swap, Chows };
+GluthJob GluthJobOf(Plan const& plan, Unit* gluth, Player* bot, int& post)
+{
+    post = -1;
+    Unit* held = gluth->GetVictim();
+    Player* holder = held ? held->ToPlayer() : nullptr;
+    bool holderIsTank = false;
+    for (Member const& m : plan.members)
+        if (m.p == holder && m.tank)
+            holderIsTank = true;
+    if (!holderIsTank)
+        return GluthJob::None;
+    if (bot == holder)
+        return GluthJob::Holder;
+    int index = 0;   // plan.members is sorted by guid
+    for (Member const& m : plan.members)
+    {
+        if (!m.tank || m.p == holder || !m.p->IsAlive())
+            continue;
+        if (m.p == bot)
+        {
+            if (index == 0)
+                return GluthJob::Swap;
+            post = (index - 1) % int(std::size(kGluthChowPosts));
+            return GluthJob::Chows;
+        }
+        ++index;
+    }
+    return GluthJob::None;
+}
+
+bool GluthMoveTo(Player* bot, RaidOrder& out, float x, float y, float tol, char const* why)
+{
+    if (bot->GetExactDist2d(x, y) <= tol)
+    {
+        out.at_post = true;
+        return true;
+    }
+    float z = kGluthFloorZ;
+    if (!Usable(bot, x, y, kGluthFloorZ, z))
+        return false;
+    return SetMove(out, x, y, z, why);
+}
+
+// A chow on this bot, alive and still a chow the tanks hold (not one Decimate sent walking to him).
+bool ChowOnMe(Player* bot)
+{
+    Unit* victim = bot->GetVictim();
+    return victim && victim->GetEntry() == kZombieChow && victim->IsAlive() && victim->GetVictim() == bot;
+}
+
+int NearestChowPost(Player* bot)
+{
+    int best = 0;
+    for (int i = 1; i < int(std::size(kGluthChowPosts)); ++i)
+        if (bot->GetExactDist2d(kGluthChowPosts[i].x, kGluthChowPosts[i].y) < bot->GetExactDist2d(kGluthChowPosts[best].x, kGluthChowPosts[best].y))
+            best = i;
+    return best;
+}
+
+bool GluthMove(Plan const& plan, Member const& self, uint32_t now, RaidOrder& out)
+{
+    if (!self.bot || !self.tank)
+        return false;
+    Unit* gluth = FindGluth(plan);
+    if (!gluth)
+        return false;
+    int post = -1;
+    GluthJob job = GluthJobOf(plan, gluth, self.p, post);
+    Player* bot = self.p;
+    // The swap tank with a chow on it takes the chow to a post: next to him, he eats it (1115f: Mctankwb held chows 3-14 y from him and he
+    // went from 91% back to 94-96% three times).
+    if (job == GluthJob::Swap && ChowOnMe(bot))
+    {
+        job = GluthJob::Chows;
+        post = NearestChowPost(bot);
+    }
+    if (job == GluthJob::Holder || job == GluthJob::Swap)
+    {
+        GluthAnchor const& spot = GluthSpot(gluth, now);
+        out.post_enemy = gluth->GetGUID();
+        if (!spot.settled)
+        {
+            if (job == GluthJob::Swap)
+                return false;   // he is still on the way: it follows and stays in taunt reach on its own
+            return GluthMoveTo(bot, out, kGluthDragX, kGluthDragY, kGluthSpotTol, "gluth: drag to the east wall");
+        }
+        float const cx = kGluthCampX - spot.x, cy = kGluthCampY - spot.y;
+        float const len = std::max(0.1f, std::sqrt(cx * cx + cy * cy));
+        float const ux = cx / len, uy = cy / len;
+        float x = spot.x + ux * kGluthTankStep, y = spot.y + uy * kGluthTankStep;
+        if (job == GluthJob::Swap)
+        {
+            x -= uy * kGluthSwapSide;
+            y += ux * kGluthSwapSide;
+        }
+        return GluthMoveTo(bot, out, x, y, kGluthSpotTol, job == GluthJob::Holder ? "gluth: camp side of him" : "gluth: beside his tank");
+    }
+    if (job != GluthJob::Chows)
+        return false;
+    // A chow tank going for a loose chow runs to it (the tank brain's pick-up); one with a chow on it, or with nothing, holds its post.
+    if (Unit* victim = bot->GetVictim())
+        if (victim->GetEntry() == kZombieChow && victim->IsAlive() && victim->GetVictim() != bot)
+            return false;
+    GluthPost const& p = kGluthChowPosts[post];
+    return GluthMoveTo(bot, out, p.x, p.y, kGluthChowTol, "gluth: chow post");
+}
+
 } // namespace
+
+void NaxxGluthTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders);
+
+// After PublishTargets: in Thaddius' phase one a non-tank bot only attacks the add on its own platform (the other is 85 y away and a 194 y
+// walk round). The kill-together rule's spread still holds: an own add it forbids (more than 10% ahead of the other) leaves the bot with
+// nothing to hit until the other side catches up.
+void NaxxPostTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders)
+{
+    for (Member const& m : plan.members)
+    {
+        if (!m.bot || m.tank)
+            continue;
+        ThadSpot const* spot = nullptr;
+        Unit* own = nullptr;
+        Unit* other = nullptr;
+        if (!ThadPhaseOneSide(plan, m.p, spot, own, other))
+            continue;
+        auto it = orders.find(m.p->GetGUID().GetCounter());
+        if (it == orders.end())
+            continue;
+        RaidOrder& o = it->second;
+        if (other)
+            o.forbidden_targets.push_back(other->GetGUID());
+        bool const ownForbidden = !own ||
+            std::find(o.forbidden_targets.begin(), o.forbidden_targets.end(), own->GetGUID()) != o.forbidden_targets.end();
+        o.fallback_target = ownForbidden ? ObjectGuid::Empty : own->GetGUID();
+    }
+    NaxxGluthTargets(plan, orders);
+}
+
+// Gluth's chow tanks never attack him: their post is 35-55 y from him and the attack would walk them over (and bring their chows into his
+// reach).
+// While his tank drags him to the east wall the DPS do not hit him: a tank on the run builds no threat, and the timed threat releases let
+// the raid's damage take him off it (naxx_gluth 1115g: on the main tank at 3 s, on a fury warrior at 6 s with the drag half done, then on
+// one DPS after another; 3 tanks and 10 raiders dead by 36 s). Once he stands at his spot the normal threat holds take over. Ordered casts
+// (Tranquilizing Shot) still go; the wait is bounded by kGluthDragHoldMs from the start of the drag.
+void NaxxGluthTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders)
+{
+    Unit* gluth = FindGluth(plan);
+    if (!gluth)
+        return;
+    uint32_t const now = GameTime::GetGameTimeMS();
+    GluthAnchor& spot = GluthSpot(gluth, now);
+    int unused = -1;
+    bool dragging = false;
+    for (Member const& m : plan.members)
+        if (m.tank && GluthJobOf(plan, gluth, m.p, unused) == GluthJob::Holder)
+            dragging = !spot.settled;
+    if (!dragging)
+        spot.drag_since = 0;
+    else if (!spot.drag_since)
+        spot.drag_since = now ? now : 1u;
+    if (dragging && now - spot.drag_since >= kGluthDragHoldMs)
+    {
+        if (!spot.drag_timed_out)
+            TC_LOG_INFO("playerbot.v2.raid", "[raid_gluth] the drag has not brought him within {:.0f} y of {:.0f},{:.0f} in {} s (he is at {:.1f},{:.1f}): "
+                        "the DPS open where he is", kGluthArrived, kGluthDragX, kGluthDragY, kGluthDragHoldMs / 1000u,
+                        gluth->GetPositionX(), gluth->GetPositionY());
+        spot.drag_timed_out = true;
+        dragging = false;
+    }
+    else if (!dragging)
+        spot.drag_timed_out = false;
+    for (Member const& m : plan.members)
+    {
+        if (!dragging || !m.bot || m.tank || m.healer)
+            continue;
+        auto it = orders.find(m.p->GetGUID().GetCounter());
+        if (it != orders.end())
+            it->second.hold_target = gluth->GetGUID();
+    }
+    for (Member const& m : plan.members)
+    {
+        int post = -1;
+        if (!m.bot || !m.tank || GluthJobOf(plan, gluth, m.p, post) != GluthJob::Chows)
+            continue;
+        auto it = orders.find(m.p->GetGUID().GetCounter());
+        if (it == orders.end() || it->second.cast_kind == RaidOrder::CastKind::Taunt)
+            continue;   // a swap taunt elected for this tank still goes
+        it->second.forbidden_targets.push_back(gluth->GetGUID());
+    }
+}
+
+// Patchwerk
+// ----------------------------------------------------------------------------------------------------------------------------------
+// The healers wait at their posts at the east end of his hall before he is pulled (RaidEncounterData_NAXX.cpp: 3326,-3223 and
+// 3326,-3241, 20 y from his spawn, east of it, where his walk never goes). From the room's lower floor where the raid waits they had a
+// 75 y walk after the pull: naxx_patchwerk 1115i fought him at his spawn, each soaker took one Hateful Strike (7k of 10.7k) in the first
+// 3 s, and the healers spent 29 of 61 s walking, cast nothing for 18 s and every tank died before the first heal landed.
+// They go only while he is far down his walk (kPatchFarYards from his spawn: 18 s or more at his pace, their walk takes about 8 s), and
+// once sent they stay sent for the instance, so the post is held as he walks back. In combat the fight's stand rows take over.
+constexpr uint32_t kPatchwerk      = 16028;
+constexpr float    kPatchSpawnX    = 3308.5f, kPatchSpawnY = -3232.1f;
+constexpr float    kPatchFarYards  = 90.0f;
+constexpr float    kPatchNearRaid  = 150.0f;
+constexpr float    kPatchHallZ     = 294.1f;
+struct PatchPost { float x, y; };
+constexpr PatchPost kPatchHealerPosts[] = { { 3326.0f, -3223.0f }, { 3326.0f, -3241.0f } };   // share 1 (even), share 2 (odd)
+std::unordered_set<uint32_t> g_patchPrePull;   // instances whose healers were sent
+
+void NaxxPrePullPatchwerk(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, std::ostringstream& dump)
+{
+    Player* first = plan.members.front().p;
+    if (first->GetExactDist2d(kPatchSpawnX, kPatchSpawnY) > kPatchNearRaid)
+        return;
+    Creature* patch = first->FindNearestCreature(kPatchwerk, 300.0f, true);
+    if (!patch || patch->IsInCombat())
+        return;
+    uint32_t const instance = first->GetInstanceId();
+    float const away = patch->GetExactDist2d(kPatchSpawnX, kPatchSpawnY);
+    if (!g_patchPrePull.count(instance))
+    {
+        if (away < kPatchFarYards)
+            return;
+        g_patchPrePull.insert(instance);
+        TC_LOG_INFO("playerbot.v2.raid", "[raid_patchwerk] he is {:.0f} y down his walk (at {:.1f},{:.1f}): the healers go to their posts at the hall's east end",
+                    away, patch->GetPositionX(), patch->GetPositionY());
+    }
+    uint32_t index = 0, sent = 0;
+    for (Member const& m : plan.members)
+    {
+        if (!m.healer)
+            continue;
+        PatchPost const& post = kPatchHealerPosts[index++ & 1u];
+        if (!m.bot)
+            continue;
+        float z = kPatchHallZ;
+        if (!Usable(m.p, post.x, post.y, kPatchHallZ, z))
+            z = kPatchHallZ;
+        RaidOrder& o = orders[m.p->GetGUID().GetCounter()];
+        o.active = true;
+        o.prepull = true;
+        SetMove(o, post.x, post.y, z, "patchwerk: healer post");
+        ++sent;
+    }
+    dump << "  Patchwerk: " << sent << " healers to the east end, he is " << int(away) << " y from his spawn\n";
+}
 
 void NaxxPrePull(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, std::ostringstream& dump)
 {
+    NaxxPrePullPatchwerk(plan, orders, dump);
+    if (g_patchPrePull.size() > 64)
+        g_patchPrePull.clear();
     NaxxPrePullGothik(plan, orders, dump);
+    NaxxPrePullThaddius(plan, orders, dump);
+    if (g_thadSpot.size() > 512)
+        g_thadSpot.clear();
+    if (g_thadAnchor.size() > 64)
+        g_thadAnchor.clear();
     if (g_gothSpot.size() > 512)
         g_gothSpot.clear();
     if (g_gothAnchor.size() > 64)
         g_gothAnchor.clear();
+    if (g_gluthAnchor.size() > 64)
+        g_gluthAnchor.clear();
 }
 
 bool NaxxMechanicsMove(Plan const& plan, Member const& self, uint32_t now, RaidOrder& out)
 {
-    return HeiganMove(plan, self, now, out) || SapphironMove(plan, self, now, out);
+    return HeiganMove(plan, self, now, out) || SapphironMove(plan, self, now, out) || ThaddiusSideMove(plan, self, out) ||
+           GluthMove(plan, self, now, out);
 }
 
 void NaxxMechanicsElect(Election& e, uint32_t /*now*/)

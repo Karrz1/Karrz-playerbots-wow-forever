@@ -33,6 +33,7 @@
 #include "Fleet/CraftOrderBoard.h"
 #include "Fleet/PlayerCraftOrders.h"
 #include "Fleet/BotQueueFiller.h"
+#include "Fleet/PickupGroups.h"     // the bots' own pickup groups break up at the end of their life
 #include "Fleet/JunkQuestResolver.h"
 #include "Bot/ClassTables.h"   // MaxPlayerLevel()
 #include "Bot/Battleground/BgTeamCoordinator.h"
@@ -87,7 +88,9 @@
 #include "Fleet/OwnerTrail.h"
 #include "Diagnostics/ScenarioHuman.h"
 #include "Random.h"
+#include "MMapManager.h"   // MMAP::ScopedThreadNavMeshQuery (same-map split build)
 #include <functional>
+#include <optional>
 #include <unordered_set>
 #include "WorldSession.h"
 #include "Bot/BotCommandParser.h"
@@ -163,6 +166,18 @@ namespace Playerbot::V2 {
 
 // Players still to be told about the add-on (world thread only: the login hook, the add-on's hello and the world update all run there).
 static AddonHintTracker g_addon_hints;
+
+// PlayerbotV2.SnapshotBuildSplitMap counters for the TickPerf window (world thread only).
+struct SameMapSplitStats
+{
+    uint64 ticks = 0;            // ticks that split at least one map
+    uint64 parts = 0;            // split parts built over those ticks
+    uint64 bots = 0;             // bots built in split parts
+    uint64 deferred_grids = 0;   // grid loads the split builds handed to the world thread
+};
+static SameMapSplitStats g_split_stats;
+// Grid loads the bot logic threads handed to the world thread, for the TickPerf window (world thread only).
+static uint64 g_bot_logic_grid_loads = 0;
 
 namespace {
 
@@ -1043,7 +1058,8 @@ namespace
     //                        survive a crash). Human groups are left intact.
     // purge_pure_bot=false → runtime pass: leave pure-bot groups (legit dungeon
     //                        / BG / quest groups) and only disband human groups
-    //                        whose human member(s) have ALL been offline ≥30min.
+    //                        whose human member(s) have ALL been offline ≥30min,
+    //                        and the bots' own pickup groups whose life is over.
     //
     // only_these (boot purge): the group ids that existed when the module's first tick ran. The purge runs when the boot gate opens,
     // which with no human logged in is 60 s later, and a group formed in that minute is live, not persisted. 2026-10-09: the
@@ -1078,6 +1094,27 @@ namespace
             if (!has_bot)
                 continue;
 
+            // Two world bots' own pickup group (Fleet/PickupGroups.h): once a player is in it, it is his group; otherwise it breaks up at
+            // the end of its life, when no member is fighting, being teleported or in an instance (the spawner breaks it up sooner when
+            // no player is near).
+            if (PickupGroups::Has(gid))
+            {
+                if (has_human)
+                    PickupGroups::Forget(gid);
+                else if (!purge_pure_bot && PickupGroups::Expired(PickupGroups::Table().at(gid), now_ms))
+                {
+                    bool busy = false;
+                    for (auto const& slot : group->GetMemberSlots())
+                        if (Player* m = ObjectAccessor::FindConnectedPlayer(slot.guid))
+                            if (m->IsInCombat() || m->IsBeingTeleported() || (m->GetMap() && m->GetMap()->Instanceable()))
+                            { busy = true; break; }
+                    if (!busy)
+                    {
+                        to_disband.emplace_back(group, "pickup-life-over");
+                        continue;
+                    }
+                }
+            }
             if (!has_human)
             {
                 g_group_humans_offline_since.erase(gid);
@@ -1121,9 +1158,13 @@ namespace
                 to_disband.emplace_back(group, "human-afk-30min");
         }
         // Disband AFTER iterating — Group::Disband() mutates the GroupStore.
+        // A pickup group that is gone (it broke up, or its last member left it) is forgotten.
+        std::erase_if(PickupGroups::Table(),
+            [](auto const& kv) { return !sGroupMgr->GetGroupByGUID(ObjectGuid::Create<HighGuid::Party>(kv.first)); });
         for (auto const& [g, reason] : to_disband)
         {
             g_group_humans_offline_since.erase(g->GetGUID().GetCounter());
+            PickupGroups::Forget(g->GetGUID().GetCounter());
             TC_LOG_INFO("playerbot.v2",
                 "[group_hygiene] disbanding bot group {} reason={}",
                 g->GetGUID().GetCounter(), reason);
@@ -1786,6 +1827,7 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
     static TickId      next_tick    = 1;
     total += diff;
     BotLanguage::Update();   // the login queries for the players' client language
+    BotCommandParser::TickRaidResets();   // "raid reset": close the emptied instances, then clear the locks
     {
         static std::chrono::milliseconds last_hint_check{0};
         if (total - last_hint_check >= std::chrono::milliseconds(2000))
@@ -2267,12 +2309,19 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
         std::shared_ptr<BotSnapshot const>   snap;               // null = Build returned {}
         uint32                               build_us = 0;       // this bot's Build wall time (TickPerf slowest-build)
     };
+    // Grids the rules' nav-point probes asked for on the bot logic threads
+    // (BotMovement::ScopedBotLogicThread). The maps are still here, so this is
+    // where they load; the builds below already see them.
+    g_bot_logic_grid_loads += ::Playerbot::BotMovement::LoadDeferredGrids();
+
     // Partition: Map* -> the slots whose bots live on that map. A vector of
     // (Map*, slots) preserves a stable iteration; build_order records the
     // global registry order for the post-barrier serial pass.
     std::vector<BuiltSlot> build_order;
     std::unordered_map<Map const*, std::vector<size_t>> by_map;   // Map* -> indices into build_order
+    std::vector<uint64> split_key;   // per build_order slot: group or bot, for PlayerbotV2.SnapshotBuildSplitMap
     build_order.reserve(256);
+    split_key.reserve(256);
 
     {
         const uint32 selectA_t0 = getMSTime();
@@ -2326,6 +2375,11 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
             build_order.push_back(BuiltSlot{ id, p, e.ai.get(), {} });
             Map const* m = p ? p->GetMap() : nullptr;
             by_map[m].push_back(slot);
+            // Same-map split key: a group's bots share one key, so they always
+            // build on one thread (the builder reads group-wide coordinator
+            // state); an ungrouped bot is its own key.
+            Group const* g = p ? p->GetGroup() : nullptr;
+            split_key.push_back(g ? (uint64(1) << 63) | g->GetGUID().GetCounter() : uint64(id));
         });
         t_snap_setup_ms += getMSTimeDiff(selectA_t0, getMSTime());
     }
@@ -2340,9 +2394,12 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
     // Decide serial vs. parallel for THIS tick. Read the kill-switch every
     // tick so the operator can flip it live. The pool is created + started
     // lazily on first parallel tick (a box that never enables pays nothing).
-    const bool want_parallel =
-        Services::Config().parallel_snapshot_build() && build_order.size() > 1 && by_map.size() > 1;
-    if (want_parallel && !snapshot_build_pool_)
+    const bool parallel_on = Services::Config().parallel_snapshot_build() && build_order.size() > 1;
+    // PlayerbotV2.SnapshotBuildSplitMap: one busy open-world map may also be
+    // split over the pool (see the fan-out below). Off = one thread per map.
+    const bool split_on = parallel_on && Services::Config().snapshot_build_split_map();
+    const bool want_pool = parallel_on && (by_map.size() > 1 || split_on);
+    if (want_pool && !snapshot_build_pool_)
     {
         snapshot_build_pool_ = std::make_unique<Playerbot::SnapshotBuildPool>(
             Services::Config().snapshot_build_threads());
@@ -2377,9 +2434,28 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
         // one worker serializes that map's pathfinding, which is the invariant the
         // shared query requires. (start/end kept as params for the serial path;
         // the parallel path always passes the full range.)
+        //
+        // same_map_split (PlayerbotV2.SnapshotBuildSplitMap): this chunk is one
+        // part of a map whose other parts build on other threads at the same
+        // time. Two things then change for the length of the chunk:
+        //  - every navmesh query on this thread uses the thread's OWN
+        //    dtNavMeshQuery (MMAP::ScopedThreadNavMeshQuery), so the shared
+        //    per-instance query above is never touched by two threads. The
+        //    dtNavMesh itself is only read, and no tile loads or unloads while
+        //    the build runs (tiles change in sMapMgr->Update, which is done).
+        //  - a build never loads a grid itself (BotMovement::ScopedDeferGridLoads):
+        //    a grid load adds creatures and navmesh tiles under the other parts'
+        //    feet. The world thread loads those grids right after the barrier.
         auto build_chunk =
-            [&](std::vector<size_t> const& slots, size_t start, size_t end)
+            [&](std::vector<size_t> const& slots, size_t start, size_t end, bool same_map_split)
         {
+            std::optional<MMAP::ScopedThreadNavMeshQuery> own_query;
+            std::optional<BotMovement::ScopedDeferGridLoads> no_grid_loads;
+            if (same_map_split)
+            {
+                own_query.emplace();
+                no_grid_loads.emplace();
+            }
             const uint32 part_t0 = getMSTime();
             for (size_t i = start; i < end; ++i)
             {
@@ -2398,40 +2474,119 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
                 getMSTimeDiff(part_t0, getMSTime()), std::memory_order_relaxed);
         };
 
-        if (want_parallel && snapshot_build_pool_)
+        // Build parts: one per Map*, and with PlayerbotV2.SnapshotBuildSplitMap
+        // an open-world map with enough due bots becomes several parts. Only
+        // open-world maps (MAP_COMMON) are split: an instance's bots share
+        // instance-wide script / coordinator state, and an instance rarely holds
+        // more than one group anyway. Inside a split map the part is chosen by
+        // the bot's split_key (its group, or the bot alone), so a group never
+        // builds on two threads and a bot keeps landing in the same part while
+        // the part count stays the same (warm thread_local LoS / recycle pools).
+        struct BuildPart
         {
-            // Fan out ONE task per Map* on that map's STABLE sticky lane
-            // (map_worker_slot_) so the builder's thread_local recycle/LoS pools
-            // stay warm via ping-pong reuse AND each map-instance's shared
-            // dtNavMeshQuery is only ever touched by one thread per batch. Do NOT
-            // split a single map across lanes — see the build_chunk note above
-            // (concurrent findPath on the shared per-instance query → freeze).
-            std::vector<Playerbot::SnapshotBuildPool::LaneTask> tasks;
-            tasks.reserve(by_map.size());
-            for (auto& [m, slots] : by_map)
+            void const*                 map;     // sticky lane key
+            uint32                      sub;     // part index inside a split map
+            std::vector<size_t> const*  slots;
+            bool                        split;
+        };
+        std::vector<BuildPart> parts;
+        std::vector<std::vector<size_t>> split_slots;   // slot lists of the split maps' parts
+        if (want_pool && snapshot_build_pool_)
+        {
+            constexpr size_t kMinBotsPerSplitPart = 8;   // below this the hand-off costs more than it saves
+            const size_t threads = snapshot_build_pool_->worker_count() + 1;   // the world thread builds too
+            auto part_count = [&](Map const* m, size_t due) -> size_t
             {
-                if (slots.empty()) continue;
+                if (!split_on || !m || !m->IsWorldMap())
+                    return 1;
+                return std::clamp<size_t>(due / kMinBotsPerSplitPart, 1, threads);
+            };
+            // split_slots must not reallocate once parts point into it.
+            size_t split_total = 0;
+            for (auto const& [m, slots] : by_map)
+                if (size_t const n = part_count(m, slots.size()); n > 1)
+                    split_total += n;
+            split_slots.reserve(split_total);
+            for (auto const& [m, slots] : by_map)
+            {
+                if (slots.empty())
+                    continue;
+                size_t const n = part_count(m, slots.size());
+                if (n <= 1)
+                {
+                    parts.push_back({ m, 0, &slots, false });
+                    continue;
+                }
+                size_t const first = split_slots.size();
+                split_slots.resize(first + n);
+                for (size_t slot : slots)
+                {
+                    // splitmix64 finaliser: bot ids and group counters are
+                    // sequential, a plain modulo would stripe them.
+                    uint64 h = split_key[slot] + 0x9E3779B97F4A7C15ull;
+                    h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ull;
+                    h = (h ^ (h >> 27)) * 0x94D049BB133111EBull;
+                    h ^= h >> 31;
+                    split_slots[first + size_t(h % n)].push_back(slot);
+                }
+                for (size_t k = 0; k < n; ++k)
+                    if (!split_slots[first + k].empty())
+                        parts.push_back({ m, uint32(k), &split_slots[first + k], true });
+            }
+        }
+        const bool want_parallel = parts.size() > 1;
+
+        if (want_parallel)
+        {
+            // Fan out ONE task per part on that map's STABLE sticky lane
+            // (map_worker_slot_, plus the part index for a split map) so the
+            // builder's thread_local recycle/LoS pools stay warm via ping-pong
+            // reuse. An unsplit map's shared dtNavMeshQuery is only ever touched
+            // by one thread per batch; a split map's parts each use their own
+            // thread's query (see the build_chunk note above). Never split a map
+            // without same_map_split = true (concurrent findPath on the shared
+            // per-instance query → freeze).
+            std::vector<Playerbot::SnapshotBuildPool::LaneTask> tasks;
+            tasks.reserve(parts.size());
+            size_t split_parts = 0;
+            size_t split_bots = 0;
+            for (BuildPart const& part : parts)
+            {
                 // Sticky lane for this Map*. New maps get the next round-robin
                 // slot; despawned maps leave a harmless stale key.
                 uint32 lane;
-                auto it = map_worker_slot_.find(static_cast<void const*>(m));
+                auto it = map_worker_slot_.find(part.map);
                 if (it != map_worker_slot_.end())
                     lane = it->second;
                 else
                 {
                     lane = next_worker_slot_++;
-                    map_worker_slot_.emplace(static_cast<void const*>(m), lane);
+                    map_worker_slot_.emplace(part.map, lane);
                 }
-                // Capture a POINTER to the actual by_map element (which outlives
-                // run_and_wait), NOT a reference to the per-iteration `slots`
-                // binding — that would dangle once the loop iteration ends. by_map
-                // is not mutated during the batch, so &slots is stable for the run.
-                tasks.push_back({ lane,
-                    [&build_chunk, sp = &slots]() {
-                        build_chunk(*sp, 0, sp->size());
+                if (part.split)
+                {
+                    ++split_parts;
+                    split_bots += part.slots->size();
+                }
+                // Capture a POINTER to the slot list (by_map element or
+                // split_slots entry, both outlive run_and_wait and are not
+                // mutated during the batch), never a reference to a loop binding.
+                tasks.push_back({ lane + part.sub,
+                    [&build_chunk, sp = part.slots, split = part.split]() {
+                        build_chunk(*sp, 0, sp->size(), split);
                     } });
             }
             snapshot_build_pool_->run_and_wait(tasks);
+
+            if (split_parts > 0)
+            {
+                // Grids the split builds wanted but could not load themselves.
+                // World thread, every part done: nothing else reads the maps now.
+                g_split_stats.ticks += 1;
+                g_split_stats.parts += split_parts;
+                g_split_stats.bots += split_bots;
+                g_split_stats.deferred_grids += ::Playerbot::BotMovement::LoadDeferredGrids();
+            }
         }
         else
         {
@@ -2439,7 +2594,7 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
             // partition inline on the world thread. Identical behavior + same
             // thread_local pools (the world thread's) as the pre-Phase-4 path.
             for (auto& [m, slots] : by_map)
-                build_chunk(slots, 0, slots.size());
+                build_chunk(slots, 0, slots.size(), false);
         }
 
         t_snap_build_ms += par_build_ms_acc.load(std::memory_order_relaxed);
@@ -2920,6 +3075,22 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
                 snap_total > 0 ? 100.0 * double(perf_snap_built_count_) / double(snap_total) : 0.0,
                 perf_intents_drained_,
                 double(perf_intents_drained_) / double(n));
+
+            // Same-map split (PlayerbotV2.SnapshotBuildSplitMap). With it on,
+            // "build" above is the time summed over all build threads, so it can
+            // exceed "snap", which stays the world thread's wall time.
+            if (g_split_stats.ticks > 0)
+                TC_LOG_INFO("playerbot.v2",
+                    "[PlayerbotV2] TickPerf same_map_split: ticks={} parts_per_tick={:.1f} bots_per_part={:.1f} deferred_grids={}",
+                    g_split_stats.ticks,
+                    double(g_split_stats.parts) / double(g_split_stats.ticks),
+                    g_split_stats.parts > 0 ? double(g_split_stats.bots) / double(g_split_stats.parts) : 0.0,
+                    g_split_stats.deferred_grids);
+            g_split_stats = {};
+            if (g_bot_logic_grid_loads > 0)
+                TC_LOG_INFO("playerbot.v2", "[PlayerbotV2] TickPerf bot_logic_grid_loads={} (asked by rule probes, loaded on the world thread)",
+                    g_bot_logic_grid_loads);
+            g_bot_logic_grid_loads = 0;
 
             // Spike attribution. The averages above hide a once-per-period
             // spike, so name it: the phase breakdown of the single worst tick,
@@ -3844,11 +4015,12 @@ void Module::OnDamageTaken(Unit* attacker, Unit* victim, int32 amount, uint32 sp
     tl_damage_spell = 0;
     if (!initialized_) return;
     PveGroupCoordinator::NoteDamageDone(attacker, victim, amount);   // the [raid_dps] per-bot tally
+    GroupSnapshotBuilder::NoteDamageTaken(victim, amount);            // a grouped player's damage taken per second, for the raid healers
     // The bot's own hit (not its pet's) for the idle watchdog: "did anything land in the last 4 s".
     if (attacker && attacker->IsPlayer() && victim && amount > 0 && !victim->IsPlayer())
         if (BotAI* ai = Services::Registry().ai(attacker->GetGUID().GetCounter()))
             ai->note_damage_done(GameTime::GetGameTimeMS());
-    Diagnostics::Scenario::NoteDamage(attacker, victim, amount);   // a scenario's boss-pull statistics; one atomic load when none runs
+    Diagnostics::Scenario::NoteDamage(attacker, victim, amount, lethal_spell);   // a scenario's boss-pull statistics; one atomic load when none runs
     // The core hands this hook spell 0; the spell is the one NoteDamageSpell stashed just before (0 = a melee swing). With 0 every spell and
     // DoT tick was tallied as "white swing" and no per-spell row matched its outcome.
     Diagnostics::Parity::NoteDamage(attacker, victim, amount, lethal_spell);   // the damage_parity tally; one atomic load when none runs
@@ -3885,6 +4057,7 @@ void Module::OnHealOutcome(Unit* healer, Unit* target, uint32 spell_id, uint32 r
 {
     if (!initialized_) return;
     Diagnostics::Parity::NoteHeal(healer, target, spell_id, raw, effective);   // one atomic load when no support scorecard runs
+    Diagnostics::Scenario::NoteHeal(healer, spell_id, raw, effective);         // a scenario's boss-pull heal breakdown
 }
 
 void Module::OnHealReceived(Unit* /*healer*/, Unit* /*target*/, int32 /*amount*/, uint32 /*spell_id*/)
@@ -4115,6 +4288,12 @@ void Module::RouteGroupOrder(Player* sender, Group* group, std::string order)
         return;
     if (BotCommandParser::ApplyPlaceOrder(sender, order, "group"))
         return;
+    if (BotCommandParser::ApplyRaidResetOrder(sender, order, "group"))
+        return;
+    if (BotCommandParser::ApplyLeadOrder(sender, order, "group"))
+        return;
+    // Stay / Hold / Follow / Come while the tank leads pause the lead ("go" picks it up); the order itself goes on below.
+    BotCommandParser::PauseLeadForOwnerOrder(sender, order, "group");
     if (order.rfind("crowdcontrol ", 0) == 0 || order.rfind("crowd control ", 0) == 0 || order == "cc on" || order == "cc off")
     {
         // A switch of the owner's, not an order to each bot: set once, answer once.
@@ -4407,7 +4586,7 @@ void Module::OnPartyChat(Player* sender, Group* group, std::string const& msg, b
     // own name with short conversational replies so group chat reads like
     // a room of real players. Runs for every message; the reactor itself
     // gates on bot verbosity, per-bot throttle, and skips bot-sent lines.
-    BotChatReactor::React(sender, group, msg);
+    BotChatReactor::React(sender, group, msg, raid_chat);
     if (msg.front() != ';')
     {
         // The owner's crowd-control orders ("no fear", "@warlock no fear", "@mages no sheep", "off cc"): stored once for the
@@ -4430,6 +4609,9 @@ void Module::OnPartyChat(Player* sender, Group* group, std::string const& msg, b
         // A bare group order ("follow", "stay", ...) in party or raid chat goes to every bot of the sender's in the
         // group. A line that starts with the name of a bot in the group, or with "all", is that bot's (every bot's)
         // order without the ';' ("Lentha use altar", "all use altar"). Other chatter stays ignored.
+        // "go" while the tank leads or is paused picks the lead up (BotCommandParser::ApplyLeadOrder); otherwise it is chatter.
+        if (BotCommandParser::IsLeadGoWord(msg) && BotCommandParser::ApplyLeadOrder(sender, msg, raid_chat ? "raid" : "party"))
+            return;
         if (auto const order = ClassifyGroupOrder(msg, Services::Config().behavior_owner_commands()))
             RouteGroupOrder(sender, group, *order);
         else if (auto const addressed = AddressedGroupOrder(msg, [group](std::string_view name) { return GroupHasBotNamed(group, name); }))

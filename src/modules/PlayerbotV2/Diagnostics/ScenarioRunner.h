@@ -51,7 +51,10 @@ void Tick(std::uint32_t diff_ms);
 void NoteBotDeath(std::uint64_t guid_low, ScenarioDeath death);
 void NoteCreatureKilled(std::uint32_t map, std::uint32_t entry, bool tapped);   // tapped: the raiders had a share in the kill (a script's KillSelf or a despawn is no kill)
 // From Module::OnDamageTaken: every hit dealt; counted for the squad's raiders (and their pets) from the boss's first combat.
-void NoteDamage(Unit* attacker, Unit* victim, std::int32_t amount);
+// spell_id 0 is a melee swing. Each raider's damage is also tallied by spell for the [pull_spells] lines.
+void NoteDamage(Unit* attacker, Unit* victim, std::int32_t amount, std::uint32_t spell_id);
+// From Module::OnHealOutcome: each raider's heals by spell (raw and effective), for the [pull_spells] heal lines.
+void NoteHeal(Unit* healer, std::uint32_t spell_id, std::uint32_t raw, std::uint32_t effective);
 
 // Human-readable text for the command: what is running now, and the last verdict.
 std::string Status();

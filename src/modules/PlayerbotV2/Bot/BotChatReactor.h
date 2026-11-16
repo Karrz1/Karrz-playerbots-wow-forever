@@ -34,8 +34,9 @@ class BotChatReactor
 public:
     // Entry point. Called from PlayerbotV2::Module::OnPartyChat for every
     // party/raid/instance-chat line (after the ;-prefix command path).
-    // No-op when sender is null / a bot / message is empty.
-    static void React(Player* sender, Group* group, std::string const& msg);
+    // No-op when sender is null / a bot / message is empty. `raid_chat`: the line was said in raid chat, and the answer goes
+    // there too (a party-chat answer in a raid reaches only the answering bot's sub-group, so the player often never saw it).
+    static void React(Player* sender, Group* group, std::string const& msg, bool raid_chat = false);
 
     // Playerbot.ChatModel party/raid path. Called from PlayerbotV2::Module::OnPartyChat for a line that is not an order. A bot
     // named in the line, or now and then one picked by hash, answers through BotChatModel on the channel it heard: raid chat

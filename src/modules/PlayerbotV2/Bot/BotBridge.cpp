@@ -13,6 +13,7 @@
 #include "Quest/CompanionQuest.h"
 #include "Quest/QuestOrders.h"
 #include "Quest/QuestRefusal.h"
+#include "Raid/RaidVoice.h"
 #include "../Api/PlayerbotAPI.h"
 #include "../Api/BotTradeShop.h"
 #include "../Diagnostics/ScenarioHuman.h"
@@ -2139,6 +2140,9 @@ void WriteMoment(ConfigReader::BridgeConfig const& cfg, Moment const& m, uint32 
     Player* to = MomentListener(bot);
     if (!to)
         return;
+    // A raid of more than 15 hears its bots in raid chat (Bot/Raid/RaidVoice.h): party chat there reaches only the bot's sub-group.
+    Group const* group = bot->GetGroup();
+    char const* const channel = group && group->GetMembersCount() > Raid::kRaidVoiceGroupSize ? "raid" : "party";
     Event e;
     e.type = "moment";
     FillBot(e, bot, 0);
@@ -2146,7 +2150,7 @@ void WriteMoment(ConfigReader::BridgeConfig const& cfg, Moment const& m, uint32 
     e.fields.emplace_back("detail", m.detail);
     if (!m.example.empty())
         e.fields.emplace_back("example", m.example);
-    e.fields.emplace_back("channel", "party");
+    e.fields.emplace_back("channel", channel);
     e.fields.emplace_back("to", to->GetName());
     e.fields.emplace_back("locale", ClientLocale(to));
     bool const owned = Services::Owners().GetOwner(m.bot).account_id != 0;
@@ -2164,8 +2168,8 @@ void WriteMoment(ConfigReader::BridgeConfig const& cfg, Moment const& m, uint32 
     Write(e);
     if (g_chat.size() > 2048)
         g_chat.clear();
-    // The answer comes back as a reply to this id, so it goes to party and its action is checked for `to`, as for a chat_in.
-    g_chat[e.id] = ChatAsk{ m.bot, to->GetName(), to->GetGUID(), false, "party", now_ms };
+    // The answer comes back as a reply to this id, so it goes to the group's chat and its action is checked for `to`, as for a chat_in.
+    g_chat[e.id] = ChatAsk{ m.bot, to->GetName(), to->GetGUID(), false, channel, now_ms };
     TC_LOG_INFO("playerbot.v2", "[bridge] moment {} for {} ({}): {}", m.what, bot->GetName(), to->GetName(), m.detail);
 }
 

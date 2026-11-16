@@ -136,7 +136,7 @@ public:
     // panel). Refused, with the reason in `reply`, when the server does not allow the mode (Playerbot.OwnedGear.AllowedModes).
     // Otherwise stored for the account (kept across restarts) and every companion of the owner is regeared at the next frame
     // (RequestGearRefresh). Thread safe. `reply` is the line to tell the owner.
-    bool SetOwnerGearMode(uint32 account_id, uint8 requested_mode, std::string& reply);
+    bool SetOwnerGearMode(uint32 account_id, uint8 requested_mode, std::string& reply, Player const* requester = nullptr);
     // Queues a companion for a gear pass at the next frame (ignoring the cooldown); a bot in combat or dead is left to the 5-minute
     // sweep, which notices the changed refresh key. Thread safe.
     void RequestGearRefresh(BotId bot);

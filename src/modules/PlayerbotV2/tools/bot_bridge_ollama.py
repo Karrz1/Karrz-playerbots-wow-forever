@@ -534,7 +534,23 @@ def read_backup_settings(folder, opts):
     got = {"url": opts.backup_url or "", "model": opts.backup_model or "", "key": opts.backup_key or ""}
     if got["url"]:
         return got
-    for path in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "backup.txt"), os.path.join(folder, "backup.txt")):
+    return read_service_file("backup.txt", folder, got)
+
+
+def read_main_settings(folder, opts):
+    """url / model / key of the player's own AI service as the MAIN one, instead of the local Ollama: --url etc., else api.txt
+    in the BotBridge folder or next to this program, the same lines as backup.txt (the launcher's AI BOTS tab writes it when
+    the player picks "My own AI service"). Its model wins over --model, as the two belong together. Empty url: the local
+    Ollama (the default)."""
+    got = {"url": "", "model": "", "key": ""}
+    if opts.url:
+        return got
+    return read_service_file("api.txt", folder, got)
+
+
+def read_service_file(name, folder, got):
+    """`got` filled from the first `name` (next to this program, then in the BotBridge folder) that sets a url."""
+    for path in (os.path.join(os.path.dirname(os.path.abspath(__file__)), name), os.path.join(folder, name)):
         found = {}
         try:
             with open(path, encoding="utf-8-sig") as f:
@@ -1197,9 +1213,20 @@ def answer_talk(event, api, minds, opts):
     log("%s [%s, %.1f s]: %s" % (bot, "talk" if channel == "say" else channel, time.time() - started, say))
 
 
+# The raid's own talk that is no mistake (Playerbot.Raid.Talk, the server's RaidVoice): what the bot is doing when it speaks.
+RAID_VOICE = {
+    "kill_crowd": "Your raid just killed a boss; you say something short in raid chat the way raiders do then.",
+    "run_back": "Your raid just wiped and you are on the way back; you say something a raider says then (repair, rez, buffs, a "
+                "small joke).",
+    "rebuff_call": "You are the raid leader; after a wipe you get everyone to resurrect, rebuff and go again, calm and short.",
+    "between_pulls": "Your raid is resting between pulls; you say something a raider says then (buffs, water, loot, the next "
+                     "boss, a small joke).",
+}
+
+
 def answer_raid_line(event, api, opts):
     """A bot's raid chat line about something that just happened in the fight (the raid leader reacting to a mistake, a raider
-    after a wipe). Fast or nothing: the server says its fixed line itself when this one is not back within wait_ms (2.5 s), so
+    after a wipe), or the raid's own talk (a kill, the run back, between pulls: RAID_VOICE). Fast or nothing: the server says its fixed line itself when this one is not back within wait_ms (2.5 s), so
     the prompt is short, the answer is a few words, and a slow model simply loses. No persona text of anyone's goes in: the
     lines stay game banter, never about a person, never a slur (check_line still filters what comes back)."""
     api = getattr(api, "primary", api)   # never the paid backup for banter
@@ -1212,16 +1239,21 @@ def answer_raid_line(event, api, opts):
     harsh = str(event.get("mood", "mild")) == "harsh"
     leader = str(event.get("role", "")) == "raid leader"
     russian = str(event.get("locale", "")).lower() == "ruru"
+    voice = RAID_VOICE.get(str(event.get("what", "")))
+    if voice and leader and event.get("what") == "between_pulls":
+        voice = "You are the raid leader; the raid rests between pulls and you get them ready for the next one, calm and short."
     system = ("You are %s, a level %s %s in a World of Warcraft raid, writing in raid chat like a real player. %s "
-              "Write ONE short line (at most 12 words), lowercase, no emoji, no quotes. Only about the game and this mistake: "
+              "Write ONE short line (at most 12 words), lowercase, no emoji, no quotes. Only about the game and this %s: "
               "never about the person behind the character, never insults about real life, never slurs, no threats. "
               "Answer as JSON: {\"say\": \"...\"}."
               % (bot, event.get("level", "60"), event.get("class", ""),
+                 voice if voice else
                  ("You are the raid leader and you %s." % ("freak out at every mistake, loud and dramatic, CAPS now and then, but it "
                                                            "is all in good fun" if harsh else "tease people about mistakes, "
                                                            "calm and a bit dry")) if leader else
                  ("You just wiped with your raid; you %s." % ("blame someone a bit, half joking" if harsh else
-                                                              "make an excuse, a joke or own up"))))
+                                                              "make an excuse, a joke or own up")),
+                 "moment" if voice else "mistake"))
     if russian:
         system += " " + language_line(True)
     user = "Just now: %s.\nThe kind of line meant (don't copy it): %s" % (event.get("detail", "something happened"), event.get("example", ""))
@@ -1316,6 +1348,11 @@ def main():
         log("another bridge program already answers for %s (the launcher's AI bots, or a window left open); this one stops" % folder)
         sys.exit(0)
     url = opts.url or "http://%s:%d/v1" % (opts.host or "127.0.0.1", opts.port or 11434)
+    own = read_main_settings(folder, opts)
+    if own["url"]:
+        url, opts.key = own["url"], own["key"] or opts.key
+        opts.model = own["model"] or opts.model
+        log("your own AI service from api.txt: %s at %s%s" % (opts.model, url, " (with a key)" if opts.key else ""))
     actions_on = not opts.no_actions
     api = ChatApi(url, opts.model, opts.key, opts.timeout)
     api.no_think = not opts.think

@@ -37,6 +37,9 @@ struct GroupMemberSummary
     bool                   is_main_tank = false;
     int32                  hp      = 0;
     int32                  max_hp  = 0;
+    // Damage the member took per second over the last few seconds, decayed (ClassicHeal::DamageRate; GroupSnapshotBuilder::NoteDamageTaken).
+    // Only kept inside instances. The raid healers count what it brings before a heal in flight lands.
+    float                  damage_taken_per_s = 0.f;
     int32                  mana    = 0;     // Power index 0 (mana) only.
     int32                  max_mana = 0;
     bool                   online  = false;

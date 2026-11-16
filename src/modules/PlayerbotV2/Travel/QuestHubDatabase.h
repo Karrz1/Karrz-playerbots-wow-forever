@@ -15,6 +15,7 @@
 #pragma once
 
 #include "Position.h"
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <optional>

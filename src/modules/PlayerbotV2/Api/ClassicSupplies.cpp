@@ -121,6 +121,7 @@ constexpr RaidConsumable kTankKit[] = {
     { 13458, false, 5, false, true },   // Greater Nature Protection Potion: AQ40 Huhuran's Poison Bolt Volley
     { 13456, false, 5, false, true },   // Greater Frost Protection Potion: Naxxramas Sapphiron
     { 19183, false, 5, false, true },   // Hourglass Sand: the cure for Chromaggus' Brood Affliction: Bronze (RaidRules::cureItem)
+    { 13455, false, 5, false, true },   // Greater Stoneshield Potion (+2000 armour, 2 min): the tanks' potion on Patchwerk (RaidRules::resistPotion)
 };
 constexpr RaidConsumable kMeleeKit[] = {
     { 13452, false, 5 }, { 9206, false, 5 }, { 20452, true, 20 },
@@ -146,6 +147,8 @@ constexpr RaidConsumable kCasterKit[] = {
 };
 constexpr RaidConsumable kHealerKit[] = {
     { 13511, false, 5, true }, { 20007, false, 5 }, { 13931, true, 20 },
+    // Stocked, never drunk by the pre-pull picker: Brilliant Mana Oil goes on the main hand by idle:classic_weapon (PickPoison).
+    { 20748, false, 5, false, true },   // Brilliant Mana Oil: +12 mana every 5 s, +25 healing on the weapon
     { 13457, false, 5, false, true },   // Greater Fire Protection Potion: drunk in the fight where the boss data orders it (Ragnaros, Geddon, Onyxia, Firemaw, Vaelastrasz)
     { 13459, false, 5, false, true },   // Greater Shadow Protection Potion: BWL Shadow Flame (Ebonroc, Flamegor, Nefarian)
     { 13458, false, 5, false, true },   // Greater Nature Protection Potion: AQ40 Huhuran's Poison Bolt Volley

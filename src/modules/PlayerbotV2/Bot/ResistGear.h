@@ -31,6 +31,7 @@ constexpr bool ResistSwapSlot(std::uint8_t slot, bool tank)
 // the cloak there: a grouped level 60 companion wears one while it is in the instance (BotPopulationManager::SwapFightCloak,
 // Playerbot.Raid.OnyxiaCloak), and the resistance swap and the regear leave its back slot alone meanwhile.
 constexpr std::uint32_t kOnyxiaScaleCloak = 15138;
+constexpr std::uint32_t kOnyxiaScaleCloakAura = 22683;   // its equip spell: the aura Shadow Flame checks
 constexpr bool FightCloakMap(std::uint32_t map_id)
 {
     return map_id == 469;

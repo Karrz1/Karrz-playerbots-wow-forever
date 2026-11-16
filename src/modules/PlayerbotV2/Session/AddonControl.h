@@ -39,6 +39,10 @@ constexpr uint32_t      kMaxReassemblyChunks = 64; // client-supplied chunk coun
 bool OnAddonWhisper(Player* sender, Player* receiver,
                     std::string const& prefix, std::string const& body);
 
+// `.bot trade <seq hex> <what the window shows>` from the ForeverBots trade window: accepts a trade with a bot when the window
+// holds exactly what the player saw (BotTradeRequest in AddonControl.cpp). The answer is a TRADE_RESP frame.
+void BotTradeRequest(Player* player, uint32 seq, std::string const& seen);
+
 // Tear-down hook — reaps the per-account reassembly state and retry spool
 // when a session logs out. Called from PlayerbotV2 module on OnSessionLogout.
 void OnSessionLogout(uint32 sessionAccountId);

@@ -338,6 +338,14 @@ ForeverBotsLocale = {
     [" (type /w %s <message>)"] = " (введите /w %s <сообщение>)",
     ["whisper to %s failed: %s"] = "шепот игроку %s не удался: %s",
     ["bot confirmations in chat: %s"] = "подтверждения ботов в чате: %s",
+    ["enemy nameplates only in combat: %s"] = "индикаторы здоровья врагов только в бою: %s",
+    ["off: the client's own nameplate settings apply."] = "выкл.: действуют настройки индикаторов здоровья самого клиента.",
+    ["on, but it needs Enemy Unit Nameplates on and Always Show Nameplates off (Esc > Options > Nameplates)."] =
+        "вкл., но нужно включить индикаторы здоровья противников и выключить «Всегда показывать индикаторы здоровья» (Esc > Настройки > Индикаторы здоровья).", -- check
+    ["on: a health bar only over mobs that fight you, your pet or your group; the others keep their name."] =
+        "вкл.: полоска здоровья только над мобами, которые сражаются с вами, вашим питомцем или вашей группой; у остальных только имя.",
+    ["on, waiting for the server to confirm (an older server does not have it)."] =
+        "вкл., ждем подтверждения сервера (на старом сервере этого нет).",
     ["shown"] = "включено",
     ["hidden (shown in the Bots panel status line)"] = "скрыто (отображается в строке состояния панели ботов)",
     ["minimap button: %s"] = "кнопка у миникарты: %s",
@@ -579,4 +587,12 @@ ForeverBotsLocale = {
     ["Set with the mouse"] = "Поставить мышью",
     ["short:G%d"] = "Г%d",
     ["Tick every bot in this raid group. Click again when they are all ticked to untick them."] = "Отметить всех ботов этой группы рейда. Нажмите еще раз, когда отмечены все, чтобы снять отметку.",
+    ["The bot changed its offer: look at it again, then click Trade."] = "Бот изменил свое предложение: посмотрите еще раз и нажмите «Обмен».", -- check
+    -- Tank leads (Orders tab)
+    ["short:Ignore"] = "Не трогать", -- check
+    ["short:Tank leads"] = "Танк ведет", -- check
+    ["short:Lead paused"] = "Пауза",
+    ["Tank leads"] = "Танк ведет группу", -- check
+    ["In a dungeon or a raid your tank bot leads: it walks on, pulls pack by pack, waits for mana and for you, and goes boss to boss. You follow. In a raid it stops before each boss: pull it yourself, or say go.\nClick: on or off. Right-click: pause (it holds where it stands) or go on.\nGreen: on. Blue: paused. It ends when you leave the dungeon or raid. Follow, Stay and Come pause it: say go (or right-click) and it leads on."] = "В подземелье или рейде группу ведет ваш бот-танк: идет вперед, пулит по одной группе мобов, ждет ману и вас и идет от босса к боссу. Вы следуете за ним. В рейде он останавливается перед каждым боссом: пульте его сами или скажите go.\nЩелчок: вкл. или выкл. Правый щелчок: пауза (стоит на месте) или дальше.\nЗеленый: вкл. Синий: пауза. Заканчивается, когда вы выходите из подземелья или рейда. «За мной», «Стоять» и «Ко мне» ставят ведение на паузу: скажите go (или правый щелчок), и танк ведет дальше.", -- check
+    ["the tank does not lead now: click the button first."] = "танк сейчас не ведет: сначала нажмите кнопку.",
 }

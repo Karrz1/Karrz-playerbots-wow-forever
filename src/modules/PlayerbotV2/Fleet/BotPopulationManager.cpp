@@ -1157,7 +1157,7 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
     return changed;
 }
 
-bool BotPopulationManager::SetOwnerGearMode(uint32 account_id, uint8 requested_mode, std::string& reply)
+bool BotPopulationManager::SetOwnerGearMode(uint32 account_id, uint8 requested_mode, std::string& reply, Player const* requester)
 {
     using Gear::Owned::GearMode;
     if (requested_mode >= Gear::Owned::kGearModeCount)
@@ -1269,8 +1269,17 @@ void BotPopulationManager::RunGearBackfill(uint32 now_ms)
             // never touched, and neither is one whose account cannot be told.
             WorldSession const* sess = p->GetSession();
             if (sess && Services::Accounts().is_pool_account(sess->GetAccountId()) && s_dupes_checked.insert(id).second)
+            {
                 if (uint32 const dropped = DropDuplicateGearCopies(p))
                     TC_LOG_INFO("playerbot.v2", "[gear] {} (bot {}): {} extra copies of gear pieces taken out of the bags", p->GetName(), id, dropped);
+                // Bags too (BotSetupPipeline::EnsureBags: every bag slot gets a full-size bag, nothing is lost): only the starter kit
+                // gave them, so a bot that never had it carried 20 slots in all. Its bags were full and it could not take the Onyxia
+                // Scale Cloak (dev realm 2026-11-14: four warlocks with no grey item to drop, 13 refusals each, burnt at the landing).
+                uint32 const before = p->GetFreeInventorySlotCount();
+                BotSetupPipeline::EnsureBags(p);
+                if (uint32 const after = p->GetFreeInventorySlotCount(); after != before)
+                    TC_LOG_INFO("playerbot.v2", "[gear] {} (bot {}): bags filled up, free bag slots {} -> {}", p->GetName(), id, before, after);
+            }
         }
         if (gear_regear_count_ >= 25) continue;     // bound per sweep
         BackfillOne(id, p, now_ms, gear_regear_count_, /*ignore_cooldown*/ false);
@@ -2640,9 +2649,18 @@ uint32 BotPopulationManager::SwapFightCloak(Player* p, bool on)
         s_fight_cloak.erase(it);
         return changed;
     }
-    if (s_fight_cloak.count(id))
-        return 0;
     Item* cur = p->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_BACK);
+    if (auto const it = s_fight_cloak.find(id); it != s_fight_cloak.end())
+    {
+        if (cur && cur->GetEntry() == Classic::kOnyxiaScaleCloak)
+            return 0;
+        // The copy is no longer on (a regear or the owner put another cloak in the slot): drop the stale swap, then wear it again
+        // (dev realm 2026-11-13: bots pulled Nefarian in their own cloaks while the swap still counted as done).
+        RestoreOwnGear(p, it->second);
+        s_fight_cloak.erase(it);
+        TC_LOG_INFO("playerbot.v2", "[fight_cloak] {} lost the Onyxia Scale Cloak from the back slot: wearing it again", p->GetName());
+        cur = p->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_BACK);
+    }
     if (cur && cur->GetEntry() == Classic::kOnyxiaScaleCloak)
         return 0;   // wears one already (its own, or the copy of a session before a relog)
     ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(Classic::kOnyxiaScaleCloak);
@@ -2654,11 +2672,53 @@ uint32 BotPopulationManager::SwapFightCloak(Player* p, bool on)
     }
     uint16 eq_dest = 0;
     ItemPosCountVec dest;
-    // The replaced cloak goes to the bag slot the copy came from: no free slot, no swap.
-    if (p->CanEquipNewItem(EQUIPMENT_SLOT_BACK, eq_dest, Classic::kOnyxiaScaleCloak, /*swap*/ cur != nullptr) != EQUIP_ERR_OK ||
-        p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, Classic::kOnyxiaScaleCloak, 1) != EQUIP_ERR_OK)
+    // The replaced cloak goes to the bag slot the copy came from: no free slot, no swap. Full bags give up their cheapest grey
+    // item for it, as a regear does (dev realm 2026-11-13: 23 of 39 raiders pulled Nefarian without the cloak, bags full).
+    InventoryResult const equip_res = p->CanEquipNewItem(EQUIPMENT_SLOT_BACK, eq_dest, Classic::kOnyxiaScaleCloak, /*swap*/ cur != nullptr);
+    InventoryResult store_res = p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, Classic::kOnyxiaScaleCloak, 1);
+    if (equip_res == EQUIP_ERR_OK && store_res != EQUIP_ERR_OK && FreeOneJunkBagSlot(p))
     {
-        TC_LOG_INFO("playerbot.v2", "[fight_cloak] {} cannot put the Onyxia Scale Cloak on (no bag room, or the slot refuses it)", p->GetName());
+        dest.clear();
+        store_res = p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, Classic::kOnyxiaScaleCloak, 1);
+    }
+    // No grey item either: the bot may simply lack bags (only the starter kit gave them; four warlocks on the dev realm 2026-11-14
+    // carried 20 slots in all). Full-size bags lose nothing (BotSetupPipeline::EnsureBags), then the cloak has its room.
+    if (equip_res == EQUIP_ERR_OK && store_res != EQUIP_ERR_OK)
+    {
+        BotSetupPipeline::EnsureBags(p);
+        dest.clear();
+        store_res = p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, Classic::kOnyxiaScaleCloak, 1);
+    }
+    if (equip_res != EQUIP_ERR_OK || store_res != EQUIP_ERR_OK)
+    {
+        // What fills the bags, by item quality (0 grey .. 4 epic and up) and by kind, so the next step for full bags follows the data.
+        std::array<uint32, 5> by_quality{};
+        uint32 gear = 0, consumables = 0, trade_goods = 0, quest = 0, other = 0;
+        auto count = [&](Item const* it)
+        {
+            if (!it) return;
+            ItemTemplate const* t = it->GetTemplate();
+            if (!t) return;
+            ++by_quality[std::min<uint32>(t->GetQuality(), 4u)];
+            switch (t->GetClass())
+            {
+                case ITEM_CLASS_ARMOR: case ITEM_CLASS_WEAPON: ++gear; break;
+                case ITEM_CLASS_CONSUMABLE: ++consumables; break;
+                case ITEM_CLASS_TRADE_GOODS: case ITEM_CLASS_REAGENT: ++trade_goods; break;
+                case ITEM_CLASS_QUEST: ++quest; break;
+                default: ++other; break;
+            }
+        };
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            count(p->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = p->GetBagByPos(b))
+                for (uint32 s = 0; s < bag->GetBagSize(); ++s)
+                    count(p->GetItemByPos(b, uint8(s)));
+        TC_LOG_INFO("playerbot.v2", "[fight_cloak] {} cannot put the Onyxia Scale Cloak on (equip result {}, bag result {}: no grey item to make room, bags full size); "
+                    "bags hold quality 0-4 {}/{}/{}/{}/{}, gear {}, consumables {}, trade goods {}, quest {}, other {}",
+                    p->GetName(), uint32(equip_res), uint32(store_res), by_quality[0], by_quality[1], by_quality[2], by_quality[3], by_quality[4],
+                    gear, consumables, trade_goods, quest, other);
         return 0;
     }
     Item* copy = p->StoreNewItem(dest, Classic::kOnyxiaScaleCloak, true);
@@ -2677,8 +2737,9 @@ uint32 BotPopulationManager::SwapFightCloak(Player* p, bool on)
     ResistSwapState st;
     st.pieces.push_back({ uint8(EQUIPMENT_SLOT_BACK), own, copy->GetGUID() });
     s_fight_cloak[id] = std::move(st);
-    TC_LOG_INFO("playerbot.v2", "[fight_cloak] {} wears the Onyxia Scale Cloak in Blackwing Lair{}", p->GetName(),
-                cur ? "" : " (no cloak of its own)");
+    // The protection is the cloak's equip aura 22683 (what Shadow Flame checks), so the line says whether it is on.
+    TC_LOG_INFO("playerbot.v2", "[fight_cloak] {} wears the Onyxia Scale Cloak in Blackwing Lair{}, aura {} {}", p->GetName(),
+                cur ? "" : " (no cloak of its own)", Classic::kOnyxiaScaleCloakAura, p->HasAura(Classic::kOnyxiaScaleCloakAura) ? "on" : "MISSING");
     return 1;
 }
 
@@ -2862,6 +2923,10 @@ void BotPopulationManager::CompanionGroupHygiene(uint32 now_ms)
             return;
         Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
         if (!p || !p->IsInWorld() || p->InBattleground() || p->InArena())
+            return;
+        // A soak anchor (Playerbot.World.SoakAnchors, overnight perf soaks with nobody on) stands in for a player and stays logged in. Two
+        // anchors that were the owner's companions were let go two minutes into the 11-15 D2 soak ("[world] anchors=2" of 4).
+        if (IsSoakAnchor(p->GetName()))
             return;
         // A self-bot (`.playerbot self on`) is the owner's own character on the owner's client, bound to its own account: no other
         // character of that account is in the group, so it was taken out of its group and queued for a logout (Discord 2026-10-28).

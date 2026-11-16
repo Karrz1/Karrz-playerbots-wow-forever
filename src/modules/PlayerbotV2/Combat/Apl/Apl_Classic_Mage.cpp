@@ -107,10 +107,17 @@ bool FireBuild(ApPredicateContext const& ctx)
 }
 
 // Fire talents -> Fireball; else Frostbolt; Fireball before Frostbolt is
-// trained; Arcane Missiles only if nothing else is known.
+// trained; Arcane Missiles only if nothing else is known. A school the victim
+// resists (the raid school hint: a Red Drakonid's fire, a Blue one's frost) is
+// skipped, so a fire mage throws Frostbolts at a Red Drakonid.
 uint32 NukeSpell(ApPredicateContext const& ctx)
 {
     bool const fire_build = FireBuild(ctx);
+    auto usable = [&](uint32 spell) { return ctx.bot.knows_spell(spell) && !SchoolHint::VictimAvoids(ctx, spell); };
+    if (fire_build && usable(FIREBALL)) return FIREBALL;
+    if (usable(FROSTBOLT))              return FROSTBOLT;
+    if (usable(FIREBALL))               return FIREBALL;
+    if (usable(ARCANE_MISSILES))        return ARCANE_MISSILES;
     if (fire_build && ctx.bot.knows_spell(FIREBALL)) return FIREBALL;
     if (ctx.bot.knows_spell(FROSTBOLT))              return FROSTBOLT;
     if (ctx.bot.knows_spell(FIREBALL))               return FIREBALL;
@@ -334,10 +341,15 @@ SchoolHint::SchoolChoice const kSchoolChoices[] = {
     { ARCANE_MISSILES, ShouldArcaneMissilesNuke },
 };
 // A fire mage on a boss keeps Fire Vulnerability at 5 stacks with Scorch before it throws Fireballs (raid vanilla rule); the stacks are
-// shared, so the mage only casts it when no mage has them at 5 with time left.
+// shared, so the mage only casts it when no mage has them at 5 with time left. Only on the boss itself (or a mob of boss-like health):
+// five Scorches on every short-lived add of a boss fight are five casts lost (bwl_nefarian, dev realm 2026-11-13: the Blue Drakonids
+// got Scorch after Scorch and died at half the pace of the passing test).
 bool ShouldScorch(ApPredicateContext const& ctx)
 {
     if (!FireBuild(ctx) || !Classic::BossFight(ctx.bot))
+        return false;
+    NearbyUnit const* v = ctx.bot.victim_info();
+    if (!v || !(Classic::IsBossUnit(*v) || v->max_hp >= 100'000))
         return false;
     if (!NukeUsable(ctx, SCORCH)) return false;
     AuraEntry const* fv = ctx.bot.find_aura_any_caster(FIRE_VULNERABILITY, ctx.bot.victim());

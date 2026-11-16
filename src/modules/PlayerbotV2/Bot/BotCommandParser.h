@@ -49,6 +49,17 @@ public:
     // "ignore clear" (empties it): the sender's bots never attack a mob on it (OwnerRegistry::ToggleFightIgnore). Stored once for the sender's
     // account and answered once. Returns false for any other line.
     static bool ApplyIgnoreOrder(Player* sender, std::string const& line, char const* via);
+    // "Tank leads" (BotAI::TankLead): "lead" / "lead on" hands the lead of a 5-man dungeon to the sender's tank bot (it walks the
+    // route, pulls pack by pack, waits for mana and for him, goes boss to boss; he follows), "lead pause" holds it where it stands,
+    // "lead off" gives the lead back to him. Set on every bot of the sender's in his group, answered once. The ForeverBots Lead
+    // button and `.bot lead` send the same words. "go" alone (or "lead resume") picks up a paused lead; it is the lead's word only
+    // while the lead is on or paused. Returns false for any other line. World thread.
+    static bool ApplyLeadOrder(Player* sender, std::string const& line, char const* via);
+    // True when `line` is "go" alone (or the Russian "вперед" / "го"), the word that picks up a paused lead.
+    static bool IsLeadGoWord(std::string const& line);
+    // An owner's Stay / Hold / Follow / Come (`line`, a bare order or a squad line) while his tank leads: the lead pauses (Karrz,
+    // 2026-11-13) and he is told "go" goes on; the order itself is not consumed. Does nothing for any other line. World thread.
+    static void PauseLeadForOwnerOrder(Player* sender, std::string const& line, char const* via);
 
     // The ForeverBots Positions tab (add-on PLACE_REQ) and the "place" order: the chosen bots of the sender's group stand in `shape`
     // (close, circle, arc, spread, line, column, spear, arrow; Placement.h) with `gap` (tight, normal, wide) round `anchor` (here =
@@ -64,6 +75,11 @@ public:
     // "place <shape> [tight|normal|wide] [here|target] [who...]" / "place follow [who...]": PlaceBots once, answered as a system line.
     // Returns false for any other line.
     static bool ApplyPlaceOrder(Player* sender, std::string const& line, char const* via);
+    // "raid reset" (also "reset raid"): the sender, outside, gets his bots out of every raid instance they are in, the emptied instance
+    // is closed, and his and their locks on that raid are cleared, so the next entry opens a fresh one. Answered once; finished by
+    // TickRaidResets on the world thread.
+    static bool ApplyRaidResetOrder(Player* sender, std::string const& line, char const* via);
+    static void TickRaidResets();
 
     // May `sender` give this bot a group order (the panel, a party / raid line)? Its owner, or for a bot with no owner a player
     // who is its controller in the group they share (GroupControl.h): the group leader when human, else the first human

@@ -1,0 +1,14 @@
+# Your own AI service for the talking bots, used INSTEAD of the local model (Ollama). Off by default: leave "url" empty and
+# the program uses Ollama on this PC as before.
+#
+# The launcher's AI BOTS tab writes this file into server\BotBridge\ when you pick "My own AI service" there. By hand: fill
+# in the three lines here or in server\BotBridge\api.txt, then restart the AI bots. All of the bots' talk then goes to that
+# service, and an online service may charge for it. The model named here is used, not the tier's.
+#
+# Any service that speaks the OpenAI-style chat API works:
+#   Another PC at home with Ollama:  url = http://192.168.1.20:11434/v1        model = gemma4:12b       (no key)
+#   LM Studio / llama.cpp server:    url = http://127.0.0.1:1234/v1            model = the model's name
+#   An online service:               url = https://api.deepseek.com/v1         model = deepseek-chat    key = your key
+url =
+model =
+key =

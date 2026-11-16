@@ -1579,6 +1579,23 @@ bool OwnerUseFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
         ai.set_last_rule_fired("idle:owner_use_walk");
         return true;
     }
+    if (o.ritual)
+    {
+        // A place taken for a person's ritual (idle:ritual_join): use it only while this snapshot still picks the bot. Once the
+        // ritual has fired or its places are filled, one more use would start a new ritual of one that nobody finishes.
+        bool still_open = false;
+        for (auto const& n : s.nearby_objects())
+            if (n.guid == o.go && n.ritual_join)
+                still_open = true;
+        if (!still_open)
+            return finish("ritual no longer needs this bot");
+        emit.use_game_object(o.go);
+        ai.end_owner_use();
+        // No Stay: a ritual without an owner has no channel to keep, so the bot goes back to following.
+        TC_LOG_INFO("playerbot.v2", "[ritual_join] {} uses object {} at {:.1f}y", s.name(), o.go.GetCounter(), d);
+        ai.set_last_rule_fired("idle:ritual_join_use");
+        return true;
+    }
     emit.use_game_object(o.go);
     ai.end_owner_use();
     // The Stay the command set keeps the follow from walking the bot off the object while the ritual runs; it does not outlive it. The 30 min
@@ -1589,6 +1606,39 @@ bool OwnerUseFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
     TC_LOG_INFO("playerbot.v2", "[owner_use] {} uses object {} at {:.1f}y", s.name(), o.go.GetCounter(), d);
     ai.set_last_rule_fired("idle:owner_use");
     return true;
+}
+
+// idle:ritual_join - a person in the group used an altar that needs several users (Altar of Archaedas / of the Keepers in Uldaman,
+// the UBRS Blackrock Altar) and this bot is one the snapshot picked to fill an open place (NearbyObject::ritual_join): the bot
+// takes it as if told "use altar" and idle:owner_use walks it over and uses it. Before this a person with bots could not wake
+// Archaedas or the Stone Keepers without knowing the "use" order (Discord 1570946298532601866).
+bool RitualJoinGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32)
+{
+    if (ai.owner_use_active() || s.in_combat() || !s.is_alive())
+        return false;
+    for (auto const& o : s.nearby_objects())
+        if (o.ritual_join)
+            return true;
+    return false;
+}
+bool RitualJoinFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit, uint32 now)
+{
+    for (auto const& o : s.nearby_objects())
+    {
+        if (!o.ritual_join)
+            continue;
+        BotAI::OwnerUseOrder order;
+        order.map = s.map_id();
+        order.go = o.guid;
+        order.x = o.x; order.y = o.y; order.z = o.z;
+        uint32 const now_ms = s.published_at_ms();
+        order.set_ms = now_ms ? now_ms : 1u;
+        order.ritual = true;
+        ai.start_owner_use(order);
+        TC_LOG_INFO("playerbot.v2", "[ritual_join] {} joins the ritual at object {} (entry {})", s.name(), o.guid.GetCounter(), o.entry);
+        return OwnerUseFire(s, ai, g, emit, now);
+    }
+    return false;
 }
 
 void RegisterPrologueRules(IdleRuleRegistry& r)
@@ -1616,6 +1666,7 @@ void RegisterPrologueRules(IdleRuleRegistry& r)
     add("idle:fallback",          994, &FallbackGate,       &FallbackFire);
     add("idle:pull_back",         994, &PullBackGate,       &PullBackFire);
     add("idle:owner_use",         994, &OwnerUseGate,       &OwnerUseFire);
+    add("idle:ritual_join",       994, &RitualJoinGate,     &RitualJoinFire);
     // 992: a member not yet in the fight joins the line-of-sight pull's spot (SightPullGather) before the opener and the follow rules.
     add("idle:sight_pull",        992, &SightPullIdleGate,  &SightPullIdleFire);
     add("combat:opener",          993, &OpenerGate,         &OpenerFire);

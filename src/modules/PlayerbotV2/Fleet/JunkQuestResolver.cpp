@@ -8,6 +8,7 @@
 #include "LootItemType.h"
 #include "Creature.h"
 #include "Log.h"
+#include <mutex>
 #include <array>
 #include <limits>
 #include <shared_mutex>

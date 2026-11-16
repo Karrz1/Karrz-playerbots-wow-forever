@@ -98,7 +98,8 @@ private:
         uint32 global_per_tick  = 8;
         bool   filler_hub_only  = true;    // world-wide filler reuses only pool bots saved inside a quest hub / town
         uint32 rss_budget_mb    = 0;       // 0 = off. Over it the world-wide filler stops adding bots; 15% over, the bubble too
-        uint32 town_pct         = 70;      // share of bots placed in a town that stay in town (profession mode)
+        uint32 town_pct         = 50;      // share of bots placed in a town that stay in town (profession mode)
+        uint32 town_hub_cap     = 6;       // most bots placed at one meeting place of a capital (bank, auction house, inn); 0 = no cap
         bool   seed_roster      = false;   // build the sleeping roster up to PoolMax without waiting for a player to arrive
         uint32 seed_in_flight   = 8;       // seeded bots set up at the same time
         uint32 pool_max         = 400;     // ambient characters allowed to exist (online or not)
@@ -109,7 +110,7 @@ private:
         bool   day_rhythm       = true;    // scale the bubble target by the hour of the day (Fleet/DayRhythm.h)
         uint32 jump_grace_ms    = 20000;   // bots around the place a player jumped away from are kept this long (an instance trip: ZoneGraceSec)
         uint32 area_cap_outdoors = 14;     // most world bots within area_radius of one another outdoors (0 = no cap; Fleet/AreaCap.h)
-        uint32 area_cap_town    = 40;      // the same in a capital
+        uint32 area_cap_town    = 15;      // the same in a capital
         uint32 area_cap_start   = 10;      // the same in a start zone: one camp and one quest giver for every new character
         float  area_radius      = 45.0f;
         uint32 pool_horde_pct   = 50;      // share of the roster that should be Horde, in every level bracket (PoolBalance.h)
@@ -281,7 +282,7 @@ private:
     // Why PlaceNear's candidate spots were refused (index: 0 no ground, 1 water, 2 no navmesh point, 3 lava, 4 no complete path, 5 area full, 6 a town of
     // the other side) and
     // how many calls found none at all; reported in the [world] line so a placement that never succeeds names its cause.
-    uint64 n_place_reject_[7] = {};
+    uint64 n_place_reject_[8] = {};   // [7]: a capital's meeting place already held Town.HubCap bots
     uint64 n_place_none_ = 0;
     uint64 n_place_calls_ = 0;
     uint32 last_have_ = 0, last_target_ = 0;   // the last anchor a spawn pass found at its bubble target: how many it has and what it may have ([world] line)
@@ -340,6 +341,7 @@ private:
     uint64 n_arrived_walking_ = 0;
     uint64 n_left_walking_ = 0;
     uint64 n_idle_swaps_ = 0;
+    uint64 n_pickup_broken_ = 0;    // bots' own pickup groups broken up with no player near (Fleet/PickupGroups.h)
     uint32 last_swap_pass_ms_ = 0;
     std::unordered_map<uint64, uint32> swap_ms_;   // per bot: when it was last swapped
     uint32 swap_burst_until_ms_ = 0;   // module ms until which a jump (teleport / hearth) swaps the bubble at a higher rate

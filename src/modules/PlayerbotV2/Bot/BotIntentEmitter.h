@@ -169,6 +169,7 @@ public:
     { return emit(FollowIntent{leader, distance, angle_radians}); }
 
     bool say(std::string text) { return emit(ChatIntent{PartyChatIntent{std::move(text)}}); }
+    bool raid_say(std::string text) { return emit(ChatIntent{RaidChatIntent{std::move(text)}}); }
     bool say_world(std::string text)  { return emit(ChatIntent{SayChatIntent{std::move(text)}}); }
     bool yell_world(std::string text) { return emit(ChatIntent{YellChatIntent{std::move(text)}}); }
     bool emote_text(std::string text) { return emit(ChatIntent{EmoteChatIntent{std::move(text)}}); }

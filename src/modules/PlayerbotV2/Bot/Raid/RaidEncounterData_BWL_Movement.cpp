@@ -50,11 +50,31 @@ namespace Playerbot::Raid {
         // cone the bots stepped out of (healers at their hold, casters at work, bots walking). 46 = the 45 and a step for his size. The
         // drakes cast the same spell; their 24 y cone lost nobody to it in these sweeps, so it stays.
         r.avoidFrontal.push_back({ 11583, 46.0f, 55.0f, Who::NonTank });
-        r.avoidFrontal.push_back({ 11583, 20.0f, 45.0f, Who::NonTank, 180.0f });
+        // Tail Lash 23364 reaches 30 yards behind him (client data: radius 30 on all three effects, printed on every death to it), not the
+        // 20 the rear arc had: of the 100 bots it killed in the Nefarian sweeps and the dev realm raids up to 2026-11-13, 37 stood 20-35 y
+        // from him (dist on the bot_death line, centre to centre), and Karrz's raid lost half its casters to it. 34 = the 30, his size and a
+        // step. The arc is Onyxia's Tail Sweep 15847 (-120 in its client data, 60 each side of straight behind), the same breath-and-tail
+        // dragon: there is no SpellTargetRestrictions copy here to read Tail Lash's own cone from, so the next run's deaths check it.
+        r.avoidFrontal.push_back({ 11583, 34.0f, kOnyTailHalfDeg, Who::NonTank, 180.0f, 100.0f, 0.0f, true, kOnyConeMarginDeg });
         // His tank puts his front away from the raid: with no rule he faced whoever he walked at, and with no tank on him he walked into the
         // camp (bwl_nefarian 1110a run 1: Shadow Flame killed three casters standing on the camp 9 y in front of him, Cleave and his swings
         // the healers at their post).
         r.faceAway.push_back({ 11583 });
+        // Everybody but his tank stands on his flank, in the wedge between the Shadow Flame cone (55 degrees each side, plus a 12 degree margin
+        // for his turn) and the Tail Lash arc (kOnyTailHalfDeg + kOnyConeMarginDeg), the Onyxia layout (StandFlank, RaidBrain 3d). Without it
+        // nothing placed the raid after the landing (the phase 1 posts end there) and the bots stood wherever they were, round his tank: in
+        // Karrz's dev raid 2026-11-14 15:10 the raid centre stood 6 y from him ("[raid_face] axis ... raid centre 6 yd out, 27 raiders"),
+        // Shadow Flame killed 5 and his swings and Cleave 10 more within 5-10 y of him, and his tank found no spot to turn him ("no spot on
+        // the axis behind Nefarian", 8 times). Melee 3-10 y, healers 21-25 y, ranged 23-29 y (inside their 30 y spells).
+        {
+            constexpr float kNefFrontEdgeDeg = 55.0f + kOnyConeMarginDeg + kOnyWedgeGapDeg;
+            constexpr float kNefTailEdgeDeg  = 180.0f - kOnyTailHalfDeg - kOnyConeMarginDeg - kOnyWedgeGapDeg;
+            constexpr float kNefWedgeCentreDeg = 0.5f * (kNefFrontEdgeDeg + kNefTailEdgeDeg);
+            constexpr float kNefWedgeHalfDeg   = 0.5f * (kNefTailEdgeDeg - kNefFrontEdgeDeg);
+            r.standFlank.push_back({ 11583, Who::Melee, 3.0f, 10.0f, kNefWedgeCentreDeg, kNefWedgeHalfDeg });
+            r.standFlank.push_back({ 11583, Who::Healer, 21.0f, 25.0f, kNefWedgeCentreDeg, kNefWedgeHalfDeg });
+            r.standFlank.push_back({ 11583, Who::Ranged, 23.0f, 29.0f, kNefWedgeCentreDeg, kNefWedgeHalfDeg });
+        }
         // Phase three (under 20%, classic_boss_nefarian.cpp: Raise Drakonid 23362): the Drakonid Bones (gameobject 179804) of phase one rise as
         // Bone Constructs, about 40 of them, each on a random raider. The one pass of the 0136 sweeps (sweep-bwl-0136-2) had the spare tanks
         // standing where the drakonids had died: the constructs rose next to them and the area taunts took 41 loose ones to 3 in three

@@ -12,6 +12,8 @@
 #include "Diagnostics/PerfCounters.h"
 #include "Timer.h"     // getMSTime for per-tick latency recording
 #include "GameTime.h"  // GameTime::GetGameTimeMS — same base as snapshot.published_at_ms
+#include "MMapManager.h"         // MMAP::ScopedThreadNavMeshQuery
+#include "PlayerbotMovement.h"   // BotMovement::ScopedBotLogicThread
 #include <algorithm>
 #include <chrono>
 
@@ -101,6 +103,13 @@ void AiWorkerPool::schedule_ticks(std::span<BotId const> bots)
 
 void AiWorkerPool::run_worker()
 {
+    // Rules run here while the map threads update the world. Their path and
+    // nav-point probes use this thread's own navmesh queries under the navmesh
+    // read lock (never the map's shared query, never across a tile load), and
+    // never load a grid themselves (the world thread does it).
+    MMAP::ScopedThreadNavMeshQuery const own_navmesh_queries;
+    Playerbot::BotMovement::ScopedBotLogicThread const bot_logic_thread;
+
     for (;;)
     {
         BotId bot = 0;

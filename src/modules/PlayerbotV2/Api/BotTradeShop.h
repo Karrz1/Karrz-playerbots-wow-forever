@@ -41,6 +41,9 @@ bool IsUpgrade(Player* bot, ItemTemplate const* tmpl);
 constexpr int32 kLaterLevels = 10;
 bool IsForLater(Player const* bot, ItemTemplate const* tmpl);
 
+// A consumable the bot uses itself: a potion, elixir, flask, food or drink, weapon oil or stone, or bandage it can use now.
+bool IsOwnSupply(Player const* bot, ItemTemplate const* tmpl);
+
 // The stacks the bot is willing to sell, most valuable first, at most `max` of them: tradeable, no quest items, nothing the bot
 // itself lives on (consumables, reagents, ammo) and no gear that would be an upgrade for it.
 std::vector<Offer> BuildOffers(Player* bot, uint32 max = 10);

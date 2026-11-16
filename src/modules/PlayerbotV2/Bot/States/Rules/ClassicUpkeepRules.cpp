@@ -39,6 +39,7 @@
 #include "Bot/BotSnapshotView.h"
 #include "Bot/BotIntentEmitter.h"
 #include "Bot/ClassicUpkeep.h"
+#include "Bot/ResistGear.h"
 #include "Services.h"
 #include "SharedDefines.h"
 #include "Util/ConfigReader.h"
@@ -632,7 +633,46 @@ bool FightCloakGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const
     if (!UpkeepWindow(s, g) || s.recently_in_combat(3000))
         return false;
     bool const want = Classic::WantsFightCloak(s);
-    return want != ai.fight_cloak() && !ai.action_recently_tried(BotAI::ActionKind::ClassUpkeep, uint64(want) | kFightCloakKeyBit, now_ms);
+    // Wanted but not worn: the swap was refused (combat, bags) or something took the cloak off since. The flag alone said "done" and the
+    // bot pulled in its own cloak (dev realm 2026-11-13); the back slot is what counts.
+    bool const worn = s.raw().inventory.equipped[14 /*EQUIPMENT_SLOT_BACK*/].entry == Classic::kOnyxiaScaleCloak;
+    if (want && worn && !s.has_aura(Classic::kOnyxiaScaleCloakAura))
+    {
+        // Worn but its equip aura is gone, so Shadow Flame burns the bot anyway (dev realm 2026-11-13: eight cloaked bots died of the
+        // burn). Logged once a minute per bot until the cause is known; the line's time places the loss among the fight's events.
+        static std::mutex sMissingMutex;
+        static std::unordered_map<uint64, uint32> sMissingLogged;
+        bool log_now = false;
+        {
+            std::lock_guard<std::mutex> lock(sMissingMutex);
+            if (sMissingLogged.size() > 4096)
+                sMissingLogged.clear();
+            uint32& at = sMissingLogged[s.guid().GetCounter()];
+            if (!at || now_ms - at > 60000)
+            {
+                at = now_ms;
+                log_now = true;
+            }
+        }
+        if (log_now)
+            TC_LOG_INFO("playerbot.v2", "[fight_cloak] {} wears the Onyxia Scale Cloak but aura {} is MISSING (alive {}, in combat {})",
+                s.name(), Classic::kOnyxiaScaleCloakAura, s.is_alive(), s.in_combat());
+    }
+    // Worn and wanted, but the flag is not set: a relog (a fresh BotAI) with the copy still on. Without the flag the equip rules see the
+    // own cloak in the bags as an upgrade and take the copy off (BotAI::gear_slot_held).
+    if (want && worn && !ai.fight_cloak())
+        ai.set_fight_cloak(true);
+    // The raid is still in there: a bot that died, released and came back alive at the graveyard outside (or is a ghost on its way back)
+    // keeps the copy on. It runs back into a fight in progress, where nobody can change armour, so the swap back would never happen.
+    // Karrz's Nefarian kill 2026-11-14 15:10-15:20: 11 bots put their own cloak back at 15:16:22-15:17:45 after the phase 3 death wave, ran
+    // back in and died 13 times to the Shadow Flame burn 22682; every one of them wore the copy again only after the kill (15:20:46).
+    if (!want && worn && ai.fight_cloak() && s.in_group() && s.is_in_raid())
+        if (auto const* members = g.members())
+            for (auto const& m : *members)
+                if (m.is_alive && !m.is_ghost && Classic::FightCloakMap(m.map_id))
+                    return false;
+    bool const differs = want ? !worn : ai.fight_cloak();
+    return differs && !ai.action_recently_tried(BotAI::ActionKind::ClassUpkeep, uint64(want) | kFightCloakKeyBit, now_ms);
 }
 bool FightCloakFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32 now_ms)
 {

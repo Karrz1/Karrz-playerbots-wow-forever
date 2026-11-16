@@ -125,14 +125,56 @@ static bool RecipeFocusNear(BotSnapshotView const& s, uint32 spell_id)
 
 // The mana wait before a pull. A party with a player in it has none (playtest 2026-10-15: the player watches the mana); a raid keeps it,
 // and so does a group of bots alone, where nobody else would hold the pull for the healer's drink (deadmines_full n57: the priest
-// went into every fight at 1-5 % mana).
-static bool PullManaGate(BotSnapshotView const& s, GroupSnapshotView const& g)
+// went into every fight at 1-5 % mana). With the tank leading the dungeon ("lead on") the tank holds it, the player's own mana too:
+// the player follows and no longer watches the pulls.
+static bool PullManaGate(BotSnapshotView const& s, BotAI const& ai, GroupSnapshotView const& g)
 {
     if (s.is_in_raid()) return true;
+    if (ai.tank_leads_here(s)) return true;
     auto const* members = g.members();
     if (!members) return false;
     for (auto const& m : *members)
         if (m.online && !m.is_bot) return false;
+    return true;
+}
+
+// "Tank leads" in a raid (Karrz, 2026-11-14: "Can it be done for RAIDs as well?"): the main tank leads the trash pack by pack, but a
+// boss is the player's to pull. Called by every out-of-combat boss pull of the autopilot right before it would start the fight: while
+// the lead is on in a raid and the player has not said "go" for this boss, the tank stays where it would have pulled from, says once
+// that the boss is next, and pulls nothing. The player pulls himself (the raid joins the fight as any boss fight), or says "go"
+// (BotCommandParser::ApplyLeadOrder sets tank_lead_boss_go) and the tank pulls it through the same gates (mana, the dead, the player).
+// BotAI::update_dungeon_autopilot_hold clears both once the fight is on.
+static bool LeadHoldsBossPull(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit, ObjectGuid boss, uint32 now_ms)
+{
+    if (!s.is_in_raid() || !ai.tank_leads_here(s) || ai.tank_lead() != BotAI::TankLead::On || boss.IsEmpty())
+        return false;
+    uint32 const entry = boss.GetEntry();
+    if (entry != 0 && ai.tank_lead_boss_go() == entry)
+        return false;
+    // Said once per stop, and again after a minute of waiting, in party chat like the other waits of the lead. Its own clock (not
+    // tank_lead_said): a mana wait in between must not make the tank say the boss line again each time the mana comes back.
+    constexpr uint32 kSayAgainMs = 60000;
+    static std::mutex said_mu;
+    static std::unordered_map<uint64, uint32> said_ms;   // tank -> when it last said the boss line
+    bool say = false;
+    {
+        std::lock_guard<std::mutex> lock(said_mu);
+        uint32& last = said_ms[uint64(s.raw().guid.GetCounter())];
+        if (ai.tank_lead_boss_wait() != entry || last == 0 || now_ms - last >= kSayAgainMs)
+        {
+            last = now_ms ? now_ms : 1u;
+            say = true;
+        }
+    }
+    if (ai.tank_lead_boss_wait() != entry)
+    {
+        ai.set_tank_lead_boss_wait(entry);
+        TC_LOG_INFO("playerbot.v2", "[tank_lead] {} stops before boss entry {} ({}): waits for the player's pull or 'go'",
+                    s.name(), entry, boss.GetCounter());
+    }
+    if (say)
+        emit.say("the boss is next: pull it when you are ready, or say go");
+    ai.set_last_rule_fired("idle:tank_lead_boss_stop");
     return true;
 }
 
@@ -317,9 +359,17 @@ bool MaintainPet(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit,
         constexpr uint32 CALL_PET_4   = 83244;
         constexpr uint32 CALL_PET_5   = 83245;
         constexpr uint32 REVIVE_PET   = 982;
-        // Pet entry exists but is dead → revive
-        if (!s.pet_guid().IsEmpty() && s.knows_spell(REVIVE_PET) && s.is_ready(REVIVE_PET))
+        // The pet died: its body still lies there (a guid but no living pet), or the body is gone and the pet is saved dead in an
+        // active slot (no guid any more). Only Revive Pet brings it back; the core refuses Call Pet for every active pet while one is
+        // saved dead, so never fall through to the Call Pet loop below (it was cast again and again, Discord 2026-11-14).
+        bool active_pet_dead = false;
+        for (auto const& sp : s.raw().pet.stable_pets)
+            if (sp.slot_kind == 0 && sp.creature_id != 0 && sp.dead)
+            { active_pet_dead = true; break; }
+        if (!s.pet_guid().IsEmpty() || active_pet_dead)
         {
+            if (!s.knows_spell(REVIVE_PET) || !s.is_ready(REVIVE_PET))
+                return false;
             emit.cast(REVIVE_PET);
             ai.note_pet_summon_attempt(pet_now_ms);
             return true;
@@ -816,7 +866,9 @@ bool MaintainAutoEquipUpgrades(BotSnapshotView const& s, BotAI& ai,
         // every candidate is throttled the walk falls through to the bump
         // and the rule goes quiet until the next ding / periodic re-check.
         if (ai.equip_recently_tried(it.entry, equip_now_ms)) continue;
+        // The raid swap pieces (resistance gear, the Onyxia Scale Cloak) stay on while they are wanted.
         EquippedItem const& cur = raw.inventory.equipped[it.equip_slot];
+        if (ai.gear_slot_held(it.equip_slot, s.map_id(), cur.entry)) continue;
         // A piece a player chose for the bot (trade or "equip <item>") stays on.
         if (ai.worn_is_kept(it.equip_slot, cur.entry)) continue;
         // Score-based upgrade test (was pure item_level). 12.0 level-scaling
@@ -2492,6 +2544,37 @@ static NearbyUnit const* FrontArcBossAt(BotSnapshotView const& s, GroupSnapshotV
     return boss;
 }
 
+// A point inside a cone the map's raid rules list (Raid::RaidRules::avoidFrontal: the encounter's real reach and arc, Nefarian's
+// Shadow Flame 46 y), for a bot that is not a tank or a melee DPS. FrontArcBossAt is the generic 20 y guess; a step chosen with only
+// that walked a healer into Nefarian's breath (bwl_nefarian 2026-11-14 11:12: Mchealse's line of sight step to (-7535,-1251), 27 y
+// in front of him, and Shadow Flame killed it there from full health).
+static bool InRuledFrontalCone(BotSnapshotView const& s, float px, float py)
+{
+    Raid::RaidRules const* rules = Raid::RulesForMap(s.map_id());
+    if (!rules || rules->avoidFrontal.empty())
+        return false;
+    for (auto const& u : s.raw().combat.nearby_enemies)
+    {
+        if (u.hp <= 0 || u.max_hp <= 0 || u.is_player || !u.unit_in_combat) continue;
+        float const hp_pct = 100.0f * float(u.hp) / float(u.max_hp);
+        for (Raid::AvoidFrontal const& rule : rules->avoidFrontal)
+        {
+            if (rule.enemy != u.entry || hp_pct > rule.hpMax || hp_pct < rule.hpMin) continue;
+            if (rule.who == Raid::Who::Tank || rule.who == Raid::Who::MainTank || rule.who == Raid::Who::OffTank || rule.who == Raid::Who::Melee)
+                continue;
+            float const rx = px - u.x, ry = py - u.y;
+            float const d2 = rx * rx + ry * ry;
+            if (d2 > rule.radius * rule.radius) continue;
+            if (d2 < 1.0f) return true;
+            float const dir = u.o + rule.facingOffsetDeg * float(M_PI) / 180.0f;
+            float const cosOff = (std::cos(dir) * rx + std::sin(dir) * ry) / std::sqrt(d2);
+            if (cosOff >= std::cos(Raid::ConeEdgeDeg(rule) * float(M_PI) / 180.0f))
+                return true;
+        }
+    }
+    return false;
+}
+
 // ---------- Ground hazards (snapshot combat.ground_hazards) ----------
 // A zone counts from its radius + kHazardMargin; a stand point chosen to
 // leave one clears the edge by a further kHazardExitPad so the next tick's
@@ -3018,9 +3101,10 @@ static bool RaidRangedApproachTank(BotSnapshotView const& s, BotAI& ai,
         if (ox * ox + oy * oy <= slot_tolerance * slot_tolerance)
             return false;   // in place
     }
-    // A human leads: the slot stays within the companion leash of him (CompanionLeash::StandPointNearLeader).
+    // A human leads: the slot stays within the companion leash of him (CompanionLeash::StandPointNearLeader). Not while the tank
+    // leads the dungeon ("lead on"): the group stands round the tank and the player follows.
     GroupMemberSummary const* human_lead = nullptr;
-    if (!g.leader_is_bot())
+    if (!g.leader_is_bot() && !ai.tank_leads_here(s))
         if (auto const* mems = g.members())
             for (auto const& m : *mems)
                 if (m.guid == g.leader() && !m.is_bot && m.online && m.is_alive && m.map_id == s.map_id()) { human_lead = &m; break; }
@@ -4086,8 +4170,9 @@ bool RaidCastLosStep(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
     // Step toward the anchor tank (the formation's centre); the target when
     // there is no tank to anchor on.
     // A human leads the group in a 5-man (the caster hold): the anchor is the human, not the tank, which drifts with every pickup.
+    // With the tank leading ("lead on") the tank is the anchor, as in a group of bots alone.
     GroupMemberSummary const* human = nullptr;
-    if (!s.is_in_raid() && !g.leader_is_bot())
+    if (!s.is_in_raid() && !g.leader_is_bot() && !ai.tank_leads_here(s))
         if (auto const* mems = g.members())
             for (auto const& m : *mems)
                 if (!m.is_bot && m.online && m.is_alive && m.map_id == s.map_id() && m.guid != s.guid()) { human = &m; break; }
@@ -4154,7 +4239,7 @@ bool RaidCastLosStep(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
         // it straight back out of LoS (a two-rule ping-pong).
         {
             float ad2, afx, afy;
-            if (FrontArcBossAt(s, g, px, py, ad2, afx, afy)) { ++rej_arc; continue; }
+            if (FrontArcBossAt(s, g, px, py, ad2, afx, afy) || InRuledFrontalCone(s, px, py)) { ++rej_arc; continue; }
         }
         if (DungeonStepRefused(s, ai, px, py, pz, now_ms)) { ++rej_dungeon; continue; }
         G3D::Vector3 end;
@@ -4191,7 +4276,7 @@ bool RaidCastLosStep(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
             float ad2, afx, afy;
             if (clear_of_elites(pt.x, pt.y) && !RaidPointBlocked(s, pt.x, pt.y, pt.z, kHazardMargin) &&
                 !RaidPointInUnpulledReach(s, pt.x, pt.y, pt.z) &&
-                !FrontArcBossAt(s, g, pt.x, pt.y, ad2, afx, afy) &&
+                !FrontArcBossAt(s, g, pt.x, pt.y, ad2, afx, afy) && !InRuledFrontalCone(s, pt.x, pt.y) &&
                 !DungeonStepRefused(s, ai, pt.x, pt.y, pt.z, now_ms))
             {
                 if (DungeonMoveOwnedElsewhere(s, ai, pt.x, pt.y, pt.z, now_ms, "raid:los_step"))
@@ -4852,7 +4937,7 @@ bool DungeonCombatPositioning(BotSnapshotView const& s, BotAI& ai,
                             // The boss is a long fight: the mana users drink to the pull-ready mark before it too, not only the healer
                             // (deadmines_full@sneed: mage 2%, hunter 11% when the tank died). Bounded below so a bot that cannot drink
                             // never freezes the pull.
-                            if (PullManaGate(s, g) && m.max_mana > 0 && Services::Config().behavior_pull_recover() &&
+                            if (PullManaGate(s, ai, g) && m.max_mana > 0 && Services::Config().behavior_pull_recover() &&
                                 int64(m.mana) * 100 < int64(m.max_mana) * Classic::kPullReadyDpsManaPct)
                             {
                                 ++boss_dps_dry;
@@ -4865,7 +4950,7 @@ bool DungeonCombatPositioning(BotSnapshotView const& s, BotAI& ai,
                         const float mdx = m.x - sx0, mdy = m.y - sy0;
                         const float d2 = mdx * mdx + mdy * mdy;
                         if (d2 < healer_d2) healer_d2 = d2;
-                        if (PullManaGate(s, g) && m.max_mana > 0 && int64(m.mana) * 100 < int64(m.max_mana) * Classic::PullReadyHealerManaPct(s))
+                        if (PullManaGate(s, ai, g) && m.max_mana > 0 && int64(m.mana) * 100 < int64(m.max_mana) * Classic::PullReadyHealerManaPct(s))
                         {
                             healer_dry = true;
                             healer_dry_name = m.name;
@@ -4985,6 +5070,10 @@ bool DungeonCombatPositioning(BotSnapshotView const& s, BotAI& ai,
                     if (trash_on_tank && healer_in_pull && s.victim() != pb_boss->GetGUID() && ai.tank_diag_due(now_ms))
                         TC_LOG_INFO("playerbot.v2", "[pull_gate] {} holds the boss pull: {} mob(s) still on the tank",
                                     s.name(), s.fightable_attackers_count());
+                    // Raid lead: the boss is the player's to pull (LeadHoldsBossPull).
+                    if (healer_in_pull && !dps_wait && !trash_on_tank && s.victim() != pb_boss->GetGUID() &&
+                        LeadHoldsBossPull(s, ai, emit, pb_boss->GetGUID(), now_ms))
+                        return true;
                     if (healer_in_pull && !dps_wait && !trash_on_tank && s.victim() != pb_boss->GetGUID() &&
                         !ai.action_recently_tried(BotAI::ActionKind::PveTargetSwitch, pull_key, now_ms) &&
                         emit.start_attack(pb_boss->GetGUID()))
@@ -8926,7 +9015,18 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
         // instance starts drinking below this, so it never holds the pull dry.
         const int64 kReadyHealerManaPct = Classic::PullReadyHealerManaPct(s);
         const float ready_other_y = tight_engage ? 25.0f : 50.0f;
+        // "Tank leads" ("lead on" / "lead pause"; BotAI::TankLead): what the leading tank waits for, for its word to the group below
+        // (nullptr: not held for a reason the player can act on).
+        const bool tank_leads = ai.tank_leads_here(s);
+        char const* lead_wait = nullptr;
         auto compute_group_ready_base = [&]() -> bool {
+            lead_wait = nullptr;
+            // Paused: the lead stays with the tank, but it starts no pull and walks no further until "lead on".
+            if (tank_leads && ai.tank_lead() == BotAI::TankLead::Paused)
+            {
+                lead_wait = "paused";
+                return false;
+            }
             if (!g.exists()) return true;
             auto const* mems = g.members();
             if (!mems) return true;
@@ -8948,7 +9048,33 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                 // here, or a ghost still running back from the graveyard outside
                 // the instance (another map, so it must be checked before the
                 // same-map filter below).
-                if (!m.is_alive) return false;
+                if (!m.is_alive)
+                {
+                    if (tank_leads && !m.is_bot) lead_wait = "you";
+                    return false;
+                }
+                // The tank leads: it never walks on or pulls without the player, who follows it. A player outside the dungeon (another
+                // map) or more than kTankLeadPlayerHoldYd behind holds it, without a cap: he asked to be led.
+                if (tank_leads && !m.is_bot)
+                {
+                    const float hdx = m.x - bx_ga, hdy = m.y - by_ga;
+                    const bool outside = m.map_id != s.map_id();
+                    if (outside || hdx * hdx + hdy * hdy > BotAI::kTankLeadPlayerHoldYd * BotAI::kTankLeadPlayerHoldYd)
+                    {
+                        static std::mutex tl_mu;
+                        static std::unordered_map<uint64, uint32> tl_last;
+                        std::lock_guard<std::mutex> tl_lock(tl_mu);
+                        uint32& last = tl_last[uint64(s.raw().guid.GetCounter())];
+                        if (now_ms - last > 10000u)
+                        {
+                            last = now_ms ? now_ms : 1u;
+                            TC_LOG_INFO("playerbot.v2", "[tank_lead] {} waits for {}: {}", s.name(), m.name,
+                                outside ? std::string("outside the dungeon") : fmt::format("{:.0f}y behind", std::sqrt(hdx * hdx + hdy * hdy)));
+                        }
+                        lead_wait = "you";
+                        return false;
+                    }
+                }
                 if (m.map_id != s.map_id()) continue;
                 if (m.max_hp > 0 &&
                     (int64(m.hp) * 100) < (int64(m.max_hp) * ready_hp_pct))
@@ -8985,7 +9111,7 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                     // check): a healer under 80% mana holds the pull.
                     // A party with a player in it has no mana gate before a pull (playtest 2026-10-15): the owner watches the mana; raids
                     // and groups of bots alone keep it.
-                    if (PullManaGate(s, g) && m.max_mana > 0 &&
+                    if (PullManaGate(s, ai, g) && m.max_mana > 0 &&
                         (int64(m.mana) * 100) < (int64(m.max_mana) * kReadyHealerManaPct))
                         healer_low_mana = true;   // held below, for at most the cap: a healer with no drink must not freeze the run
                 }
@@ -8994,7 +9120,7 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                     // Other mana users drink to the same mark between pulls
                     // (Playerbot.Behavior.PullRecover); the hold is capped
                     // below so a bot with no drink never freezes the raid.
-                    if (PullManaGate(s, g) && m.max_mana > 0 && Services::Config().behavior_pull_recover() &&
+                    if (PullManaGate(s, ai, g) && m.max_mana > 0 && Services::Config().behavior_pull_recover() &&
                         (int64(m.mana) * 100) < (int64(m.max_mana) * Classic::kPullReadyDpsManaPct))
                         ++dps_low_mana;
                     ++others;
@@ -9031,7 +9157,10 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                     clk.second = now_ms;
                     uint32 const cap = s.is_in_raid() ? Classic::kBossPullWaitCapMs : Classic::kPullReadyDungeonHealerHoldCapMs;
                     if (now_ms - clk.first < cap)
+                    {
+                        lead_wait = "mana";
                         return false;
+                    }
                     if (now_ms - clk.first < cap + 1000u)
                         TC_LOG_INFO("playerbot.v2", "[healer_hold] {} pulls with a healer under {}% mana: held {}s, the healer cannot reach the mark",
                                     s.name(), int(kReadyHealerManaPct), cap / 1000);
@@ -9076,7 +9205,10 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                         clk.first = now_ms ? now_ms : 1u;
                     clk.second = now_ms;
                     if (now_ms - clk.first < Classic::kPullReadyDpsHoldCapMs)
+                    {
+                        lead_wait = "mana";
                         return false;
+                    }
                 }
             }
             // The two position holds (a healer out of range, too few of the group near the tank) wait for the group to walk up, for at
@@ -9208,6 +9340,26 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
         if (ai.effective_role(s) == Role::Tank && s.is_in_dungeon())
             group_ready_for_advance = compute_group_ready();
 
+        // The leading tank says what it waits for, once per hold (and again after kSayAgainMs of the same hold), in party chat, as a
+        // real tank would: the player who handed it the lead sees why nothing moves. Out of combat and with the autopilot running
+        // only; "paused" is the player's own order and the order's answer already said it.
+        // In a raid only the main tank leads; a spare tank on off-tank duty says nothing.
+        if (tank_leads && ai.effective_role(s) == Role::Tank && ai.dungeon_active() && s.is_alive() && !s.in_combat() &&
+            !(s.raw().pve_order.active && !s.raw().pve_order.main_tank.IsEmpty() && s.raw().pve_order.main_tank != s.guid()))
+        {
+            constexpr uint32 kSayAgainMs = 45000;
+            char const* const said = ai.tank_lead_said();
+            bool const same = said && lead_wait && std::string_view(said) == lead_wait;
+            if (!group_ready_for_advance && lead_wait && std::string_view(lead_wait) != "paused" &&
+                (!same || now_ms - ai.tank_lead_said_ms() >= kSayAgainMs))
+            {
+                emit.say(std::string_view(lead_wait) == "mana" ? "waiting for mana" : "waiting for you");
+                ai.note_tank_lead_said(lead_wait, now_ms);
+            }
+            else if (group_ready_for_advance && said)
+                ai.note_tank_lead_said(nullptr, 0);   // ready: the next hold is said again
+        }
+
         // Rich, throttled (10s) gate diagnostic — the previous edge-triggered
         // one-liner couldn't answer "why is the tank standing still" without
         // a debugger (2026-06-11: three Stockades stall reports in one day,
@@ -9240,7 +9392,11 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                 // group_not_ready detail: name the first failing member +
                 // check so the log answers the question directly.
                 std::string detail;
-                if (std::string_view(gate_blocker) == "group_not_ready" && g.exists())
+                if (std::string_view(gate_blocker) == "group_not_ready" && tank_leads && ai.tank_lead() == BotAI::TankLead::Paused)
+                    detail = "lead paused (the player's 'lead pause')";
+                else if (std::string_view(gate_blocker) == "group_not_ready" && tank_leads && lead_wait && std::string_view(lead_wait) == "you")
+                    detail = "tank lead: the player is dead, outside or too far behind (see [tank_lead])";
+                else if (std::string_view(gate_blocker) == "group_not_ready" && g.exists())
                 {
                     if (auto const* mems = g.members())
                     {
@@ -10138,6 +10294,9 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                             // tank engages the boss directly below.
                             if (engage_target && bd2 <= kBossEngageR2 && in_los)
                             {
+                                // Raid lead: the tank stands here until the player pulls or says "go" (LeadHoldsBossPull).
+                                if (LeadHoldsBossPull(s, ai, emit, engage_target->GetGUID(), now_ms))
+                                    return true;
                                 // Pull: stationary boss, chasing can't overshoot.
                                 if (!emit.start_attack(engage_target->GetGUID()))
                                     return false;
@@ -12327,6 +12486,8 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
             // Lockout-gate so a refused boss-engage doesn't claim
             // dispatch every tick. note_engage on success aligns this
             // with idle:tank_pull_next and idle:quest_kill.
+            // Raid lead: the boss is the player's to pull (LeadHoldsBossPull).
+            if (LeadHoldsBossPull(s, ai, emit, s.current_boss_guid(), now_ms)) return true;
             if (!emit.start_attack(s.current_boss_guid())) return false;
             ai.note_engage(s.current_boss_guid(), now_ms);
             ai.set_last_rule_fired("idle:dungeon_engage_boss");
@@ -12362,7 +12523,7 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                     // drinks like his other bots (OocRecoveryPick / Classic::LedMaySitDown), below kLedDrinkBelowManaPct, to full, and not
                     // while he walks on. The pull-gate mark (90 % in a party) started a drink at 74-85 % at every stop and the next step
                     // stood her up: 15 drinks and four members held on healer_mana in one Wailing Caverns run, which timed out (0.1.26 RC2).
-                    bool const led = s.in_group() && s.is_led_by_player();
+                    bool const led = s.in_group() && s.is_led_by_player() && !ai.tank_leads_here(s);   // "lead on": the pull gate's pace
                     bool const led_may_sit = !led || Classic::LedMaySitDown({ Classic::IsDrinking(s), ai.since_rest_broken_ms(now_ms),
                                                                               ai.since_anchor_moved_ms(now_ms) });
                     if (hdx * hdx + hdy * hdy + hdz * hdz <= 45.0f * 45.0f && led_may_sit)
@@ -12794,7 +12955,10 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                     if (bi.equip_slot >= eq_raw.inventory.equipped.size()) continue;
                     if (bi.item_level == 0 || bi.quality == 0) continue;
                     if (ai.equip_recently_tried(bi.entry, now_ms)) continue;
+                    // The raid swap pieces (resistance gear, the Onyxia Scale Cloak) stay on while they are wanted: this rule put
+                    // the own cloak back on in Blackwing Lair within seconds of the swap (dev realm 2026-11-13).
                     EquippedItem const& cur_eq = eq_raw.inventory.equipped[bi.equip_slot];
+                    if (ai.gear_slot_held(bi.equip_slot, s.map_id(), cur_eq.entry)) continue;
                     if (ai.worn_is_kept(bi.equip_slot, cur_eq.entry)) continue;
                     if (::Playerbot::V2::Gear::RaidGearActive(eq_raw.identity.level))
                     {
@@ -21382,7 +21546,9 @@ void DispatchIdle(BotAI& ai,
                 if (!reach.empty())
                 {
                     uint32 const h32 = uint32(s.guid().GetCounter()) * 2654435761u + w.strikes * 40503u;
-                    int const k = ::Playerbot::V2::Fleet::PickGatherSpot(reach, float(h32 % 10000u) / 10000.0f);
+                    // Every place the same chance: by weight a bank or an auction house (four NPCs and more) drew nearly every walk,
+                    // and the bots the watch caught in a city all ended in the same heap there (test realm 0.1.36, Trade District).
+                    int const k = int((h32 >> 4) % uint32(reach.size()));
                     float const a = float(h32 % 628u) / 100.0f;
                     float const rr = float((h32 >> 8) % 100u) / 100.0f * ::Playerbot::V2::Fleet::kGatherRadius;
                     tx = reach[k].x + std::cos(a) * rr; ty = reach[k].y + std::sin(a) * rr; tz = reach[k].z;

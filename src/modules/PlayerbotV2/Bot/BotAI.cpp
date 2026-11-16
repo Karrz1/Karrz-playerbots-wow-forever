@@ -698,8 +698,57 @@ void BotAI::tick(BotSnapshotView snapshot,
     dispatch_layers(snapshot, group, emit);
 }
 
+bool BotAI::tank_leads_here(BotSnapshotView const& s) const
+{
+    // Map::IsDungeon covers raid maps too; there only a raid group is led (a party there stays on its owner, raid_map_party_hold).
+    return tank_lead_engaged() && s.is_in_dungeon() && !s.in_battleground() && (!s.is_in_raid() || s.in_raid_group());
+}
+
 void BotAI::update_dungeon_autopilot_hold(BotSnapshotView s, GroupSnapshotView g)
 {
+    // "Tank leads" ends with the dungeon: once the bot has been inside a 5-man with the lead on, kTankLeadLeaveMs outside it (the
+    // run is over, or the group left) turns the lead off, so the next dungeon starts with the player leading again. A lead given
+    // outside waits for the group to go in. A loading-screen blink is shorter than the grace.
+    tank_leads_now_ = tank_leads_here(s);
+    if (tank_lead_engaged())
+    {
+        uint32 const now_ms = s.published_at_ms();
+        if (tank_leads_here(s))
+        {
+            tank_lead_inside_ms_ = now_ms ? now_ms : 1u;
+            tank_lead_away_ms_ = 0;
+        }
+        else if (tank_lead_inside_ms_ != 0)
+        {
+            if (tank_lead_away_ms_ == 0)
+                tank_lead_away_ms_ = now_ms ? now_ms : 1u;
+            else if (now_ms - tank_lead_away_ms_ >= kTankLeadLeaveMs)
+            {
+                set_tank_lead(TankLead::Off);
+                tank_lead_inside_ms_ = 0;
+                tank_lead_away_ms_ = 0;
+                TC_LOG_INFO("playerbot.v2", "[tank_lead] {} ends the tank lead: left the dungeon (map {})", s.name(), s.map_id());
+            }
+        }
+    }
+    else
+    {
+        tank_lead_inside_ms_ = 0;
+        tank_lead_away_ms_ = 0;
+    }
+    // The raid lead's boss stop ends with the lead and once the boss fight is on (the player pulled, or "go" let the tank pull): the
+    // next boss, or the same one after a wipe, stops again.
+    if (tank_lead_boss_wait() != 0 || tank_lead_boss_go() != 0)
+    {
+        bool const boss_fight = s.is_encounter_in_progress() ||
+                                (s.in_combat() && !s.current_boss_guid().IsEmpty() && s.victim() == s.current_boss_guid());
+        if (!tank_leads_now_ || tank_lead() != TankLead::On || !s.is_in_raid() || boss_fight)
+        {
+            set_tank_lead_boss_wait(0);
+            set_tank_lead_boss_go(0);
+        }
+    }
+
     // An owner Stay / Hold: the dungeon autopilot (converge, rejoin, advance, pull) walks nobody who was told to stay.
     owner_hold_ = holding_position(s.published_at_ms());
     // A companion's party that is not a raid group, inside a raid map (MC 2026-10-06: the owner's
@@ -753,7 +802,8 @@ void BotAI::update_dungeon_autopilot_hold(BotSnapshotView s, GroupSnapshotView g
             bool const present = human_seen_ms_ != 0 && now_ms - human_seen_ms_ < 30000u;
             int64_t const steady = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
-            lead_hold = present && steady >= orders_.release_until.load(std::memory_order_relaxed);
+            // The owner handed the lead to the tank ("lead on" / "lead pause"): the bots do not follow him, the tank leads.
+            lead_hold = present && steady >= orders_.release_until.load(std::memory_order_relaxed) && !tank_lead_engaged();
         }
         else
             human_seen_ms_ = 0;
@@ -764,6 +814,7 @@ void BotAI::update_dungeon_autopilot_hold(BotSnapshotView s, GroupSnapshotView g
                 s.name(), lead_hold ? "suspends" : "resumes", s.map_id(),
                 lead_hold ? "a human leads (follows him, advances/pulls on his orders)"
                           : !s.is_in_dungeon() ? "left the dungeon (the autopilot runs only inside one)"
+                          : tank_lead_engaged() ? "the tank leads (lead on)"
                                                : "order / fight window or no human near");
         }
     }
@@ -1271,7 +1322,8 @@ void BotAI::dispatch_layers(BotSnapshotView s, GroupSnapshotView g,
 
     // ike3 speech that no game event announces: companions' combat / ammo callouts and world
     // bots' General / Trade suggestions. Rate-limited inside; at most one chat intent.
-    if (!s.big_raid())   // quiet in 40-man raids
+    // A 40-man raid hears it only with Playerbot.Raid.Talk on (one voice for the whole raid, Bot/Raid/RaidVoice.h).
+    if (!s.big_raid() || BotChatter::RaidTalkOn())
         BotChatter::SpeechTick(*this, s, em);
 
     // Future: detect AtVendor / AtMailbox / AtAh / InInstance / Decorating

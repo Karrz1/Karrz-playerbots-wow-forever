@@ -21,6 +21,8 @@
 #include "Player.h"
 #include "PlayerbotMovement.h"
 #include "ScriptMgr.h"
+#include "Services.h"
+#include "Util/ConfigReader.h"   // Services::Config().refresh() on `.reload config`
 #include "SharedDefines.h"
 #include "Spell.h"
 #include "SpellAuras.h"
@@ -90,6 +92,15 @@ public:
     void OnShutdown() override
     {
         Module::instance().Shutdown();
+    }
+
+    // `.reload config` has just read every config file again (playerbot.conf included): the module takes the new values too,
+    // so one reload is enough for a bot setting in worldserver.conf.d.
+    void OnConfigLoad(bool reload) override
+    {
+        if (!reload || !Playerbot::Services::Initialized())
+            return;
+        Playerbot::Services::Config().refresh();
     }
 
     // A real player is about to take a place in a running battleground (a bot is leaving for them): no second instance

@@ -667,7 +667,7 @@ uint32 ComputeReplyDeferMs(uint32 now_ms, BotPersonality const& p,
 
 } // namespace
 
-void BotChatReactor::React(Player* sender, Group* group, std::string const& msg)
+void BotChatReactor::React(Player* sender, Group* group, std::string const& msg, bool raid_chat)
 {
     if (!sender || !group || msg.empty()) return;
     // Bot speakers never trigger reactions — prevents echo storms when
@@ -700,6 +700,8 @@ void BotChatReactor::React(Player* sender, Group* group, std::string const& msg)
     {
         Player* member = itr.GetSource();
         if (!member || member == sender) continue;
+        // Party chat in a raid reaches only the speaker's sub-group: only those bots heard it.
+        if (!raid_chat && group->isRaidGroup() && !group->SameSubGroup(sender, member)) continue;
         if (!member->GetSession() || !member->GetSession()->IsBot()) continue;
         // Dead bots stay silent — a ghost saying "ty!" reads as broken. The
         // ghost will rejoin chatter once rezzed and snapshot ticks Idle.
@@ -852,7 +854,8 @@ void BotChatReactor::React(Player* sender, Group* group, std::string const& msg)
         const size_t reply_len = reply_str.size();
         Intent it{};
         it.bot_id = c.id;
-        it.body   = ChatIntent{PartyChatIntent{std::move(reply_str)}};
+        // The answer goes where the line was said: raid chat for a raid line, party chat (the sub-group) otherwise.
+        it.body   = raid_chat ? ChatIntent{RaidChatIntent{std::move(reply_str)}} : ChatIntent{PartyChatIntent{std::move(reply_str)}};
         // SC-P2a: personality-paced latency (see ComputeReplyDeferMs), plus a
         // per-replier stagger for multi-name lines.
         const BotPersonality& p = c.ai ? c.ai->personality() : DefaultPersonality();

@@ -31,6 +31,12 @@ Port of Karrz's raid10-revamp ike3 raid logic (Karrz1/wow-1.12, src/game/PlayerB
   that blame and excuse themselves after a wipe; `SpotMishaps` / `TrackPull` / `EndQuietPulls` in RaidBrain.cpp find them.
   Fixed lines with a mild and a harsh set, rate limited by `BanterGate`; with the bridge on, a `raid_line` event asks the program
   first and the fixed line is said when its answer is not back in `kModelWaitMs` (2.5 s). `Playerbot.Raid.Banter` (0 / 1 / 2).
+- `RaidVoice.h`: a raid of more than 15 with a real player in it talks like a crowd instead of staying silent. The bots' own chatter
+  (BotTextMgr: loot, a death, a ready check) comes back with one line for the whole raid per gap (`RaidVoiceGate`) in raid chat;
+  `KillCrowd` (a few gg / grats and cheers after a kill), `RunBackVoice` (talk on the run back and the leader's rebuff call after a
+  wipe) and `VoiceBetweenPulls` (a line now and then out of combat, and the leader's brief of a boss a player walks up to,
+  `BossBrief` / `BossBriefGate`, again after a wipe on it) in RaidBrain.cpp. The program may word the lines (`raid_line`, not the
+  briefs). `Playerbot.Raid.Talk` (0 off / 1 normal / 2 chatty).
 - `BossTactics.h`: the player's own plan per boss in plain words (`tactics Lucifron: adds first, no aoe, no fear, tank here`), kept per
   account and boss (OwnerRegistry, migration 0039). While that boss fights: kill order (`PublishTargets` takes the boss or the adds
   off the DPS candidates), `no_aoe`, `cc_deny` (left out of the crowd-control election and added to the snapshot's deny), and the

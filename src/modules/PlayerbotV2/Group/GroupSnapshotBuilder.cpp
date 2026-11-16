@@ -13,6 +13,7 @@
 #include "GameTime.h"
 #include "Unit.h"
 #include "ObjectAccessor.h"
+#include "Map.h"
 #include "SpellAuras.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
@@ -27,6 +28,7 @@
 #include <unordered_map>
 #include "SharedDefines.h"
 #include "Diagnostics/ScenarioHuman.h"   // Scenario::PlaysAsHuman: a player-led scenario's stand-in counts as the player
+#include "Bot/ClassicHealCover.h"           // DamageRate: a member's damage taken per second
 
 namespace Playerbot {
 
@@ -262,6 +264,37 @@ Role TranslateRole(uint8 lfg_role_bits, uint8 group_flags, uint8 cls, uint32 spe
 
 } // anonymous
 
+namespace {
+
+// Damage taken per second of each grouped player inside an instance (GroupMemberSummary::damage_taken_per_s). Written from the map
+// threads (OnDamageTaken), read by Build on the world thread.
+std::mutex g_dmg_taken_mtx;
+std::unordered_map<uint64, Combat::ClassicHeal::DamageRate> g_dmg_taken;
+constexpr size_t kDamageTakenMaxEntries = 4096;   // a stale entry decays to 0 but stays; the table is cleared past this
+
+float DamageTakenPerSecond(uint64 guid_low, uint32 now_ms)
+{
+    std::lock_guard lk(g_dmg_taken_mtx);
+    auto const it = g_dmg_taken.find(guid_low);
+    return it == g_dmg_taken.end() ? 0.0f : Combat::ClassicHeal::DamageRateAt(it->second, now_ms);
+}
+
+} // namespace
+
+void GroupSnapshotBuilder::NoteDamageTaken(Unit* victim, int32 amount)
+{
+    if (amount <= 0 || !victim || !victim->IsPlayer())
+        return;
+    Player const* vp = victim->ToPlayer();
+    if (!vp->GetGroup() || !vp->GetMap() || !vp->GetMap()->IsDungeon())
+        return;
+    uint32 const now = GameTime::GetGameTimeMS();
+    std::lock_guard lk(g_dmg_taken_mtx);
+    if (g_dmg_taken.size() > kDamageTakenMaxEntries)
+        g_dmg_taken.clear();
+    Combat::ClassicHeal::DamageRateAdd(g_dmg_taken[vp->GetGUID().GetCounter()], amount, now);
+}
+
 std::shared_ptr<GroupSnapshot const> GroupSnapshotBuilder::Build(Player* p, SnapshotVer version)
 {
     if (!p) return {};
@@ -301,6 +334,8 @@ std::shared_ptr<GroupSnapshot const> GroupSnapshotBuilder::Build(Player* p, Snap
             m.level        = mp->GetLevel();
             m.hp           = static_cast<int32>(mp->GetHealth());
             m.max_hp       = static_cast<int32>(mp->GetMaxHealth());
+            if (mp->GetMap() && mp->GetMap()->IsDungeon())
+                m.damage_taken_per_s = DamageTakenPerSecond(slot.guid.GetCounter(), GameTime::GetGameTimeMS());
             m.mana         = static_cast<int32>(mp->GetPower(POWER_MANA));
             m.max_mana     = static_cast<int32>(mp->GetMaxPower(POWER_MANA));
             m.in_combat    = mp->IsInCombat();

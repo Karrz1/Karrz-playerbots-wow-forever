@@ -138,6 +138,10 @@ public:
     uint8  group_invite_leader_level() const { return s_->social_events.group_invite_leader_level; }
     bool   group_invite_leader_is_real() const { return s_->social_events.group_invite_leader_is_real; }
     bool   group_invite_leader_privileged() const { return s_->social_events.group_invite_leader_privileged; }
+    bool   group_invite_leader_owner() const { return s_->social_events.group_invite_leader_owner; }
+    bool   group_invite_leader_gm() const { return s_->social_events.group_invite_leader_gm; }
+    bool   group_invite_leader_friend() const { return s_->social_events.group_invite_leader_friend; }
+    bool   group_invite_leader_guildmate() const { return s_->social_events.group_invite_leader_guildmate; }
     uint32 lfg_proposal_id()       const { return s_->lfg.proposal_id; }
     bool   has_lfg_proposal()      const { return s_->lfg.proposal_id != 0; }
     bool   lfg_role_check_pending() const { return s_->lfg.role_check_pending; }

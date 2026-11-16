@@ -84,6 +84,9 @@ struct ScenarioDef
     // The raid lands at least this far from that creature (0 = the default 40 y). A boss that aggroes on sight (Onyxia: 58 y) is not held, so a
     // landing inside its reach starts the fight on whoever stands nearest instead of on the tank walking in (onyxia_full n6, 2026-10-14).
     float arrive_min_yards = 0.f;
+    // A fixed landing spot instead of the ring search (z != 0), path-checked to the creature once, as a checkpoint's staging spot: a room
+    // whose own corners are the danger (Kel'Thuzad's alcoves full of phase 1 adds that a raid on the rings walks into).
+    float stage_x = 0.f, stage_y = 0.f, stage_z = 0.f;
     // The school the squad gears resistance for, as a vanilla raid dressed for the fight (nature for Princess Huhuran); 0 = none. Every
     // armour and jewellery slot takes the piece with the most of it under the tier's item level (GearGenerationContext::resist_school).
     std::uint8_t resist_school = 0;
@@ -92,6 +95,10 @@ struct ScenarioDef
     // Staging kills every hostile on the map but the goal boss, its formation and these entries (the boss's own adds); 0 = none.
     std::uint32_t keep_entry = 0;
     std::uint32_t keep_entry_b = 0, keep_entry_c = 0;
+    // Staging leaves the boss's formation alone (Garr's Firesworn stand in it round him). A world DB that links the room's trash, or a whole
+    // wing's, into the boss's formation (Faerlina's Acolytes 31 y off, Patchwerk's Bile Retchers 200 y down the hall) leaves that trash for
+    // the fight: members further than this from the boss's spawn are killed like any trash, kept entries excepted. 0 = the whole formation stays.
+    float clear_formation_beyond = 0.f;
     // A fight with no boss death to wait for (Majordomo Executus yields when his eight adds are dead): the goal is reached when this many
     // creatures of these two entries have died on the map. 0 = the goal boss's death.
     std::uint32_t goal_adds_a = 0, goal_adds_b = 0, goal_adds_needed = 0;
@@ -310,6 +317,8 @@ struct RaidBossRow
     std::uint32_t start_object = 0;     // see ScenarioDef::start_object
     std::uint32_t start_event = 0;      // see ScenarioDef::start_event
     std::uint32_t start_add = 0;        // see ScenarioDef::start_add
+    float clear_formation_beyond = 0.f; // see ScenarioDef::clear_formation_beyond
+    float stage_x = 0.f, stage_y = 0.f, stage_z = 0.f;   // a listed landing spot instead of the ring search; see ScenarioDef::stage_x
     // The instance data of the bosses a raid kills before this one (SetData type, value), set at the attack: see ScenarioDef::start_instance_data.
     std::array<std::pair<std::uint32_t, std::uint32_t>, 8> start_data{};
     std::uint8_t start_data_n = 0;
@@ -369,6 +378,21 @@ constexpr RaidBossRow StartsOnEvent(RaidBossRow r, std::uint32_t event_id)
 constexpr RaidBossRow OpensOn(RaidBossRow r, std::uint32_t add_entry)
 {
     r.start_add = add_entry;
+    return r;
+}
+
+// A row whose boss's formation in the world DB holds trash as well as his adds (ScenarioDef::clear_formation_beyond).
+constexpr RaidBossRow ClearsFormation(RaidBossRow r, float beyond_yards)
+{
+    r.clear_formation_beyond = beyond_yards;
+    return r;
+}
+
+// A row whose room the ring search cannot land the raid in (every spot in the boss's sight is on his walk, or has no floor): the raid lands
+// on the listed spot, where its encounter rules fight him (RaidRules stand / tank posts).
+constexpr RaidBossRow Staged(RaidBossRow r, float x, float y, float z)
+{
+    r.stage_x = x; r.stage_y = y; r.stage_z = z;
     return r;
 }
 
@@ -449,6 +473,8 @@ inline ScenarioDef MakeRaidScenario(RaidBossRow const& r, RaidEntrance const& e,
     d.start_object = r.start_object;
     d.start_event = r.start_event;
     d.start_add = r.start_add;
+    d.clear_formation_beyond = r.clear_formation_beyond;
+    d.stage_x = r.stage_x; d.stage_y = r.stage_y; d.stage_z = r.stage_z;
     d.start_instance_data.assign(r.start_data.begin(), r.start_data.begin() + r.start_data_n);
     d.order_attack = true;
     d.order_delay_ms = 20000;
@@ -682,8 +708,12 @@ inline constexpr RaidBossRow kAq40Bosses[] = {
 inline constexpr RaidBossRow kNaxxBosses[] = {
     Sight({ "naxx_anubrekhan", "Naxxramas: 40 level 60 raiders to Anub'Rekhan (Locust Swarm kite, Crypt Guards, scarabs)",
       15956, "Anub'Rekhan",            20, 16573 }, 63.f),   // Crypt Guard; sees 55 y
-    Keeps({ "naxx_faerlina", "Naxxramas: 40 level 60 raiders to Grand Widow Faerlina (Worshipper sacrifice after each Enrage, Rain of Fire)",
-      15953, "Grand Widow Faerlina", 20, 16506 }, 16505),   // Naxxramas Worshipper, Follower
+    // Six Naxxramas Acolytes 31 y off stand in her formation (the world DB links them to her), so the clearing left them, and every ring spot
+    // was refused for one inside 40 y (naxx_faerlina 2026-11-14 1114a). Keeping the Acolytes was wrong (1114c: the entry kept all 24 in the
+    // instance, and their Shadow Bolt Volley killed 37): they are trash a raid clears first, so the formation's members beyond 20 y of her
+    // go with the trash; her Worshippers and Followers stand at her side.
+    ClearsFormation(Keeps({ "naxx_faerlina", "Naxxramas: 40 level 60 raiders to Grand Widow Faerlina (Worshipper sacrifice after each Enrage, Rain of Fire)",
+      15953, "Grand Widow Faerlina", 20, 16506 }, 16505), 20.f),   // Naxxramas Worshipper, Follower
     Sight({ "naxx_maexxna",    "Naxxramas: 40 level 60 raiders to Maexxna (Web Wrap freed, Necrotic Poison dispelled, Poison Shock cone)",
       15952, "Maexxna",                20 }, 48.f),   // sees 40 y
     { "naxx_noth",       "Naxxramas: 40 level 60 raiders to Noth the Plaguebringer (the curse dispelled first, spread, balcony adds)",
@@ -698,17 +728,51 @@ inline constexpr RaidBossRow kNaxxBosses[] = {
       16060, "Gothik the Harvester",   25 },
     Sight(Keeps({ "naxx_horsemen", "Naxxramas: 40 level 60 raiders to the Four Horsemen (marks, the tank rotation, Void Zones, Meteor)",
       16062, "Highlord Mograine", 25, 16063 }, 16064, 16065), 83.f),   // Zeliek, Korth'azz, Blaumeux; they see 75 y
-    { "naxx_patchwerk",  "Naxxramas: 40 level 60 raiders to Patchwerk (Hateful Strike soaked by three off tanks)",
-      16028, "Patchwerk",              15 },
+    // His formation in the world DB spans the hall's trash (Bile Retchers 16018, 16017, 16021, 16029, 3000-3171 x, up to 300 y from him),
+    // which the clearing left; it joined the fight on his patrol and Bile Vomit killed 21 (naxx_patchwerk 1114c). Cleared like trash.
+    // His walk runs through his room on the raised floor (z 294.1), and no ring spot both sees him and keeps off it: the raid landed out
+    // of his sight twice (1114e, 1114f: 17 spots near the walk, 43 out of sight, 158 without floor) and the healers' heals failed for line
+    // of sight while the tanks died at the edge of the walk. It waits on the room's lower floor south of the walk (z 292.6, out of his
+    // sight while he walks), and once he is pulled it goes up into the hall, where he is fought (RaidEncounterData_NAXX.cpp).
+    Staged(ClearsFormation({ "naxx_patchwerk",  "Naxxramas: 40 level 60 raiders to Patchwerk (Hateful Strike soaked by three off tanks)",
+      16028, "Patchwerk",              15 }, 20.f), 3285.0f, -3297.0f, 292.6f),
     { "naxx_grobbulus",  "Naxxramas: 40 level 60 raiders to Grobbulus (Mutating Injection carrier runs, poison clouds, Slime Spray cone)",
       15931, "Grobbulus",              20 },
-    Sight({ "naxx_gluth",      "Naxxramas: 40 level 60 raiders to Gluth (Mortal Wound tank swap, Frenzy tranquilized, Zombie Chows)",
-      15932, "Gluth",                  20, 16360 }, 57.f),   // Zombie Chow; sees 49 y
-    Keeps({ "naxx_thaddius", "Naxxramas: 40 level 60 raiders to Thaddius (Stalagg and Feugen first, Static Field, Polarity Shift sides)",
-      15928, "Thaddius", 25, 15929 }, 15930),   // Stalagg, Feugen
-    { "naxx_kelthuzad",  "Naxxramas: 40 level 60 raiders to Kel'Thuzad (phase 1 adds, Detonate Mana, Shadow Fissures, Guardians shackled)",
-      15990, "Kel'Thuzad",            30 },
+    // Gluth sees 49 y (MoveInLineOfSight, classic_boss_gluth.cpp) from his spawn 3283.1,-3157.0 in the middle of his room. The raid lands
+    // just outside that, on the north wall by the way in (3262,-3108: 53 y from him), 28 y from its camp (RaidEncounterData_NAXX.cpp,
+    // 3290,-3110), so the main tank opens and the healers have a short walk. 0080 landed it on the old camp 3294,-3141, 19 y from him:
+    // he came at once and killed a priest 1 s in (1115e). From the ring search's spot 57 y out the healers walked 62 y (1115d).
+    Staged(Sight({ "naxx_gluth",      "Naxxramas: 40 level 60 raiders to Gluth (Mortal Wound tank swap, Frenzy tranquilized, Zombie Chows)",
+      15932, "Gluth",                  20, 16360 }, 57.f), 3262.0f, -3108.0f, 297.8f),   // Zombie Chow; sees 49 y
+    // Thaddius sits immune to players until Stalagg and Feugen are dead (classic_boss_thaddius.cpp): the raid opens on Stalagg, as a raid
+    // does (naxx-grep-1114a: the order onto Thaddius was refused at 110 s and the raid stood for 120 s). It comes in at the room's door
+    // (Thaddius Door 3421.9,-3017.5,295.6): the ring search landed it on his own walkway, which the slime pit and a 15 y wall cut off from
+    // both add platforms (1115c: no path up, 0/5 killed). From the door both platforms are a walk (103 y to Stalagg's), and the raid brain
+    // splits the raid onto them before the pull (RaidMechanics_Naxx.cpp, Thaddius).
+    Staged(OpensOn(Keeps({ "naxx_thaddius", "Naxxramas: 40 level 60 raiders to Thaddius (Stalagg and Feugen first, Static Field, Polarity Shift sides)",
+      15928, "Thaddius", 25, 15929 }, 15930), 15929), 3421.9f, -3017.5f, 295.6f),   // Stalagg, Feugen
 };
+
+// ---- Naxxramas, Kel'Thuzad: the whole fight from the start of phase 1, 40 level 60 raiders ----
+// His room's area trigger starts the encounter (OnKTAreaTrigger, classic_boss_kelthuzad.cpp); a raid placed in sight of him never walks
+// through it, so the runner starts it as the trigger does (DoAction CLASSIC_NAXX_ACTION_KT_START). Phase 1: 5:20 of skeletons,
+// abominations and banshees from the alcoves while he channels, immune to players; the raid fights them on its own. Then his intro and
+// phase 2 15 s later, when he turns attackable; the order goes onto him. naxx-grep-1114a: the plain row ordered the tank onto him at 20 s,
+// was refused (immune, the encounter never started) and the raid stood for 429 s.
+inline ScenarioDef MakeNaxxKelThuzadScenario()
+{
+    static constexpr RaidBossRow kKt = { "naxx_kelthuzad", "Naxxramas: 40 level 60 raiders to Kel'Thuzad (phase 1 adds, Detonate Mana, Shadow Fissures, Guardians shackled)",
+                                         15990, "Kel'Thuzad", 30 };
+    ScenarioDef d = MakeRaidScenario(kKt, kNaxxEntrance, RaidSquad(kMcRaid, sizeof(kMcRaid) / sizeof(kMcRaid[0])));
+    d.start_npc = 15990;
+    d.start_npc_action = 1;        // CLASSIC_NAXX_ACTION_KT_START
+    // The raid stands in the middle round him, as in Classic, away from the alcoves: placed by the ring search 40 y out (3707,-5104), it
+    // stood within reach of an alcove's resting Soldiers, pulled them at 3 s and lost 33 raiders to their Dark Blast by 12 s
+    // (naxx_kelthuzad 1114c). He is immune and passive in phase 1, so 10 y from him is safe; same floor (z 142).
+    d.stage_x = 3736.4f; d.stage_y = -5113.4f; d.stage_z = 142.0f;
+    d.goal_wait_ms = 8u * 60u * 1000u;   // phase 2 opens 5:35 after the start
+    return d;
+}
 
 inline std::vector<ScenarioDef> MakeOtherRaidScenarios()
 {
@@ -725,6 +789,7 @@ inline std::vector<ScenarioDef> MakeOtherRaidScenarios()
         v.push_back(MakeRaidScenario(r, kAq40Entrance, squad40()));
     for (RaidBossRow const& r : kNaxxBosses)
         v.push_back(MakeRaidScenario(r, kNaxxEntrance, squad40()));
+    v.push_back(MakeNaxxKelThuzadScenario());
     return v;
 }
 

@@ -32,6 +32,9 @@ enum class CalloutKind : uint8_t
     HoldHeals,      // a healing priest stops for Nefarian's priest call
     Taunt,          // the bot taunts a boss or an add
     CrowdControl,   // the bot polymorphs, banishes or shackles an add for a long time
+    DropStacks,     // the bot steps out of the boss's sight to drop a stacking debuff (Firemaw's Flame Buffet): one bot says it
+    BreathHide,     // the raid hides from a breath (Chromaggus): one bot calls it
+    Tranq,          // the bot removes an enemy's enrage or magic buff (Tranquilizing Shot, Purge, Dispel Magic)
     Count
 };
 
@@ -41,11 +44,13 @@ struct CalloutFacts
     std::string_view move_reason;   // RaidOrder::move_reason, empty when the bot has no move
     bool taunt = false;             // its elected cast is a taunt
     bool long_cc = false;           // its elected cast is crowd control that lasts 15 s or more
+    bool purge = false;             // its elected cast removes a buff from an enemy (an enrage, a magic shield)
     bool hold_rotation = false;
     bool use_object = false;
     std::string spell;              // the elected spell's name (taunt, crowd control)
     std::string target;             // the elected cast's target name
     std::string carried;            // carrier run: the name of the aura the bot carries
+    std::string sight_aura;         // break sight: the stacking aura the bot steps away to drop (empty: hiding from a breath)
 };
 
 struct Callout
@@ -67,6 +72,9 @@ inline Callout PickCallout(CalloutFacts const& f)
         return { CalloutKind::IceBlock, "hiding behind an ice block", false };
     if (m == "spread")
         return { CalloutKind::Spread, "spread out", true };
+    if (m == "break sight")
+        return f.sight_aura.empty() ? Callout{ CalloutKind::BreathHide, "breath coming, get out of its sight", true }
+                                    : Callout{ CalloutKind::DropStacks, "dropping " + f.sight_aura + " stacks out of its sight", true };
     if (m == "heigan dance" || m == "heigan eruption")
         return { CalloutKind::HeiganDance, "dance time, follow the safe side", true };
     if (f.use_object || m.substr(0, 4) == "orb:")
@@ -77,6 +85,8 @@ inline Callout PickCallout(CalloutFacts const& f)
         return { CalloutKind::Taunt, "taunting " + f.target, false };
     if (f.long_cc && !f.spell.empty() && !f.target.empty())
         return { CalloutKind::CrowdControl, f.spell + " on " + f.target + ", don't break it", false };
+    if (f.purge && !f.spell.empty() && !f.target.empty())
+        return { CalloutKind::Tranq, "casting " + f.spell + " on " + f.target, false };
     return {};
 }
 
@@ -84,6 +94,8 @@ inline Callout PickCallout(CalloutFacts const& f)
 //  * the same bot, the same kind of line: once per kSameKindMs (a re-sheep a few seconds later stays quiet);
 //  * the same bot, any line: once per kBotGapMs;
 //  * a group-wide call (spread, wipe, dance): once per kGroupWideMs for the whole raid, whichever bot says it;
+//  * the same kind of line about the same target (`subject`, e.g. the sheeped raider): once per kSameKindMs for the whole raid,
+//    whichever bot casts it (BWL Nefarius 2026-11-13: four mages each said "Polymorph on Carmina, don't break it" within 11 s);
 //  * the whole raid: kGroupGapMs between two lines, at most kWindowMax lines in kWindowMs.
 class CalloutGate
 {
@@ -96,13 +108,20 @@ public:
     static constexpr uint32_t kWindowMax   = 5;
 
     // True when the line may be said now; it is then counted as said.
-    bool Allow(uint64_t group, uint64_t bot, CalloutKind kind, bool group_wide, uint32_t now)
+    bool Allow(uint64_t group, uint64_t bot, CalloutKind kind, bool group_wide, uint32_t now, std::string_view subject = {})
     {
         if (kind == CalloutKind::None)
             return false;
         GroupState& g = groups_[group];
         while (!g.said.empty() && now - g.said.front() >= kWindowMs)
             g.said.pop_front();
+        std::string subjectKey;
+        if (!subject.empty())
+        {
+            subjectKey.assign(1, char('A' + static_cast<uint8_t>(kind))).append(subject);
+            if (auto s = g.subjects.find(subjectKey); s != g.subjects.end() && now - s->second < kSameKindMs)
+                return false;
+        }
         if (!g.said.empty() && now - g.said.back() < kGroupGapMs)
             return false;
         if (g.said.size() >= kWindowMax)
@@ -123,6 +142,12 @@ public:
             g.wide[k] = stamp;
         b.last = stamp;
         b.kind[k] = stamp;
+        if (!subjectKey.empty())
+        {
+            for (auto it = g.subjects.begin(); it != g.subjects.end();)
+                it = now - it->second >= kSameKindMs ? g.subjects.erase(it) : std::next(it);
+            g.subjects[subjectKey] = stamp;
+        }
         return true;
     }
 
@@ -141,7 +166,7 @@ public:
 private:
     static constexpr size_t kKinds = static_cast<size_t>(CalloutKind::Count);
     struct BotState { uint32_t last = 0; uint32_t kind[kKinds] = {}; };
-    struct GroupState { std::deque<uint32_t> said; uint32_t last = 0; uint32_t wide[kKinds] = {}; };
+    struct GroupState { std::deque<uint32_t> said; uint32_t last = 0; uint32_t wide[kKinds] = {}; std::unordered_map<std::string, uint32_t> subjects; };
     std::unordered_map<uint64_t, BotState> bots_;
     std::unordered_map<uint64_t, GroupState> groups_;
 };

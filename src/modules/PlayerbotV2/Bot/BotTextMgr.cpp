@@ -11,6 +11,7 @@
 #include "BotRegistry.h"
 #include "BotSnapshotView.h"
 #include "BotBridge.h"
+#include "Raid/RaidVoice.h"
 #include "../Fleet/BotPool.h"
 #include "../Services.h"
 #include "../Threading/IntentQueue.h"
@@ -313,12 +314,35 @@ bool GroupHasRealPlayer(Player const* bot)
     return false;
 }
 
+// A raid of more than 15 talks with one voice (Bot/Raid/RaidVoice.h): forty bots each on their own chatter cooldown was spam (ike3's
+// quiet-raid rule, which kept a big raid silent), so the whole raid shares one gap instead.
+std::mutex             g_raid_voice_mtx;
+Raid::RaidVoiceGate    g_raid_voice;
+uint32                 g_raid_voice_pruned = 0;
+
+Raid::RaidVoiceTuning RaidTuning() { return Raid::VoiceTuning(Raid::RaidTalkFromConfig(Services::Config().raid_talk())); }
+
+bool IsBigRaid(Group const* g) { return g && g->GetMembersCount() > Raid::kRaidVoiceGroupSize; }
+
+// The raid's turn to hear a bot's own line: one line per raid per chatterGapMs, one per bot per chatterBotMs.
+bool TakeRaidVoice(uint64 group_low, BotId bot, uint32 now_ms)
+{
+    Raid::RaidVoiceTuning const t = RaidTuning();
+    std::lock_guard lk(g_raid_voice_mtx);
+    if (now_ms - g_raid_voice_pruned > 60000)
+    {
+        g_raid_voice.Prune(now_ms, std::max(t.chatterGapMs, t.chatterBotMs));
+        g_raid_voice_pruned = now_ms;
+    }
+    return g_raid_voice.Allow(group_low, bot, t, now_ms);
+}
+
 BotAI* ChattyAi(Player const* bot, Verbosity min_verbosity)
 {
     if (!bot || !bot->IsAlive() || !BotTextMgr::instance().Enabled())
         return nullptr;
-    // Big raids: forty bots talking at once is spam (ike3's quiet-raid rule).
-    if (Group const* g = bot->GetGroup(); g && g->GetMembersCount() > 15)
+    // A big raid hears the bots' own chatter only with Playerbot.Raid.Talk on (and then through TakeRaidVoice).
+    if (IsBigRaid(bot->GetGroup()) && !RaidTalkOn())
         return nullptr;
     BotId const id = bot->GetGUID().GetCounter();
     BotRegistry& reg = Services::Registry();
@@ -350,7 +374,9 @@ void BroadcastToParty(Player* bot, std::string_view key, TextPlaceholders& ph, c
     if (!mgr.RollChance(key))
         return;
     BotId const id = bot->GetGUID().GetCounter();
-    if (!TakeSlot(Slot::Broadcast, bot->GetGroup()->GetGUID().GetCounter(), id, GameTime::GetGameTimeMS()))
+    uint64 const group_low = bot->GetGroup()->GetGUID().GetCounter();
+    bool const raid = IsBigRaid(bot->GetGroup());
+    if (raid ? !TakeRaidVoice(group_low, id, GameTime::GetGameTimeMS()) : !TakeSlot(Slot::Broadcast, group_low, id, GameTime::GetGameTimeMS()))
         return;
     AddSelfPlaceholders(ph, bot->GetClass(), bot->GetRace(), bot->GetLevel(), bot->GetZoneId(), bot->GetAreaId());
     std::string text = mgr.Get(key, ph);
@@ -358,8 +384,12 @@ void BroadcastToParty(Player* bot, std::string_view key, TextPlaceholders& ph, c
         return;
     if (BotBridge::QueueMoment(id, what, detail, PlainText(text)))
         return;
-    // A beat later, like a person glancing at the loot window or quest log before typing.
-    PushChat(id, ChatIntent{ PartyChatIntent{ std::move(text) } }, urand(1500, 4000));
+    // A beat later, like a person glancing at the loot window or quest log before typing. A big raid reads it in raid chat (party chat
+    // there reaches only the bot's sub-group).
+    if (raid)
+        PushChat(id, ChatIntent{ RaidChatIntent{ std::move(text) } }, urand(1500, 4000));
+    else
+        PushChat(id, ChatIntent{ PartyChatIntent{ std::move(text) } }, urand(1500, 4000));
 }
 
 // Last quest status seen per (bot, quest), so an INCOMPLETE that follows nothing reads as "accepted"
@@ -1465,7 +1495,7 @@ void BanterTick(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em)
         return;
     std::string line = BanterLine(Banter::Ouch, ai, s);
     if (!line.empty())
-        em.say(std::move(line));
+        SayToGroup(em, s, std::move(line));
 }
 
 // A companion's group came to a new zone: with the bot bridge's moments on, one bot of the group may say something about it
@@ -1477,7 +1507,8 @@ std::unordered_map<uint64, std::pair<uint32, uint32>> g_zone_said;   // group lo
 
 void ZoneTick(BotAI& ai, BotSnapshotView const& s)
 {
-    if (!BotBridge::MomentsOn() || !s.is_companion_with_owner() || !s.in_group() || s.big_raid() || !s.is_alive() || !s.zone_id())
+    if (!BotBridge::MomentsOn() || !s.is_companion_with_owner() || !s.in_group() || (s.big_raid() && !RaidTalkOn()) || !s.is_alive() ||
+        !s.zone_id())
         return;
     uint32 old_zone = 0;
     {
@@ -1556,13 +1587,17 @@ std::string BanterLine(Banter kind, BotAI& ai, BotSnapshotView const& s, bool* t
 {
     if (!Services::Config().behavior_party_banter())
         return {};
-    // A companion, in a group that is not a big raid, with chatter on and a personality that talks.
-    if (!BotTextMgr::instance().Enabled() || s.big_raid() || !s.in_group() || !s.is_companion_with_owner())
+    // A companion with chatter on and a personality that talks; in a big raid only with Playerbot.Raid.Talk, and never the wipe line
+    // there (the raid leader's wipe talk covers it, RaidBrain WipeBanter).
+    if (!BotTextMgr::instance().Enabled() || !s.in_group() || !s.is_companion_with_owner())
+        return {};
+    if (s.big_raid() && (!RaidTalkOn() || kind == Banter::Wipe))
         return {};
     BotPersonality const& pers = ai.personality();
     if (pers.verbosity < Verbosity::Normal)
         return {};
-    if (!TakeBanterSlot(kind, s.group_guid().GetCounter(), s.bot_id(), s.published_at_ms()))
+    if (s.big_raid() ? (urand(1, 100) > BanterChance(kind) || !TakeRaidVoice(s.group_guid().GetCounter(), s.bot_id(), s.published_at_ms()))
+                     : !TakeBanterSlot(kind, s.group_guid().GetCounter(), s.bot_id(), s.published_at_ms()))
         return {};
     std::string line = PickBanter(kind, s.cls(), ai.effective_role(s), pers);
     if (!line.empty() && BotBridge::QueueMoment(s.bot_id(), BanterWhat(kind), BanterDetail(kind, s), line))
@@ -1574,12 +1609,25 @@ std::string BanterLine(Banter kind, BotAI& ai, BotSnapshotView const& s, bool* t
     return line;
 }
 
+bool RaidTalkOn()
+{
+    return Raid::RaidTalkFromConfig(Services::Config().raid_talk()) != Raid::RaidTalk::Off;
+}
+
+void SayToGroup(BotIntentEmitter& em, BotSnapshotView const& s, std::string text)
+{
+    if (s.big_raid())
+        em.raid_say(std::move(text));
+    else
+        em.say(std::move(text));
+}
+
 void OnBossKilled(Player* killer, Creature* boss)
 {
     if (!killer || !boss || !IsBossCreature(boss))
         return;
     Group* group = killer->GetGroup();
-    if (!group || group->GetMembersCount() > 15)
+    if (!group || IsBigRaid(group))
         return;
     ConfigReader const& cfg = Services::Config();
     bool const banter = cfg.behavior_party_banter();
@@ -1633,7 +1681,9 @@ void SpeechTick(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em)
     if (!BotTextMgr::instance().Enabled())
         return;
     uint32 const now_ms = s.published_at_ms();
-    Callouts(ai, s, em, now_ms);
+    // A big raid has its own callouts (Bot/Raid/RaidCallouts.h); the party ones from 39 bots would drown them.
+    if (!s.big_raid())
+        Callouts(ai, s, em, now_ms);
     Suggest(ai, s, em, now_ms);
     BanterTick(ai, s, em);
     ZoneTick(ai, s);

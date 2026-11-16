@@ -27,9 +27,12 @@ std::optional<std::string> ClassifyGroupOrder(std::string_view msg, bool owner_w
     // The owner's plain-language words (Playerbot.Behavior.OwnerCommands, BotCommandParser OwnerWordOrder) are exact
     // phrases too: summon, passive / defensive / aggressive, the questions who / help / stats / gear / inventory, the
     // quest orders, loot / loot all, sell grey, repair. "drop quest <name>" is an argument order below.
-    static constexpr std::array<std::string_view, 20> kGroupOrders =
+    // "lead" / "lead on" / "lead pause" / "lead off" hand the lead of a 5-man dungeon to the tank bot and back (BotCommandParser
+    // ApplyLeadOrder, the ForeverBots Lead button).
+    static constexpr std::array<std::string_view, 24> kGroupOrders =
         { "follow", "stay", "hold", "resume", "attack", "come", "disengage", "assist", "pull", "flee", "release",
-          "fallback", "fall back", "pull back", "pullback", "pull and back", "back", "rally here", "mount", "dismount" };
+          "fallback", "fall back", "pull back", "pullback", "pull and back", "back", "rally here", "mount", "dismount",
+          "lead", "lead on", "lead pause", "lead off" };
     // "stance nofight" / "stance defensive" / "stance aggressive" (and the older add-on's "stance passive") are the ForeverBots panel's
     // own re-send of its stance (BotCommandParser): stance only.
     static constexpr std::array<std::string_view, 24> kOwnerWords =
@@ -58,7 +61,9 @@ std::optional<std::string> ClassifyGroupOrder(std::string_view msg, bool owner_w
         // The panel's Ignore target button and key: the owner's own list, answered once (BotCommandParser::ApplyIgnoreOrder).
         order == "ignore target" || order == "ignore clear" ||
         // The Positions tab's words: "place <shape> [gap] [here|target] [who...]", answered once (BotCommandParser::ApplyPlaceOrder).
-        order.rfind("place ", 0) == 0;
+        order.rfind("place ", 0) == 0 ||
+        // The panel's Raid reset button (BotCommandParser::ApplyRaidResetOrder), answered once.
+        order == "raid reset" || order == "reset raid";
     // Everyday words for the two commonest orders, exact lines only ("follow me please" stays chatter). Karrz typed "wait here" in
     // party chat (2026-11-08): a bot answered "wait, got it" (BotChatReactor's acknowledgement) and nobody waited; "follow me"
     // likewise only got a reply. The Russian lines are the ones the Russian testers use.

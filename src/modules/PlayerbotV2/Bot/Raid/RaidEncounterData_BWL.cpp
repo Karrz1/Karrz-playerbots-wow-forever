@@ -149,6 +149,9 @@ namespace Playerbot::Raid {
         r.priority.push_back({ 11583, 3 });                                       // the boss must beat the constructs (boss_nefarian.cpp:371-376)
         // Bone Constructs (phase 3): 6k hp each, up to 42. Every second caster clears them with area
         // damage (first matching row wins, so this one comes first); everybody else stays on Nefarian while the tanks hold them.
+        // Every caster (Who::Caster) was tried and is worse: bwl_nefarian 1114j, 9 constructs loose 3 s after the rise and 23 at 6 s
+        // (the half split: 0-6), the casters' area threat pulled them off the spare tanks into the casters and healers, Nefarian
+        // stalled at 12-14% with only melee and hunters on him, and the raid wiped. The half split passed (1114e, kill 2026-11-14).
         r.priority.push_back({ 14605, 8, Who::AoeShare });
         r.priority.push_back({ 14605, 0 });                                       // Bone Construct: up to 40 of them, 6k hp each; tanks hold them, DPS burn Nefarian (DB 14605)
         r.priority.push_back({ 14668, 6 });                                       // Corrupted Infernal (warlock call: 2 per warlock, stun+damage) (boss_nefarian.cpp:63,609-624)

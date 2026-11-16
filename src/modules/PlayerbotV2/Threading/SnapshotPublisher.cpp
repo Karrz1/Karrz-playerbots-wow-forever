@@ -1,3 +1,4 @@
+#include <mutex>
 #include "SnapshotPublisher.h"
 
 namespace Playerbot {

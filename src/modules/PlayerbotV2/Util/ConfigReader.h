@@ -6,6 +6,7 @@
 #pragma once
 
 #include "Bot/AlwaysBuffs.h"
+#include "Bot/InvitePolicy.h"   // Playerbot.Interact.AcceptInvitesFrom
 #include <vector>
 
 #include "Bot/BotTypes.h"
@@ -20,7 +21,12 @@ class ConfigReader
 public:
     // Returns true if config loaded (or default values acceptable for missing keys).
     bool load(std::string const& file_path);
+    // .playerbot reload: reads all config files again (sConfigMgr->Reload), then refresh().
     bool reload();
+    // Takes the values from the config as it is loaded now (after `.reload config`, OnConfigLoad).
+    void refresh();
+    // One line with the effective values of the keys test runs flip (log + .playerbot reload reply).
+    std::string effective_summary() const;
 
     // ----- Accessors (HR-yes unless noted) ----
     // Threading
@@ -40,6 +46,11 @@ public:
     // [1,24]); the world thread also participates so effective parallelism is
     // this+1. (PlayerbotV2.SnapshotBuildThreads)
     uint32 snapshot_build_threads()  const { return snapshot_build_threads_; }
+    // Also split the bots of ONE open-world map over the build pool (by group, so
+    // a group always builds on one thread). Off = one thread per map as before.
+    // Dungeons, raids, battlegrounds and arenas are never split. Read every tick.
+    // (PlayerbotV2.SnapshotBuildSplitMap)
+    bool   snapshot_build_split_map() const { return snapshot_build_split_map_; }
 
     // Population
     uint32 population_total_target() const { return pop_target_; }
@@ -49,7 +60,8 @@ public:
     float  population_spawn_cap_factor() const { return pop_spawn_cap_factor_; }
 
     // Interaction
-    std::string const& accept_invites_policy() const { return accept_invites_; }
+    // Playerbot.Interact.AcceptInvitesFrom: whose group invite a bot takes (Bot/InvitePolicy.h). Default anyone.
+    InvitePolicy::From accept_invites_from() const { return accept_invites_from_; }
     bool   auto_leader_handover() const { return auto_leader_handover_; }
     char   command_prefix() const { return command_prefix_; }
 
@@ -58,6 +70,7 @@ public:
     bool   boss_warnings_enabled() const { return boss_warnings_enabled_; }
     bool   raid_callouts_enabled() const { return raid_callouts_enabled_; }
     int32  raid_banter() const { return raid_banter_; }   // 0 off, 1 mild, 2 harsh (Raid/RaidBanter.h)
+    int32  raid_talk() const { return raid_talk_; }       // 0 off, 1 normal, 2 chatty (Raid/RaidVoice.h)
     bool   raid_auto_accept_rez() const { return raid_auto_accept_rez_; }
 
     // Housing
@@ -600,6 +613,7 @@ private:
     uint32 tick_budget_ms_ = 10;
     bool   parallel_snapshot_build_ = true;
     uint32 snapshot_build_threads_  = 0;
+    bool   snapshot_build_split_map_ = false;
 
     uint32 pop_target_   = 0;      // Classic default: no ambient world bots
     uint8  pop_horde_pct_ = 50;
@@ -607,7 +621,7 @@ private:
     float  pop_max_heavy_factor_ = 0.40f;
     float  pop_spawn_cap_factor_ = 1.10f;
 
-    std::string accept_invites_ = "friends_or_higher";
+    InvitePolicy::From accept_invites_from_ = InvitePolicy::From::Anyone;
     bool        auto_leader_handover_ = true;
     char        command_prefix_ = '!';
 
@@ -615,6 +629,7 @@ private:
     bool   boss_warnings_enabled_ = true;
     bool   raid_callouts_enabled_ = true;
     int32  raid_banter_ = 1;
+    int32  raid_talk_ = 1;
     bool   raid_auto_accept_rez_ = true;
 
     bool   housing_enabled_  = true;

@@ -721,12 +721,30 @@ CastPick PickBlessing(BotSnapshotView const& s, GroupSnapshotView const& g, bool
     return {};
 }
 
+// A healer's weapon oil: Brilliant Mana Oil (+12 mana every 5 s, +25 healing, 30 minutes) on the main hand, as every raid healer ran it.
+// Stocked through the healer raid kit (ClassicSupplies.cpp kHealerKit). 12 mana per 5 s is about 720 mana in a 5-minute boss fight, a tenth
+// of a raid healer's pool; Nefarian 11-14: ten healers at 18% mana when he landed, none of them with an oil.
+constexpr uint32 BRILLIANT_MANA_OIL = 20748;
+constexpr uint32 BRILLIANT_MANA_OIL_SPELL = 25123;   // the item's spell, the source of the temporary enchant (2629)
+
+// A healer whose main hand takes the mana oil: it has one in the bags, or the oil is on the weapon now. A Restoration shaman then puts no
+// imbue on it (a Rockbiter or Flametongue Weapon heals nothing and would replace the oil).
+static bool HealerOilsWeapon(BotSnapshotView const& s)
+{
+    if (!IsHealerSpec(s.cls(), uint16(s.spec())))
+        return false;
+    WeaponUpkeep const& mh = s.classic_upkeep().main_hand;
+    return !mh.guid.IsEmpty() && (s.item_count(BRILLIANT_MANA_OIL) > 0 || s.weapon_enchant_from(mh, BRILLIANT_MANA_OIL_SPELL));
+}
+
 CastPick PickImbue(BotSnapshotView const& s, bool in_combat)
 {
     if (s.cls() != CLASS_SHAMAN || s.is_mounted())
         return {};
     WeaponUpkeep const& mh = s.classic_upkeep().main_hand;
     if (mh.guid.IsEmpty())
+        return {};
+    if (ShamanIsCaster(s.spec()) && HealerOilsWeapon(s))
         return {};
     static constexpr uint32 kMelee[]  = { WINDFURY_WEAPON, FLAMETONGUE_WEAPON, ROCKBITER_WEAPON };
     static constexpr uint32 kCaster[] = { FLAMETONGUE_WEAPON, ROCKBITER_WEAPON };
@@ -769,6 +787,13 @@ static bool IsDamageCaster(BotSnapshotView const& s)
 
 ItemPick PickPoison(BotSnapshotView const& s)
 {
+    if (HealerOilsWeapon(s) && !s.is_mounted())
+    {
+        WeaponUpkeep const& mh = s.classic_upkeep().main_hand;
+        if (s.item_count(BRILLIANT_MANA_OIL) > 0 && (!mh.temp_enchant || mh.temp_remaining.count() < 60'000))
+            return { BRILLIANT_MANA_OIL, mh.guid };
+        return {};
+    }
     if (IsDamageCaster(s) && !s.is_mounted())
     {
         WeaponUpkeep const& mh = s.classic_upkeep().main_hand;

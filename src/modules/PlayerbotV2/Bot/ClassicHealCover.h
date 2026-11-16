@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 namespace Playerbot::Combat::ClassicHeal {
@@ -15,14 +16,52 @@ constexpr int32_t kHealCriticalPct      = 25;     // a patient under this asks f
 constexpr float   kHealCriticalCover    = 1.5f;
 constexpr float   kHealTankTroubleCover = 1.25f;
 
-// The health a heal landing in a moment has to restore: what is missing now plus half the swings still coming.
-inline int64_t HealDeficitOf(int64_t max_hp, int64_t hp, int64_t incoming)
+// Damage a raid member took per second, measured from the hits that landed (Group/GroupSnapshotBuilder.cpp NoteDamageTaken) and decayed
+// with kDamageRateTauMs, so it follows a change of target within a few seconds. The swings of IncomingMelee only see the mob whose victim
+// the member is: Patchwerk's Hateful Strike, a breath or a spell volley never show there. Naxx Patchwerk 1115b: the off tank took Hateful
+// Strikes at 63 % with no swing on him, one Greater Heal (4058 in flight, 2.4 s to land) "covered" his 3880 missing, eight healers left
+// him to it, and he went on dropping while it cast.
+constexpr float kDamageRateTauMs = 3000.0f;
+
+struct DamageRate
 {
-    return std::max<int64_t>(max_hp - hp, 0) + incoming / 2;
+    float    per_s = 0.0f;   // damage per second as of at_ms
+    uint32_t at_ms = 0;      // 0: no hit yet
+};
+
+inline float DamageRateAt(DamageRate const& r, uint32_t now_ms)
+{
+    if (!r.at_ms || r.per_s <= 0.0f)
+        return 0.0f;
+    int32_t const dt = std::max<int32_t>(int32_t(now_ms - r.at_ms), 0);
+    return r.per_s * std::exp(-float(dt) / kDamageRateTauMs);
+}
+
+inline void DamageRateAdd(DamageRate& r, int64_t amount, uint32_t now_ms)
+{
+    if (amount <= 0)
+        return;
+    r.per_s = DamageRateAt(r, now_ms) + float(amount) * 1000.0f / kDamageRateTauMs;
+    r.at_ms = now_ms ? now_ms : 1u;
+}
+
+// The damage the measured rate brings before a heal `land_in_ms` away lands.
+inline int64_t DamageUntilLand(float per_s, int32_t land_in_ms)
+{
+    return per_s > 0.0f && land_in_ms > 0 ? int64_t(per_s * float(land_in_ms) / 1000.0f) : 0;
+}
+
+// The health a heal landing in a moment has to restore: what is missing now plus what comes before it lands, which is half the swings
+// still coming or, when more, `until_land` (the measured damage rate times the time to the first heal in flight, DamageUntilLand). The
+// two are the same damage seen two ways, so the larger counts, not their sum.
+inline int64_t HealDeficitOf(int64_t max_hp, int64_t hp, int64_t incoming, int64_t until_land = 0)
+{
+    return std::max<int64_t>(max_hp - hp, 0) + std::max<int64_t>(incoming / 2, until_land);
 }
 
 // The heals in flight (`inflight`) cover the deficit times `margin` (a critical patient: at least kHealCriticalCover).
-inline bool CoveredByHealsInFlight(int64_t max_hp, int64_t hp, int64_t incoming, int64_t inflight, int32_t actual_pct, float margin, bool in_fight = true)
+inline bool CoveredByHealsInFlight(int64_t max_hp, int64_t hp, int64_t incoming, int64_t inflight, int32_t actual_pct, float margin, bool in_fight = true,
+                                   int64_t until_land = 0)
 {
     if (inflight <= 0 || max_hp <= 0)
         return false;
@@ -30,7 +69,7 @@ inline bool CoveredByHealsInFlight(int64_t max_hp, int64_t hp, int64_t incoming,
     // afterwards) the deficit is exact, and three healers started a heal on a rezzed warlock at 14 % (MC Magmadar 2026-10-10: 3984 in
     // flight for a deficit of about 2700, the third heal was pure mana).
     bool const critical = actual_pct < kHealCriticalPct && in_fight;
-    float const need = float(HealDeficitOf(max_hp, hp, incoming)) * (critical ? std::max(margin, kHealCriticalCover) : margin);
+    float const need = float(HealDeficitOf(max_hp, hp, incoming, until_land)) * (critical ? std::max(margin, kHealCriticalCover) : margin);
     return float(inflight) >= need;
 }
 

@@ -541,6 +541,13 @@ float RaidItemSpellScore(ItemTemplate const* tpl, RaidWeights const& w, RaidRole
         SpellInfo const* si = sSpellMgr->GetSpellInfo(uint32(e->SpellID), DIFFICULTY_NONE);
         if (!si)
             continue;
+        // A proc counts for its uptime: at about one proc a minute, the share of the fight its aura is up (capped at the old flat 0.17).
+        // Felstriker's 3 s of +100% hit and crit scored as 17 % of a permanent +100 %, above any tank weapon's whole budget, and put the
+        // rogue dagger in every protection warrior's main hand (Karrz 11-15, Naxx: "I don't know why the tanks have that dagger").
+        bool const proc = e->TriggerType == ITEM_SPELLTRIGGER_ON_PROC;
+        if (proc)
+            if (int32 const dur = si->GetDuration(); dur > 0)
+                scale = std::min(scale, float(dur) / 60000.0f);
         for (SpellEffectInfo const& eff : si->GetEffects())
         {
             if (!eff.IsAura())
@@ -584,7 +591,8 @@ float RaidItemSpellScore(ItemTemplate const* tpl, RaidWeights const& w, RaidRole
                     mismatch = true;
                 continue;
             }
-            total += scale * weight * unit * amount;
+            // A proc's percentage past what any stat can use (Felstriker's 100 % hit) is worth no more than 10 points of it.
+            total += scale * weight * unit * ((proc && unit > 1.0f) ? std::min(amount, 10.0f) : amount);
         }
     }
     return total;

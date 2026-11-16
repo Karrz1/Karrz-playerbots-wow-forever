@@ -127,6 +127,7 @@ struct Patient
     int64      incoming  = 0;     // summed melee swings on the unit
     int64      inflight  = 0;     // raid: other healers' direct heals already on their way (ApplyInFlight)
     uint32     inflight_land_ms = 0;   // ... and when the first of them lands (published_at_ms clock)
+    int64      until_land = 0;    // raid: damage the patient's measured rate brings before that first heal lands (DamageUntilLand)
     bool       tank      = false;
     bool       valid     = false; // false: the bot itself as a "nobody needs healing" fallback
 };
@@ -385,22 +386,28 @@ inline float HealTakenFactor(GroupSnapshotView const& g, ObjectGuid guid)
 
 // Other healers' direct heals in flight on `p` (see the block comment); fills
 // p.inflight / p.inflight_land_ms and projects p.hp_pct with them. Raid only.
+constexpr uint32 kSkipHorizonMs = 2500;   // a healer skipping a patient for the heals in flight looks this far ahead (one Greater Heal / Holy Light)
+
 template <typename Claims>
 void ApplyInFlight(BotSnapshotView const& s, GroupSnapshotView const& g, Patient& p, Claims const& claims)
 {
     p.inflight = 0;
     p.inflight_land_ms = 0;
+    p.until_land = 0;
     if (!p.valid || p.max_hp <= 0 || p.guid.IsEmpty())
         return;
     uint32 const now = s.published_at_ms();
     uint64 const self = s.guid().GetCounter();
     float amount = 0.0f;
     bool any = false;
+    uint32 last_land = now;
     auto add = [&](float amt, uint32 land)
     {
         amount += amt;
         if (!any || int32(land - p.inflight_land_ms) < 0)
             p.inflight_land_ms = land;
+        if (int32(land - last_land) > 0)
+            last_land = land;
         any = true;
     };
     auto claim_of = [&](uint64 healer) -> HealClaim const*
@@ -434,9 +441,23 @@ void ApplyInFlight(BotSnapshotView const& s, GroupSnapshotView const& g, Patient
     p.inflight = any ? int64(amount) : 0;
     if (!any)
         p.inflight_land_ms = 0;
+    else if (auto const* members = g.members())
+        for (GroupMemberSummary const& m : *members)
+            if (m.guid == p.guid)
+            {
+                // The damage the heals in flight have to cover is what comes until the last of them has landed, and at least until a heal
+                // this healer starts now would land: the question is whether the patient is still covered when its own heal would
+                // arrive. Up to the first landing only was a second's damage against 2.5-3 s heals (naxx_patchwerk 1115h: six healers
+                // at once left a tank at 79% to 6292 in flight for a deficit of 4286, three of those heals were then cancelled, and the
+                // tank went on dropping).
+                int32 const horizon = std::max<int32>(int32(last_land - now), int32(kSkipHorizonMs));
+                p.until_land = DamageUntilLand(m.damage_taken_per_s, horizon);
+                break;
+            }
     // From the raw health each time (as MakePatient), so a patient handed in
-    // already projected is never projected twice.
-    int64 const projected = std::min<int64>(p.hp - p.incoming + p.inflight, p.max_hp);
+    // already projected is never projected twice. The damage until the heals land
+    // is the swings or the measured rate, whichever is more (HealDeficitOf).
+    int64 const projected = std::min<int64>(p.hp - std::max(p.incoming, p.until_land) + p.inflight, p.max_hp);
     p.hp_pct = int32(std::max<int64>(projected, 0) * 100 / p.max_hp);
 }
 
@@ -444,10 +465,10 @@ void ApplyInFlight(BotSnapshotView const& s, GroupSnapshotView const& g, Patient
 // trouble ask for a margin: damage goes on while the heals cast). A critical patient asks for kHealCriticalCover times the deficit
 // whatever lands when: a heal beyond that is mana, not life (MC Garr 2026-10-10: up to 9 healers started a heal on one tank within
 // one second; the tank's own healers were exempt from this check while it was under half health, which is when it matters most).
-inline int64 HealDeficit(Patient const& p) { return HealDeficitOf(p.max_hp, p.hp, p.incoming); }
+inline int64 HealDeficit(Patient const& p) { return HealDeficitOf(p.max_hp, p.hp, p.incoming, p.until_land); }
 inline bool CoveredByInFlight(BotSnapshotView const& s, Patient const& p, float margin = 1.0f)
 {
-    return CoveredByHealsInFlight(p.max_hp, p.hp, p.incoming, p.inflight, p.actual_pct, margin, s.in_combat());
+    return CoveredByHealsInFlight(p.max_hp, p.hp, p.incoming, p.inflight, p.actual_pct, margin, s.in_combat(), p.until_land);
 }
 
 inline void NoteCoveredSkip(BotSnapshotView const& s, Patient const& p, char const* where)
@@ -455,9 +476,10 @@ inline void NoteCoveredSkip(BotSnapshotView const& s, Patient const& p, char con
     if (!RaidLogDue(HealLogKey(s, HealLogKind::Covered), s.published_at_ms(), 3000u))
         return;
     TC_LOG_INFO("playerbot.v2",
-        "[raid_heal] {} leaves {}{} at {}% to heals in flight ({}): {} incoming heal for a deficit of {}, first lands in {} ms",
-        s.name(), p.guid.GetCounter(), p.tank ? " (tank)" : "", p.actual_pct, where, p.inflight,
-        p.max_hp - p.hp + p.incoming, std::max<int32>(int32(p.inflight_land_ms - s.published_at_ms()), 0));
+        "[raid_heal] {} leaves {}{} at {}% to heals in flight ({}): {} incoming heal for a deficit of {} (missing {} swings {} damage until it lands {}), "
+        "first lands in {} ms",
+        s.name(), p.guid.GetCounter(), p.tank ? " (tank)" : "", p.actual_pct, where, p.inflight, HealDeficit(p), p.max_hp - p.hp, p.incoming,
+        p.until_land, std::max<int32>(int32(p.inflight_land_ms - s.published_at_ms()), 0));
 }
 
 // MCRaidPolicy::HealScore.

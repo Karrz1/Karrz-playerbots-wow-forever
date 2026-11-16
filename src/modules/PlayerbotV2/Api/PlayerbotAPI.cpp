@@ -64,6 +64,8 @@
 #include "FollowDrop.h"          // follow_drop: ledge plan toward an owner who dropped or jumped down
 #include "Fleet/CityLayer.h"      // same-level moves across a drop, NoPath storm
 #include "Fleet/BotPool.h"        // Pool::IsScenarioBot: a test character trades with nobody
+#include "Fleet/BotIdentityRegistry.h"   // Lifecycle().is_bot: a bot's own invite made the group
+#include "Fleet/PickupGroups.h"   // a bot-made pickup group is noted so it breaks up again
 #include "Bot/World/ZonePicker.h" // IsVanillaCapitalZone
 #include "Fleet/InstanceEntry.h"  // PrepareInstanceEntry: a stale raid lock must not keep a companion out of its owner's instance
 #include "PartialRouteStall.h"
@@ -3077,8 +3079,9 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
     {
         if (refuse_exit_portal())
             return Result::Locked;
+        LiquidData lvData{};
         BotMovement::LiquidVerdict const lv =
-            BotMovement::ClassifyDestinationLiquid(p_, x, y, z);
+            BotMovement::ClassifyDestinationLiquid(p_, x, y, z, &lvData);
 
         // Hazard (magma / slime) is always refused Ã¢Â€Â” the bot burns to death
         // on contact regardless of distance or breath.
@@ -3091,6 +3094,15 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
             // plenty for wander to rotate through.
             Playerbot::V2::Module::instance().OnPathOutcome(3 /*FarFromPolyEnd*/);
             log_path_fail("Magma");
+            // Which liquid it was, once per map and liquid type: the type, its flags and its spell are what LiquidHurts judged.
+            static std::set<std::pair<uint32, uint32>> s_hazardLiquidLogged;
+            if (s_hazardLiquidLogged.size() < 256 && s_hazardLiquidLogged.emplace(p_->GetMapId(), lvData.entry).second)
+            {
+                LiquidTypeEntry const* lt = sLiquidTypeStore.LookupEntry(lvData.entry);
+                TC_LOG_INFO("playerbot.v2", "[liquid_hazard] map={} liquid type {} ({}) flags 0x{:X} spell {} surface {:.1f} at ({:.1f},{:.1f},{:.1f})",
+                    p_->GetMapId(), lvData.entry, lt ? lt->Name : "?", uint32(lvData.type_flags.AsUnderlyingType()), lt ? lt->SpellID : 0u,
+                    lvData.level, x, y, z);
+            }
             NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask),
                          GameTime::GetGameTimeMS());
             return Result::Locked;
@@ -3682,8 +3694,11 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
 
     // A mounted player cannot attack (Unit::Attack returns false), so a bot riding past an enemy emitted start_attack every
     // tick and nothing happened: bots ran past each other mounted in WSG (playtest, 2026-10-08). Like a real player who clicks
-    // an enemy, the bot gets off its mount first.
-    if ((p_->IsMounted() || p_->HasAuraType(SPELL_AURA_MOUNTED)) && tu->IsHostileTo(p_))
+    // an enemy, the bot gets off its mount first. Any valid attack target (checked above), a neutral (yellow) one too: the owner's
+    // Attack on a neutral beast was refused while the bot rode behind him (Unit::Attack fails mounted), the refusal armed the 30 s
+    // start_attack lockout, and the grouped bots ignored the order (Discord 6_1_8_8_1, 2026-11-14: "sometimes do not attack after
+    // using the Attack command" in the open world).
+    if (p_->IsMounted() || p_->HasAuraType(SPELL_AURA_MOUNTED))
         p_->RemoveAurasByType(SPELL_AURA_MOUNTED);
 
     // Ranged white damage. A real hunter's client casts Auto Shot (75, an
@@ -5477,6 +5492,7 @@ Result API::accept_group_invite()
     if (g->GetLeaderGUID() == p_->GetGUID()) return Result::Other;
     if (g->IsFull()) return Result::ServerRefused;
 
+    bool formed_by_bot = false;
     if (!g->IsCreated())
     {
         Player* leader = ObjectAccessor::FindPlayer(g->GetLeaderGUID());
@@ -5484,9 +5500,13 @@ Result API::accept_group_invite()
         g->RemoveInvite(leader);
         g->Create(leader);
         sGroupMgr->AddGroup(g);
+        // A world bot's own invite made this group (idle:invite_nearby_player): a pickup group, which breaks up again (Fleet/PickupGroups.h).
+        formed_by_bot = Services::Lifecycle().is_bot(leader->GetGUID().GetCounter());
     }
     g->RemoveInvite(p_);
     if (!g->AddMember(p_)) return Result::ServerRefused;
+    if (formed_by_bot)
+        ::Playerbot::V2::PickupGroups::Note(g->GetGUID().GetCounter(), GameTime::GetGameTimeMS());
     g->BroadcastGroupUpdate();
     return Result::Ok;
 }

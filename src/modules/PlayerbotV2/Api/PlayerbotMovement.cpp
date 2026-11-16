@@ -18,6 +18,9 @@
 #include "PhasingHandler.h"
 #include "Player.h"
 #include "Unit.h"
+#include "DB2Stores.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "VMapDefinitions.h"
 #include "Log.h"
 #include "Config.h"
@@ -34,6 +37,9 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <mutex>
+#include <optional>
+#include <vector>
 
 #ifdef _MSC_VER
 #include <windows.h>   // EXCEPTION_EXECUTE_HANDLER for SehSafeCalculatePath
@@ -59,8 +65,11 @@ constexpr float kGroundLiftY = 2.0f;
 
 // ---- SehSafeCalculatePath ---------------------------------------------------
 
+// The guarded bodies. An SEH frame cannot hold objects with destructors, so the
+// navmesh read lock is taken by the public wrappers further down.
+namespace {
 #ifdef _MSC_VER
-bool SehSafeCalculatePath(PathGenerator& path, float x, float y, float z) noexcept
+bool CalculatePathGuarded(PathGenerator& path, float x, float y, float z) noexcept
 {
     __try
     {
@@ -76,7 +85,7 @@ bool SehSafeCalculatePath(PathGenerator& path, float x, float y, float z) noexce
     }
 }
 
-bool SehSafeCalculatePathFrom(PathGenerator& path, float sx, float sy, float sz, float x, float y, float z) noexcept
+bool CalculatePathFromGuarded(PathGenerator& path, float sx, float sy, float sz, float x, float y, float z) noexcept
 {
     __try
     {
@@ -89,7 +98,7 @@ bool SehSafeCalculatePathFrom(PathGenerator& path, float sx, float sy, float sz,
     }
 }
 
-int SehSafeNearestPolyProbe(void const* query, float const* detourPt,
+int NearestPolyProbeGuarded(void const* query, float const* detourPt,
                             float const* extents, void const* filter,
                             float* nearestOut) noexcept
 {
@@ -108,19 +117,19 @@ int SehSafeNearestPolyProbe(void const* query, float const* detourPt,
     }
 }
 #else
-bool SehSafeCalculatePath(PathGenerator& path, float x, float y, float z) noexcept
+bool CalculatePathGuarded(PathGenerator& path, float x, float y, float z) noexcept
 {
     return path.CalculatePath(x, y, z, /*forceDest=*/false);
 }
 
-bool SehSafeCalculatePathFrom(PathGenerator& path, float sx, float sy, float sz, float x, float y, float z) noexcept
+bool CalculatePathFromGuarded(PathGenerator& path, float sx, float sy, float sz, float x, float y, float z) noexcept
 {
     return path.CalculatePath(sx, sy, sz, x, y, z, /*forceDest=*/false);
 }
 
 // Non-MSVC platforms have no SEH; run the probe directly. Mirrors the
 // _MSC_VER branch above minus the __try/__except guard.
-int SehSafeNearestPolyProbe(void const* query, float const* detourPt,
+int NearestPolyProbeGuarded(void const* query, float const* detourPt,
                             float const* extents, void const* filter,
                             float* nearestOut) noexcept
 {
@@ -131,6 +140,41 @@ int SehSafeNearestPolyProbe(void const* query, float const* detourPt,
     return ref ? 1 : 0;
 }
 #endif
+
+// A thread with its own navmesh queries (a bot logic thread, or a same-map
+// split snapshot build) holds the navmesh read lock for the whole search, so
+// a map thread cannot add or remove a tile under it (MMAP::NavMeshReadLock).
+// Map and world thread searches take no lock, as before.
+struct ReadLockIfOwnQueries
+{
+    std::optional<MMAP::NavMeshReadLock> lock;
+    ReadLockIfOwnQueries()
+    {
+        if (MMAP::ScopedThreadNavMeshQuery::Active())
+            lock.emplace();
+    }
+};
+} // namespace
+
+bool SehSafeCalculatePath(PathGenerator& path, float x, float y, float z) noexcept
+{
+    ReadLockIfOwnQueries const lock;
+    return CalculatePathGuarded(path, x, y, z);
+}
+
+bool SehSafeCalculatePathFrom(PathGenerator& path, float sx, float sy, float sz, float x, float y, float z) noexcept
+{
+    ReadLockIfOwnQueries const lock;
+    return CalculatePathFromGuarded(path, sx, sy, sz, x, y, z);
+}
+
+int SehSafeNearestPolyProbe(void const* query, float const* detourPt,
+                            float const* extents, void const* filter,
+                            float* nearestOut) noexcept
+{
+    ReadLockIfOwnQueries const lock;
+    return NearestPolyProbeGuarded(query, detourPt, extents, filter, nearestOut);
+}
 
 // ---- SnapToGround -----------------------------------------------------------
 
@@ -334,6 +378,80 @@ bool ProbeGround(Player* p, float x, float y, float zHint, float& out)
     return true;
 }
 
+// ---- Grid loads asked for by snapshot builds ---------------------------------
+
+namespace
+{
+thread_local bool t_deferGridLoads = false;
+thread_local bool t_botLogicThread = false;
+std::mutex g_deferredGridsMtx;
+// By map id + instance id, not Map*: a bot logic thread's request can outlive its map (an instance reset before the drain).
+struct DeferredGrid { uint32 map_id; uint32 instance_id; float x; float y; };
+std::vector<DeferredGrid> g_deferredGrids;
+
+void QueueGridLoad(Map const* m, float x, float y)
+{
+    std::lock_guard<std::mutex> lk(g_deferredGridsMtx);
+    g_deferredGrids.push_back({ m->GetId(), m->GetInstanceId(), x, y });
+}
+}
+
+ScopedDeferGridLoads::ScopedDeferGridLoads() : previous_(t_deferGridLoads)
+{
+    t_deferGridLoads = true;
+}
+
+ScopedDeferGridLoads::~ScopedDeferGridLoads()
+{
+    t_deferGridLoads = previous_;
+}
+
+ScopedBotLogicThread::ScopedBotLogicThread() : previous_(t_botLogicThread)
+{
+    t_botLogicThread = true;
+}
+
+ScopedBotLogicThread::~ScopedBotLogicThread()
+{
+    t_botLogicThread = previous_;
+}
+
+bool EnsureGridForQuery(Map* m, float x, float y)
+{
+    if (!m)
+        return false;
+    if (t_deferGridLoads)
+    {
+        // same-map split build: the maps are still, so the grid state can be read
+        if (m->IsGridLoaded(x, y))
+            return true;
+        QueueGridLoad(m, x, y);
+        return false;
+    }
+    if (t_botLogicThread)
+    {
+        // a map thread may be loading or unloading grids right now, so not even the grid state is read here. The search
+        // goes ahead; on a grid that is not loaded it finds no navmesh, the same as any search over an unloaded tile.
+        QueueGridLoad(m, x, y);
+        return true;
+    }
+    m->LoadGrid(x, y);   // no-op when the grid is already loaded
+    return true;
+}
+
+size_t LoadDeferredGrids()
+{
+    std::vector<DeferredGrid> grids;
+    {
+        std::lock_guard<std::mutex> lk(g_deferredGridsMtx);
+        grids.swap(g_deferredGrids);
+    }
+    for (DeferredGrid const& g : grids)
+        if (Map* m = sMapMgr->FindMap(g.map_id, g.instance_id))
+            m->LoadGrid(g.x, g.y);   // a grid asked for twice is a no-op the second time
+    return grids.size();
+}
+
 // ---- NearestNavPoint --------------------------------------------------------
 
 bool NearestNavPoint(Player* p, float tx, float ty, float tz,
@@ -346,9 +464,14 @@ bool NearestNavPoint(Player* p, float tx, float ty, float tz,
         return false;
 
     // The tile under the target may not be resident (a tall lift shaft can
-    // span into a grid the bot hasn't streamed). LoadGrid is a no-op when the
+    // span into a grid the bot hasn't streamed). Loading is a no-op when the
     // grid is already loaded; it keeps the navmesh tile alive for the query.
-    m->LoadGrid(tx, ty);
+    // Inside a same-map parallel build the load waits for the world thread
+    // and this build has no answer (see ScopedDeferGridLoads); on a bot logic
+    // thread the load also waits for the world thread, and the search runs
+    // on what is loaded now (see ScopedBotLogicThread).
+    if (!EnsureGridForQuery(m, tx, ty))
+        return false;
 
     // Resolve the query the same way PathGenerator does: the *terrain* map id
     // (phased maps share a parent terrain) drives the navmesh selection, while
@@ -492,8 +615,7 @@ bool SafeNearTeleport(Player* p, float x, float y, float z, float o, bool navmes
             map_liquidHeaderTypeFlags::AllLiquids, &ld);
         // The vmap filters on the model's raw liquid type, before the area table's override (the Majordomo dais is lava only after it),
         // so ask for all liquids and test the flags that come back.
-        if (st != LIQUID_MAP_NO_WATER && !ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) &&
-            !ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Slime))
+        if (st != LIQUID_MAP_NO_WATER && !LiquidCanHurt(ld))
             return false;
         // A point ON the surface reads WATER_WALK (delta > -0.1) and one just above it ABOVE_WATER, and the bot falls in at
         // once: the Molten Core entrance snap lands exactly on the lava surface (z 168.5, ground 165.2), so only IN / UNDER
@@ -699,8 +821,8 @@ bool SwimLevel(Player* p, float x, float y, float zHint, float& swimZ)
                                                 p->GetCollisionHeight());
     if (st == LIQUID_MAP_NO_WATER || st == LIQUID_MAP_ABOVE_WATER)
         return false;
-    // Lava and slime are not swum: the flee and refuse rules deal with them.
-    if (ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) || ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Slime))
+    // A liquid that hurts is not swum: the flee and refuse rules deal with it.
+    if (LiquidCanHurt(ld))
         return false;
     if (!Swim::IsDeep(ld.level, floor_z, p->GetCollisionHeight()) || Swim::AskedFromAbove(zHint, ld.level))
         return false;
@@ -823,6 +945,34 @@ void PostTeleportSnap(Player* p)
     p->NearTeleportTo(nx, ny, nz, p->GetOrientation());
 }
 
+// ---- LiquidHurts --------------------------------------------------------------
+
+namespace
+{
+bool LiquidSpellHurts(LiquidData const& ld)
+{
+    LiquidTypeEntry const* type = sLiquidTypeStore.LookupEntry(ld.entry);
+    if (!type || !type->SpellID)
+        return false;
+    SpellInfo const* spell = sSpellMgr->GetSpellInfo(type->SpellID, DIFFICULTY_NONE);
+    return spell && !spell->IsPositive();
+}
+}
+
+bool LiquidCanHurt(LiquidData const& ld)
+{
+    return ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) || LiquidSpellHurts(ld);
+}
+
+bool LiquidHurts(LiquidData const& ld, ZLiquidStatus st)
+{
+    if (st == LIQUID_MAP_NO_WATER)
+        return false;
+    if (ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma))
+        return true;
+    return (st & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER)) != 0 && LiquidSpellHurts(ld);
+}
+
 // ---- ClassifyDestinationLiquid ----------------------------------------------
 
 LiquidVerdict ClassifyDestinationLiquid(Player* p, float x, float y, float z,
@@ -854,9 +1004,8 @@ LiquidVerdict ClassifyDestinationLiquid(Player* p, float x, float y, float z,
     if (zs == LIQUID_MAP_NO_WATER || !LiquidMattersFor(p->IsAlive()))
         return LiquidVerdict::Dry;
 
-    // Magma / slime is lethal on contact regardless of depth.
-    if (liq.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) ||
-        liq.type_flags.HasFlag(map_liquidHeaderTypeFlags::Slime))
+    // A liquid that hurts is refused whatever its depth.
+    if (LiquidHurts(liq, zs))
         return LiquidVerdict::Hazard;
 
     // Fully submerged for this bot's collision height => must swim: a
