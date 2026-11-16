@@ -259,8 +259,6 @@ local function ServerCommand(text)
     end
     Cmd.Say(text)
 end
--- a dot command from a click, for the other files (ForeverBots_Trade.lua): see Cmd.Say
-Cmd.ns.Say = function(text) ServerCommand(text) end
 
 -- Stance button of the panel, three steps (Karrz 2026-11-03: "passive, defensive and aggressive"). ForeverBotsDB.stance is
 --   "nofight"    - Passive: the bots attack nothing at all, not even to defend; heals and buffs go on (taming a beast, a sheep that
@@ -2116,19 +2114,25 @@ function UI.StopDrag(self)
 end
 
 -- Opens or closes the window, or says it will once combat ends. The window is built out of combat only: it creates the secure
--- order buttons and sets their macros.
+-- order buttons and sets their macros. The wait is said once per fight and wish (hf-01372: a key pressed again and again in a fight
+-- printed "opens when combat ends" eight times); UI.windowWaitSaid is cleared when combat ends.
+local function SayWindowWait(show)
+    if UI.windowWaitSaid == show then return end
+    UI.windowWaitSaid = show
+    Print(show and L["the bot window opens when combat ends."] or L["the bot window closes when combat ends."])
+end
 function UI.SetWindowShown(show)
     if not frame then
         if not show then UI.buildAfterCombat = nil; return end
         if InCombatLockdown and InCombatLockdown() then
             UI.buildAfterCombat = true
-            Print(L["the bot window opens when combat ends."])
+            SayWindowWait(true)
             return
         end
         BuildFrame()
     end
     if not UI.SetShown(frame, show) and UI.afterCombat[frame] ~= nil then
-        Print(show and L["the bot window opens when combat ends."] or L["the bot window closes when combat ends."])
+        SayWindowWait(show)
     end
 end
 
@@ -2141,65 +2145,6 @@ local function Toggle()
         open = UI.buildAfterCombat and true or false
     end
     UI.SetWindowShown(not open)
-end
-
--- Enemy nameplates in combat only. The client's own setting for it (Enemy Unit Nameplates on, Always Show Nameplates off) shows a
--- bar over every hostile mob in range, fighting you or not. With those two settings the add-on asks the server to filter
--- (PLATES|1, Player::SetCombatPlateFilter): a mob outside your, your pet's or your group's fight keeps its plain red name and one
--- that joins the fight gets its bar; the client draws both itself. Any other setting: no filter (PLATES|0). On by default;
--- /fb plates off leaves the client's own behaviour. The server forgets it on a UI reload, so it is asked again on every
--- loading screen and whenever one of the two settings changes. Up to three tries when no answer comes.
-UI.plates = { asked = nil, confirmed = nil, tries = 0, gen = 0 }
-local function CVarOn(name)
-    if C_CVar and C_CVar.GetCVarBool then return C_CVar.GetCVarBool(name) and true or false end
-    return GetCVar and GetCVar(name) == "1" or false
-end
-local function PlatesWanted()
-    return ForeverBotsDB.combatPlates ~= false and CVarOn("nameplateShowEnemies") and not CVarOn("nameplateShowAll")
-end
-function UI.PlatesSync(force)
-    local Net = Cmd.ns.Net
-    if not Net then return end
-    local want = PlatesWanted()
-    local st = UI.plates
-    if not force and st.asked == want and st.confirmed == want then return end
-    st.asked, st.confirmed, st.tries = want, nil, 0
-    st.gen = st.gen + 1
-    local gen = st.gen
-    local function try()
-        if gen ~= st.gen then return end
-        st.tries = st.tries + 1
-        Net.EnsureMode(function()
-            Net.Request("PLATES", { want and "1" or "0" }, function(fields)
-                if gen ~= st.gen then return end
-                if fields and fields[1] == (want and "1" or "0") then
-                    st.confirmed = want
-                elseif st.tries < 3 and C_Timer and C_Timer.After then
-                    C_Timer.After(st.tries * 3, try)
-                end
-            end)
-        end)
-    end
-    try()
-end
-function UI.CombatPlates(on)
-    ForeverBotsDB.combatPlates = on and true or false
-    UI.PlatesSync(true)
-end
-do   -- kept out of the main chunk: Lua 5.1 allows 200 locals there
-local platesFrame = CreateFrame("Frame")
-platesFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
-platesFrame:RegisterEvent("CVAR_UPDATE")
-platesFrame:SetScript("OnEvent", function(_, event, name)
-    if event == "CVAR_UPDATE" then
-        if issecretvalue and issecretvalue(name) then return end
-        name = type(name) == "string" and name:lower() or ""
-        if name ~= "nameplateshowenemies" and name ~= "nameplateshowall" then return end
-        UI.PlatesSync(false)
-        return
-    end
-    UI.PlatesSync(true)   -- a new session or a UI reload: the server has forgotten
-end)
 end
 
 do   -- kept out of the main chunk: Lua 5.1 allows 200 locals there
@@ -2227,6 +2172,7 @@ combatFrame:SetScript("OnEvent", function(_, event)
     end
     if UI.pendingTab then ShowTab(UI.pendingTab) end
     tabWaitSaid = nil
+    UI.windowWaitSaid = nil
     for f, show in pairs(UI.afterCombat) do
         UI.afterCombat[f] = nil
         if show then f:Show() else f:Hide() end
@@ -2258,11 +2204,44 @@ local function MinimapDrag()
     MinimapPlace()
 end
 
+-- SIN's Forever Combat Nameplates (/fcn): enemy bars only on mobs fighting you or your pet. His add-on is on while Enemy Unit
+-- Nameplates are on and Always Show Nameplates is off, and follows those two settings itself; /fcn only reports. The menu entry
+-- switches Always Show: off gives every enemy a bar again, as without the add-on. The client does not change nameplate settings
+-- in combat.
+-- One table, not six main-chunk locals: this chunk is near Lua's 200-local limit.
+local CombatPlates = { enemies = "nameplateShowEnemies", always = "nameplateShowAll" }
+function CombatPlates.Loaded()
+    local loaded = (C_AddOns and C_AddOns.IsAddOnLoaded) or IsAddOnLoaded
+    return loaded ~= nil and loaded("ForeverCombatNameplates") and C_CVar ~= nil
+end
+function CombatPlates.On()
+    return C_CVar.GetCVarBool(CombatPlates.enemies) and not C_CVar.GetCVarBool(CombatPlates.always)
+end
+function CombatPlates.Label()
+    if not CombatPlates.Loaded() then return L["Combat nameplates (add-on off)"] end
+    return CombatPlates.On() and L["Combat nameplates: on"] or L["Combat nameplates: off"]
+end
+function CombatPlates.Toggle()
+    if not CombatPlates.Loaded() then return end
+    if InCombatLockdown and InCombatLockdown() then
+        Print(L["combat nameplates can't be switched in combat."])
+        return
+    end
+    if CombatPlates.On() then
+        C_CVar.SetCVar(CombatPlates.always, "1")
+        Print(L["combat nameplates off: every enemy gets a bar."])
+    else
+        C_CVar.SetCVar(CombatPlates.always, "0")
+        if not C_CVar.GetCVarBool(CombatPlates.enemies) then C_CVar.SetCVar(CombatPlates.enemies, "1") end
+        Print(L["combat nameplates on: bars only on mobs fighting you or your pet."])
+    end
+end
+
 local function ToggleMinimapMenu()
     if not mmMenu then
         local m = CreateFrame("Frame", "ForeverBotsMinimapMenu", UIParent, BackdropTemplateMixin and "BackdropTemplate" or nil)
         mmMenu = m
-        m:SetSize(150, 4 * 28 + 12)
+        m:SetSize(170, 5 * 28 + 12)   -- five items below
         m:SetFrameStrata("DIALOG")
         m:EnableMouse(true)
         if m.SetBackdrop then
@@ -2276,6 +2255,7 @@ local function ToggleMinimapMenu()
             { L["Raid ready"], RaidReady },
             { L["Call saved bots"], function() ServerCommand(".bot summon saved") end },
             { L["Dismiss all bots"], function() ServerCommand(".bot dismiss all") end },
+            { CombatPlates.Label(), CombatPlates.Toggle, "plates" },
             { L["Hide this button"], function()
                 ForeverBotsDB.minimap.hidden = true
                 mmButton:Hide()
@@ -2283,9 +2263,10 @@ local function ToggleMinimapMenu()
             end },
         }
         for i, it in ipairs(items) do
-            local b = MakeSkinButton(m, it[1], 138, 24, { size = 12 })
+            local b = MakeSkinButton(m, it[1], 158, 24, { size = 12 })
             b:SetPoint("TOPLEFT", 6, -6 - (i - 1) * 28)
             b:SetScript("OnClick", function() m:Hide(); it[2]() end)
+            if it[3] == "plates" then m.plates = b end
         end
         m:SetScript("OnUpdate", function(self, elapsed)
             -- (the global MouseIsOver no longer exists on this client: "attempt to call a nil value" every frame)
@@ -2302,6 +2283,8 @@ local function ToggleMinimapMenu()
     else
         mmMenu:SetPoint("TOPLEFT", mmButton, "BOTTOMLEFT", 0, -2)
     end
+    mmMenu.plates:SetText(CombatPlates.Label())
+    mmMenu.plates:SetEnabled(CombatPlates.Loaded())
     mmMenu.away = 0
     mmMenu:Show()
 end
@@ -3041,24 +3024,6 @@ SlashCmdList.FOREVERBOTS = function(msg)
         elseif class == "off" then ForeverBotsDB.showChat = false
         else ForeverBotsDB.showChat = not ForeverBotsDB.showChat end
         Print(L["bot confirmations in chat: %s"]:format(ForeverBotsDB.showChat and L["shown"] or L["hidden (shown in the Bots panel status line)"]) .. "  (/fb chat on|off)")
-        return
-    end
-    if verb == "plates" or verb == "nameplates" then
-        -- "/fb plates" alone shows the state (and asks the server again if it never answered)
-        if class == "on" then UI.CombatPlates(true)
-        elseif class == "off" then UI.CombatPlates(false)
-        elseif UI.plates.confirmed == nil then UI.PlatesSync(true) end
-        local text
-        if ForeverBotsDB.combatPlates == false then
-            text = L["off: the client's own nameplate settings apply."]
-        elseif not PlatesWanted() then
-            text = L["on, but it needs Enemy Unit Nameplates on and Always Show Nameplates off (Esc > Options > Nameplates)."]
-        elseif UI.plates.confirmed == true then
-            text = L["on: a health bar only over mobs that fight you, your pet or your group; the others keep their name."]
-        else
-            text = L["on, waiting for the server to confirm (an older server does not have it)."]
-        end
-        Print(L["enemy nameplates only in combat: %s"]:format(text) .. "  (/fb plates on|off)")
         return
     end
     if verb == "bots" or verb == "manage" or verb == "roster" then

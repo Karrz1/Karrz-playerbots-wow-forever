@@ -355,8 +355,14 @@ void LoadLoot(BuildCtx& ctx)
 
     std::unordered_map<uint32, std::vector<uint32>> go_loot_ids;
     for (auto const& [entry, gt] : sObjectMgr->GetGameObjectTemplates())
+    {
         if (uint32 loot = gt.GetLootId())
             go_loot_ids[loot].push_back(entry);
+        // Most quest chests of the current client hand out their items as personal loot (chest data 30), not through the
+        // legacy shared loot id, and GetLootId() does not return that one.
+        if (gt.type == GAMEOBJECT_TYPE_CHEST && gt.chest.chestPersonalLoot && gt.chest.chestPersonalLoot != gt.GetLootId())
+            go_loot_ids[gt.chest.chestPersonalLoot].push_back(entry);
+    }
 
     LoadLootTable("creature_loot_template",   creature_loot_ids, ctx.item_creatures_loot, ctx.item_creatures_loot_qr);
     LoadLootTable("gameobject_loot_template", go_loot_ids,       ctx.item_gos_loot,       ctx.item_gos_loot_qr);

@@ -707,8 +707,6 @@ public:
             { "unsave",        HandleBotUnsave,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "delete",        HandleBotDelete,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "list",          HandleBotList,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
-            // Every player: the ForeverBots trade window (accept a bot's offer as seen). Sent by the add-on, not typed.
-            { "trade",         HandleBotTrade,      rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "language",      HandleBotLanguage,   rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "world",         HandleBotWorld,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             // GM only: how many world bots the realm has (Off / Low / Medium / High), set in game until the next restart (the launcher's Bots setting decides at every start).
@@ -812,22 +810,6 @@ public:
         // it into LANG_UNIVERSAL for GMs / two-side chat like a client whisper, and prints "No player named ..." itself.
         Language const lang = sess->GetPlayer()->GetTeam() == ALLIANCE ? LANG_COMMON : LANG_ORCISH;
         sess->HandleChatMessage(CHAT_MSG_WHISPER, lang, std::move(msg), std::move(name));
-        return true;
-    }
-
-    // `.bot trade <seq hex> <what the window shows>`: right after the stock Trade click, the ForeverBots trade window sends what it
-    // shows, and a trade with a bot is accepted when that is still exactly the offer (AddonControl::BotTradeRequest). Alone the
-    // add-on sends it as a whisper to the player's own name from the click: a dot command runs before any whisper is made, so
-    // nothing is sent to anyone. The answer is a hidden TRADE_RESP frame, never plain text.
-    static bool HandleBotTrade(ChatHandler* handler, std::string seqHex, std::string seen)
-    {
-        WorldSession* sess = handler->GetSession();
-        Player* me = sess ? sess->GetPlayer() : nullptr;
-        if (!me || seqHex.empty() || seqHex.size() > 8 || seqHex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
-            return true;   // quiet: only the add-on sends this
-        if (seen.empty() || seen.size() > 230 || seen.find_first_not_of("0123456789:") != std::string::npos)
-            return true;
-        Playerbot::V2::AddonControl::BotTradeRequest(me, uint32(std::strtoul(seqHex.c_str(), nullptr, 16)), seen);
         return true;
     }
 
@@ -5881,9 +5863,9 @@ public:
                 handler->PSendSysMessage("collisionprobe: %u display %u: no display or model data", entry, model.CreatureDisplayID);
                 continue;
             }
-            handler->PSendSysMessage("collisionprobe: %u display %u model %u: raw CollisionHeight %.2f, used %.2f, bounds top %.2f, unit height %.2f",
-                entry, model.CreatureDisplayID, display->ModelID, modelData->CollisionHeight, modelData->GetCollisionHeight(), modelData->GeoBox[5],
-                modelData->GetCollisionHeight() * modelData->ModelScale * display->CreatureModelScale);
+            handler->PSendSysMessage("collisionprobe: %u display %u model %u: raw CollisionHeight %.2f, bounds top %.2f, model height %.2f",
+                entry, model.CreatureDisplayID, display->ModelID, modelData->CollisionHeight, modelData->GeoBox[5],
+                modelData->CollisionHeight * modelData->ModelScale * display->CreatureModelScale);
         }
 
         if (!name)

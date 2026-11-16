@@ -359,14 +359,8 @@ bool MaintainPet(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit,
         constexpr uint32 CALL_PET_4   = 83244;
         constexpr uint32 CALL_PET_5   = 83245;
         constexpr uint32 REVIVE_PET   = 982;
-        // The pet died: its body still lies there (a guid but no living pet), or the body is gone and the pet is saved dead in an
-        // active slot (no guid any more). Only Revive Pet brings it back; the core refuses Call Pet for every active pet while one is
-        // saved dead, so never fall through to the Call Pet loop below (it was cast again and again, Discord 2026-11-14).
-        bool active_pet_dead = false;
-        for (auto const& sp : s.raw().pet.stable_pets)
-            if (sp.slot_kind == 0 && sp.creature_id != 0 && sp.dead)
-            { active_pet_dead = true; break; }
-        if (!s.pet_guid().IsEmpty() || active_pet_dead)
+        // Revive also works after the corpse has despawned.
+        if (!s.pet_guid().IsEmpty() || s.raw().pet.has_dead_active_pet)
         {
             if (!s.knows_spell(REVIVE_PET) || !s.is_ready(REVIVE_PET))
                 return false;

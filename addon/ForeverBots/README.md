@@ -155,10 +155,6 @@ Built on the client's own portrait window (the one its Raid and Looking For Grou
 
 - `/fb scale <0.7-1.5>` sets the window size (default 1.2, saved).
 - `/fb minimap on|off|reset` shows, hides or re-centres the minimap button.
-- Enemy nameplates only in combat: with Enemy Unit Nameplates on and Always Show Nameplates off, the client alone shows a health
-  bar over every hostile mob in range. The add-on has the server fix that: a mob fighting you, your pet or your group gets its
-  bar, every other one keeps its plain red name, and a mob that joins the fight gets its bar at once. It is on by default and
-  works only with those two settings; `/fb plates off` turns it off, `/fb plates` shows whether the server confirmed it.
 - `/fb quick` fills your group with bots: to five in the open world and 5-player dungeons, to the instance size in a bigger one (10 in Upper Blackrock Spire, 20 or 40 in a raid), with tanks, healers and damage dealers; `/fb resume` and `/fb flee` send those two orders.
 - Group finder tab (the fifth tab, after Marks): the bot dungeon finder without typing. Pick your role (Auto, Tank, Heal, DPS;
   remembered) and a dungeon with < and > (Any for my level, then the dungeons of your level, then the rest; Upper Blackrock Spire

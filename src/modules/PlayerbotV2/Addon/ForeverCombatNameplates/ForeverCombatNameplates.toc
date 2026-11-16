@@ -1,0 +1,7 @@
+## Interface: 16001
+## Title: Forever Combat Nameplates
+## Notes: Show native plates for your combat opponents on compatible Forever realms.
+## Version: 3.0.0-test
+## DefaultState: enabled
+
+ForeverCombatNameplates.lua

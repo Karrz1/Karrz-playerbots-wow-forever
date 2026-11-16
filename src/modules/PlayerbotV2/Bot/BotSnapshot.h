@@ -1735,7 +1735,6 @@ struct StablePet
     uint8  level = 0;
     uint8  slot_kind = 0;            // 0=active, 1=stabled, 2=unslotted
     uint8  slot_index = 0;
-    bool   dead = false;             // saved with 0 health: died, and its body is gone (only Revive Pet brings it back)
 };
 struct PetState
 {
@@ -1753,6 +1752,7 @@ struct PetState
     std::string            pet_name;
     std::vector<AuraEntry> pet_auras;
     std::vector<StablePet> stable_pets;
+    bool has_dead_active_pet = false;
     // Whom the pet is currently attacking (Empty if no victim). Drives
     // the assist-pet rule: bot picks up the pet's target so a hunter
     // standing idle while his cat melees a mob actually opens up too.

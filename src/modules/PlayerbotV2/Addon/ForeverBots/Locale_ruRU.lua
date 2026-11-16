@@ -205,6 +205,12 @@ ForeverBotsLocale = {
     ["Call saved bots"] = "Призвать сохраненных",
     ["Dismiss all bots"] = "Отозвать всех ботов",
     ["Hide this button"] = "Скрыть эту кнопку",
+    ["Combat nameplates: on"] = "Боевые индикаторы: вкл",
+    ["Combat nameplates: off"] = "Боевые индикаторы: выкл",
+    ["Combat nameplates (add-on off)"] = "Боевые индикаторы (аддон выключен)",
+    ["combat nameplates can't be switched in combat."] = "боевые индикаторы нельзя переключить в бою.",
+    ["combat nameplates off: every enemy gets a bar."] = "боевые индикаторы выключены: полоски у всех противников.",
+    ["combat nameplates on: bars only on mobs fighting you or your pet."] = "боевые индикаторы включены: полоски только у противников, которые сражаются с вами или вашим питомцем.",
     ["minimap button hidden: /fb minimap brings it back."] = "кнопка у миникарты скрыта: команда /fb minimap вернет ее.",
     ["Click: open or close the bot window"] = "ЛКМ: открыть/закрыть окно ботов",
     ["Right-click: raid ready, call, dismiss"] = "ПКМ: проверка готовности, призвать, отозвать",
@@ -338,14 +344,6 @@ ForeverBotsLocale = {
     [" (type /w %s <message>)"] = " (введите /w %s <сообщение>)",
     ["whisper to %s failed: %s"] = "шепот игроку %s не удался: %s",
     ["bot confirmations in chat: %s"] = "подтверждения ботов в чате: %s",
-    ["enemy nameplates only in combat: %s"] = "индикаторы здоровья врагов только в бою: %s",
-    ["off: the client's own nameplate settings apply."] = "выкл.: действуют настройки индикаторов здоровья самого клиента.",
-    ["on, but it needs Enemy Unit Nameplates on and Always Show Nameplates off (Esc > Options > Nameplates)."] =
-        "вкл., но нужно включить индикаторы здоровья противников и выключить «Всегда показывать индикаторы здоровья» (Esc > Настройки > Индикаторы здоровья).", -- check
-    ["on: a health bar only over mobs that fight you, your pet or your group; the others keep their name."] =
-        "вкл.: полоска здоровья только над мобами, которые сражаются с вами, вашим питомцем или вашей группой; у остальных только имя.",
-    ["on, waiting for the server to confirm (an older server does not have it)."] =
-        "вкл., ждем подтверждения сервера (на старом сервере этого нет).",
     ["shown"] = "включено",
     ["hidden (shown in the Bots panel status line)"] = "скрыто (отображается в строке состояния панели ботов)",
     ["minimap button: %s"] = "кнопка у миникарты: %s",
@@ -587,7 +585,6 @@ ForeverBotsLocale = {
     ["Set with the mouse"] = "Поставить мышью",
     ["short:G%d"] = "Г%d",
     ["Tick every bot in this raid group. Click again when they are all ticked to untick them."] = "Отметить всех ботов этой группы рейда. Нажмите еще раз, когда отмечены все, чтобы снять отметку.",
-    ["The bot changed its offer: look at it again, then click Trade."] = "Бот изменил свое предложение: посмотрите еще раз и нажмите «Обмен».", -- check
     -- Tank leads (Orders tab)
     ["short:Ignore"] = "Не трогать", -- check
     ["short:Tank leads"] = "Танк ведет", -- check

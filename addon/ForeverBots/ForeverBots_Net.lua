@@ -81,7 +81,7 @@ Net.Unescape = Unescape
 local ANSWERS = { ROSTER_RESP = true, BOT_DETAIL_RESP = true, STATS_RESP = true, PONG = true, ALTS_RESP = true,
                   EVENT_PUSH = true, SUMMON_RESP = true, LOGIN_RESP = true, LOGOUT_RESP = true, SELF_RESP = true,
                   GEAR_RESP = true, BAGS_RESP = true, QUESTS_RESP = true, SPEC_RESP = true, LFG_RESP = true,
-                  ASSIGN_RESP = true, PLATES_RESP = true }
+                  ASSIGN_RESP = true }
 Net.ANSWERS = ANSWERS
 
 Net.seq = math.random(1, 0x3fffffff)

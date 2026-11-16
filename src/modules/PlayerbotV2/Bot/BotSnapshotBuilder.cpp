@@ -10813,6 +10813,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
     // idle:summon_stabled_pet rule so a hunter that ends up petless (died
     // and despawned, abandoned) can pull a stabled pet at the next
     // stablemaster visit. Empty for non-hunters or pre-PetStable bots.
+    snap->pet.has_dead_active_pet = false;
     if (PetStable const* stable = p->GetPetStable())
     {
         snap->pet.stable_pets.reserve(8);
@@ -10825,9 +10826,10 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             sp.creature_id = info.CreatureId;
             sp.name        = info.Name;
             sp.level       = info.Level;
+            if (info.CreatureId && info.Health == 0)
+                snap->pet.has_dead_active_pet = true;
             sp.slot_kind   = 0;  // active
             sp.slot_index  = i;
-            sp.dead        = info.Health == 0;
             snap->pet.stable_pets.push_back(std::move(sp));
         }
         for (uint8 i = 0; i < stable->StabledPets.size(); ++i)
