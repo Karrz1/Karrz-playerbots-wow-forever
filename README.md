@@ -12,7 +12,7 @@ The ready-made package is on the Releases page: **https://github.com/Karrz1/Karr
 > **Important: unzip into a folder whose path has NO SPACES, for example `C:\WoWForever`.** Not "Downloads", not "Program Files", not a folder with a space in its name. The installer stops if the path has a space.
 
 1. Download **one file**: `WoW-Forever-Bots-<version>.zip` and unzip it into that folder (for example `C:\WoWForever`).
-2. Double-click **Install.cmd**. Windows asks once for permission. It looks for your WoW Forever game folder (build 70888, or another build listed in `client-builds.txt`: the folder that contains `.build.info`) and then lets you pick it in a window; it sets up the database, extracts the maps from your own client (the slow part: about 10 to 20 minutes on a modern PC), installs the add-on and a local certificate, creates the shortcuts, starts the server and offers to create your account (name, password, optionally GM).
+2. Double-click **Install.cmd**. Windows asks once for permission. It looks for your WoW Forever game folder (build 70938, or another build listed in `client-builds.txt`: the folder that contains `.build.info`) and then lets you pick it in a window; it sets up the database, extracts the maps from your own client (the slow part: about 10 to 20 minutes on a modern PC), installs the add-on and a local certificate, creates the shortcuts, starts the server and offers to create your account (name, password, optionally GM).
 3. From then on use the **WoW Forever Bots** menu (Start Menu or Desktop, or `WoW-Forever-Bots.cmd`): **1** Start server, **2** Shut down server, **3** Auto-restart (restarts it if it crashes), **4** Update (installs the newest release, keeps your characters), **5** Create account, **6** Join our Discord. Start the game with **WoWForeverLauncher** (the PLAY button), log in with your account, realm Trinity. Always start the game from the launcher: it puts the server key into the game every time.
 
 The package contains no Blizzard files; the maps are made from your own client. `SHA256SUMS.txt` on the release page lets you check the download. Full text: `README.md` inside the zip.
@@ -57,7 +57,7 @@ advocaite's `forever` does **not** give a working bot build (the module loader a
    `sql/playerbot_shared/`, rename `playerbot.conf.dist` to `playerbot.conf`, start worldserver (it applies `sql/playerbot_v2`).
 
 3. In `worldserver.conf` add `Network.EnterEncryptedModeRegionGroup = 8` (it is not in `worldserver.conf.dist`; without it the game
-   says "server identity check failed" or WOW51900319). The client builds the server accepts (70888, 70862 and older) come from
+   says "server identity check failed" or WOW51900319). The client builds the server accepts (70938, 70888 and older) come from
    `sql/custom/auth`, which the server applies at start (`Updates.EnableDatabases = 15`).
 4. The game only talks to a server whose certificate it trusts: bnetserver needs a certificate for your portal name that Windows
    (or Wine) trusts, and the portal name must point at the server (hosts line). The repack's Install.cmd does both; on your own build
@@ -71,10 +71,28 @@ into `worldserver.conf.d`, and [`doc/OptionalServerOptions.md`](doc/OptionalServ
 The original (1.12) spell, creature and mana numbers are **not** in this repository. [`tools/classic_spell_values/`](tools/classic_spell_values/README.md) builds them
 from the VMaNGOS database dump that you download yourself; without them the server uses the client's own values.
 
+## Optional settings (0.1.37)
+
+All of these are off or at the old behaviour by default. Set them in `worldserver.conf` (or a file in `worldserver.conf.d/`) and restart the server.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `Forever.DayCycle.Speed` | 1 | Day and night speed, 1 to 24. The launcher settings have 1x/2x/3x. Players can use `.time day`, `.time night`, `.time auto` for themselves. |
+| `Forever.VanillaAoE` | 0 | 1 = vanilla Consecration and Improved Blizzard. |
+| `Classic.AdventureGuide` | 0 | 1 = the Adventure Guide is shown. |
+| `Respawn.DynamicOpenWorld` | 0 | 1 = open world respawns speed up when lots of players are around (thanks SIN). |
+| `Instance.NefarianCapAdds` | 0 | 1 = Nefarian phase 1 calls at most 42 drakonids (the repack's realm settings turn it on). |
+| `Playerbot.Raid.Talk` | 1 | Raid chat from bots in a raid of more than 15 with a player: 0 off, 1 normal, 2 chatty. |
+
+### Bot commands added in 0.1.37
+- `.bot lead on` / `.bot lead off`: your bot tank leads the dungeon (also the Tank leads button in the bot panel).
+- `/fb plates`: enemy nameplates only in combat (add-on option).
+- Open a trade window with one of your bots to give it items or take items from it.
+
 ## What you need, and where to get it
 
 - **The server code**: the `forever-bots` branch of https://github.com/Karrz1/TrinityCore (advocaite's Forever core, based on TrinityCore, plus the bots). Follow "Server owners" above.
-- **The game client**: the WoW Forever client, build **70888** (10 November). 70862 and the other builds in `client-builds.txt` work too. We do not distribute client files.
+- **The game client**: the WoW Forever client, build **70938**. 70888, 70790 and the other builds in `client-builds.txt` work too. We do not distribute client files.
 - **The launcher**: `WoWForeverLauncher.exe` from the Releases page. It writes the server key into the game every time it starts it, so you need it for every server, also one you build yourself. It can also add the hosts line for a server on another PC.
 - **Vanilla (1.12) data**: the VMaNGOS project (https://github.com/vmangos/core) and its public database dump `world_full_14_june_2021` (https://github.com/brotalnia/database). You download it yourself; `tools/classic_spell_values/build_vanilla_data.py` turns it into the SQL files the server uses. Nothing from the dump is in this repository.
 - **Maps**: extracted from your own client with the tools in this repository (`tools/extract_client_data.sh` or `.ps1`).
