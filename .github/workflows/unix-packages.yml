@@ -128,6 +128,13 @@ jobs:
             sudo apt-get install -yq gcc-12 g++-12
             echo "::warning::The gcc 13 PPA was not reachable: built with gcc 12."
           fi
+          # The packager copies libtinfo.so.6 and libncursesw.so.6 (for the bundled mysql client) from /usr/lib, where Arch keeps them.
+          # Ubuntu keeps them in /lib/x86_64-linux-gnu: link them where the packager looks (it copies the real file behind the link).
+          for f in libtinfo.so.6 libncursesw.so.6; do
+            real=$(readlink -f "/lib/x86_64-linux-gnu/$f")
+            [ -f "$real" ] || { echo "::error::$f is not on this runner"; exit 1; }
+            [ -e "/usr/lib/$f" ] || sudo ln -s "$real" "/usr/lib/$f"
+          done
           echo "CC=gcc-$cc" >> "$GITHUB_ENV"
           echo "CXX=g++-$cc" >> "$GITHUB_ENV"
           echo "Linux compiler: gcc $cc" >> "$GITHUB_STEP_SUMMARY"
@@ -197,6 +204,43 @@ jobs:
           if grep -rqsE "\([[:space:]]*$client[[:space:]]*," "$CORE/sql/custom/auth"; then rm -f launcher/tools/repack/patches/*auth-build*.patch; fi
           df -h "$GITHUB_WORKSPACE"
 
+      - name: Build the launcher (from a neutral folder, so no runner path ends up in it)
+        run: |
+          set -euo pipefail
+          # The launcher is built from /tmp/wfl with NuGet packages in /tmp/wfl-nuget: neither the runner's home (/Users/runner,
+          # /home/runner) nor the workspace can be written into the program. ContinuousIntegrationBuild and PathMap make the
+          # compiler write /src/ for the source folder.
+          rm -rf /tmp/wfl /tmp/wfl-out
+          cp -R launcher /tmp/wfl
+          export NUGET_PACKAGES=/tmp/wfl-nuget
+          # MSBuild takes environment variables as properties, so this reaches build-app.sh's dotnet publish too; the launcher's
+          # Directory.Build.props already sets DebugType=none and PathMap <repo>=/src/ for Release
+          export ContinuousIntegrationBuild=true
+          props="-p:DebugType=none -p:DebugSymbols=false -p:PathMap=/tmp/wfl/=/src/"
+          if [ "$RUNNER_OS" = macOS ]; then
+            # build-app.sh publishes, makes the .app and signs it ad hoc (sign-launcher.sh); the packager then takes it as it is
+            VERSION="$VER" bash /tmp/wfl/tools/mac/build-app.sh -o /tmp/wfl-out
+            exe="/tmp/wfl-out/WoW Forever Launcher.app/Contents/MacOS/WowForeverLauncher"
+            echo "LAUNCHER_ARG=-LauncherExe" >> "$GITHUB_ENV"
+            echo "LAUNCHER_VAL=/tmp/wfl-out/WoW Forever Launcher.app" >> "$GITHUB_ENV"
+          else
+            # the place build-package.ps1 takes the launcher from with -NoLauncher
+            dotnet publish /tmp/wfl/src/WowForeverLauncher.App -c Release -r linux-x64 --self-contained true \
+              -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true $props -o "$FOREVER_BUILD_DIR/launcher"
+            exe="$FOREVER_BUILD_DIR/launcher/WowForeverLauncher"
+            echo "LAUNCHER_ARG=-NoLauncher" >> "$GITHUB_ENV"
+            echo "LAUNCHER_VAL=" >> "$GITHUB_ENV"
+          fi
+          # our own check, with the strings printed: none of OUR folders (this workspace, this runner's NuGet and .NET folders) in the
+          # launcher. Microsoft's .NET runtime and Avalonia's native code are prebuilt by them and carry their own build paths
+          # (/Users/runner/work/1/s/..., /Users/runner/work/Avalonia/...): those are upstream strings, not ours, so they are not looked for.
+          ours="$GITHUB_WORKSPACE|$HOME/\.nuget|$HOME/\.dotnet"
+          hits=$(LC_ALL=C grep -aoE "($ours)[^[:cntrl:]\"']{0,100}" "$exe" | sort -u | head -40 || true)
+          if [ -n "$hits" ]; then echo "::error::The launcher carries paths of this build:"; echo "$hits"; exit 1; fi
+          other=$(LC_ALL=C grep -aoE "/tmp/wfl[^[:cntrl:]\"']{0,100}" "$exe" | sort -u | head -20 || true)
+          [ -z "$other" ] || { echo "::notice::Neutral build paths left in the launcher (harmless, for the record):"; echo "$other"; }
+          ls -l "$exe"
+
       - name: Restore the compiler cache
         uses: actions/cache/restore@v4
         with:
@@ -233,40 +277,6 @@ jobs:
         with:
           path: .ccache
           key: ccache-${{ matrix.plat }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Build the launcher (from a neutral folder, so no runner path ends up in it)
-        run: |
-          set -euo pipefail
-          # The launcher is built from /tmp/wfl with NuGet packages in /tmp/wfl-nuget: neither the runner's home (/Users/runner,
-          # /home/runner) nor the workspace can be written into the program. ContinuousIntegrationBuild and PathMap make the
-          # compiler write /src/ for the source folder.
-          rm -rf /tmp/wfl /tmp/wfl-out
-          cp -R launcher /tmp/wfl
-          export NUGET_PACKAGES=/tmp/wfl-nuget
-          # MSBuild takes environment variables as properties, so this reaches build-app.sh's dotnet publish too; the launcher's
-          # Directory.Build.props already sets DebugType=none and PathMap <repo>=/src/ for Release
-          export ContinuousIntegrationBuild=true
-          props="-p:DebugType=none -p:DebugSymbols=false -p:PathMap=/tmp/wfl/=/src/"
-          if [ "$RUNNER_OS" = macOS ]; then
-            # build-app.sh publishes, makes the .app and signs it ad hoc (sign-launcher.sh); the packager then takes it as it is
-            VERSION="$VER" bash /tmp/wfl/tools/mac/build-app.sh -o /tmp/wfl-out
-            exe="/tmp/wfl-out/WoW Forever Launcher.app/Contents/MacOS/WowForeverLauncher"
-            echo "LAUNCHER_ARG=-LauncherExe" >> "$GITHUB_ENV"
-            echo "LAUNCHER_VAL=/tmp/wfl-out/WoW Forever Launcher.app" >> "$GITHUB_ENV"
-          else
-            # the place build-package.ps1 takes the launcher from with -NoLauncher
-            dotnet publish /tmp/wfl/src/WowForeverLauncher.App -c Release -r linux-x64 --self-contained true \
-              -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true $props -o "$FOREVER_BUILD_DIR/launcher"
-            exe="$FOREVER_BUILD_DIR/launcher/WowForeverLauncher"
-            echo "LAUNCHER_ARG=-NoLauncher" >> "$GITHUB_ENV"
-            echo "LAUNCHER_VAL=" >> "$GITHUB_ENV"
-          fi
-          # our own check, with the strings printed: no runner home or workspace path in the launcher
-          hits=$(LC_ALL=C grep -aoE "(/Users/runner|/home/runner)[^[:cntrl:]\"']{0,100}" "$exe" | sort -u | head -40 || true)
-          if [ -n "$hits" ]; then echo "::error::The launcher carries runner paths:"; echo "$hits"; exit 1; fi
-          other=$(LC_ALL=C grep -aoE "/tmp/wfl[^[:cntrl:]\"']{0,100}" "$exe" | sort -u | head -20 || true)
-          [ -z "$other" ] || { echo "::notice::Neutral build paths left in the launcher (harmless, for the record):"; echo "$other"; }
-          ls -l "$exe"
 
       - name: Make the package
         env:
