@@ -27,3 +27,6 @@ cmake-build-*/*
 # Bots: vanilla data built from your own VMaNGOS dump (tools/classic_spell_values/build_vanilla_data.py), never committed
 /sql/custom/world/2026_10_12_5*_world_classic_vanilla_*.sql
 /tools/classic_spell_values/data/
+
+# opcode tools stay private
+tools/protocol/
