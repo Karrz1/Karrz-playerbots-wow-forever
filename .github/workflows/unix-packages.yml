@@ -1,0 +1,339 @@
+# File: .github/workflows/unix-packages.yml in Karrz1/Karrz-playerbots-wow-forever (the public repo the releases are on).
+#
+# When a release is published (chris's normal Windows release), this builds the Linux x64 and macOS arm64 packages from the
+# release's own files and adds them to the same release:
+#   - the server: wow-forever-source-<ver>.zip of that release (the exact source of the Windows programs)
+#   - the world and hotfixes dumps: WoW-Forever-Bots-<ver>.zip of that release
+#   - the packaging scripts and the launcher: Karrz1/wow-forever-launcher (private, read with LAUNCHER_READ_TOKEN)
+# Standard runners are free and unlimited on public repositories, macOS included. Nothing in the private repos is changed.
+# Run it again by hand: Actions, "Linux and macOS packages", Run workflow, tag v0.1.38.
+
+name: Linux and macOS packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (for example v0.1.38)
+        required: true
+      launcher_ref:
+        description: Branch or tag of wow-forever-launcher to package with (empty = a tag named like the release, else main)
+        required: false
+        default: ''
+      publish:
+        description: Add the packages to the release (off = a test run, the zips stay on the run page for 3 days)
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unix-packages-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: true
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  GH_TOKEN: ${{ github.token }}
+  LAUNCHER_REPO: Karrz1/wow-forever-launcher
+  PUBLISH: ${{ github.event_name == 'release' || inputs.publish }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      version: ${{ steps.check.outputs.version }}
+      launcher_ref: ${{ steps.check.outputs.launcher_ref }}
+    steps:
+      - name: Check the release
+        id: check
+        env:
+          LAUNCHER_READ_TOKEN: ${{ secrets.LAUNCHER_READ_TOKEN }}
+          WANT_REF: ${{ inputs.launcher_ref }}
+        run: |
+          set -euo pipefail
+          skip() { echo "skip=1" >> "$GITHUB_OUTPUT"; echo "$1" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; }
+          [[ "$TAG" =~ ^v([0-9]+(\.[0-9]+){1,3})$ ]] || skip "Tag $TAG is not a package version: nothing to build."
+          ver="${BASH_REMATCH[1]}"
+          names=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+          for f in "wow-forever-source-$ver.zip" "WoW-Forever-Bots-$ver.zip" SHA256SUMS.txt; do
+            grep -qxF "$f" <<< "$names" || skip "Release $TAG has no $f, so there is no new server to build. Linux and Mac players stay on the last package."
+          done
+          [ -n "${LAUNCHER_READ_TOKEN:-}" ] || { echo "::error::The LAUNCHER_READ_TOKEN secret is missing (see SETUP.md)."; exit 1; }
+          ref="$WANT_REF"
+          if [ -z "$ref" ]; then
+            if git ls-remote --exit-code --tags "https://x-access-token:${LAUNCHER_READ_TOKEN}@github.com/${LAUNCHER_REPO}.git" "refs/tags/$TAG" > /dev/null; then ref="$TAG"; else ref=main; fi
+          fi
+          echo "skip=0" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "launcher_ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Building $ver for Linux x64 and macOS arm64 (launcher and scripts from $ref)." >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.skip == '0'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - plat: linux-x64
+            os: ubuntu-22.04     # glibc 2.35: runs on Ubuntu 22.04+, Debian 12+, Mint 21+, Fedora 36+, SteamOS 3
+          - plat: osx-arm64
+            os: macos-15         # Homebrew bottles and the macos15 MySQL build: macOS 15 or newer
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 340
+    env:
+      VER: ${{ needs.prepare.outputs.version }}
+      PLAT: ${{ matrix.plat }}
+      CORE: ${{ github.workspace }}/core
+      FOREVER_BUILD_DIR: ${{ github.workspace }}/fbuild
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 3G
+      CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
+      CCACHE_COMPRESS: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell/Modules/Az* || true
+          sudo docker image prune -af > /dev/null 2>&1 || true
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update -q
+          sudo apt-get install -yq gcc-13 g++-13 ccache libboost-dev libboost-filesystem-dev libboost-locale-dev libboost-program-options-dev \
+            libboost-regex-dev libboost-thread-dev libboost-system-dev libmysqlclient-dev libssl-dev libreadline-dev zlib1g-dev libbz2-dev \
+            libncurses-dev patchelf zip unzip p7zip-full libarchive-tools
+          echo "CC=gcc-13" >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
+
+      - name: Build tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          for p in cmake boost openssl@3 mysql-client@8.4 readline ccache; do brew list --versions "$p" > /dev/null || brew install "$p"; done
+          df -h "$GITHUB_WORKSPACE"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '11.0.x'
+
+      - name: Packaging scripts and launcher (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LAUNCHER_REPO }}
+          ref: ${{ needs.prepare.outputs.launcher_ref }}
+          token: ${{ secrets.LAUNCHER_READ_TOKEN }}
+          path: launcher
+          persist-credentials: false
+
+      - name: Download the release files
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dl \
+            -p "wow-forever-source-$VER.zip" -p "WoW-Forever-Bots-$VER.zip" -p SHA256SUMS.txt
+          cd dl
+          tr -d '\r' < SHA256SUMS.txt | grep -E "  (wow-forever-source-$VER|WoW-Forever-Bots-$VER)\.zip$" > check.txt
+          [ "$(wc -l < check.txt)" -eq 2 ] || { echo "::error::SHA256SUMS.txt does not list both zips"; exit 1; }
+          shasum -a 256 -c check.txt
+
+      - name: Unpack the source, take the dumps and the client build
+        run: |
+          set -euo pipefail
+          unzip -q "dl/wow-forever-source-$VER.zip" -d src-unpack
+          mv "src-unpack/wow-forever-source-$VER" "$CORE"
+          rm -rf src-unpack "dl/wow-forever-source-$VER.zip"
+          # build-server.ps1 wants a git checkout (it clones the public branch otherwise, and applies its patches with git).
+          # This commit stays on the runner. Its date is the release's, so the package file times are the same on every run.
+          when=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json publishedAt -q .publishedAt)
+          git -C "$CORE" init -q
+          git -C "$CORE" add -A
+          GIT_AUTHOR_DATE="$when" GIT_COMMITTER_DATE="$when" git -C "$CORE" -c user.name=Karrz1 -c user.email=127596890+Karrz1@users.noreply.github.com \
+            commit -q -m "wow-forever-source-$VER"
+          # the Windows package: the two database dumps, its version.json, then it is deleted (disk)
+          full="dl/WoW-Forever-Bots-$VER.zip"
+          mkdir -p dumps/sql
+          for f in world hotfixes; do
+            unzip -p "$full" "sql\\\\$f.sql" > "dumps/sql/$f.sql" 2>/dev/null || unzip -p "$full" "sql/$f.sql" > "dumps/sql/$f.sql"
+            [ -s "dumps/sql/$f.sql" ] || { echo "::error::sql/$f.sql is not in $full"; exit 1; }
+          done
+          unzip -p "$full" version.json | tr -d '\r' | sed '1s/^\xEF\xBB\xBF//' > win-version.json
+          unzip -p "$full" 'repack\\client-builds.txt' > dl/client-builds.txt 2>/dev/null || unzip -p "$full" 'repack/client-builds.txt' > dl/client-builds.txt
+          rm -f "$full"
+          (cd dumps && zip -q -1 ../dumps.zip sql/world.sql sql/hotfixes.sql) && rm -rf dumps
+          [ "$(jq -r .version win-version.json)" = "$VER" ] || { echo "::error::version.json in the Windows zip is not $VER"; exit 1; }
+          echo "WIN_COMMIT=$(jq -r .commit win-version.json)" >> "$GITHUB_ENV"
+          # the release's client list wins (chris adds new client builds there; the packager checks against this file)
+          tr -d '\r' < dl/client-builds.txt > launcher/tools/repack/client-builds.txt
+          client=$(grep -E '^[0-9]+$' launcher/tools/repack/client-builds.txt | head -1)
+          echo "CLIENT=$client" >> "$GITHUB_ENV"
+          # the auth row patch is only for the public branch: the release source has its own row for this build
+          if grep -rqsE "\([[:space:]]*$client[[:space:]]*," "$CORE/sql/custom/auth"; then rm -f launcher/tools/repack/patches/*auth-build*.patch; fi
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Restore the compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.plat }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-${{ matrix.plat }}-
+
+      - name: Restore the downloads (MySQL, PowerShell)
+        uses: actions/cache@v4
+        with:
+          path: fbuild/cache/*.tar.*
+          key: downloads-${{ matrix.plat }}-${{ hashFiles('launcher/tools/repack/linux-common.ps1', 'launcher/tools/repack/build-package.ps1') }}
+
+      - name: Build the server
+        id: build
+        run: |
+          set -euo pipefail
+          # ccache, and no precompiled headers (they defeat the cache), through a toolchain file so build-server.ps1 runs unchanged
+          cat > ci-toolchain.cmake <<'EOF'
+          set(CMAKE_C_COMPILER_LAUNCHER ccache CACHE STRING "")
+          set(CMAKE_CXX_COMPILER_LAUNCHER ccache CACHE STRING "")
+          set(USE_COREPCH 0 CACHE BOOL "")
+          set(USE_SCRIPTPCH 0 CACHE BOOL "")
+          set(WITHOUT_GIT 1 CACHE BOOL "")
+          EOF
+          export CMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/ci-toolchain.cmake"
+          ccache -z
+          pwsh -NoProfile -File launcher/tools/repack/build-server.ps1 -Source "$CORE"
+          ccache -s
+
+      - name: Save the compiler cache
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.plat }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Make the package
+        env:
+          USER: forever-package-builder   # the packager's user name check would otherwise look for "runner", a normal word in the launcher
+        run: |
+          set -euo pipefail
+          pwsh -NoProfile -File launcher/tools/repack/build-package.ps1 -Version "$VER" -Client "$CLIENT" -Source "$CORE" \
+            -WorldDumpZip "$GITHUB_WORKSPACE/dumps.zip" -NoArchive -StageDir "$GITHUB_WORKSPACE/dist"
+
+      - name: Same commit and source note as the Windows package, then zip
+        run: |
+          set -euo pipefail
+          name="WoW-Forever-Bots-$VER-$PLAT"
+          out="dist/$name"
+          jq --arg c "$WIN_COMMIT" '.commit = $c | .kitCommit = $c' "$out/version.json" > v.json && mv v.json "$out/version.json"
+          {
+            echo "SOURCE CODE (GPL v2)"
+            echo
+            echo "The server programs in this package are built from wow-forever-source-$VER.zip, the same source as the Windows package of"
+            echo "release v$VER (commit $WIN_COMMIT): TrinityCore, the advocaite 'forever' fork, the PlayerbotV2 bot module and our changes,"
+            echo "all GPL v2. The changes in repack/source-patches/ are applied on top (the programs do not record the operating system of"
+            echo "the build machine; on macOS the OpenSSL legacy provider is loaded from the programs' folder and memory use is read through Mach)."
+            echo
+            echo "The MySQL server in mysql/ is the unmodified MySQL Community Server (GPL v2, see mysql/LICENSE and mysql/README)."
+            echo
+            echo "No Blizzard client files are included. This is an unofficial fan project and is not endorsed by Blizzard."
+          } > "$out/SOURCE.txt"
+          # the two changed files get their new sizes in the package list the launcher checks
+          python3 - "$out" <<'EOF'
+          import os, sys
+          out = sys.argv[1]
+          p = os.path.join(out, 'repack', 'package-files.txt')
+          rows = []
+          for line in open(p, encoding='utf-8').read().splitlines():
+              size, rel = line.split('\t', 1)
+              if rel in ('version.json', 'SOURCE.txt'):
+                  size = str(os.path.getsize(os.path.join(out, rel)))
+              rows.append(size + '\t' + rel)
+          open(p, 'w', encoding='utf-8', newline='\n').write('\n'.join(rows) + '\n')
+          EOF
+          stamp=$(TZ=UTC date -d "@$(git -C "$CORE" log -1 --format=%ct)" +%Y%m%d%H%M.%S 2>/dev/null || TZ=UTC date -r "$(git -C "$CORE" log -1 --format=%ct)" +%Y%m%d%H%M.%S)
+          find "$out" -exec env TZ=UTC touch -h -t "$stamp" {} +
+          (cd dist && find "$name" | LC_ALL=C sort | TZ=UTC zip -q -X -y -9 "$name.zip" -@)
+          ls -l "dist/$name.zip"
+          size=$(wc -c < "dist/$name.zip")
+          [ "$size" -lt 2000000000 ] || { echo "::error::$name.zip is over 2 GB, GitHub will not take it"; exit 1; }
+
+      - name: Keep the package on the run page (test run)
+        if: env.PUBLISH != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: WoW-Forever-Bots-${{ env.VER }}-${{ matrix.plat }}
+          path: dist/WoW-Forever-Bots-${{ env.VER }}-${{ matrix.plat }}.zip
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload (hidden until the checksums are in)
+        if: env.PUBLISH == 'true'
+        run: |
+          set -euo pipefail
+          name="WoW-Forever-Bots-$VER-$PLAT.zip"
+          mkdir -p hash
+          printf '%s  %s\n' "$(shasum -a 256 "dist/$name" | cut -d' ' -f1)" "$name" > "hash/$PLAT.sha256"
+          mv "dist/$name" "dist/$name.part"
+          gh release upload "$TAG" "dist/$name.part" -R "$GITHUB_REPOSITORY" --clobber
+
+      - if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hash-${{ matrix.plat }}
+          path: hash/${{ matrix.plat }}.sha256
+          retention-days: 3
+
+  publish:
+    needs: [prepare, build]
+    if: always() && needs.prepare.outputs.skip == '0' && (github.event_name == 'release' || inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VER: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hash-*
+          path: hash
+          merge-multiple: true
+
+      - name: Add the checksums, then show the packages
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          done_any=0
+          gh release download "$TAG" -R "$repo" -p SHA256SUMS.txt -O sums.txt --clobber
+          cp sums.txt sums.new
+          for plat in linux-x64 osx-arm64; do
+            name="WoW-Forever-Bots-$VER-$plat.zip"
+            if [ ! -s "hash/$plat.sha256" ]; then echo "$plat: no package this time (see the build job)." | tee -a "$GITHUB_STEP_SUMMARY"; continue; fi
+            tr -d '\r' < sums.new | grep -vF "  $name" > sums.tmp || true
+            mv sums.tmp sums.new
+            cat "hash/$plat.sha256" >> sums.new
+            done_any=1
+          done
+          [ "$done_any" = 1 ] || { echo "::error::Neither package was built."; exit 1; }
+          mv sums.new SHA256SUMS.txt
+          gh release upload "$TAG" SHA256SUMS.txt -R "$repo" --clobber
+          rel_id=$(gh api "repos/$repo/releases/tags/$TAG" -q .id)
+          for plat in linux-x64 osx-arm64; do
+            name="WoW-Forever-Bots-$VER-$plat.zip"
+            [ -s "hash/$plat.sha256" ] || continue
+            part=$(gh api "repos/$repo/releases/$rel_id/assets?per_page=100" -q ".[] | select(.name == \"$name.part\") | .id")
+            [ -n "$part" ] || continue
+            old=$(gh api "repos/$repo/releases/$rel_id/assets?per_page=100" -q ".[] | select(.name == \"$name\") | .id")
+            [ -z "$old" ] || gh api -X DELETE "repos/$repo/releases/assets/$old"
+            gh api -X PATCH "repos/$repo/releases/assets/$part" -f name="$name" > /dev/null
+            echo "$name is on release $TAG." | tee -a "$GITHUB_STEP_SUMMARY"
+          done
