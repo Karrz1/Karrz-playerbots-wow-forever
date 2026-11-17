@@ -112,13 +112,25 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          echo 'Acquire::Retries "5";' | sudo tee /etc/apt/apt.conf.d/80-retries > /dev/null
           sudo apt-get update -q
-          sudo apt-get install -yq gcc-13 g++-13 ccache libboost-dev libboost-filesystem-dev libboost-locale-dev libboost-program-options-dev \
+          sudo apt-get install -yq ccache libboost-dev libboost-filesystem-dev libboost-locale-dev libboost-program-options-dev \
             libboost-regex-dev libboost-thread-dev libboost-system-dev libmysqlclient-dev libssl-dev libreadline-dev zlib1g-dev libbz2-dev \
             libncurses-dev patchelf zip unzip p7zip-full libarchive-tools
-          echo "CC=gcc-13" >> "$GITHUB_ENV"
-          echo "CXX=g++-13" >> "$GITHUB_ENV"
+          # gcc 13 comes from the toolchain PPA on Launchpad. When Launchpad is down, build with jammy's own gcc 12 instead of failing.
+          cc=12
+          for i in 1 2 3; do
+            if sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test && sudo apt-get update -q && sudo apt-get install -yq gcc-13 g++-13; then cc=13; break; fi
+            echo "Toolchain PPA not reachable (try $i of 3)"; sleep 30
+          done
+          if [ "$cc" = 12 ]; then
+            sudo add-apt-repository -y -r ppa:ubuntu-toolchain-r/test || true
+            sudo apt-get install -yq gcc-12 g++-12
+            echo "::warning::The gcc 13 PPA was not reachable: built with gcc 12."
+          fi
+          echo "CC=gcc-$cc" >> "$GITHUB_ENV"
+          echo "CXX=g++-$cc" >> "$GITHUB_ENV"
+          echo "Linux compiler: gcc $cc" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build tools (macOS)
         if: runner.os == 'macOS'
@@ -222,13 +234,52 @@ jobs:
           path: .ccache
           key: ccache-${{ matrix.plat }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+      - name: Build the launcher (from a neutral folder, so no runner path ends up in it)
+        run: |
+          set -euo pipefail
+          # The launcher is built from /tmp/wfl with NuGet packages in /tmp/wfl-nuget: neither the runner's home (/Users/runner,
+          # /home/runner) nor the workspace can be written into the program. ContinuousIntegrationBuild and PathMap make the
+          # compiler write /src/ for the source folder.
+          rm -rf /tmp/wfl /tmp/wfl-out
+          cp -R launcher /tmp/wfl
+          export NUGET_PACKAGES=/tmp/wfl-nuget
+          # MSBuild takes environment variables as properties, so this reaches build-app.sh's dotnet publish too; the launcher's
+          # Directory.Build.props already sets DebugType=none and PathMap <repo>=/src/ for Release
+          export ContinuousIntegrationBuild=true
+          props="-p:DebugType=none -p:DebugSymbols=false -p:PathMap=/tmp/wfl/=/src/"
+          if [ "$RUNNER_OS" = macOS ]; then
+            # build-app.sh publishes, makes the .app and signs it ad hoc (sign-launcher.sh); the packager then takes it as it is
+            VERSION="$VER" bash /tmp/wfl/tools/mac/build-app.sh -o /tmp/wfl-out
+            exe="/tmp/wfl-out/WoW Forever Launcher.app/Contents/MacOS/WowForeverLauncher"
+            echo "LAUNCHER_ARG=-LauncherExe" >> "$GITHUB_ENV"
+            echo "LAUNCHER_VAL=/tmp/wfl-out/WoW Forever Launcher.app" >> "$GITHUB_ENV"
+          else
+            # the place build-package.ps1 takes the launcher from with -NoLauncher
+            dotnet publish /tmp/wfl/src/WowForeverLauncher.App -c Release -r linux-x64 --self-contained true \
+              -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true $props -o "$FOREVER_BUILD_DIR/launcher"
+            exe="$FOREVER_BUILD_DIR/launcher/WowForeverLauncher"
+            echo "LAUNCHER_ARG=-NoLauncher" >> "$GITHUB_ENV"
+            echo "LAUNCHER_VAL=" >> "$GITHUB_ENV"
+          fi
+          # our own check, with the strings printed: no runner home or workspace path in the launcher
+          hits=$(LC_ALL=C grep -aoE "(/Users/runner|/home/runner)[^[:cntrl:]\"']{0,100}" "$exe" | sort -u | head -40 || true)
+          if [ -n "$hits" ]; then echo "::error::The launcher carries runner paths:"; echo "$hits"; exit 1; fi
+          other=$(LC_ALL=C grep -aoE "/tmp/wfl[^[:cntrl:]\"']{0,100}" "$exe" | sort -u | head -20 || true)
+          [ -z "$other" ] || { echo "::notice::Neutral build paths left in the launcher (harmless, for the record):"; echo "$other"; }
+          ls -l "$exe"
+
       - name: Make the package
         env:
           USER: forever-package-builder   # the packager's user name check would otherwise look for "runner", a normal word in the launcher
         run: |
           set -euo pipefail
-          pwsh -NoProfile -File launcher/tools/repack/build-package.ps1 -Version "$VER" -Client "$CLIENT" -Source "$CORE" \
-            -WorldDumpZip "$GITHUB_WORKSPACE/dumps.zip" -NoArchive -StageDir "$GITHUB_WORKSPACE/dist"
+          # The packager also looks for $HOME in every file. The PowerShell 7 tarball from Microsoft carries their own build path
+          # (/Users/runner, /home/runner), the same as our runner's home, so the check runs with a home of its own.
+          export HOME=/tmp/forever-pkg-home
+          mkdir -p "$HOME"
+          args=(-Version "$VER" -Client "$CLIENT" -Source "$CORE" -WorldDumpZip "$GITHUB_WORKSPACE/dumps.zip" -NoArchive -StageDir "$GITHUB_WORKSPACE/dist" "$LAUNCHER_ARG")
+          [ -z "$LAUNCHER_VAL" ] || args+=("$LAUNCHER_VAL")
+          pwsh -NoProfile -File launcher/tools/repack/build-package.ps1 "${args[@]}"
 
       - name: Same commit and source note as the Windows package, then zip
         run: |
