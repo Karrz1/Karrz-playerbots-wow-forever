@@ -43,10 +43,6 @@ struct SiphonClock
     ObjectGuid puller;         // the bot that pulls it
 };
 
-// The ranged openers of a pull: one shot from range makes the Son run at the shooter.
-Ranks const kArcaneShot = { 3044, 14281, 14282, 14283, 14284, 14285, 14286, 14287 };
-Ranks const kFrostbolt  = { 116, 205, 837, 7322, 8406, 8407, 8408, 10179, 10180, 10181, 25304 };
-Ranks const kShadowBolt = { 686, 695, 705, 1088, 1106, 7641, 11659, 11660, 11661, 25307 };
 constexpr float kPullReach = 28.0f;   // the puller walks to this far from the Son (inside the 30-35 y of the openers)
 std::unordered_map<uint64_t, SiphonClock> g_siphon;   // by Hakkar's guid
 
@@ -201,18 +197,6 @@ Creature* SonToPull(Plan const& plan, SiphonClock& c, Unit* hakkar, uint32_t t)
     return best;
 }
 
-// The opener a bot pulls with (0: none it knows). Hunters first, then mages, then warlocks.
-uint32_t PullSpell(Player* p, int& order)
-{
-    switch (p->GetClass())
-    {
-        case CLASS_HUNTER:  order = 0; return KnownRank(p, kArcaneShot);
-        case CLASS_MAGE:    order = 1; return KnownRank(p, kFrostbolt);
-        case CLASS_WARLOCK: order = 2; return KnownRank(p, kShadowBolt);
-        default:            order = 3; return 0;
-    }
-}
-
 } // namespace
 
 void ZgMechanicsElect(Election& e, uint32_t now)
@@ -259,7 +243,7 @@ void ZgMechanicsElect(Election& e, uint32_t now)
     {
         int order = 3;
         return m.bot && !m.tank && !m.healer && m.p->IsAlive() && hakkar->GetVictim() != m.p && !m.p->HasAura(kCorruptedBlood) &&
-               PullSpell(m.p, order) != 0;
+               RangedPullSpell(m.p, order) != 0;
     };
     Member* puller = nullptr;
     for (Member& m : e.plan.members)
@@ -273,7 +257,7 @@ void ZgMechanicsElect(Election& e, uint32_t now)
             if (!canPull(m) || e.busy.count(m.p->GetGUID().GetCounter()))
                 continue;
             int order = 3;
-            PullSpell(m.p, order);
+            RangedPullSpell(m.p, order);
             float const yards = m.p->GetExactDist2d(son);
             if (!puller || order < bestOrder || (order == bestOrder && yards < bestYards))
             {
@@ -291,7 +275,7 @@ void ZgMechanicsElect(Election& e, uint32_t now)
             son->GetGUID().GetCounter(), puller->p->GetExactDist2d(son));
     }
     int order = 3;
-    uint32_t const spell = PullSpell(puller->p, order);
+    uint32_t const spell = RangedPullSpell(puller->p, order);
     if (e.busy.count(puller->p->GetGUID().GetCounter()) || !Ready(puller->p, spell, son, true))
         return;   // walking in (ZgMechanicsMove), or out of reach or sight: the walk goes on
     RaidOrder* o = e.OrderOf(puller->p);

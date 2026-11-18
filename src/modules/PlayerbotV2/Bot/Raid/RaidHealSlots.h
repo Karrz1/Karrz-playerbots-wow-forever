@@ -30,4 +30,29 @@ inline std::vector<uint64_t> HealSlotOrder(uint64_t main_tank, uint64_t off_tank
     return order;
 }
 
+// A melee-soak boss (RaidRules::meleeSoak, Patchwerk's Hateful Strike on the off tanks): the strike goes to the soakers, never the main
+// tank while they are in melee, so they take the healers. The main tank gets one, then the soakers (off tank and spare tanks) one each
+// in turns, up to three each, then the main tank a second. naxx_patchwerk 1115 night: with main 3 / off 2 / spare 1 the soakers stood at
+// 50-65 % when the next 9-11k strike came and one died every 5-10 s (41 deaths in 143 s).
+inline std::vector<uint64_t> SoakHealSlotOrder(uint64_t main_tank, uint64_t off_tank, std::vector<uint64_t> const& spare_tanks, uint32_t slots)
+{
+    std::vector<uint64_t> soakers;
+    if (off_tank)
+        soakers.push_back(off_tank);
+    for (uint64_t t : spare_tanks)
+        if (t)
+            soakers.push_back(t);
+    std::vector<uint64_t> order;
+    if (main_tank)
+        order.push_back(main_tank);
+    for (int round = 0; round < 3; ++round)
+        for (uint64_t t : soakers)
+            order.push_back(t);
+    if (main_tank)
+        order.push_back(main_tank);
+    if (order.size() > slots)
+        order.resize(slots);
+    return order;
+}
+
 } // namespace Playerbot::Raid

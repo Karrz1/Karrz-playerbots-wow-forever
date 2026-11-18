@@ -87,6 +87,9 @@ struct ScenarioDef
     // A fixed landing spot instead of the ring search (z != 0), path-checked to the creature once, as a checkpoint's staging spot: a room
     // whose own corners are the danger (Kel'Thuzad's alcoves full of phase 1 adds that a raid on the rings walks into).
     float stage_x = 0.f, stage_y = 0.f, stage_z = 0.f;
+    // The point the staging spot's route is checked to instead of the boss (z != 0): a boss who stands where no raider walks until his
+    // fight brings him down (Gothik on his balcony, 18 y above his room: naxx22 failed its setup at 0 s, no route from the floor to him).
+    float route_x = 0.f, route_y = 0.f, route_z = 0.f;
     // The school the squad gears resistance for, as a vanilla raid dressed for the fight (nature for Princess Huhuran); 0 = none. Every
     // armour and jewellery slot takes the piece with the most of it under the tier's item level (GearGenerationContext::resist_school).
     std::uint8_t resist_school = 0;
@@ -319,6 +322,7 @@ struct RaidBossRow
     std::uint32_t start_add = 0;        // see ScenarioDef::start_add
     float clear_formation_beyond = 0.f; // see ScenarioDef::clear_formation_beyond
     float stage_x = 0.f, stage_y = 0.f, stage_z = 0.f;   // a listed landing spot instead of the ring search; see ScenarioDef::stage_x
+    float route_x = 0.f, route_y = 0.f, route_z = 0.f;   // see ScenarioDef::route_x
     // The instance data of the bosses a raid kills before this one (SetData type, value), set at the attack: see ScenarioDef::start_instance_data.
     std::array<std::pair<std::uint32_t, std::uint32_t>, 8> start_data{};
     std::uint8_t start_data_n = 0;
@@ -393,6 +397,13 @@ constexpr RaidBossRow ClearsFormation(RaidBossRow r, float beyond_yards)
 constexpr RaidBossRow Staged(RaidBossRow r, float x, float y, float z)
 {
     r.stage_x = x; r.stage_y = y; r.stage_z = z;
+    return r;
+}
+
+// A staged row whose boss no raider can walk to before his fight (ScenarioDef::route_x): the landing's route is checked to this point.
+constexpr RaidBossRow RoutesTo(RaidBossRow r, float x, float y, float z)
+{
+    r.route_x = x; r.route_y = y; r.route_z = z;
     return r;
 }
 
@@ -475,6 +486,7 @@ inline ScenarioDef MakeRaidScenario(RaidBossRow const& r, RaidEntrance const& e,
     d.start_add = r.start_add;
     d.clear_formation_beyond = r.clear_formation_beyond;
     d.stage_x = r.stage_x; d.stage_y = r.stage_y; d.stage_z = r.stage_z;
+    d.route_x = r.route_x; d.route_y = r.route_y; d.route_z = r.route_z;
     d.start_instance_data.assign(r.start_data.begin(), r.start_data.begin() + r.start_data_n);
     d.order_attack = true;
     d.order_delay_ms = 20000;
@@ -724,8 +736,14 @@ inline constexpr RaidBossRow kNaxxBosses[] = {
       16011, "Loatheb",                25 },
     { "naxx_razuvious",  "Naxxramas: 40 level 60 raiders to Instructor Razuvious (priests control the understudies that tank him)",
       16061, "Instructor Razuvious",   20, 16803 },   // Deathknight Understudy
-    { "naxx_gothik",     "Naxxramas: 40 level 60 raiders to Gothik the Harvester (the side split, waves, the gate, teleports)",
-      16060, "Gothik the Harvester",   25 },
+    // Gothik stands on his balcony (2642.1,-3387.0,285.5); his room's floor, where the combat gate stands (2692.07,-3360.78,267.5), is 18 y
+    // below it. The ring search landed the raid at the balcony's height (2670.9,-3359.2,285.8, naxx-data-1114a), where the raid brain's
+    // side split does not count it in the room: no split, and he reset at his first speech for fewer than 10 players on a side (naxx21,
+    // 1114a). The raid lands on the living side's floor, 26 y south of the gate, and splits from there (RaidMechanics_Naxx.cpp, Gothik).
+    // Nobody walks to him on the balcony, so the landing's route is checked to the dead side's spot of that split, 18 y north of the gate
+    // (GothAnchor's first try): the way half the raid walks before the pull.
+    RoutesTo(Staged({ "naxx_gothik",     "Naxxramas: 40 level 60 raiders to Gothik the Harvester (the side split, waves, the gate, teleports)",
+      16060, "Gothik the Harvester",   25 }, 2691.2f, -3387.0f, 267.7f), 2692.1f, -3342.8f, 267.5f),
     Sight(Keeps({ "naxx_horsemen", "Naxxramas: 40 level 60 raiders to the Four Horsemen (marks, the tank rotation, Void Zones, Meteor)",
       16062, "Highlord Mograine", 25, 16063 }, 16064, 16065), 83.f),   // Zeliek, Korth'azz, Blaumeux; they see 75 y
     // His formation in the world DB spans the hall's trash (Bile Retchers 16018, 16017, 16021, 16029, 3000-3171 x, up to 300 y from him),
@@ -734,8 +752,13 @@ inline constexpr RaidBossRow kNaxxBosses[] = {
     // of his sight twice (1114e, 1114f: 17 spots near the walk, 43 out of sight, 158 without floor) and the healers' heals failed for line
     // of sight while the tanks died at the edge of the walk. It waits on the room's lower floor south of the walk (z 292.6, out of his
     // sight while he walks), and once he is pulled it goes up into the hall, where he is fought (RaidEncounterData_NAXX.cpp).
+    // That lower floor lies behind his exit gate (181123 at 3318.0,-3254.4, closed until he dies): with bot paths kept clear of closed
+    // doors the staging route stopped at the gate (release-0138 setup: path type 0x4, 46 y for 69 y straight), and no player stands
+    // there before he dies. The raid waits at the hall's west end instead, on its own floor (z 294.1): a complete 48.5 y route to his
+    // spawn, away from the gate (PC check on the map 533 navmesh, 2026-11-18). It is in his hall, so if his walk reaches it during the
+    // hold he is pulled early: watch the first run for that.
     Staged(ClearsFormation({ "naxx_patchwerk",  "Naxxramas: 40 level 60 raiders to Patchwerk (Hateful Strike soaked by three off tanks)",
-      16028, "Patchwerk",              15 }, 20.f), 3285.0f, -3297.0f, 292.6f),
+      16028, "Patchwerk",              15 }, 20.f), 3260.0f, -3232.0f, 294.1f),
     { "naxx_grobbulus",  "Naxxramas: 40 level 60 raiders to Grobbulus (Mutating Injection carrier runs, poison clouds, Slime Spray cone)",
       15931, "Grobbulus",              20 },
     // Gluth sees 49 y (MoveInLineOfSight, classic_boss_gluth.cpp) from his spawn 3283.1,-3157.0 in the middle of his room. The raid lands
@@ -751,6 +774,13 @@ inline constexpr RaidBossRow kNaxxBosses[] = {
     // splits the raid onto them before the pull (RaidMechanics_Naxx.cpp, Thaddius).
     Staged(OpensOn(Keeps({ "naxx_thaddius", "Naxxramas: 40 level 60 raiders to Thaddius (Stalagg and Feugen first, Static Field, Polarity Shift sides)",
       15928, "Thaddius", 25, 15929 }, 15930), 15929), 3421.9f, -3017.5f, 295.6f),   // Stalagg, Feugen
+    // Sapphiron has no creature row: the instance summons him at his lair once the raid touches his bones (GO_SAPPHIRON_SPAWN, Birth in
+    // classic_boss_sapphiron.cpp; EVENT_SPAWN_SAPPHIRON at aSapphPositions, classic_naxxramas.h). The runner summons him there, as for
+    // Ragnaros. Frost Aura (28529) on the whole raid, Life Drain, Blizzard, Cleave and Tail Sweep on the ground, then the air phase every 40 s
+    // of ground: Icebolts that freeze their targets into ice blocks and Frost Breath, which only the blocks shelter from
+    // (RaidMechanics_Naxx.cpp, Sapphiron). Worn in frost resistance, as a raid goes in.
+    Sight(Resist({ "naxx_sapphiron", "Naxxramas: 40 level 60 raiders to Sapphiron (Frost Aura, Life Drain decursed, Blizzard, air phase: ice blocks and Frost Breath)",
+      15989, "Sapphiron", 25, 0, 0, 0, 3522.56f, -5236.76f, 137.626f, 4.4855f }, ScnSchool::Frost), 60.f),
 };
 
 // ---- Naxxramas, Kel'Thuzad: the whole fight from the start of phase 1, 40 level 60 raiders ----

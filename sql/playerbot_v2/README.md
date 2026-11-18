@@ -22,6 +22,8 @@ Applied in ascending numeric order; each file records itself in
 - `0025_owner_gear_mode.sql` — `playerbot_v2_owner_gear`: the gear mode (match / best / t1 / t2 / t3) an owner chose for their companions, per owner account
 - `0038_owner_language.sql` — `playerbot_v2_owner_language`: the language (en / ru) a player chose for the bots' replies with `.bot language`, per account
 - `0040_companion_talent_code.sql` — `playerbot_v2_character.companion_talents`: a companion's own talent build, given as a Wowhead Forever talent calculator code (`change talents <link>`), kept across relog and restart
+- `0041_bot_text_fixes.sql` — (shared DB) removes stock lines that read as nonsense or as a bot: the `suggest_something` line that was only `%zone_name`, and "dont ask me %s, im just a bot"
+- `0042_bot_text_meta_lines.sql` — (shared DB) removes four "not understood" replies that talk about the chat like a program ("getting confused from chat again", "i will attempt to understand that comment", ...)
 
 ## Discipline
 - Never edit a numbered migration after it ships. Add a new one to amend.

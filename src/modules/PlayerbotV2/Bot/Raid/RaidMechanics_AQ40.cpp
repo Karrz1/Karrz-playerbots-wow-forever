@@ -125,7 +125,7 @@ bool GlareMove(Plan const& plan, Member const& self, RaidOrder& out)
         if (Usable(bot, x, y, bot->GetPositionZ(), z, /*urgent*/ true))
         {
             out.hold_melee = !self.ranged && !self.healer;
-            return SetMove(out, x, y, z, "c'thun: out of dark glare");
+            return SetMove(out, x, y, z, "c'thun: out of dark glare", /*urgent*/ true);
         }
     }
     return false;

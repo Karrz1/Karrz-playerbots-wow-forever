@@ -609,6 +609,11 @@ bool FindGrindSpotNear(bool alliance, uint32 map, float x, float y, uint32 level
     return true;
 }
 
+uint32 GrindMobsNear(bool alliance, uint32 map, float x, float y, uint32 level, float radius)
+{
+    return MobSupplyNear(GrindSpotsFor(alliance), map, x, y, level, radius);
+}
+
 DestinationPick SpreadWithinZone(DestinationPick d, uint8 level, bool alliance, uint64 seed, bool allow_grind)
 {
     Map* const map = sMapMgr->FindMap(d.map_id, 0);

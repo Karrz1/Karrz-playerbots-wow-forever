@@ -40,6 +40,8 @@ struct GroupMemberSummary
     // Damage the member took per second over the last few seconds, decayed (ClassicHeal::DamageRate; GroupSnapshotBuilder::NoteDamageTaken).
     // Only kept inside instances. The raid healers count what it brings before a heal in flight lands.
     float                  damage_taken_per_s = 0.f;
+    // The largest single hit it took in the last ClassicHeal::kSpikeWindowMs (DamageSpike): the next hit can be that big again.
+    int32                  damage_spike = 0;
     int32                  mana    = 0;     // Power index 0 (mana) only.
     int32                  max_mana = 0;
     bool                   online  = false;

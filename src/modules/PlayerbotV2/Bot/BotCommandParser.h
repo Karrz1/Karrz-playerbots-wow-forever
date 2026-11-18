@@ -107,6 +107,10 @@ public:
     struct AssignRow { uint8 marker; std::string name; char const* role; };
     static std::vector<AssignRow> AssignList(Group* grp);
 
+    // The bot's declared role, as `/setrole` sets it: the role override, the Classic virtual spec that goes with it (rotation,
+    // talents, gear) and, for an owned companion, the stored role a relog restores. Role::Unknown clears it. World thread.
+    static void DeclareRole(Player* bot, Role role);
+
 private:
     // The command table; DispatchSingle wraps it with the [owner_order] log line.
     static bool DispatchSingleImpl(Player* sender, Player* bot_player, std::string const& msg);

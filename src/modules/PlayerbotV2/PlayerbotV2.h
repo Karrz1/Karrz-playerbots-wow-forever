@@ -106,6 +106,8 @@ public:
     void OnSpiritReleased(Player* p);
     // A raid member's sub-group changed: an owned companion's is stored (OwnerRegistry::SetSubgroup).
     void OnRaidSubgroupChanged(Group* group, ObjectGuid member, uint8 subgroup);
+    // A player set a bot's party role in the role menu (CMSG_SET_ROLE): the bot takes it as its declared role.
+    void OnMemberRoleSet(Group* group, ObjectGuid setter, ObjectGuid member, uint8 newRole);
     void OnGroupMemberRemoved(Group* group, ObjectGuid member, uint8 method, ObjectGuid kicker);
     // SC-P2b: a new guild member joined — one online bot guildmate welcomes.
     void OnGuildMemberAdded(uint64 guild_id, ObjectGuid joiner_guid, std::string const& joiner_name);

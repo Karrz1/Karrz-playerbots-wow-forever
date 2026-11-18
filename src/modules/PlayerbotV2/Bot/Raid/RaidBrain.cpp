@@ -169,6 +169,22 @@ uint32_t KnownRank(Player* p, Ranks const& ranks)
     return 0;
 }
 
+// The ranged openers of a pull (the Sons of Hakkar, Gothik on his balcony).
+Ranks const kPullArcaneShot = { 3044, 14281, 14282, 14283, 14284, 14285, 14286, 14287 };
+Ranks const kPullFrostbolt  = { 116, 205, 837, 7322, 8406, 8407, 8408, 10179, 10180, 10181, 25304 };
+Ranks const kPullShadowBolt = { 686, 695, 705, 1088, 1106, 7641, 11659, 11660, 11661, 25307 };
+
+uint32_t RangedPullSpell(Player* p, int& order)
+{
+    switch (p->GetClass())
+    {
+        case CLASS_HUNTER:  order = 0; return KnownRank(p, kPullArcaneShot);
+        case CLASS_MAGE:    order = 1; return KnownRank(p, kPullFrostbolt);
+        case CLASS_WARLOCK: order = 2; return KnownRank(p, kPullShadowBolt);
+        default:            order = 3; return 0;
+    }
+}
+
 // Cooldown, range and line of sight. Casting state is handled by the
 // election (a busy caster is only a second choice) and by the consumer
 // (it waits for the running cast to finish).
@@ -233,6 +249,14 @@ bool InPhase(Unit const* enemy, float hpMax, float hpMin)
 {
     float const pct = enemy->GetHealthPct();
     return pct <= hpMax && pct >= hpMin;
+}
+
+// An enemy up in the air has no ground cone: flying (Onyxia's phase 2) or hovering (Sapphiron's air phase, where he only breathes and
+// throws Icebolts). naxx_sapphiron r27: the arc guard dropped three bots' walks to an ice block as crossing his Cleave arc while he hovered,
+// and two of them died to the Frost Breath where they stood.
+bool Airborne(Unit const* enemy)
+{
+    return enemy->IsFlying() || enemy->IsHovering();
 }
 
 float Dist2D(float ax, float ay, float bx, float by) { return std::sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by)); }
@@ -550,7 +574,7 @@ void ApplyFrontArcGuard(Plan const& plan, Member const& self, uint32_t now, Raid
     float const bx = self.p->GetPositionX(), by = self.p->GetPositionY();
     for (Unit* enemy : plan.enemies)
     {
-        if (!enemy->IsAlive() || enemy->IsFlying())
+        if (!enemy->IsAlive() || Airborne(enemy))
             continue;
         AvoidFrontal const* front = FrontRule(*plan.rules, plan, self, enemy);
         if (!front)
@@ -573,11 +597,12 @@ void ApplyFrontArcGuard(Plan const& plan, Member const& self, uint32_t now, Raid
     }
 }
 
-bool SetMove(RaidOrder& out, float x, float y, float z, char const* reason)
+bool SetMove(RaidOrder& out, float x, float y, float z, char const* reason, bool urgent)
 {
     out.move = true;
     out.move_x = x; out.move_y = y; out.move_z = z;
     out.move_reason = reason;
+    out.move_urgent = urgent;
     return true;
 }
 
@@ -702,7 +727,7 @@ bool Escape(Player* bot, std::vector<Circle> const& circles, RaidOrder& out, std
                 ++why[g_usableWhy];
                 continue;
             }
-            return SetMove(out, px, py, pz, "leave hazard");
+            return SetMove(out, px, py, pz, "leave hazard", /*urgent*/ true);
         }
     }
     tally();
@@ -713,12 +738,35 @@ bool Escape(Player* bot, std::vector<Circle> const& circles, RaidOrder& out, std
 std::string g_clearestWhy;
 constexpr float kCarrierFloorDz = 4.0f;   // a carrier run ends on the carrier's own floor: no more than this above or below it
 
-bool Clearest(Player* bot, std::vector<Player*> const& others, float wanted, RaidOrder& out, char const* reason,
-              std::vector<Circle> const& avoid, bool urgent)
+// Where each bot of this plan pass was sent (world thread, cleared with the probe budget each Update). A bot that spreads or runs scores its
+// spots against where the others are going, not where they stand: two raiders side by side both ran to the same open patch and stood
+// together again, and a raider whose neighbour was already walking off left too. Bots later in the pass see the earlier ones' moves; the
+// pass starts at a different bot each time (Update), so no bot always chooses last.
+std::unordered_map<uint64_t, std::pair<float, float>> g_passDest;
+
+void PlannedAt(Player const* p, float& x, float& y)
+{
+    auto const it = g_passDest.find(p->GetGUID().GetCounter());
+    if (it != g_passDest.end()) { x = it->second.first; y = it->second.second; return; }
+    x = p->GetPositionX(); y = p->GetPositionY();
+}
+
+float NearestPlanned(float x, float y, std::vector<Player*> const& others)
 {
     float nearest = 9999.0f;
     for (Player* p : others)
-        nearest = std::min(nearest, Dist2D(bot->GetPositionX(), bot->GetPositionY(), p->GetPositionX(), p->GetPositionY()));
+    {
+        float px, py;
+        PlannedAt(p, px, py);
+        nearest = std::min(nearest, Dist2D(x, y, px, py));
+    }
+    return nearest;
+}
+
+bool Clearest(Player* bot, std::vector<Player*> const& others, float wanted, RaidOrder& out, char const* reason,
+              std::vector<Circle> const& avoid, bool urgent)
+{
+    float const nearest = NearestPlanned(bot->GetPositionX(), bot->GetPositionY(), others);
 
     // Candidate points on rings round the bot, scored first (cheap) and probed best first (a path query each). A carrier standing inside
     // the raid (Living Bomb, MC 2026-10-12: nearest raider 11-14 yd, 25-30 of the ring points "not better") needs the rings that reach past
@@ -736,9 +784,7 @@ bool Clearest(Player* bot, std::vector<Player*> const& others, float wanted, Rai
             float const angle = float(i) * (2.0f * float(M_PI) / float(steps));
             float const px = bot->GetPositionX() + distance * std::cos(angle);
             float const py = bot->GetPositionY() + distance * std::sin(angle);
-            float clear = 9999.0f;
-            for (Player* p : others)
-                clear = std::min(clear, Dist2D(px, py, p->GetPositionX(), p->GetPositionY()));
+            float const clear = NearestPlanned(px, py, others);
             if (clear < nearest + improvement)
             {
                 ++skippedNear;
@@ -781,9 +827,7 @@ bool Clearest(Player* bot, std::vector<Player*> const& others, float wanted, Rai
             }
             cx = snapped.GetPositionX();
             cy = snapped.GetPositionY();
-            float clear = 9999.0f;
-            for (Player* p : others)
-                clear = std::min(clear, Dist2D(cx, cy, p->GetPositionX(), p->GetPositionY()));
+            float const clear = NearestPlanned(cx, cy, others);
             if (clear < nearest + improvement || (!avoid.empty() && InsideAny(avoid, cx, cy, 1.0f)))
             {
                 ++offMesh;
@@ -825,7 +869,7 @@ bool Clearest(Player* bot, std::vector<Player*> const& others, float wanted, Rai
 
 // Keeps a decision for a couple of seconds so bots do not jitter between equally good points.
 // World thread only (Update), so no locking.
-struct Sticky { float x, y, z; uint32_t at; char const* reason; };
+struct Sticky { float x, y, z; uint32_t at; char const* reason; bool urgent; };
 std::unordered_map<uint64_t, Sticky> g_sticky;
 std::unordered_map<uint64_t, uint32_t> g_lastSpread;
 std::unordered_map<uint64_t, uint32_t> g_lastSpreadLog;
@@ -835,6 +879,7 @@ std::unordered_map<uint64_t, uint32_t> g_lastRearStep;
 std::unordered_map<uint64_t, uint32_t> g_lastCarrierLog;
 std::unordered_map<uint64_t, uint32_t> g_lastBombLog;
 std::unordered_map<uint64_t, uint32_t> g_lastStuckLog;
+std::unordered_map<uint64_t, uint32_t> g_lastDragOutLog;
 std::unordered_map<uint64_t, uint32_t> g_lastSafeCrossLog;
 
 bool UseSticky(Player* bot, std::vector<Circle> const& circles, uint32_t now, RaidOrder& out)
@@ -845,12 +890,12 @@ bool UseSticky(Player* bot, std::vector<Circle> const& circles, uint32_t now, Ra
     Sticky const& s = it->second;
     if (now - s.at > 2000 || Dist2D(bot->GetPositionX(), bot->GetPositionY(), s.x, s.y) < 2.0f || InsideAny(circles, s.x, s.y, 0.5f))
         return false;
-    return SetMove(out, s.x, s.y, s.z, s.reason);
+    return SetMove(out, s.x, s.y, s.z, s.reason, s.urgent);
 }
 
 void Remember(Player* bot, RaidOrder const& d, uint32_t now)
 {
-    g_sticky[bot->GetGUID().GetCounter()] = { d.move_x, d.move_y, d.move_z, now, d.move_reason };
+    g_sticky[bot->GetGUID().GetCounter()] = { d.move_x, d.move_y, d.move_z, now, d.move_reason, d.move_urgent };
 }
 
 // Line hazard (AvoidBreath): the corridor is latched when the breath starts so it stays put while the enemy flies along it.
@@ -1224,7 +1269,7 @@ Brain::MoveContext BuildMoveContext(Plan const& plan, Member const& self, std::v
         for (Unit* enemy : plan.enemies)
         {
             // A flying enemy has no ground cone (Onyxia's phase 2: she circles the cave and turns every waypoint).
-            if (enemy->GetEntry() != rule.enemy || !enemy->IsAlive() || enemy->IsFlying() || !InPhase(enemy, rule.hpMax, rule.hpMin))
+            if (enemy->GetEntry() != rule.enemy || !enemy->IsAlive() || Airborne(enemy) || !InPhase(enemy, rule.hpMax, rule.hpMin))
                 continue;
             float const facing = enemy->GetOrientation() + rule.facingOffsetDeg * (float(M_PI) / 180.0f);
             float const cx = std::cos(facing), cy = std::sin(facing);
@@ -1257,7 +1302,7 @@ Brain::MoveContext BuildMoveContext(Plan const& plan, Member const& self, std::v
             continue;
         for (Unit* enemy : plan.enemies)
         {
-            if (enemy->GetEntry() != rule.enemy || !enemy->IsAlive() || enemy->IsFlying() || !InPhase(enemy, rule.hpMax, rule.hpMin))
+            if (enemy->GetEntry() != rule.enemy || !enemy->IsAlive() || Airborne(enemy) || !InPhase(enemy, rule.hpMax, rule.hpMin))
                 continue;
             float const eo = enemy->GetOrientation(), ex = enemy->GetPositionX(), ey = enemy->GetPositionY();
             // Rear: three circles across the back half; front: one in line with her facing. Radius 5 at 6.5 y.
@@ -1824,7 +1869,7 @@ bool LeaveMagma(Player* bot, uint32_t now, RaidOrder& out)
             dry.GetPositionX(), dry.GetPositionY(), dry.GetPositionZ(),
             bot->isMoving(), bot->IsNonMeleeSpellCast(false), bot->IsMovementPreventedByCasting(),
             bot->HasUnitState(UNIT_STATE_NOT_MOVE), uint32(bot->GetMotionMaster()->GetCurrentMovementGeneratorType()));
-    return SetMove(out, dry.GetPositionX(), dry.GetPositionY(), dry.GetPositionZ(), "leave lava");
+    return SetMove(out, dry.GetPositionX(), dry.GetPositionY(), dry.GetPositionZ(), "leave lava", /*urgent*/ true);
 }
 
 // ---------- Out of the enemy's sight (RaidRules::breakSight) ----------
@@ -2488,7 +2533,12 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             g_carrierRun = true;
             bool const found = Clearest(bot, others, rule.clearDistance, out, "carrier run", circles, /*urgent*/ true);
             g_carrierRun = false;
-            if (found) { Remember(bot, out, now); return; }
+            if (found)
+            {
+                out.move_urgent = true;   // the aura goes off on its own timer, wherever the carrier stands
+                Remember(bot, out, now);
+                return;
+            }
             uint32_t& at = g_lastCarrierLog[bot->GetGUID().GetCounter()];
             if (now - at >= 3000)
             {
@@ -2561,7 +2611,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                 }
                 if (!Usable(bot, s->x, s->y, bot->GetPositionZ(), pz, /*urgent*/ true, /*hazard*/ true))
                     continue;
-                SetMove(out, s->x, s->y, pz, "leave hazard");
+                SetMove(out, s->x, s->y, pz, "leave hazard", /*urgent*/ true);
                 Remember(bot, out, now);
                 return;
             }
@@ -2599,6 +2649,46 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
         Remember(bot, out, now);
         return;
     }
+    // 2a2. A tank leads its boss out of the lasting hazards he stands in (DragOut): a spot well clear of them, the nearest that a path reaches.
+    if (self.tank)
+        for (DragOut const& rule : rules.dragOut)
+        {
+            Unit* held = bot->GetVictim();
+            if (!held || held->GetEntry() != rule.enemy || held->GetVictim() != bot)
+                continue;
+            std::list<Creature*> hazards;
+            held->GetCreatureListWithEntryInGrid(hazards, rule.hazard, 60.0f);
+            std::vector<Circle> clear;
+            for (Creature* h : hazards)
+                if (h->IsAlive() && clear.size() < 32)
+                    clear.push_back({ h->GetPositionX(), h->GetPositionY(), rule.clear });
+            if (!InsideAny(clear, held->GetPositionX(), held->GetPositionY(), 0.0f))
+                continue;
+            float const away = std::atan2(bot->GetPositionY() - held->GetPositionY(), bot->GetPositionX() - held->GetPositionX());
+            int probes = 0;
+            for (float step : { 10.0f, 15.0f, 20.0f, 26.0f })
+                for (float turn : { 0.0f, 0.5f, -0.5f, 1.0f, -1.0f, 1.6f, -1.6f, 2.3f, -2.3f, 3.14f })
+                {
+                    float const x = bot->GetPositionX() + step * std::cos(away + turn);
+                    float const y = bot->GetPositionY() + step * std::sin(away + turn);
+                    if (InsideAny(clear, x, y, 4.0f) || InsideAny(circles, x, y, 1.0f) || ++probes > 8)
+                        continue;
+                    float z = 0.0f;
+                    if (!Usable(bot, x, y, bot->GetPositionZ(), z, /*urgent*/ true, /*hazard*/ true))
+                        continue;
+                    SetMove(out, x, y, z, "lead the boss out of the hazard");
+                    uint32_t& at = g_lastDragOutLog[bot->GetGUID().GetCounter()];
+                    if (now - at >= 5000u)
+                    {
+                        at = now;
+                        TC_LOG_INFO("playerbot.v2.raid", "[raid_dragout] {} leads {} out of {} hazard(s) to {:.1f},{:.1f} ({:.0f} y)", bot->GetName(),
+                                    held->GetName(), clear.size(), x, y, step);
+                    }
+                    Remember(bot, out, now);
+                    return;
+                }
+        }
+
     // Melee whose target stands inside a hazard for them: hold instead of chasing back in.
     if (!circles.empty() && !self.tank && !self.healer && !self.ranged)
         if (Unit* victim = bot->GetVictim())
@@ -2615,7 +2705,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             continue;
         for (Unit* enemy : plan.enemies)
         {
-            if (enemy->GetEntry() != rule.enemy || enemy->IsFlying() || !InPhase(enemy, rule.hpMax, rule.hpMin))
+            if (enemy->GetEntry() != rule.enemy || Airborne(enemy) || !InPhase(enemy, rule.hpMax, rule.hpMin))
                 continue;
             if (sideTank && (bot->GetVictim() != enemy || enemy->GetVictim() == bot || !TauntImmune(enemy)))
                 continue;
@@ -2646,6 +2736,13 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                     float const py = enemy->GetPositionY() + ring * std::sin(angle);
                     if (!circles.empty() && InsideAny(circles, px, py, 1.0f))
                         continue;
+                    // The way out goes round him, never across his face: the walk to the far edge runs past his front (naxx_sapphiron r27:
+                    // three bots 25 y off his flank took the far edge when the near one was no use, passed 3-6 y from him and his Cleave
+                    // killed all three; four more died that way). A straight line that comes nearer to him than most of the ring is not
+                    // taken.
+                    if (SegmentDist2D(bot->GetPositionX(), bot->GetPositionY(), px, py, enemy->GetPositionX(), enemy->GetPositionY()) <
+                        0.8f * std::min(distance, ring))
+                        continue;
                     if (++pathChecks > 6)
                         break;
                     float pz = 0.0f;
@@ -2653,7 +2750,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                         continue;
                     if (stayHidden && EnemySees(enemy, bot, px, py, pz))
                         continue;
-                    SetMove(out, px, py, pz, "leave cone");
+                    SetMove(out, px, py, pz, "leave cone", /*urgent*/ true);
                     return;
                 }
         }
@@ -2678,7 +2775,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                 continue;
             for (Unit* enemy : plan.enemies)
             {
-                if (enemy->GetEntry() != rule.enemy || !enemy->IsAlive() || enemy->IsFlying() || enemy->GetVictim() != bot ||
+                if (enemy->GetEntry() != rule.enemy || !enemy->IsAlive() || Airborne(enemy) || enemy->GetVictim() != bot ||
                     !InPhase(enemy, rule.hpMax, rule.hpMin))
                     continue;
                 float const ex = enemy->GetPositionX(), ey = enemy->GetPositionY();
@@ -2727,9 +2824,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             for (Unit* enemy : plan.enemies)
                 if (enemy->GetEntry() == rule.enemy && InPhase(enemy, rule.hpMax, rule.hpMin))
                 {
-                    float nearest = 9999.0f;
-                    for (Player* p : others)
-                        nearest = std::min(nearest, Dist2D(bot->GetPositionX(), bot->GetPositionY(), p->GetPositionX(), p->GetPositionY()));
+                    float const nearest = NearestPlanned(bot->GetPositionX(), bot->GetPositionY(), others);
                     if (nearest >= rule.radius * 0.85f)
                         continue;
                     // At most one spread move per bot every 4 seconds, so casters are not hopping around and cancelling their own casts.
@@ -3080,7 +3175,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             continue;
         for (Unit* enemy : plan.enemies)
         {
-            if (enemy->GetEntry() != rule.enemy || !enemy->IsAlive() || enemy->IsFlying() || !InPhase(enemy, rule.hpMax, rule.hpMin))
+            if (enemy->GetEntry() != rule.enemy || !enemy->IsAlive() || Airborne(enemy) || !InPhase(enemy, rule.hpMax, rule.hpMin))
                 continue;
             float const ex = enemy->GetPositionX(), ey = enemy->GetPositionY();
             // The wedge is measured from the line the tank holds her on (the locked FaceAway axis), not from her live facing: that swings with
@@ -3433,6 +3528,17 @@ void ElectTankSwaps(Election& e)
             for (Member& m : plan.members)
                 clean.push_back(&m);
             std::stable_sort(clean.begin(), clean.end(), [&](Member* a, Member* b) { return a->p->GetDistance(enemy) < b->p->GetDistance(enemy); });
+            // A tank holding other enemies is the last pick: the taunt brings them to the boss with it. On Gluth those are the Zombie Chows
+            // the chow tanks hold, and he eats every one within 15 y (naxx_gluth 1116 run 8: the chow tank Mctankwc "tank swap: take over"
+            // 52 times, the swap tank kept at a chow post by the chow on it, Gluth back to 99-100% after each 10% the raid took off).
+            auto const holdsOthers = [&](Member const* m)
+            {
+                for (Unit* other : plan.enemies)
+                    if (other != enemy && other->IsAlive() && other->GetVictim() == m->p)
+                        return true;
+                return false;
+            };
+            std::stable_partition(clean.begin(), clean.end(), [&](Member* m) { return !holdsOthers(m); });
             for (Member* mp : clean)
             {
                 Member& m = *mp;
@@ -3685,9 +3791,30 @@ void PublishMeleeSoak(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& order
         {
             if (enemy->GetEntry() != rule.enemy)
                 continue;
-            for (Player* p : MeleeSoakers(plan, rule))
+            std::vector<Player*> const soakers = MeleeSoakers(plan, rule);
+            for (Player* p : soakers)
                 if (auto it = orders.find(p->GetGUID().GetCounter()); it != orders.end())
                     it->second.attack_target = enemy->GetGUID();
+            // Every 10 s per group: each soaker's health, armour, reach and Greater Stoneshield (RaidRules::resistPotion), so a
+            // run shows whether the soakers were full and potioned when the strikes came (naxx_patchwerk 1115 night: 9-11k strikes on
+            // soakers of about 11k health).
+            static std::unordered_map<uint64_t, uint32_t> s_soakLogAt;
+            uint32_t const now = GameTime::GetGameTimeMS();
+            uint32_t& at = s_soakLogAt[plan.groupLow];
+            if (at && now - at < 10000u)
+                continue;
+            at = now ? now : 1u;
+            // The potion's aura from its item (Greater Stoneshield Potion 13455), not a guessed spell id.
+            uint32_t potionAura = 0;
+            if (ItemTemplate const* pot = sObjectMgr->GetItemTemplate(13455))
+                for (ItemEffectEntry const* e : pot->Effects)
+                    if (e && e->SpellID > 0) { potionAura = uint32_t(e->SpellID); break; }
+            std::string line;
+            for (Player* p : soakers)
+                line += fmt::format("{}{} {}/{} armor {} melee {} stoneshield {}", line.empty() ? "" : " | ", p->GetName(), p->GetHealth(),
+                                    p->GetMaxHealth(), p->GetArmor(), enemy->IsWithinMeleeRange(p) ? 1 : 0, potionAura && p->HasAura(potionAura) ? 1 : 0);
+            TC_LOG_INFO("playerbot.v2.raid", "[raid_soak] group {} {} {}%: {}", plan.groupLow, enemy->GetName(), uint32(enemy->GetHealthPct()),
+                        line.empty() ? std::string("no soakers") : line);
         }
 }
 
@@ -5978,6 +6105,9 @@ void Brain::Update(uint32_t now_ms)
     std::unordered_map<uint64_t, std::vector<EnemySchools>> nextSchools;
     std::unordered_map<uint64_t, MoveContext> nextMoveCtx;
     ResetPathProbes();
+    g_passDest.clear();
+    static uint32_t passTurn = 0;
+    ++passTurn;
     std::ostringstream dump;
     for (auto& [key, b] : buckets)
     {
@@ -6137,8 +6267,10 @@ void Brain::Update(uint32_t now_ms)
             }
         }
 
-        for (Member const& m : plan.members)
-            if (m.bot)
+        // Each bot decides its own move, starting at a different bot each pass (see g_passDest): the probe budget runs out for whoever
+        // comes last, and with the members in guid order that was always the same raiders.
+        for (std::size_t turn = 0; turn < plan.members.size(); ++turn)
+            if (Member const& m = plan.members[(turn + passTurn) % plan.members.size()]; m.bot)
             {
                 RaidOrder& o = next[m.p->GetGUID().GetCounter()];
                 o.active = true;
@@ -6156,7 +6288,10 @@ void Brain::Update(uint32_t now_ms)
                 if (!plan.rules->hideBeforeBreath.empty())
                     LogBreathHideMissed(plan, m, now_ms, o);
                 if (o.move)
+                {
+                    g_passDest[m.p->GetGUID().GetCounter()] = { o.move_x, o.move_y };
                     dump << "  " << m.p->GetName() << ": move (" << o.move_reason << ")\n";
+                }
                 for (NoAoe const& rule : plan.rules->noAoe)
                     for (Unit* enemy : plan.enemies)
                         if (enemy->GetEntry() == rule.enemy && m.p->GetDistance(enemy) < 40.0f)

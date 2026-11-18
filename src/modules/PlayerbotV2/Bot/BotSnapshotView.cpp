@@ -1060,6 +1060,12 @@ NearbyUnit const* BotSnapshotView::taunt_candidate(float range) const
             // Sneed's Shredder on the party's casters untaunted while the tank walked to its assigned mob (deadmines_full run 11:
             // 79 [tank_loose] lines, Taunt ready, mobs 3-4 y away, no Taunt).
         }
+        // A raid boss on this tank is all it holds: a loose add is the other tanks' (the coordinator gives them the adds on a boss's tank
+        // first). The taunt turns the tank's swings onto the add, it walks after it with the boss in tow, and the boss turns on the raid.
+        // naxx_maexxna r23: at 36-39 s the main tank went for a spiderling on a healer 12 y off, Maexxna went to the second tank, the main
+        // tank took her back just before the Web Spray with the spiderlings on it too, and died in the stun at 47 s.
+        if (s_->instance_ctx.is_in_raid && ThreatVictim(a->victim_kind) == ThreatVictim::Me && (a->is_dungeon_boss || a->is_boss_rank))
+            return nullptr;
     }
     return UnclaimedLooseAttacker(*s_, range, /*target_reach=*/true, /*leash=*/false, /*controller_leash=*/true);
 }

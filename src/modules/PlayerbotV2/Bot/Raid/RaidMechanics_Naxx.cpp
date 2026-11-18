@@ -19,6 +19,7 @@
 //    the gate stays closed until he opens it, so every bot only fights enemies on its own side.
 
 #include "RaidBrainInternal.h"
+#include "SpellFamily.h"
 
 #include "Creature.h"
 #include "GameObject.h"
@@ -253,7 +254,7 @@ bool HeiganMove(Plan const& plan, Member const& self, uint32_t now, RaidOrder& o
         float z = 0.0f;
         if (Usable(bot, c.trap->x, c.trap->y, c.trap->z, z, /*urgent*/ true))
         {
-            SetMove(out, c.trap->x, c.trap->y, z, st.dance ? "heigan dance" : "heigan eruption");
+            SetMove(out, c.trap->x, c.trap->y, z, st.dance ? "heigan dance" : "heigan eruption", /*urgent*/ true);
             return true;
         }
     }
@@ -269,6 +270,10 @@ constexpr uint32_t kIcebolt          = 28522;   // the frozen player inside a bl
 constexpr uint32_t kFrostBreath      = 28524;   // 7 s cast from the air
 constexpr uint32_t kFrostBreathDummy = 30101;   // the falling ball, 0.5 s before the cast
 constexpr float    kIceboltSpread    = 10.0f;
+// The blocks standing when the raid starts to hide: his five Icebolts come 3.5 s apart, the breath's falling ball 1.5 s after the fifth and
+// the 7 s cast 0.5 s after that (classic_boss_sapphiron.cpp RescheduleIcebolt, EVENT_SAPPH_FROST_BREATH_*). Hiding from the fourth block
+// on gives 12.5 s instead of 7.5. naxx_sapphiron r23: 14 died to the first breath at 95 s, most of them still walking ("raid:move").
+constexpr std::size_t kHideFromBlocks = 4;
 
 std::unordered_map<uint64_t, uint32_t> g_airSpread;   // bot -> last air phase spread move
 
@@ -295,11 +300,14 @@ bool SapphironMove(Plan const& plan, Member const& self, uint32_t now, RaidOrder
     if (bot->HasAura(kIcebolt))
         return true;   // frozen inside a block
 
-    if (Casting(sapphiron, kFrostBreath) || Casting(sapphiron, kFrostBreathDummy))
+    std::list<GameObject*> blocks;
+    sapphiron->GetGameObjectListWithEntryInGrid(blocks, kIceBlock, 150.0f);
+    blocks.remove_if([](GameObject* b) { return !b->isSpawned(); });
+    // From the breath's falling ball on, a cast under way is stopped for the walk; before it (the fourth block) it is let finish first.
+    bool const breathing = Casting(sapphiron, kFrostBreath) || Casting(sapphiron, kFrostBreathDummy);
+    if (breathing || blocks.size() >= kHideFromBlocks)
     {
         // Hide: stand right behind the nearest ice block, on the line from Sapphiron through the block.
-        std::list<GameObject*> blocks;
-        sapphiron->GetGameObjectListWithEntryInGrid(blocks, kIceBlock, 150.0f);
         GameObject* nearest = nullptr;
         float nearestDist = 0.0f;
         for (GameObject* block : blocks)
@@ -313,23 +321,63 @@ bool SapphironMove(Plan const& plan, Member const& self, uint32_t now, RaidOrder
             return false;
         // Melee and tanks stay behind the block instead of chasing Sapphiron (casters may keep casting from cover).
         out.hold_melee = !self.ranged && !self.healer;
-        float const away = std::atan2(nearest->GetPositionY() - sapphiron->GetPositionY(), nearest->GetPositionX() - sapphiron->GetPositionX());
+        // The spot behind the block is this bot's post against him: no step out for a line of sight to its target or its tank
+        // ([raid_los] skips a bot with a post enemy), no formation walk and no clump spacing (both skip a bot at its post).
+        // naxx_sapphiron r25 (combined 1118): Mclocka hid, stepped 16 y toward its tank for sight 7 s before the breath and died with six
+        // others at (3491,-5272); Mchealsd walked back to its formation slot between hide orders and died on its way.
+        out.post_enemy = sapphiron->GetGUID();
+        // The breath reaches whoever he sees (an area spell checks the line from him, high in the air, to each target; the block is a
+        // game object with a model in that check). A spot counts as hidden when the same check from him is blocked: a fixed 2.5-4 y
+        // behind the block left the line over its top. naxx22 1116: 14 died to the first breath, the melee among them holding behind
+        // blocks 20 y from him.
+        // The test is the one the spell makes (Spell::CheckEffectTarget for an area spell: the target's IsWithinLOS to the cast's source
+        // point): from the player's eye to his position raised by the player's own height, M2 models left out. naxx_sapphiron r27: five
+        // bots stood on one spot this check called hidden, and four hunters on another, and the breath killed all nine there; the old
+        // line ran from the top of him and counted M2 models.
+        Map* const map = bot->GetMap();
+        float const eye = bot->GetCollisionHeight();
+        float const sx = sapphiron->GetPositionX(), sy = sapphiron->GetPositionY(), sz = sapphiron->GetPositionZ() + eye;
+        auto hidden = [&](float px, float py, float pz)
+        {
+            return !map->isInLineOfSight(bot->GetPhaseShift(), px, py, pz + eye, sx, sy, sz, LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::M2);
+        };
+        if (hidden(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()))
+        {
+            out.at_post = true;
+            return true;   // already hidden: stays
+        }
+        float const away = std::atan2(nearest->GetPositionY() - sy, nearest->GetPositionX() - sx);
         int pathChecks = 0;
-        for (float distance : { 3.0f, 2.5f, 4.0f })
-            for (float side : { 0.0f, 0.25f, -0.25f })
+        for (float distance : { 1.5f, 2.0f, 2.5f, 3.0f, 4.0f })
+            for (float side : { 0.0f, 0.15f, -0.15f })
             {
                 float const px = nearest->GetPositionX() + distance * std::cos(away + side);
                 float const py = nearest->GetPositionY() + distance * std::sin(away + side);
-                if (Dist2D(bot->GetPositionX(), bot->GetPositionY(), px, py) < 1.2f)
-                    return true;   // already hidden
-                if (++pathChecks > 5)
+                float const gz = map->GetHeight(bot->GetPhaseShift(), px, py, nearest->GetPositionZ() + 2.0f, true, 6.0f);
+                if (gz <= INVALID_HEIGHT + 1.0f || !hidden(px, py, gz))
+                    continue;
+                if (++pathChecks > 4)
                     return true;
                 float pz = 0.0f;
-                if (!Usable(bot, px, py, nearest->GetPositionZ(), pz, /*urgent*/ true))
+                if (!Usable(bot, px, py, gz, pz, /*urgent*/ true))
                     continue;
-                SetMove(out, px, py, pz, "hide behind ice block");
+                SetMove(out, px, py, pz, "hide behind ice block", breathing);
                 return true;
             }
+        // No spot behind the nearest block is out of his sight: said once per bot and breath.
+        uint32_t& logged = g_airSpread[bot->GetGUID().GetCounter() | (uint64_t(1) << 63)];
+        if (now - logged >= 10000)
+        {
+            logged = now;
+            TC_LOG_INFO("playerbot.v2.raid", "[raid] Sapphiron: {} finds no spot behind the ice block at {:.1f},{:.1f},{:.1f} out of his sight "
+                        "(he is at {:.1f},{:.1f},{:.1f}, {:.0f} y off)", bot->GetName(), nearest->GetPositionX(), nearest->GetPositionY(),
+                        nearest->GetPositionZ(), sx, sy, sz, Dist2D(sx, sy, nearest->GetPositionX(), nearest->GetPositionY()));
+        }
+        // Then right behind it all the same, on the line from him through the block.
+        float const px = nearest->GetPositionX() + 2.0f * std::cos(away), py = nearest->GetPositionY() + 2.0f * std::sin(away);
+        float pz = 0.0f;
+        if (Dist2D(bot->GetPositionX(), bot->GetPositionY(), px, py) >= 1.2f && Usable(bot, px, py, nearest->GetPositionZ(), pz, /*urgent*/ true))
+            SetMove(out, px, py, pz, "hide behind ice block", breathing);
         return true;
     }
 
@@ -581,6 +629,19 @@ bool LiveSide(GameObject* gate, float y) { return y <= gate->GetPositionY(); }  
 struct GothSpot { uint32_t instance = 0; bool live = false; float x = 0, y = 0, z = 0; };
 std::unordered_map<uint64_t, GothSpot> g_gothSpot;                  // bot -> its pre-pull spot
 std::unordered_map<uint64_t, std::pair<bool, Position>> g_gothAnchor; // (instance << 1 | side) -> anchor found?
+std::unordered_set<uint32_t> g_gothOffFloorLogged;                    // instances whose off-the-floor raid was logged
+std::unordered_map<uint32_t, std::pair<bool, Position>> g_gothDraw;   // instance -> the spot under his balcony that draws him, found?
+constexpr float kGothDrawMargin = 3.0f;   // the draw spot stands this far inside his aggro reach (or the opener's range)
+// When no floor spot lies inside his aggro reach, a ranged bot on the live side opens on him with one shot from the floor. His reach is
+// 15 y less his combat reach for a creature above the expansion's top level (Creature::GetAttackDistance), and he stands 18 y above the
+// floor: naxx_gothik r25 (combined 1118): "his aggro reach 9.0 y ... nobody can draw him", the raid stood split until the run failed.
+struct GothShot { bool searched = false, found = false; ObjectGuid shooter; Position spot; };
+std::unordered_map<uint32_t, GothShot> g_gothShot;   // instance -> its ranged opener
+// The draw waits for the split, but not for a straggler: once this long has passed since the split was first ordered, a bot that has not
+// reached its spot no longer holds it back. naxx_gothik r24h (0045): the raid stood split for 120 s and nobody drew him, two healers 43-46 y
+// from the tanks; one bot short of its spot held the whole pull.
+constexpr uint32_t kGothDrawWaitMs = 20000;
+std::unordered_map<uint32_t, uint32_t> g_gothSplitSince;   // instance -> when its split was first ordered
 
 // A floor point on one side, reachable on foot (the gate is open before the pull, and the navmesh ignores it anyway).
 bool GothAnchor(Player* bot, GameObject* gate, bool live, Position& out)
@@ -613,6 +674,126 @@ bool GothAnchor(Player* bot, GameObject* gate, bool live, Position& out)
     return false;
 }
 
+// A spot on the live side's floor within `want` yards of him, in his sight, that `bot` walks to on a complete path (the nearest bearing to
+// the live side's anchor first, the farthest distance first).
+bool GothFloorSpot(Creature* gothik, GameObject* gate, Player* bot, float want, Position& out)
+{
+    float const dz = gothik->GetPositionZ() - gate->GetPositionZ();
+    if (want <= std::fabs(dz) + 1.0f)
+        return false;
+    float const h = std::sqrt(want * want - dz * dz);
+    Position anchor;
+    float const toward = GothAnchor(bot, gate, true, anchor) ? gothik->GetAbsoluteAngle(anchor.GetPositionX(), anchor.GetPositionY())
+                                                             : gothik->GetAbsoluteAngle(bot);
+    for (float r = h; r >= 2.0f; r -= 2.0f)
+        for (int step = 0; step <= 8; ++step)
+            for (int sign : { 1, -1 })
+            {
+                if (step == 0 && sign < 0)
+                    continue;
+                float const a = toward + float(sign * step) * float(M_PI) / 16.0f;
+                float const x = gothik->GetPositionX() + r * std::cos(a);
+                float const y = gothik->GetPositionY() + r * std::sin(a);
+                if (!LiveSide(gate, y))
+                    continue;
+                float const z = bot->GetMap()->GetHeight(bot->GetPhaseShift(), x, y, gate->GetPositionZ() + 2.0f, true, 8.0f);
+                if (z <= INVALID_HEIGHT + 1.0f || std::fabs(z - gate->GetPositionZ()) > 4.0f)
+                    continue;
+                if (gothik->GetExactDist(x, y, z) > want || !gothik->IsWithinLOS(x, y, z + 2.0f))
+                    continue;
+                PathGenerator path(bot);
+                if (!path.CalculatePath(x, y, z, false) || (path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE)))
+                    continue;
+                out.Relocate(x, y, z);
+                return true;
+            }
+    return false;
+}
+
+// One shot from the live side's floor starts the fight (JustEngagedWith: the zone joins in, he takes his immunity and the gate closes):
+// a hunter, else a mage, else a warlock, on the live side. The shooter is kept while it can still shoot (a swap mid-walk sends a second
+// bot to the spot and the first one back); its spot is inside its opener's range, in his sight. Its other order (the side spot) gives way.
+void NaxxGothikRangedOpener(std::unordered_map<uint64_t, RaidOrder>& orders, std::vector<Member const*> const& ordered,
+                            Creature* gothik, GameObject* gate, uint32_t instance, std::ostringstream& dump)
+{
+    GothShot& shot = g_gothShot[instance];
+    auto const canShoot = [&](Member const* m, uint32_t& spell, int& order)
+    {
+        auto it = g_gothSpot.find(m->p->GetGUID().GetCounter());
+        spell = RangedPullSpell(m->p, order);
+        return m->bot && !m->tank && !m->healer && m->p->IsAlive() && spell && it != g_gothSpot.end() && it->second.instance == instance &&
+               it->second.live;
+    };
+    Member const* shooter = nullptr;
+    uint32_t spell = 0;
+    int order = 3;
+    for (Member const* m : ordered)
+        if (m->p->GetGUID() == shot.shooter && canShoot(m, spell, order))
+            shooter = m;
+    if (!shooter)
+    {
+        int bestOrder = 3;
+        float bestYards = 0.0f;
+        for (Member const* m : ordered)
+        {
+            uint32_t s = 0;
+            int o = 3;
+            if (!canShoot(m, s, o))
+                continue;
+            float const yards = m->p->GetExactDist2d(gothik);
+            if (!shooter || o < bestOrder || (o == bestOrder && yards < bestYards))
+            {
+                shooter = m;
+                bestOrder = o;
+                bestYards = yards;
+            }
+        }
+        if (!shooter)
+        {
+            if (!shot.searched)
+                TC_LOG_WARN("playerbot.v2.raid", "[raid] Gothik: no hunter, mage or warlock bot on the live side to open on him");
+            shot.searched = true;
+            return;
+        }
+        shot.shooter = shooter->p->GetGUID();
+        shot.searched = false;   // a new shooter looks for its own spot
+        canShoot(shooter, spell, order);
+    }
+    Player* const p = shooter->p;
+    SpellInfo const* info = sSpellMgr->GetSpellInfo(spell, DIFFICULTY_NONE);
+    if (!info)
+        return;
+    if (!shot.searched)
+    {
+        shot.searched = true;
+        float const range = info->GetMaxRange(false, p);
+        shot.found = GothFloorSpot(gothik, gate, p, range - kGothDrawMargin, shot.spot);
+        if (shot.found)
+            TC_LOG_INFO("playerbot.v2.raid", "[raid] Gothik: {} opens on him with {} from ({:.1f},{:.1f},{:.1f}), {:.1f} y from him (range {:.0f} y)",
+                        p->GetName(), spell, shot.spot.GetPositionX(), shot.spot.GetPositionY(), shot.spot.GetPositionZ(),
+                        gothik->GetExactDist(shot.spot), range);
+        else
+            TC_LOG_WARN("playerbot.v2.raid", "[raid] Gothik: no floor spot on the live side within {}'s range {:.0f} y of him: nobody can open",
+                        p->GetName(), range);
+    }
+    if (!shot.found)
+        return;
+    RaidOrder& o = orders[p->GetGUID().GetCounter()];
+    o.active = true;
+    o.prepull = true;
+    if (p->GetExactDist2d(shot.spot.GetPositionX(), shot.spot.GetPositionY()) > 2.0f || !Ready(p, spell, gothik, true))
+    {
+        SetMove(o, shot.spot.GetPositionX(), shot.spot.GetPositionY(), shot.spot.GetPositionZ(), "gothik: walks to the opener spot");
+        dump << "  Gothik: " << p->GetName() << " walks to open on him\n";
+        return;
+    }
+    o.move = false;
+    o.cast_kind = RaidOrder::CastKind::Nuke;
+    o.cast_spell = spell;
+    o.cast_target = gothik->GetGUID();
+    dump << "  Gothik: " << p->GetName() << " opens on him\n";
+}
+
 void NaxxPrePullGothik(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, std::ostringstream& dump)
 {
     Player* first = plan.members.front().p;
@@ -621,13 +802,30 @@ void NaxxPrePullGothik(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orde
         return;
     Creature* gothik = gate->FindNearestCreature(kGothik, 120.0f, true);
     if (!gothik || gothik->IsInCombat() || gate->GetGoState() != GO_STATE_ACTIVE)
+    {
+        g_gothSplitSince.erase(first->GetInstanceId());   // the next split's wait starts afresh
+        g_gothShot.erase(first->GetInstanceId());          // and the next opener is chosen afresh
         return;
+    }
     bool inRoom = false;
+    Player* above = nullptr;   // near the gate on the map but off its floor (his balcony's height): logged, the split waits for the floor
     for (Member const& m : plan.members)
-        if (m.p->GetExactDist2d(gate) < kGothRoom && std::fabs(m.p->GetPositionZ() - gate->GetPositionZ()) < 8.0f)
+    {
+        if (m.p->GetExactDist2d(gate) >= kGothRoom)
+            continue;
+        if (std::fabs(m.p->GetPositionZ() - gate->GetPositionZ()) < 8.0f)
             inRoom = true;
+        else if (!above)
+            above = m.p;
+    }
+    if (!inRoom && above && g_gothOffFloorLogged.insert(first->GetInstanceId()).second)
+        TC_LOG_WARN("playerbot.v2.raid", "[raid] Gothik: {} stands {:.0f} y from the combat gate at z {:.1f}, the gate's floor is z {:.1f}: no side split "
+                    "off the floor", above->GetName(), above->GetExactDist2d(gate), above->GetPositionZ(), gate->GetPositionZ());
     if (!inRoom || plan.members.size() < 2 * kSideMinimum)
+    {
+        g_gothSplitSince.erase(first->GetInstanceId());
         return;
+    }
 
     // Humans stay where they are and count for that side; bots alternate within each role so both sides get tanks,
     // healers and damage, starting with the side that has fewer humans.
@@ -675,6 +873,120 @@ void NaxxPrePullGothik(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orde
         SetMove(o, spot.x, spot.y, spot.z, side ? "gothik: live side" : "gothik: dead side");
     }
     dump << "  Gothik split: " << live << " live side, " << dead << " dead side\n";
+
+    // Once every bot stands at its spot, a tank on the live side draws him: he stands on his balcony 18 y above the floor and starts the
+    // fight only when somebody comes into his aggro reach in his sight (no area trigger in the classic script), and nobody walks up to him.
+    // naxx_gothik r23: the split worked, the attack order sent the main tank at him (no path up, his reach 49 y off), and the raid stood
+    // in its pre-pull spots for 121 s until the run failed. The draw spot is on the live side's floor, inside his reach by kGothDrawMargin.
+    uint32_t const nowMs = GameTime::GetGameTimeMS();
+    uint32_t const since = g_gothSplitSince.emplace(instance, nowMs).first->second;
+    std::vector<std::string> walking;
+    auto const shotIt = g_gothShot.find(instance);
+    for (Member const* m : ordered)
+    {
+        // The ranged opener's spot is its own: counted as walking to its side spot, it held the opener back every other pass and the
+        // split order sent it back (naxx_gothik r26: Mchuntc swapped between "walks to the opener spot" and "live side" for 10 s).
+        if (shotIt != g_gothShot.end() && shotIt->second.found && m->p->GetGUID() == shotIt->second.shooter)
+            continue;
+        auto it = g_gothSpot.find(m->p->GetGUID().GetCounter());
+        if (it == g_gothSpot.end() || it->second.instance != instance || m->p->GetExactDist2d(it->second.x, it->second.y) > 3.0f)
+            walking.push_back(fmt::format("{} {:.0f} y", m->p->GetName(), it == g_gothSpot.end() ? -1.0f : m->p->GetExactDist2d(it->second.x, it->second.y)));
+    }
+    if (!walking.empty())
+    {
+        if (nowMs - since < kGothDrawWaitMs)
+            return;   // still walking
+        static std::unordered_map<uint32_t, uint32_t> logged;
+        uint32_t& at = logged[instance];
+        if (!at || nowMs - at >= 15000u)
+        {
+            at = nowMs ? nowMs : 1u;
+            std::string list;
+            for (std::string const& w : walking)
+                list += (list.empty() ? "" : ", ") + w;
+            TC_LOG_INFO("playerbot.v2.raid", "[raid] Gothik: the split has stood {} s; the draw goes ahead with {} not at their spots: {}",
+                        (nowMs - since) / 1000u, walking.size(), list);
+        }
+    }
+    Member const* puller = nullptr;
+    for (Member const* m : ordered)
+    {
+        if (!m->tank || !g_gothSpot[m->p->GetGUID().GetCounter()].live)
+            continue;
+        if (!puller || m->p == plan.mainTank)
+            puller = m;
+    }
+    if (!puller)
+    {
+        NaxxGothikRangedOpener(orders, ordered, gothik, gate, instance, dump);   // no tank on the live side to draw him
+        return;
+    }
+    Player* const tank = puller->p;
+    auto drawIt = g_gothDraw.find(instance);
+    if (drawIt == g_gothDraw.end())
+    {
+        float const reach = gothik->GetAttackDistance(tank) + gothik->GetCombatReach() + tank->GetCombatReach();
+        float const dz = gothik->GetPositionZ() - gate->GetPositionZ();
+        Position draw;
+        bool const found = GothFloorSpot(gothik, gate, tank, reach - kGothDrawMargin, draw);
+        drawIt = g_gothDraw.emplace(instance, std::make_pair(found, draw)).first;
+        if (found)
+            TC_LOG_INFO("playerbot.v2.raid", "[raid] Gothik: {} draws him from ({:.1f},{:.1f},{:.1f}), {:.1f} y from him on his balcony at "
+                        "({:.1f},{:.1f},{:.1f}), his aggro reach {:.1f} y", tank->GetName(), draw.GetPositionX(), draw.GetPositionY(),
+                        draw.GetPositionZ(), gothik->GetExactDist(draw), gothik->GetPositionX(), gothik->GetPositionY(), gothik->GetPositionZ(), reach);
+        else
+            TC_LOG_WARN("playerbot.v2.raid", "[raid] Gothik: no floor spot on the live side within his aggro reach {:.1f} y (him at "
+                        "({:.1f},{:.1f},{:.1f}), {:.1f} y above the gate's floor): a ranged opener pulls him", reach, gothik->GetPositionX(),
+                        gothik->GetPositionY(), gothik->GetPositionZ(), dz);
+    }
+    if (!drawIt->second.first)
+    {
+        NaxxGothikRangedOpener(orders, ordered, gothik, gate, instance, dump);
+        return;
+    }
+    Position const& draw = drawIt->second.second;
+    RaidOrder& o = orders[tank->GetGUID().GetCounter()];
+    SetMove(o, draw.GetPositionX(), draw.GetPositionY(), draw.GetPositionZ(), "gothik: draws him from under his balcony");
+    dump << "  Gothik: " << tank->GetName() << " draws him\n";
+}
+
+// In the fight each side keeps its raiders. He goes back out of combat (EnterEvadeMode) when either side of the combat gate has fewer
+// than 10 living players at any of his speech checks, 5 s apart (classic_boss_gothik.cpp HasLessPlayersPerSide), and the gate stays shut
+// until late in the fight. naxx_gothik r26: the opener pulled him, the out-of-combat split orders ended with the pull, the raid ran after
+// its tanks across the gate line, and he reset 5 s later at 100%. So while he is on his balcony or the gate is shut, a bot on the wrong
+// side or out of his room goes back to its spot; one with no enemy on its side near it waits at its spot; one with an add near it fights.
+constexpr float kGothAddNear = 40.0f;
+bool GothikSideMove(Plan const& plan, Member const& self, RaidOrder& out)
+{
+    Unit* gothik = nullptr;
+    for (Unit* enemy : plan.enemies)
+        if (enemy->GetEntry() == kGothik)
+            gothik = enemy;
+    if (!gothik || !gothik->IsInCombat())
+        return false;
+    Player* const bot = self.p;
+    GameObject* gate = GothikGate(bot);
+    if (!gate || (gate->GetGoState() == GO_STATE_ACTIVE && !gothik->HasAura(kGothImmune)))
+        return false;   // the gates are open: one room again
+    auto it = g_gothSpot.find(bot->GetGUID().GetCounter());
+    if (it == g_gothSpot.end() || it->second.instance != bot->GetInstanceId())
+        return false;
+    GothSpot const& spot = it->second;
+    bool const away = LiveSide(gate, bot->GetPositionY()) != spot.live || bot->GetExactDist2d(gate) > kGothRoom;
+    if (!away)
+        for (Unit* enemy : plan.enemies)
+            if ((enemy->GetEntry() != kGothik || !enemy->HasAura(kGothImmune)) && LiveSide(gate, enemy->GetPositionY()) == spot.live &&
+                bot->GetExactDist2d(enemy) <= kGothAddNear)
+                return false;   // an add, or Gothik down from his balcony, on its side: the fight is here
+    out.post_enemy = gothik->GetGUID();
+    if (!away && bot->GetExactDist2d(spot.x, spot.y) <= 4.0f)
+    {
+        out.at_post = true;
+        out.hold_melee = !self.ranged && !self.healer;
+        return true;
+    }
+    SetMove(out, spot.x, spot.y, spot.z, spot.live ? "gothik: back to the live side" : "gothik: back to the dead side", away);
+    return true;
 }
 
 // In the fight the gate is closed: a bot only fights enemies on its own side (the other side is out of reach).
@@ -1187,6 +1499,8 @@ constexpr float    kPatchNearRaid  = 150.0f;
 constexpr float    kPatchHallZ     = 294.1f;
 struct PatchPost { float x, y; };
 constexpr PatchPost kPatchHealerPosts[] = { { 3326.0f, -3223.0f }, { 3326.0f, -3241.0f } };   // share 1 (even), share 2 (odd)
+// The ranged DPS stand at the same east end, 4 y further east, between the healers' corners (RaidEncounterData_NAXX.cpp, Patchwerk).
+constexpr PatchPost kPatchRangedPosts[] = { { 3330.0f, -3227.0f }, { 3330.0f, -3237.0f } };   // share 1 (even), share 2 (odd)
 std::unordered_set<uint32_t> g_patchPrePull;   // instances whose healers were sent
 
 void NaxxPrePullPatchwerk(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, std::ostringstream& dump)
@@ -1204,15 +1518,19 @@ void NaxxPrePullPatchwerk(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& o
         if (away < kPatchFarYards)
             return;
         g_patchPrePull.insert(instance);
-        TC_LOG_INFO("playerbot.v2.raid", "[raid_patchwerk] he is {:.0f} y down his walk (at {:.1f},{:.1f}): the healers go to their posts at the hall's east end",
+        TC_LOG_INFO("playerbot.v2.raid", "[raid_patchwerk] he is {:.0f} y down his walk (at {:.1f},{:.1f}): the healers and the ranged go to their posts at the hall's east end",
                     away, patch->GetPositionX(), patch->GetPositionY());
     }
-    uint32_t index = 0, sent = 0;
+    // Healers and ranged DPS alike: the ranged had their post west of him in the hall, and from the lower floor the way up to it runs past
+    // him, so they walked into his 18 y circle, out again and back for the whole fight (naxx_patchwerk 1115 threat run: all 16 ranged DPS
+    // on "leave hazard" / "role position" turn about, 0 damage in 90 s). Waiting at the east end before the pull, they never cross it.
+    uint32_t healerIndex = 0, rangedIndex = 0, healers = 0, ranged = 0;
     for (Member const& m : plan.members)
     {
-        if (!m.healer)
+        bool const isRanged = !m.tank && !m.healer && m.ranged;   // Who::Ranged
+        if (!m.healer && !isRanged)
             continue;
-        PatchPost const& post = kPatchHealerPosts[index++ & 1u];
+        PatchPost const& post = m.healer ? kPatchHealerPosts[healerIndex++ & 1u] : kPatchRangedPosts[rangedIndex++ & 1u];
         if (!m.bot)
             continue;
         float z = kPatchHallZ;
@@ -1221,10 +1539,10 @@ void NaxxPrePullPatchwerk(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& o
         RaidOrder& o = orders[m.p->GetGUID().GetCounter()];
         o.active = true;
         o.prepull = true;
-        SetMove(o, post.x, post.y, z, "patchwerk: healer post");
-        ++sent;
+        SetMove(o, post.x, post.y, z, m.healer ? "patchwerk: healer post" : "patchwerk: ranged post");
+        ++(m.healer ? healers : ranged);
     }
-    dump << "  Patchwerk: " << sent << " healers to the east end, he is " << int(away) << " y from his spawn\n";
+    dump << "  Patchwerk: " << healers << " healers and " << ranged << " ranged to the east end, he is " << int(away) << " y from his spawn\n";
 }
 
 void NaxxPrePull(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, std::ostringstream& dump)
@@ -1233,6 +1551,10 @@ void NaxxPrePull(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, st
     if (g_patchPrePull.size() > 64)
         g_patchPrePull.clear();
     NaxxPrePullGothik(plan, orders, dump);
+    if (g_gothDraw.size() > 64)
+        g_gothDraw.clear();
+    if (g_gothSplitSince.size() > 64)
+        g_gothSplitSince.clear();
     NaxxPrePullThaddius(plan, orders, dump);
     if (g_thadSpot.size() > 512)
         g_thadSpot.clear();
@@ -1240,23 +1562,214 @@ void NaxxPrePull(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, st
         g_thadAnchor.clear();
     if (g_gothSpot.size() > 512)
         g_gothSpot.clear();
+    if (g_gothOffFloorLogged.size() > 64)
+        g_gothOffFloorLogged.clear();
     if (g_gothAnchor.size() > 64)
         g_gothAnchor.clear();
     if (g_gluthAnchor.size() > 64)
         g_gluthAnchor.clear();
 }
 
+// ---------------------------------------------------------------------------
+// Maexxna: Web Spray
+// ---------------------------------------------------------------------------
+// Web Spray (29484) stuns the whole raid in her room for 10 s, her tank too, every 40 s from the pull (MaexWebSprayCooldown in
+// classic_boss_maexxna.cpp): nobody heals and the tank cannot block, parry or dodge while she keeps hitting it. At 30% she enrages
+// (28747: +250% damage done, +50% attack speed). naxx21: the tank fell to 33-39% in each of the first two stuns and died right after the
+// second to a Poison Shock; once she was enraged every stun killed the tank she was on, and the last tank went at 133 s. In the seconds
+// before the spray the healers put what keeps healing through a stun on her tank (Power Word: Shield, Renew, Rejuvenation, Regrowth),
+// each by one healer, and once she is enraged her warrior tank opens Shield Wall, or Last Stand when the wall is spent.
+constexpr uint32_t kMaexxna        = 15952;
+constexpr uint32_t kWebSpray       = 29484;
+constexpr uint32_t kMaexEnrage     = 28747;
+constexpr uint32_t kSprayCycleMs   = 40000;
+constexpr uint32_t kSprayPrepMs    = 7000;    // the jobs start this long before the spray is due (a Regrowth's cast and a GCD each)
+constexpr uint32_t kSprayLateMs    = 5000;    // and stop this long after it was due, if the clock was off and no spray came
+constexpr uint32_t kWeakenedSoul   = 6788;
+constexpr uint32_t kShieldWall     = 871;
+constexpr uint32_t kLastStand      = 12975;
+
+// `withinMs`: the job waits until the spray is due within this long (0: from kSprayPrepMs on).
+struct SprayJob { uint32_t base; uint32_t blockedBy; uint32_t withinMs; char const* what; };
+// Abolish Poison: her Necrotic Poison (28776, healing taken -90 %) comes back on her target every 5-10 s, so one lands while every
+// healer stands stunned in the web and the heals over time on her tank do a tenth. naxx_maexxna r25 (combined 1118): it was cleansed
+// 4 s before the first spray and on him again 5 s into it; her tank went from 94 % to dead in 9 s under the HoTs. Abolish Poison
+// takes a poison off every 2 s for 8 s, stunned healer or not, so it goes on as late as it can: within 2.5 s of the spray it lasts
+// some 6 s into it.
+SprayJob const kSprayJobs[] = {
+    { 2893, 0,             2500, "maexxna: abolish poison on her tank before Web Spray" },   // Abolish Poison
+    { 17,   kWeakenedSoul, 0,    "maexxna: shield her tank before Web Spray" },     // Power Word: Shield
+    { 139,  0,             0,    "maexxna: renew her tank before Web Spray" },      // Renew
+    { 774,  0,             0,    "maexxna: rejuvenation on her tank before Web Spray" },
+    { 8936, 0,             0,    "maexxna: regrowth on her tank before Web Spray" },
+};
+
+struct MaexSpray
+{
+    uint32_t engaged = 0;   // first plan that saw her in the fight
+    uint32_t seen = 0;      // last plan that saw her (a gap means a new pull: her guid stays the same after a wipe)
+    uint32_t last = 0;      // when the last spray went on (from its aura)
+    bool     up = false;    // a spray is on the raid now
+    std::unordered_map<uint32_t, uint64_t> jobOf;   // job family -> the healer on it for the coming spray
+    uint32_t jobsFor = 0;   // the spray time those jobs are for
+};
+std::unordered_map<uint64_t, MaexSpray> g_maexSpray;   // her guid -> the spray clock
+
+bool AnyRankOn(Unit* u, uint32_t base)
+{
+    for (uint32_t const id : SpellFamily::Ranks(base))
+        if (u->HasAura(id))
+            return true;
+    return false;
+}
+
+bool Stunned(Player* p) { return p->HasUnitState(UNIT_STATE_STUNNED) || p->HasAura(kWebSpray); }
+
+int ManaPctOf(Player* p)
+{
+    uint32_t const max = p->GetMaxPower(POWER_MANA);
+    return max ? int(uint64_t(p->GetPower(POWER_MANA)) * 100 / max) : 100;
+}
+
+// One healer for one job: the one that had it while it is still able, else the first idle one that can cast it now.
+Player* SprayHealer(Election& e, MaexSpray& st, SprayJob const& job, Unit* tank, uint32_t& spell)
+{
+    Ranks const ranks = SpellFamily::Ranks(job.base);
+    auto able = [&](Member const& m)
+    {
+        if (!m.bot || !m.healer || m.p == tank || e.busy.count(m.p->GetGUID().GetCounter()) || Stunned(m.p) || ManaPctOf(m.p) < 10)
+            return false;
+        spell = KnownRank(m.p, ranks);
+        return spell && Ready(m.p, spell, tank, false);
+    };
+    if (auto it = st.jobOf.find(job.base); it != st.jobOf.end())
+        for (Member const& m : e.plan.members)
+            if (m.p->GetGUID().GetCounter() == it->second && able(m))
+                return m.p;
+    for (bool allowCasting : { false, true })
+        for (Member const& m : e.plan.members)
+            if (Busy(m.p) == allowCasting && able(m))
+                return m.p;
+    return nullptr;
+}
+
+void ElectMaexxnaSpray(Election& e, uint32_t now)
+{
+    Plan& plan = e.plan;
+    Unit* maex = nullptr;
+    for (Unit* enemy : plan.enemies)
+        if (enemy->GetEntry() == kMaexxna)
+            maex = enemy;
+    if (!maex)
+        return;
+    MaexSpray& st = g_maexSpray[maex->GetGUID().GetCounter()];
+    if (st.engaged && now - st.seen > 10000)
+        st = MaexSpray();
+    st.seen = now;
+    if (!st.engaged)
+        st.engaged = now;
+    // The clock follows the spray itself once one was seen: it went on when its aura did.
+    bool up = false;
+    for (Member const& m : plan.members)
+        if (Aura const* a = m.p->GetAura(kWebSpray))
+        {
+            up = true;
+            if (!st.up)
+                st.last = now - std::min<uint32_t>(now, uint32_t(std::max(0, a->GetMaxDuration() - a->GetDuration())));
+            break;
+        }
+    st.up = up;
+    uint32_t const due = (st.last ? st.last : st.engaged) + kSprayCycleMs;
+    if (up || now + kSprayPrepMs < due || now > due + kSprayLateMs)
+        return;
+    if (st.jobsFor != due)
+    {
+        st.jobsFor = due;
+        st.jobOf.clear();
+    }
+    // Every heal on her tank lands from here to the spray (CancelOverheal keeps it).
+    for (Member const& m : plan.members)
+        if (m.bot && m.healer)
+            if (RaidOrder* ho = e.OrderOf(m.p))
+                ho->keep_heals = true;
+    Unit* tank = maex->GetVictim();
+    Player* holder = tank ? tank->ToPlayer() : nullptr;
+    if (!holder || !FindMember(plan, holder))
+        return;
+    int const inMs = int(due) - int(now);
+    // Her tank is set for the spray: from here on no other tank takes her (its taunt would leave the shield, the heals over time and
+    // Abolish Poison on the tank she just left). naxx_maexxna r26: the jobs went on Mctankwb 7-2 s before the spray, the main tank
+    // took her back from it 1.5 s before, and died in the web with one shield on him.
+    if (Member const* hm = FindMember(plan, holder); hm && hm->tank)
+        for (Member const& m : plan.members)
+            if (m.tank && m.p != holder)
+                if (RaidOrder* to = e.OrderOf(m.p))
+                    to->forbidden_targets.push_back(maex->GetGUID());
+
+    for (SprayJob const& job : kSprayJobs)
+    {
+        if (AnyRankOn(holder, job.base) || (job.blockedBy && holder->HasAura(job.blockedBy)) || (job.withinMs && inMs > int(job.withinMs)))
+            continue;
+        uint32_t spell = 0;
+        Player* healer = SprayHealer(e, st, job, holder, spell);
+        if (!healer)
+            continue;
+        RaidOrder* o = e.OrderOf(healer);
+        if (!o)
+            continue;
+        o->cast_kind = RaidOrder::CastKind::Prepare;
+        o->cast_spell = spell;
+        o->cast_target = holder->GetGUID();
+        e.busy.insert(healer->GetGUID().GetCounter());
+        e.dump << "  " << healer->GetName() << ": " << job.what << " " << spell << " -> " << holder->GetName() << "\n";
+        auto [it, fresh] = st.jobOf.try_emplace(job.base, healer->GetGUID().GetCounter());
+        if (fresh || it->second != healer->GetGUID().GetCounter())
+        {
+            it->second = healer->GetGUID().GetCounter();
+            TC_LOG_INFO("playerbot.v2.raid", "[raid_maexxna] {} casts {} on {} ({:.0f}%) {:.1f} s before Web Spray", healer->GetName(), spell,
+                        holder->GetName(), holder->GetHealthPct(), inMs / 1000.0f);
+        }
+    }
+
+    // Enraged, a stun is a tank's death: the wall first, Last Stand once the wall is spent.
+    Member* hm = FindMember(plan, holder);
+    if (!hm->bot || !hm->tank || holder->GetClass() != CLASS_WARRIOR || e.busy.count(holder->GetGUID().GetCounter()))
+        return;
+    if (!maex->HasAura(kMaexEnrage) || holder->HasAura(kShieldWall) || holder->HasAura(kLastStand))
+        return;
+    for (uint32_t const spell : { kShieldWall, kLastStand })
+    {
+        if (!holder->HasSpell(spell) || !Ready(holder, spell, holder, false))
+            continue;
+        RaidOrder* o = e.OrderOf(holder);
+        if (!o)
+            return;
+        o->cast_kind = RaidOrder::CastKind::Prepare;
+        o->cast_spell = spell;
+        o->cast_target = holder->GetGUID();
+        e.busy.insert(holder->GetGUID().GetCounter());
+        e.dump << "  " << holder->GetName() << ": maexxna: " << (spell == kShieldWall ? "Shield Wall" : "Last Stand") << " before Web Spray\n";
+        if (inMs > int(kSprayPrepMs) - 1000)
+            TC_LOG_INFO("playerbot.v2.raid", "[raid_maexxna] {} opens {} at {:.0f}%, she is enraged, {:.1f} s before Web Spray", holder->GetName(),
+                        spell == kShieldWall ? "Shield Wall" : "Last Stand", holder->GetHealthPct(), inMs / 1000.0f);
+        return;
+    }
+}
+
 bool NaxxMechanicsMove(Plan const& plan, Member const& self, uint32_t now, RaidOrder& out)
 {
-    return HeiganMove(plan, self, now, out) || SapphironMove(plan, self, now, out) || ThaddiusSideMove(plan, self, out) ||
+    return HeiganMove(plan, self, now, out) || SapphironMove(plan, self, now, out) || GothikSideMove(plan, self, out) || ThaddiusSideMove(plan, self, out) ||
            GluthMove(plan, self, now, out);
 }
 
-void NaxxMechanicsElect(Election& e, uint32_t /*now*/)
+void NaxxMechanicsElect(Election& e, uint32_t now)
 {
     ElectRazuvious(e);
     ElectFaerlina(e);
     ElectGothikSides(e);
+    ElectMaexxnaSpray(e, now);
+    if (g_maexSpray.size() > 64)
+        g_maexSpray.clear();
     if (g_airSpread.size() > 256)
         g_airSpread.clear();
 }

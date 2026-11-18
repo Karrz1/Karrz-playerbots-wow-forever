@@ -6,6 +6,7 @@
 #pragma once
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <map>
@@ -75,6 +76,32 @@ inline int PickGrindSpot(std::vector<GrindSpot> const& spots, std::uint32_t map,
         ok.push_back(int(i));
     }
     return ok.empty() ? -1 : ok[seed % ok.size()];
+}
+
+// Mob supply (Playerbot.World.MobsPerBot): the ordinary hostile mobs in the camps of a level (within kGrindLevelSpread of the camp's
+// average) within `radius` of (x, y). The world bots around a player all level on these, so they set how many bots a place can feed.
+inline std::uint32_t MobSupplyNear(std::vector<GrindSpot> const& spots, std::uint32_t map, float x, float y, std::uint32_t level, float radius)
+{
+    std::uint32_t mobs = 0;
+    for (GrindSpot const& g : spots)
+    {
+        if (g.map != map) continue;
+        std::uint32_t const gap = g.level > level ? g.level - level : level - g.level;
+        if (gap > kGrindLevelSpread) continue;
+        if (std::hypot(g.x - x, g.y - y) > radius) continue;
+        mobs += g.mobs;
+    }
+    return mobs;
+}
+
+// How many world bots `mobs` feed: one per `mobs_per_bot`, never fewer than `floor` (a place with few camps still looks lived in;
+// those bots quest, travel and visit towns too). mobs_per_bot 0 = no supply cap. Eastern Plaguelands 2026-11-16 (Karrz): the zone
+// number of bots around one player left nothing alive. A bot kills a mob of its level about every 40 s with rest, so on a 5 minute
+// respawn about 7 spawns feed one bot; the default 10 leaves the rest for the players.
+inline std::uint32_t SupplyBotCap(std::uint32_t mobs, std::uint32_t mobs_per_bot, std::uint32_t floor)
+{
+    if (!mobs_per_bot) return UINT32_MAX;
+    return std::max(floor, mobs / mobs_per_bot);
 }
 
 } // namespace Playerbot::V2::World

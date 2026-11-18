@@ -26,9 +26,28 @@ char const* CastRuleName(RaidOrder::CastKind kind)
         case RaidOrder::CastKind::Nuke:         return "raid:nuke";
         case RaidOrder::CastKind::Disarm:       return "raid:disarm";
         case RaidOrder::CastKind::StanceDance:  return "raid:stance_dance";
+        case RaidOrder::CastKind::Prepare:      return "raid:prepare";
         case RaidOrder::CastKind::None:         break;
     }
     return "raid:cast";
+}
+
+// The core takes no move from a stunned, rooted, feared or confused bot (UNIT_STATE_NOT_MOVE; fear and confusion move it themselves).
+bool BodyHeld(BotSnapshotView const& s)
+{
+    return s.is_stunned() || s.is_rooted() || s.is_feared() || s.is_confused();
+}
+
+// A raid move while the bot casts (see DispatchRaidOrder): an urgent one stops the cast and goes (true, cast cancelled); any other holds
+// the tick until the cast ends (false, the caller claims the tick without sending the move).
+bool CastGivesWay(RaidOrder const& o, BotSnapshotView const& s, BotIntentEmitter& emit)
+{
+    if (!s.is_casting())
+        return true;
+    if (!o.move_urgent)
+        return false;
+    emit.cancel_cast();
+    return true;
 }
 
 } // namespace
@@ -88,14 +107,22 @@ bool DispatchRaidOrder(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em
     // 1. Hazards first: leaving Inferno / Living Bomb range / a breath corridor beats everything else.
     //    A deduped re-emit (same point, still walking) still owns the tick so the rotation does not chase back in. A move that was
     //    refused (the path ring, the API's no-path answer) owns nothing: the bot stood on the spot casting and attacking nothing.
-    if (o.move)
+    //    Each bot takes its own move when it can walk. The core refuses a move while the bot casts, is stunned or rooted, and the
+    //    refusal used to mark the spot as one the bot cannot reach for 6 s (BotAI::note_move_refused, meant for a navmesh refusal): the
+    //    move gave the tick back, the rotation started the next cast, and the bot stood in the open casting until the 6 s ran out
+    //    (naxx22 1116: 73 "casting" refusals of raid moves in Gluth, 57 in the Horsemen, Sapphiron's hide refused for frozen and casting
+    //    raiders alike). So no move is sent while it cannot be taken:
+    //    - stunned, rooted, feared or confused: the rotation gets the tick (a rooted caster still casts), the move goes out once free;
+    //    - casting: a way out of something that kills where the bot stands (RaidOrder::move_urgent) stops the cast and goes now; any other
+    //      move holds the tick until the cast ends, so no new cast starts before it (onyxia_full 245: two healers stood in Heated Ground
+    //      22194/22195 casting Flash Heal and Flash of Light for two to three seconds after their leave-hazard order, and died).
+    if (o.move && !BodyHeld(s))
     {
-        // A way out of a hazard or a cone is not held back by the bot's own cast: the core refuses every move while a cast runs, and a
-        // healer started the next heal in the same tick the refused move gave the tick back (onyxia_full 245: two healers stood in
-        // Heated Ground 22194/22195 casting Flash Heal and Flash of Light for two to three seconds after their leave-hazard order, and died).
-        if (s.is_casting() && o.move_reason &&
-            (std::strcmp(o.move_reason, "leave hazard") == 0 || std::strcmp(o.move_reason, "leave cone") == 0))
-            emit.cancel_cast();
+        if (!CastGivesWay(o, s, emit))
+        {
+            ai.set_last_rule_fired("raid:move_after_cast");
+            return true;
+        }
         if (emit.move_to(o.move_x, o.move_y, o.move_z, /*run=*/true) || emit.move_already_emitted(o.move_x, o.move_y, o.move_z))
         {
             ai.set_last_rule_fired("raid:move");
@@ -184,8 +211,14 @@ bool DispatchRaidOrder(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em
         std::find(o.forbidden_targets.begin(), o.forbidden_targets.end(), victim) != o.forbidden_targets.end();
     // An idle DPS bot picks up the fallback too, unless its owner told it to stay.
     bool const idleDps = victim.IsEmpty() && !o.fallback_target.IsEmpty() && !ai.holding_position(s.published_at_ms());
-    // An idle tank (its enemy is airborne or dead) takes the brain's ground target.
-    bool const idleTank = victim.IsEmpty() && o.fallback_target.IsEmpty() && !o.tank_fallback_target.IsEmpty() && !ai.holding_position(s.published_at_ms());
+    // An idle tank (its enemy is airborne or dead) takes the brain's ground target, unless that target is one it must not attack:
+    // Gluth's chow tanks have him forbidden and a chow for their soak target, and the ground target (him) taken here first was dropped
+    // as forbidden next tick, over and over, so the soak step below never ran (naxx_gluth r25: Mctankwc on Gluth 56 y off and off
+    // again every 1-2 s for the whole fight, Mctankda alone held 12 chows and died at 72 s, the loose chows killed the casters).
+    bool const tankFallbackForbidden = !o.tank_fallback_target.IsEmpty() &&
+        std::find(o.forbidden_targets.begin(), o.forbidden_targets.end(), o.tank_fallback_target) != o.forbidden_targets.end();
+    bool const idleTank = victim.IsEmpty() && o.fallback_target.IsEmpty() && !o.tank_fallback_target.IsEmpty() && !tankFallbackForbidden &&
+        !ai.holding_position(s.published_at_ms());
     if (idleTank && emit.start_attack(o.tank_fallback_target))
     {
         ai.set_last_rule_fired("raid:switch_target");
@@ -201,7 +234,8 @@ bool DispatchRaidOrder(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em
                 return true;
             }
         }
-        if (forbidden && !o.tank_fallback_target.IsEmpty() && o.tank_fallback_target != victim && o.tank_fallback_target != o.fallback_target)
+        if (forbidden && !o.tank_fallback_target.IsEmpty() && !tankFallbackForbidden && o.tank_fallback_target != victim &&
+            o.tank_fallback_target != o.fallback_target)
         {
             if (emit.start_attack(o.tank_fallback_target))
             {
@@ -277,11 +311,17 @@ void RegisterRaidIdleRules(IdleRuleRegistry& r)
     move.gate = [](BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
     {
         RaidOrder const& o = s.raw().raid_order;
-        return o.active && !o.prepull && o.move && s.is_alive();
+        return o.active && !o.prepull && o.move && s.is_alive() && !Raid::BodyHeld(s);
     };
     move.fire = [](BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
     {
         RaidOrder const& o = s.raw().raid_order;
+        // A buff under way finishes first, unless the move is a way out (as in DispatchRaidOrder).
+        if (!Raid::CastGivesWay(o, s, emit))
+        {
+            ai.set_last_rule_fired("idle:raid_move_after_cast");
+            return true;
+        }
         // A refused move does not claim the tick (see raid:move in DispatchRaidOrder): the idle rules below get the bot.
         if (!emit.move_to(o.move_x, o.move_y, o.move_z, /*run=*/true) && !emit.move_already_emitted(o.move_x, o.move_y, o.move_z))
             return false;

@@ -71,7 +71,9 @@ inline constexpr std::array<Option, 1> kPriest    = {{ { 9484, kUndead, 28.f, fa
 // mob must come within reach of the hunter) first; in combat Scare Beast still holds a beast. Scare Beast is a short-range spell
 // (vanilla 10 y; every rank has SpellMisc RangeIndex 7, Polymorph has 4): at 28 the hunter cast it from 24-27 y and the core
 // refused every one (smlibrary_loksey 0.1.28j: 18 casts in 41 s, API_BEYOND_RANGE, the hound killed the tank).
-inline constexpr std::array<Option, 2> kHunter    = {{ { kFreezingTrap, kAnyType, 12.f, true, false, true },
+// Wyvern Sting (Survival talent, a 12 s sleep shot, humanoids as ApCrowdControl::CanBeCCd keeps it) holds a humanoid in combat from range.
+inline constexpr std::array<Option, 3> kHunter    = {{ { kFreezingTrap, kAnyType, 12.f, true, false, true },
+                                                       { 19386, kHumanoid, 28.f, false, false },
                                                        { 1513, kBeast, 9.f, false, false } }};
 inline constexpr std::array<Option, 1> kRogue     = {{ { 6770, kHumanoid, 9.f, true, true } }};
 inline constexpr std::array<Option, 2> kDruid     = {{ { 2637, kBeast | kDragonkin, 28.f, false, false },

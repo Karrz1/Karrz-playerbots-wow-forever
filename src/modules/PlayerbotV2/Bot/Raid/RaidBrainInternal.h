@@ -65,12 +65,16 @@ bool Controlled(Unit* u);
 // from where it stands (the path walks round what is between) and it need not be in the fight area round the main tank (the row is wider).
 bool Usable(Player* bot, float x, float y, float zHint, float& outZ, bool urgent = false, bool hazard = false, bool fixedPlace = false);
 void ResetPathProbes();
-bool SetMove(RaidOrder& out, float x, float y, float z, char const* reason);
+// `urgent`: see RaidOrder::move_urgent (the move is a way out of something that kills where the bot stands).
+bool SetMove(RaidOrder& out, float x, float y, float z, char const* reason, bool urgent = false);
 // Best nearby point that increases the distance to every raid member in `others`.
 // Points inside `avoid` (the bot's hazard circles) are skipped.
 bool Clearest(Player* bot, std::vector<Player*> const& others, float wanted, RaidOrder& out, char const* reason,
               std::vector<Circle> const& avoid, bool urgent);
 uint32_t KnownRank(Player* p, Ranks const& ranks);
+// The ranged opener a bot pulls with, one shot from range (0: none it knows). Hunters first (order 0), then mages (1), then warlocks (2);
+// order 3 for every other class.
+uint32_t RangedPullSpell(Player* p, int& order);
 bool Ready(Player* p, uint32_t spellId, Unit* target, bool hostile);
 bool Busy(Player* p);
 uint32_t Stacks(Unit* u, uint32_t aura);

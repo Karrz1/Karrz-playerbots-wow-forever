@@ -53,6 +53,7 @@
 #include "StringFormat.h"
 #include "MotionMaster.h"
 #include "../Bot/World/ZonePicker.h"
+#include "../Bot/World/GrindSpot.h"
 #include "../Bot/World/SpreadSpot.h"
 #include "Config.h"
 #include "GameTime.h"
@@ -258,6 +259,8 @@ void WorldBotSpawner::LoadConfig()
     c.city_bots        = uint32(sConfigMgr->GetIntDefault("Playerbot.World.CityBots", 0, true));
     c.zone_bots        = uint32(sConfigMgr->GetIntDefault("Playerbot.World.ZoneBots", 0, true));
     c.start_zone_bots  = uint32(sConfigMgr->GetIntDefault("Playerbot.World.StartZoneBots", 25, true));
+    c.mobs_per_bot     = uint32(std::clamp<int64>(sConfigMgr->GetIntDefault("Playerbot.World.MobsPerBot", 10, true), 0, 1000));
+    c.supply_floor     = uint32(std::clamp<int64>(sConfigMgr->GetIntDefault("Playerbot.World.MobSupplyFloor", 5, true), 0, 1000));
     c.activity_radius  = std::max(50.0f, sConfigMgr->GetFloatDefault("Playerbot.World.ActivityRadius", 300.0f, true));
     c.despawn_radius   = std::max(c.activity_radius * 1.1f,
                                   sConfigMgr->GetFloatDefault("Playerbot.World.DespawnRadius", c.activity_radius * 1.5f, true));
@@ -862,8 +865,23 @@ void WorldBotSpawner::TrackMotion(uint32 now_ms, std::vector<Anchor>& anchors)
         it = seen.count(it->first) ? std::next(it) : motion_.erase(it);
 }
 
-// Plain bot numbers: what one place wants before the cap is shared (city number, the zone's rolled number, the start-zone cap,
-// then the hour of the day).
+uint32 WorldBotSpawner::SupplyCapFor(Anchor const& a) const
+{
+    if (!cfg_.mobs_per_bot)
+        return UINT32_MAX;
+    uint64 const key = ::Playerbot::V2::Fleet::PlaceKey(a.map, a.zone);
+    if (auto it = supply_cap_.find(key); it != supply_cap_.end() && it->second.level == a.level)
+        return it->second.cap;
+    uint32 const mobs = ::Playerbot::V2::World::GrindMobsNear(a.alliance, a.map, a.x, a.y, a.level, cfg_.activity_radius);
+    uint32 const cap = ::Playerbot::V2::World::SupplyBotCap(mobs, cfg_.mobs_per_bot, cfg_.supply_floor);
+    supply_cap_[key] = SupplyCap{ a.level, cap };
+    TC_LOG_INFO("playerbot.v2", "[world] mob supply zone {} L{}: {} mobs of the level within {:.0f} y -> at most {} bots (MobsPerBot {}, floor {})",
+        a.zone, uint32(a.level), mobs, cfg_.activity_radius, cap, cfg_.mobs_per_bot, cfg_.supply_floor);
+    return cap;
+}
+
+// Plain bot numbers: what one place wants before the cap is shared (city number, the zone's rolled number, the mob supply of a
+// leveling zone, the start-zone cap, then the hour of the day).
 uint32 WorldBotSpawner::PlaceWantFor(Anchor const& a)
 {
     namespace F = ::Playerbot::V2::Fleet;
@@ -875,7 +893,7 @@ uint32 WorldBotSpawner::PlaceWantFor(Anchor const& a)
         auto it = zone_roll_.find(key);
         if (it == zone_roll_.end())
             it = zone_roll_.emplace(key, F::ZoneRoll(cfg_.zone_lo, cfg_.zone_hi, urand(0, 0x7FFFFFFF))).first;
-        want = it->second;
+        want = std::min(it->second, SupplyCapFor(a));
     }
     bool const start_zone = !town && cfg_.start_zone_bots && ::Playerbot::V2::World::IsStartZone(a.zone);
     if (start_zone)
@@ -901,6 +919,7 @@ void WorldBotSpawner::PlanPlaces(uint32 now_ms, std::vector<Anchor> const& ancho
         if (getMSTimeDiff(it->second, now_ms) > std::max<uint32>(cfg_.leave_zone_ms, 1000u))
         {
             zone_roll_.erase(it->first);
+            supply_cap_.erase(it->first);
             it = place_seen_ms_.erase(it);
         }
         else
@@ -934,6 +953,8 @@ uint32 WorldBotSpawner::TargetFor(Anchor const& a) const
     bool const town = ::Playerbot::V2::World::IsVanillaCapitalZone(a.zone);
     uint32 const t = town ? cfg_.city_bots : cfg_.zone_bots;
     uint32 base = t ? t : cfg_.bots_per_player;
+    if (!town)
+        base = std::min(base, SupplyCapFor(a));
     // A start zone is one valley with one camp: the ordinary zone density piled 77 bots into Mulgore (PC 20 Oct), and the whole crowd walked back to the
     // camp's quest giver however often the crowd pass moved it.
     bool const start_zone = !town && cfg_.start_zone_bots && ::Playerbot::V2::World::IsStartZone(a.zone);

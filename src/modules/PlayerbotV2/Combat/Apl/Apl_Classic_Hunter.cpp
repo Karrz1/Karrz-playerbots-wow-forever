@@ -28,6 +28,7 @@
 #include "../ApRotation.h"
 #include "Apl_Baseline_Common.h"
 #include "ApSchoolHint.h"
+#include "ApCrowdControl.h"   // PickGroupCC
 #include "ApInterrupt.h"   // EngagedWithGroup
 #include "Bot/BotIntentEmitter.h"
 #include "Bot/BotSnapshotView.h"
@@ -435,6 +436,30 @@ bool ShouldPrePullTrap(ApPredicateContext const& ctx)
 }
 void DoPrePullTrap(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(FREEZING_TRAP); }
 
+// Wyvern Sting (Survival talent, 19386 and its ranks): a 12 s sleep shot. In combat it holds an add the group fights, the way the
+// mage's Polymorph does (PickGroupCC: never the kill target, the tank's target, a marked mob or a boss; in an instance from a pull of
+// three, in the open world from two). The hunter had no crowd control once the fight began (Karrz 2026-11-16: bots of every class
+// crowd-control by themselves). The owner's "no sleep" / "off cc" orders drop it (CcDeny::Sleep).
+constexpr uint32 WYVERN_STING = 19386;
+bool ShouldWyvernSting(ApPredicateContext const& ctx)
+{
+    if (!HasLiveTarget(ctx) || !ctx.bot.in_combat() || !Ready(ctx, WYVERN_STING))
+        return false;
+    ObjectGuid const pick = PickGroupCC(ctx, WYVERN_STING);
+    if (pick.IsEmpty())
+        return false;
+    // A shot: not inside the 8 yd dead zone, where the cast is refused.
+    auto const& me = ctx.bot.raw().position;
+    for (NearbyUnit const& u : ctx.bot.raw().combat.nearby_enemies)
+        if (u.guid == pick)
+        {
+            float const dx = u.x - me.x, dy = u.y - me.y, dz = u.z - me.z;
+            return dx * dx + dy * dy + dz * dz >= 8.f * 8.f;
+        }
+    return false;
+}
+void DoWyvernSting(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(WYVERN_STING, PickGroupCC(ctx, WYVERN_STING)); }
+
 // Tranquilizing Shot (level 60 book; only once learned): an elite / boss
 // engaged with the group carrying an aura the shot removes (Enrage / vanilla
 // Frenzy: Magmadar, Death Talon Seether, Chromaggus, Gluth -
@@ -511,6 +536,7 @@ ApRule const kRules[] = {
     { ShouldAspect,        DoAspect,        "classic_hunter:aspect" },
     { ShouldTrueshotAura,  DoTrueshotAura,  "classic_hunter:trueshot_aura" },
     { ShouldPrePullTrap,   DoPrePullTrap,   "classic_hunter:freezing_trap" },
+    { ShouldWyvernSting,   DoWyvernSting,   "classic_hunter:wyvern_sting" },
     { ShouldBestialWrath,  DoBestialWrath,  "classic_hunter:bestial_wrath" },
     { ShouldRapidFire,     DoRapidFire,     "classic_hunter:rapid_fire" },
     { ShouldReadiness,     DoReadiness,     "classic_hunter:readiness" },

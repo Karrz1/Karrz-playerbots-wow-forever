@@ -587,6 +587,29 @@ bool UsesThrownRanged(uint8 cls)
     return (cls == CLASS_WARRIOR || cls == CLASS_ROGUE) && Services::Config().behavior_tank_ranged_weapon();
 }
 
+bool IsFishingPole(uint32 entry)
+{
+    ItemTemplate const* t = entry ? sObjectMgr->GetItemTemplate(entry) : nullptr;
+    return t && t->GetClass() == ITEM_CLASS_WEAPON && t->GetSubClass() == ITEM_SUBCLASS_WEAPON_FISHING_POLE;
+}
+
+uint8 AutoEquipSlot(uint16 spec, uint8 slot, uint32 entry)
+{
+    if (slot != EQUIPMENT_SLOT_MAINHAND && slot != EQUIPMENT_SLOT_OFFHAND)
+        return slot;
+    ItemTemplate const* t = sObjectMgr->GetItemTemplate(entry);
+    if (!t || IsFishingPole(entry))
+        return 0xFF;
+    if (spec != 73 && spec != 66)
+        return slot;
+    uint32 const inv = t->GetInventoryType();
+    if (inv == INVTYPE_WEAPON || inv == INVTYPE_WEAPONMAINHAND)
+        return EQUIPMENT_SLOT_MAINHAND;   // a one-hander the server would put in the off hand goes to the main hand
+    if (inv == INVTYPE_SHIELD)
+        return EQUIPMENT_SLOT_OFFHAND;
+    return 0xFF;
+}
+
 int32 LiveRaidIlvlCap() { return RaidIlvlCap(); }
 int32 LiveWorldIlvlCap() { return WorldIlvlCap(); }
 
@@ -747,6 +770,13 @@ std::string PlanEquipOrder(::Playerbot::BotSnapshot const& snap, std::string con
             return fmt::format("{}: [{}] is a PvP item, I don't wear those", bot_name, t->GetDefaultLocaleName());
         if (found->equip_slot == 0xFF || found->equip_slot >= equipped.size())
             return fmt::format("{}: I can't wear [{}]", bot_name, t->GetDefaultLocaleName());
+        // A shield or off hand never goes on next to a two-hander (the server refuses it, EQUIP_ERR_2HANDED_EQUIPPED), and the
+        // answer said "equipped" (11-17: a tank holding a fishing pole "ignored" every shield it was given).
+        if (found->equip_slot == EQUIPMENT_SLOT_OFFHAND)
+            if (ItemTemplate const* mh = equipped[EQUIPMENT_SLOT_MAINHAND].entry ? sObjectMgr->GetItemTemplate(equipped[EQUIPMENT_SLOT_MAINHAND].entry) : nullptr;
+                mh && mh->GetInventoryType() == INVTYPE_2HWEAPON)
+                return fmt::format("{}: I hold a two-hander ([{}]), give me a one-hand weapon first for [{}]", bot_name,
+                                   mh->GetDefaultLocaleName(), t->GetDefaultLocaleName());
         picks.push_back({ found->bag, found->slot, found->equip_slot, found->entry });
         return fmt::format("{}: equipped {}", bot_name, describe(*found, found->equip_slot));
     }
@@ -759,7 +789,11 @@ std::string PlanEquipOrder(::Playerbot::BotSnapshot const& snap, std::string con
         if (it.equip_slot == 0xFF || it.equip_slot >= equipped.size() || it.item_level == 0 || it.quality == 0) continue;
         // Above the bot's level: the server refuses it, but the reply said "equipped" (Gremloc 11-08). Named below if nothing else goes on.
         if (ItemTemplate const* t = sObjectMgr->GetItemTemplate(it.entry); t && t->GetBaseRequiredLevel() > int32(level)) continue;
-        cands.push_back({ &it, it.equip_slot });
+        // The auto-equip rules' slot filter: never a fishing pole; a shield tank takes a one-hander in the main hand and a
+        // shield in the off hand (a two-hander here pushed the shield off and the tank rule swapped back, every pass).
+        uint8 const dst = AutoEquipSlot(spec, it.equip_slot, it.entry);
+        if (dst == 0xFF) continue;
+        cands.push_back({ &it, dst });
     }
     auto score_of = [&](InventoryItem const& it, uint8 slot) -> int32
     {
@@ -782,12 +816,13 @@ std::string PlanEquipOrder(::Playerbot::BotSnapshot const& snap, std::string con
         }
         // An off hand next to a two-hander that is being, or stays, worn.
         EquippedItem const& cur = equipped[slot];
+        uint32 const cur_entry = IsFishingPole(cur.entry) ? 0u : cur.entry;   // a worn fishing pole is no weapon
         bool better;
         if (raid)
-            better = RaidEquipUpgrade(cls, spec, level, slot, it.entry, cur.entry, equipped[EQUIPMENT_SLOT_MAINHAND].entry,
+            better = RaidEquipUpgrade(cls, spec, level, slot, it.entry, cur_entry, equipped[EQUIPMENT_SLOT_MAINHAND].entry,
                                       equipped[EQUIPMENT_SLOT_OFFHAND].entry);
         else
-            better = cur.entry == 0 || EquipFitScore(it.stats, it.item_level, snap.stat_weights) > EquipFitScore(cur.stats, cur.item_level, snap.stat_weights);
+            better = cur_entry == 0 || EquipFitScore(it.stats, it.item_level, snap.stat_weights) > EquipFitScore(cur.stats, cur.item_level, snap.stat_weights);
         if (!better) continue;
         if (ItemTemplate const* t = sObjectMgr->GetItemTemplate(it.entry); !t || ::Playerbot::Gear::IsPvpItem(t)) continue;
         taken[slot] = true;

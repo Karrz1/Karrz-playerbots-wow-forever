@@ -142,7 +142,7 @@ namespace Playerbot::Combat {
 // PickOffTargetCC only ever CCs units attacking the CASTER, which suits a
 // solo caster but never fires in a dungeon: the pack is on the tank. In a
 // party or raid this picks an add the GROUP is fighting instead, ike3-style:
-//   * only on a real pull: 3+ live enemies engaged with the group;
+//   * only on a real pull: 3+ live enemies engaged with the group in an instance, 2+ in the open world;
 //   * never the bot's own target, the skull, the tank's target or a boss;
 //   * not a unit already CC'd or one another member is casting a CC on;
 //   * one CC per caster (vanilla Polymorph / Shackle / Banish / Hibernate
@@ -175,7 +175,10 @@ namespace Playerbot::Combat {
         return ObjectGuid::Empty;   // our CC is still holding one (the same check the marked CC makes)
     for (auto const& u : enemies)
         if (engaged_with_group(u)) ++engaged;
-    if (engaged < 3)
+    // Open world: a second mob on the group is worth holding (Karrz 2026-11-16: "if they're able to do it automatically by
+    // themselves, that makes sense"); a player's companions met two at a time and fought both while the caster's sheep sat unused,
+    // as the solo caster already holds the second of two (PickOffTargetCC). An instance pack is a real pull from three.
+    if (engaged < (bot.is_in_instance() ? 3u : 2u))
         return ObjectGuid::Empty;
 
     ObjectGuid tank_target;
@@ -186,7 +189,7 @@ namespace Playerbot::Combat {
         for (auto const& m : *members)
         {
             if (!m.is_casting || m.casting_target != g || m.guid == bot.guid()) continue;
-            for (uint32 const cc : { 118u, 9484u, 710u, 2637u, 6770u })   // Polymorph / Shackle / Banish / Hibernate / Sap
+            for (uint32 const cc : { 118u, 9484u, 710u, 2637u, 6770u, 19386u })   // Polymorph / Shackle / Banish / Hibernate / Sap / Wyvern Sting
                 if (SpellFamily::Same(m.casting_spell, cc))
                     return true;
         }

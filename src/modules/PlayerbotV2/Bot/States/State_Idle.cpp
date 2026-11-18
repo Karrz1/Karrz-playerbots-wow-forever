@@ -835,19 +835,16 @@ bool MaintainAutoEquipUpgrades(BotSnapshotView const& s, BotAI& ai,
     for (auto const& it : raw.inventory.bag_items)
     {
         if (it.equip_slot == 0xFF) continue;
-        // Shield-tank weapon + offhand are owned EXCLUSIVELY by
-        // EnsureShieldTankWeapon (gear-backfill 1H+shield enforcer). A 2H scores
-        // higher than the 1H it equips, so letting this score-based rule manage
-        // those slots re-equips the displaced 2H and evicts the shield — an
-        // endless 2H<->1H+shield churn (live 2026-06-28). Prot War (73) / Prot
-        // Pala (66) only; 2H tanks (Blood DK / Guardian Druid) keep their weapon.
-        if ((s.spec() == 73 || s.spec() == 66) &&
-            (it.equip_slot == EQUIPMENT_SLOT_MAINHAND ||
-             it.equip_slot == EQUIPMENT_SLOT_OFFHAND))
-            continue;
+        // Shield tank (Prot War 73 / Prot Pala 66): a two-hander or an off-hand
+        // weapon would evict the shield and EnsureShieldTankWeapon swaps back, an
+        // endless 2H<->1H+shield churn (live 2026-06-28). Those stay in the bags;
+        // a better one-hander or shield goes on (11-17: a tank given weapons and
+        // shields wore none of them). Never a fishing pole (Gear::AutoEquipSlot).
+        uint8 const dst = ::Playerbot::V2::Gear::AutoEquipSlot(uint16(s.spec()), it.equip_slot, it.entry);
+        if (dst == 0xFF) continue;
         // Defense-in-depth: builder clamps equip_slot to <19, but indexing
         // equipped[19+] is UB (bag slots are 30-33) — never walk past it.
-        if (it.equip_slot >= raw.inventory.equipped.size()) continue;
+        if (dst >= raw.inventory.equipped.size()) continue;
         if (it.item_level == 0)    continue;
         if (it.quality == 0)       continue;
         // Per-entry retry throttle (shared with idle:equip_upgrade). When the
@@ -861,10 +858,12 @@ bool MaintainAutoEquipUpgrades(BotSnapshotView const& s, BotAI& ai,
         // and the rule goes quiet until the next ding / periodic re-check.
         if (ai.equip_recently_tried(it.entry, equip_now_ms)) continue;
         // The raid swap pieces (resistance gear, the Onyxia Scale Cloak) stay on while they are wanted.
-        EquippedItem const& cur = raw.inventory.equipped[it.equip_slot];
-        if (ai.gear_slot_held(it.equip_slot, s.map_id(), cur.entry)) continue;
+        EquippedItem const& cur = raw.inventory.equipped[dst];
+        if (ai.gear_slot_held(dst, s.map_id(), cur.entry)) continue;
         // A piece a player chose for the bot (trade or "equip <item>") stays on.
-        if (ai.worn_is_kept(it.equip_slot, cur.entry)) continue;
+        if (ai.worn_is_kept(dst, cur.entry)) continue;
+        // A worn fishing pole is no weapon: any weapon replaces it.
+        uint32 const cur_entry = ::Playerbot::V2::Gear::IsFishingPole(cur.entry) ? 0u : cur.entry;
         // Score-based upgrade test (was pure item_level). 12.0 level-scaling
         // floors low-level whites AND quest greens to the same effective ilvl,
         // so `it.item_level <= cur.item_level` tied and refused real upgrades —
@@ -875,16 +874,16 @@ bool MaintainAutoEquipUpgrades(BotSnapshotView const& s, BotAI& ai,
         if (::Playerbot::V2::Gear::RaidGearActive(raw.identity.level))
         {
             auto const& eq = raw.inventory.equipped;
-            if (!::Playerbot::V2::Gear::RaidEquipUpgrade(raw.identity.cls, uint16(raw.identity.spec), raw.identity.level, it.equip_slot, it.entry,
-                                        cur.entry, eq[EQUIPMENT_SLOT_MAINHAND].entry, eq[EQUIPMENT_SLOT_OFFHAND].entry,
+            if (!::Playerbot::V2::Gear::RaidEquipUpgrade(raw.identity.cls, uint16(raw.identity.spec), raw.identity.level, dst, it.entry,
+                                        cur_entry, eq[EQUIPMENT_SLOT_MAINHAND].entry, eq[EQUIPMENT_SLOT_OFFHAND].entry,
                                         raw.owner_guid.IsEmpty(), raw.guid.GetCounter()))
                 continue;
         }
-        else if (cur.entry != 0 &&
+        else if (cur_entry != 0 &&
             EquipFitScore(it.stats, it.item_level, raw.stat_weights) <=
             EquipFitScore(cur.stats, cur.item_level, raw.stat_weights))
             continue;
-        emit.equip_item(it.bag, it.slot, it.equip_slot);
+        emit.equip_item(it.bag, it.slot, dst);
         ai.note_equip_try(it.entry, equip_now_ms);
         return true;  // one per tick; next snapshot drains the next slot
     }
@@ -2925,13 +2924,20 @@ static bool RaidRangedStandRejected(BotSnapshotView const& s, GroupSnapshotView 
     if (RaidPointBlocked(s, px, py, pz, kHazardMargin)) return true;
     float fd2 = 0.f, ffx = 0.f, ffy = 0.f;
     if (FrontArcBossAt(s, g, px, py, fd2, ffx, ffy)) return true;
+    // The encounter's own cone (Raid::RaidRules::avoidFrontal) as well as the generic 20 y guess: naxx_sapphiron r26, the formation slot
+    // for a healer was (3519.6,-5228.0), 8 y in front of Sapphiron, inside his 30 y front half where Cleave chains; 23 raiders died to
+    // Cleave, most of them walking to or from such slots.
+    if (InRuledFrontalCone(s, px, py)) return true;
+    // Measured from the elite's edge, not its centre: a big one (Sapphiron, combat reach 10+ y) swings at a point that is
+    // kRaidRangedTooClose from its centre.
     constexpr float kElite = kRaidRangedTooClose + kRaidStandElitePad;
     for (auto const& u : s.raw().combat.nearby_enemies)
     {
         if (u.hp <= 0 || u.is_player || u.untargetable || !u.unit_in_combat) continue;
         if (!u.is_elite_or_rare && !Classic::IsBossUnit(u)) continue;
         const float ex = u.x - px, ey = u.y - py, ez = u.z - pz;
-        if (ex * ex + ey * ey + ez * ez < kElite * kElite) return true;
+        const float keep = kElite + u.combat_reach;
+        if (ex * ex + ey * ey + ez * ez < keep * keep) return true;
     }
     return UnpulledPackReaching(s, nullptr, px, py, pz, 0.0f, /*need_los=*/false, nullptr, now_ms) != nullptr;
 }
@@ -12931,43 +12937,38 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                 for (auto const& bi : eq_raw.inventory.bag_items)
                 {
                     if (bi.equip_slot == 0xFF) continue;
-                    // Shield-tank weapon + offhand are owned EXCLUSIVELY by
-                    // EnsureShieldTankWeapon (the gear-backfill 1H+shield enforcer).
-                    // The score-based auto-equip must never touch those two slots
-                    // for a Prot Warrior (73) / Prot Paladin (66): the 2H that
-                    // EnsureShieldTankWeapon displaces into the bag scores HIGHER
-                    // than the 1H it just equipped, so this rule would re-equip the
-                    // 2H, evict the shield, and the next backfill swaps back —
-                    // an infinite 2H<->1H+shield churn that leaves the tank
-                    // shield-less mid-pull (live 2026-06-28, Deadmines harbor). 2H
-                    // tanks (Blood DK / Guardian Druid) are NOT spec 73/66 and keep
-                    // their weapon.
-                    if ((s.spec() == 73 || s.spec() == 66) &&
-                        (bi.equip_slot == EQUIPMENT_SLOT_MAINHAND ||
-                         bi.equip_slot == EQUIPMENT_SLOT_OFFHAND))
-                        continue;
-                    if (bi.equip_slot >= eq_raw.inventory.equipped.size()) continue;
+                    // Shield tank (Prot War 73 / Prot Pala 66): a two-hander or an
+                    // off-hand weapon would evict the shield and EnsureShieldTankWeapon
+                    // swaps back, an infinite 2H<->1H+shield churn that left the tank
+                    // shield-less mid-pull (live 2026-06-28, Deadmines harbor). Those
+                    // stay in the bags; a better one-hander or shield goes on. 2H tanks
+                    // (Blood DK / Guardian Druid) are not spec 73/66 and keep their
+                    // weapon. Never a fishing pole (Gear::AutoEquipSlot).
+                    uint8 const dst = ::Playerbot::V2::Gear::AutoEquipSlot(uint16(s.spec()), bi.equip_slot, bi.entry);
+                    if (dst == 0xFF) continue;
+                    if (dst >= eq_raw.inventory.equipped.size()) continue;
                     if (bi.item_level == 0 || bi.quality == 0) continue;
                     if (ai.equip_recently_tried(bi.entry, now_ms)) continue;
                     // The raid swap pieces (resistance gear, the Onyxia Scale Cloak) stay on while they are wanted: this rule put
                     // the own cloak back on in Blackwing Lair within seconds of the swap (dev realm 2026-11-13).
-                    EquippedItem const& cur_eq = eq_raw.inventory.equipped[bi.equip_slot];
-                    if (ai.gear_slot_held(bi.equip_slot, s.map_id(), cur_eq.entry)) continue;
-                    if (ai.worn_is_kept(bi.equip_slot, cur_eq.entry)) continue;
+                    EquippedItem const& cur_eq = eq_raw.inventory.equipped[dst];
+                    if (ai.gear_slot_held(dst, s.map_id(), cur_eq.entry)) continue;
+                    if (ai.worn_is_kept(dst, cur_eq.entry)) continue;
+                    uint32 const cur_entry = ::Playerbot::V2::Gear::IsFishingPole(cur_eq.entry) ? 0u : cur_eq.entry;   // no weapon
                     if (::Playerbot::V2::Gear::RaidGearActive(eq_raw.identity.level))
                     {
                         auto const& eq = eq_raw.inventory.equipped;
                         if (!::Playerbot::V2::Gear::RaidEquipUpgrade(eq_raw.identity.cls, uint16(eq_raw.identity.spec), eq_raw.identity.level,
-                                                    bi.equip_slot, bi.entry, cur_eq.entry, eq[EQUIPMENT_SLOT_MAINHAND].entry,
+                                                    dst, bi.entry, cur_entry, eq[EQUIPMENT_SLOT_MAINHAND].entry,
                                                     eq[EQUIPMENT_SLOT_OFFHAND].entry,
                                                     eq_raw.owner_guid.IsEmpty(), eq_raw.guid.GetCounter()))
                             continue;
                     }
-                    else if (cur_eq.entry != 0 &&
+                    else if (cur_entry != 0 &&
                         EquipFitScore(bi.stats, bi.item_level, eq_raw.stat_weights) <=
                         EquipFitScore(cur_eq.stats, cur_eq.item_level, eq_raw.stat_weights))
                         continue;
-                    emit.equip_item(bi.bag, bi.slot, bi.equip_slot);
+                    emit.equip_item(bi.bag, bi.slot, dst);
                     ai.note_equip_try(bi.entry, now_ms);
                     ai.set_last_rule_fired("idle:dungeon_auto_equip");
                     return true;

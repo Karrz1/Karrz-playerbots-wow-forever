@@ -45,6 +45,36 @@ inline void DamageRateAdd(DamageRate& r, int64_t amount, uint32_t now_ms)
     r.at_ms = now_ms ? now_ms : 1u;
 }
 
+// The largest single hit a raid member took in the last kSpikeWindowMs (Group/GroupSnapshotBuilder.cpp NoteDamageTaken). The rate above
+// smooths a boss's spike into seconds of average damage, and a heal "covered" a soaker for the average while the next hit alone was most
+// of its health: Patchwerk's Hateful Strike, 9-11.7k on 10.9k soakers once a second among three, and the healers left each soaker to the
+// heals in flight for a deficit counted from the rate (naxx_patchwerk 1116 rerun: 147 "leaves ... (tank) to heals in flight", 57
+// stopcasts on tanks at 95%+ just before the next strike, every soaker dead by 55 s). The heals in flight have to cover the next such
+// hit as well.
+constexpr uint32_t kSpikeWindowMs = 10000;
+
+struct DamageSpike
+{
+    int64_t  amount = 0;
+    uint32_t at_ms = 0;   // 0: no hit yet
+};
+
+inline int64_t DamageSpikeAt(DamageSpike const& s, uint32_t now_ms)
+{
+    return s.at_ms && int32_t(now_ms - s.at_ms) <= int32_t(kSpikeWindowMs) ? s.amount : 0;
+}
+
+inline void DamageSpikeAdd(DamageSpike& s, int64_t amount, uint32_t now_ms)
+{
+    if (amount <= 0)
+        return;
+    if (amount >= DamageSpikeAt(s, now_ms))
+    {
+        s.amount = amount;
+        s.at_ms = now_ms ? now_ms : 1u;
+    }
+}
+
 // The damage the measured rate brings before a heal `land_in_ms` away lands.
 inline int64_t DamageUntilLand(float per_s, int32_t land_in_ms)
 {

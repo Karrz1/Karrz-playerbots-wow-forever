@@ -1952,7 +1952,47 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
             {
                 if (!e.ai || (id & 3u) != phase) return;
                 Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
-                if (!p || !p->IsInWorld() || !p->GetMap() || !p->GetMap()->IsBattleground()) return;
+                if (!p || !p->IsInWorld() || !p->GetMap()) return;
+                if (!p->GetMap()->IsBattleground())
+                {
+                    // Outside battlegrounds nothing dropped a bot left in the air either, and players saw bots hang there in fights
+                    // (Discord #общий, doctorsun 2026-11-17: "bots sometimes hang in the air in combat", no place given). A bot seen
+                    // standing still 2..30 y over the ground on two scans in a row (4 s apart; a knockback or a jump in flight is moving)
+                    // falls to it, as the client makes a player fall. Each one is logged with its fight and its last rule, at most once
+                    // a minute per bot, to find what put it there.
+                    static std::unordered_map<BotId, uint32> hover_first_ms, hover_logged_ms;
+                    uint32 const now_ms = GameTime::GetGameTimeMS();
+                    float ground = INVALID_HEIGHT;
+                    if (!::Playerbot::BotMovement::HoverGap(p, 2.0f, 30.0f, ground))
+                    {
+                        hover_first_ms.erase(id);
+                        return;
+                    }
+                    auto const [first, fresh] = hover_first_ms.try_emplace(id, now_ms);
+                    if (fresh)
+                        return;
+                    uint32 const hung_ms = now_ms - first->second;
+                    hover_first_ms.erase(first);
+                    // read before the fall: the spline makes the bot move, and the fall's own position is the ground
+                    float const z0 = p->GetPositionZ();
+                    Unit const* victim = p->GetVictim();
+                    Spell const* cast = p->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+                    uint32 const castId = cast ? cast->GetSpellInfo()->Id : 0u;
+                    bool const dropped = ::Playerbot::BotMovement::SettleToGround(p, 2.0f, 30.0f);
+                    uint32& logged = hover_logged_ms[id];
+                    if (logged && now_ms - logged < 60000u)
+                        return;
+                    logged = now_ms ? now_ms : 1u;
+                    static uint32 total_logged = 0;
+                    if (total_logged++ >= 2000)
+                        return;
+                    TC_LOG_INFO("playerbot.v2", "[hover_seen] {} map={} zone={} ({:.1f},{:.1f},{:.1f}) {:.1f} y over the ground for {} ms, combat {} "
+                                "victim {} cast {} state {} last rule {} -> {}", p->GetName(), p->GetMapId(), p->GetZoneId(), p->GetPositionX(),
+                                p->GetPositionY(), z0, z0 - ground, hung_ms, int(p->IsInCombat()),
+                                victim ? victim->GetName() : std::string("-"), castId, uint32(e.ai->state()),
+                                e.ai->last_rule_fired() ? e.ai->last_rule_fired() : "-", dropped ? "dropped" : "not dropped");
+                    return;
+                }
                 // A bot already mounted indoors in a battleground (start tunnel / hall) gets off: nobody rides in there.
                 if (p->IsMounted() && !p->IsOutdoors())
                 {
@@ -4219,6 +4259,28 @@ void Module::OnGroupMemberRemoved(Group* group, ObjectGuid member, uint8 method,
     TC_LOG_INFO("playerbot.v2", "[companion] {} released: removed from {}'s group (method {}, by {})", bot->GetName(), owner_name.empty() ? std::string("its owner") : owner_name,
                 uint32(method), by_owner ? "the owner" : remover ? remover->GetName() : std::string("no one"));
     Services::Population().QueueCompanionRelease(member.GetCounter());
+}
+
+void Module::OnMemberRoleSet(Group* group, ObjectGuid setter, ObjectGuid member, uint8 newRole)
+{
+    // The party frame's role menu (Set Role > Tank / Healer / Damage / None) on a bot. The bot used to publish its own duty role back
+    // over the choice on its next tick (ingroup:set_role_no_lfg), so a warrior set to Tank stayed a damage dealer with damage gear
+    // (DoctorSun, Discord 2026-11-17). The choice is now the bot's declared role, the same as `/setrole`. Battleground groups pick
+    // their own roles; a bot setting its own role does not come through here (API::lfg_role_check calls Group::SetLfgRoles).
+    if (!initialized_ || !group || group->isBGGroup() || group->isBFGroup() || setter == member || !member.IsPlayer())
+        return;
+    if (!Services::Lifecycle().is_bot(member.GetCounter()))
+        return;
+    Player* bot = ObjectAccessor::FindConnectedPlayer(member);
+    if (!bot || !bot->IsInWorld())
+        return;
+    uint8 const role = newRole & ~uint8(1);   // without the leader bit
+    Role const declared = role == 2 ? Role::Tank : role == 4 ? Role::Healer : role == 8 ? Role::Dps : Role::Unknown;
+    if (role && declared == Role::Unknown)
+        return;   // more than one role bit: not a choice the menu makes
+    BotCommandParser::DeclareRole(bot, declared);
+    TC_LOG_INFO("playerbot.v2", "[set_role] {} set {}'s role to {} from the role menu", setter.ToString(), bot->GetName(),
+        declared == Role::Tank ? "tank" : declared == Role::Healer ? "healer" : declared == Role::Dps ? "damage" : "none (cleared)");
 }
 
 void Module::OnRaidSubgroupChanged(Group* group, ObjectGuid member, uint8 subgroup)

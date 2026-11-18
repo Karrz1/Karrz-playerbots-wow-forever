@@ -97,6 +97,11 @@ struct AvoidGameObject { uint32_t entry; float radius; Who who; };
 // corpse: the dead creature is the hazard (Lord Kri's Toxic Vapors cloud where he died).
 struct AvoidCreature { uint32_t entry; float radius; Who who; bool corpse = false; };
 
+// While <enemy> is on its tank and its centre stands within <clear> yards of a living <hazard> creature (Grobbulus' poison clouds, which last),
+// that tank walks to a spot <clear> + 4 yards from every such creature, and he follows it out. Without it he stood in his own clouds and every
+// melee bot held off him (the hold for a victim inside a hazard).
+struct DragOut { uint32_t enemy; uint32_t hazard; float clear; };
+
 // While <enemy> is alive and fighting, matching bots keep at least <radius> from the nearest other raid member.
 // No raid move ends inside this circle while <enemy> is alive and fighting (one clamp for every rule, applied to the finished move target in
 // RaidBrain). Onyxia's two cave alcoves: the static whelps lie there, and a bot that walks up to them pulls the lot.
@@ -334,6 +339,7 @@ struct RaidRules
     std::vector<AvoidGroundEffect> avoidGroundEffect;
     std::vector<AvoidGameObject> avoidGameObject;
     std::vector<AvoidCreature> avoidCreature;
+    std::vector<DragOut> dragOut;
     std::vector<AvoidFrontal> avoidFrontal;
     std::vector<Spread> spread;
     std::vector<KeepOut> keepOut;

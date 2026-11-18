@@ -128,6 +128,8 @@ private:
 // ScopedBotLogicThread, EnsureGridForQuery never touches the map: it hands the grid to the world thread and returns true, so
 // the search runs on the tiles that are loaded now. The worker pool sets it once per thread, next to a
 // MMAP::ScopedThreadNavMeshQuery (own navmesh queries, searches under the navmesh read lock).
+// True on a bot logic thread (inside a ScopedBotLogicThread): the map threads may be changing the maps right now.
+bool InBotLogicThread();
 class ScopedBotLogicThread
 {
 public:
@@ -198,6 +200,10 @@ void PostTeleportSnap(Player* p);
 // AB / WSG start points) drops to the floor with a falling spline. A real player falls client-side; a headless bot never does.
 // False (nothing done) when it is moving, flying, swimming, on a vehicle / transport / taxi, or the ground is not in range.
 bool SettleToGround(Player* p, float minGap = 2.0f, float maxGap = 30.0f);
+
+// The test SettleToGround makes, without moving anything: true when the bot stands still `minGap`..`maxGap` yards above the ground
+// under it, with `ground` set to that ground. Same exclusions (moving, flying, swimming or deep water, vehicle / transport / taxi).
+bool HoverGap(Player* p, float minGap, float maxGap, float& ground);
 
 // Deep water at (x, y) for this bot (see Api/BotSwim.h): water (not magma or slime) over a floor more than the bot's height under the
 // surface, asked from in it and not from a bridge or a deck above it. True with `swimZ` = where the bot floats, its head out.

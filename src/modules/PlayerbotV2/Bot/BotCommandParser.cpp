@@ -1809,6 +1809,16 @@ bool BotCommandParser::OrderRelease(Player const* sender, Player const* bot, cha
     return true;
 }
 
+void BotCommandParser::DeclareRole(Player* bot, Role role)
+{
+    if (!bot)
+        return;
+    if (BotAI* ai = Services::Registry().ai(bot->GetGUID().GetCounter()))
+        ai->set_role_override(role);
+    ApplyClassicRoleSpec(bot, role);
+    PersistDeclaredRole(bot, role);
+}
+
 void BotCommandParser::ReleaseOwnerFollowOrder(Player const* sender, Player const* bot, char const* why)
 {
     if (!bot) return;

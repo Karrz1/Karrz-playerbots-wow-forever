@@ -3,6 +3,7 @@
 #include "PveGroupCoordinator.h"
 #include "Bot/SpellFamily.h"
 #include "Bot/DeathCause.h"
+#include "Bot/ClassicHealScope.h"   // HealerMayCrowdControl (Playerbot.Behavior.HealerAssist)
 #include "DungeonScript.h"
 #include "../BotRegistry.h"
 #include "../BotCommandParser.h"
@@ -404,6 +405,18 @@ void PveGroupCoordinator::Update(uint32 now_ms)
                                 100.0f * float(u.hp) / float(u.max_hp) <= rule.hpMax)
                                 want = std::max<size_t>(want, mem.size());
                 }
+            // A melee-soak boss (RaidRules::meleeSoak, Patchwerk) needs the main tank and every soaker on the roster: with three, the
+            // fourth tank played DPS, drank no Stoneshield and had no tank healer while the raid layer still sent it in as a soaker, and
+            // the bear on the roster was not one of the raid layer's soakers (naxx_patchwerk 1115 night, [raid_soak]).
+            if (Raid::RaidRules const* rules = Raid::RulesForMap(b.map_id); rules && !rules->meleeSoak.empty())
+                for (auto const& sn : snaps)
+                {
+                    if (sn->position.map_id != b.map_id) continue;
+                    for (auto const& u : sn->combat.nearby_enemies)
+                        for (Raid::MeleeSoak const& rule : rules->meleeSoak)
+                            if (u.entry == rule.enemy && u.hp > 0 && u.unit_in_combat)
+                                want = std::max<size_t>(want, size_t(rule.count) + 1);
+                }
             auto live_tank = [&](uint64 low)
             {
                 for (auto const& e : mem)
@@ -520,7 +533,18 @@ void PveGroupCoordinator::Update(uint32 now_ms)
             uint32 n_healers = 0;
             for (auto const& e : mem)
                 n_healers += e.healer && e.alive;
-            uint32 budget = n_healers - n_healers / 3;   // the rest triage
+            // A melee-soak boss in the fight (Patchwerk): the soakers take the strikes and the tank healers, and a sixth stay on triage.
+            bool soak_fight = false;
+            if (Raid::RaidRules const* rr = Raid::RulesForMap(b.map_id); rr && !rr->meleeSoak.empty())
+                for (auto const& sn : snaps)
+                {
+                    if (soak_fight || sn->position.map_id != b.map_id) continue;
+                    for (auto const& u : sn->combat.nearby_enemies)
+                        if (u.hp > 0 && u.unit_in_combat)
+                            for (Raid::MeleeSoak const& ms : rr->meleeSoak)
+                                if (ms.enemy == u.entry) soak_fight = true;
+                }
+            uint32 budget = n_healers - n_healers / (soak_fight ? 6 : 3);   // the rest triage
             // Slot order for a short budget: the main tank (it holds the boss and takes most of the damage; MC Gehennas
             // 2026-10-08: with 4 tanks and 5 healers a plain round-robin left it ONE healer and it died in 12 s) gets its
             // first two healers, then the off tank and every spare tank get one, then the main tank's third and the off
@@ -529,7 +553,8 @@ void PveGroupCoordinator::Update(uint32 now_ms)
             for (auto const& [tlow, want] : tank_quota)
                 if (tlow != main_tank && tlow != off_tank)
                     spare_tanks.push_back(tlow);
-            std::vector<uint64> const slots = Raid::HealSlotOrder(main_tank, off_tank, spare_tanks, budget);
+            std::vector<uint64> const slots = soak_fight ? Raid::SoakHealSlotOrder(main_tank, off_tank, spare_tanks, budget)
+                                                         : Raid::HealSlotOrder(main_tank, off_tank, spare_tanks, budget);
             // Sticky: a healer keeps its tank while that tank still has a
             // slot for it, so one healer dying doesn't shuffle the rest
             // across the room. Free slots then go to unassigned healers
@@ -1365,8 +1390,15 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
 
     // Healers keep healing while somebody is in trouble: no crowd control duty for them then.
     bool emergency = false;
+    int32 lowest_pct = 100;   // the most hurt live member (a healer's hold in a fight, below)
     for (auto const& e : mem)
-        if (e.alive && e.src->max_hp > 0 && Pct(e.src->hp, e.src->max_hp) < 40) { emergency = true; break; }
+        if (e.alive && e.src->max_hp > 0)
+        {
+            int32 const pct = Pct(e.src->hp, e.src->max_hp);
+            lowest_pct = std::min(lowest_pct, pct);
+            if (pct < 40) emergency = true;
+        }
+    bool const healer_assist = Services::Config().behavior_healer_assist();
 
     // An enemy the raid's data never holds (Raid::NoControl): neither an icon nor the automatic pick sends a caster to it.
     auto never_controlled = [&](uint32 entry) -> bool
@@ -1388,10 +1420,13 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
         if (marker == 4) moon_is_tank_mark = true;
     if (auto h = by_low.find(held_by[4]); held_by[4] && h != by_low.end() && h->second->tank)
         moon_is_tank_mark = true;   // the moon on a tank bot itself
-    // Pass 1: crowd control. Bots in member order, one bot per mob, never the skull, never a boss.
+    // Pass 1: crowd control. Bots in member order, one bot per mob, never the skull, never a boss. With Playerbot.Behavior.HealerAssist
+    // the damage dealers go first and the healers after, so a healer only takes a mob none of them could.
     if (cc_on)
+        for (int pass = 0; pass < (healer_assist ? 2 : 1); ++pass)
         for (auto const& e : mem)
         {
+            if (healer_assist && e.healer != (pass == 1)) continue;
             if (!e.is_bot || !e.alive || e.tank || !MarkCc::IsMarkCcClass(e.cls)) continue;
             if (e.healer && emergency) continue;
             auto po = plan.find(e.guid_low);
@@ -1480,10 +1515,16 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
             // A healer holds nothing of its own once it is in a fight: its mana is the group's healing (rfd_tutenkash 127: the
             // priest shackled a fresh ghoul every few seconds between Greater Heals, 94% to 15% mana in 27 s, out of mana three
             // times, the tank died). Before the pull it still shackles; an icon the owner gave it is still its call.
+            // Playerbot.Behavior.HealerAssist (Discord 2026-11-16: "healers don't use crowd control"): in a fight it may hold one while
+            // everyone is at 70 %+ and its mana at 60 %+ (ClassicHeal::HealerMayCrowdControl), at most one new hold per 20 s, so the
+            // tutenkash drain stops at 60 % mana and never follows a stream of fresh adds.
             // Not in a raid: ten or more players kill a pack quicker than two of the six damage dealers can hold one mob each, and
             // the hold broke and re-formed every few seconds as the kill focus moved (UBRS 20 Oct: mark_cc assign / release 66 times
             // in 5 minutes, two casters' GCDs gone). The raid's encounter rules and the owner's icons still hold mobs.
-            if (!is_raid && po->second.cc_target.IsEmpty() && !(e.healer && e.src->in_combat))
+            bool const healer_fighting = e.healer && e.src->in_combat;
+            int32 const healer_mana = e.src->max_mana > 0 ? Pct(e.src->mana, e.src->max_mana) : 0;
+            if (!is_raid && po->second.cc_target.IsEmpty() &&
+                (!healer_fighting || ::Playerbot::Combat::ClassicHeal::HealerMayCrowdControl(healer_assist, is_raid, healer_mana, lowest_pct)))
             {
                 static std::mutex auto_cc_mx;
                 static std::unordered_map<uint64, ObjectGuid> auto_cc;   // caster -> the mob it holds
@@ -1539,7 +1580,17 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
                             auto_cc.erase(it);
                     }
                 }
-                if (pick.IsEmpty() && pack.size() >= 3)
+                static std::mutex healer_hold_mx;
+                static std::unordered_map<uint64, uint32> healer_hold_ms;   // healer -> when it last took a new hold in a fight
+                bool new_hold_ok = true;
+                if (healer_fighting)
+                {
+                    std::lock_guard lk(healer_hold_mx);
+                    auto const it = healer_hold_ms.find(e.guid_low);
+                    new_hold_ok = it == healer_hold_ms.end() ||
+                        uint32(cc_now - it->second) >= ::Playerbot::Combat::ClassicHeal::kHealerCcNewHoldMs;
+                }
+                if (pick.IsEmpty() && pack.size() >= 3 && new_hold_ok)
                 {
                     // Mobs nobody tanks first (they are on a member), then the lowest guid so every plan chooses the same one.
                     NearbyUnit const* best = nullptr;
@@ -1558,8 +1609,15 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
                     if (best)
                     {
                         pick = best->guid;
-                        std::lock_guard lk(auto_cc_mx);
-                        auto_cc[e.guid_low] = pick;
+                        {
+                            std::lock_guard lk(auto_cc_mx);
+                            auto_cc[e.guid_low] = pick;
+                        }
+                        if (healer_fighting)
+                        {
+                            std::lock_guard lk(healer_hold_mx);
+                            healer_hold_ms[e.guid_low] = cc_now ? cc_now : 1u;
+                        }
                     }
                 }
                 if (!pick.IsEmpty())
@@ -2863,6 +2921,10 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             Member const* v = member_of(m.u->victim);
             mob_txt += MobName(m.u->entry) + " " + std::to_string(Pct(m.u->hp, m.u->max_hp)) + "%>" +
                        (v ? v->src->name : std::string("pet")) + (m.loose ? "!" : "");
+            // Where a boss is: a boss dragged off his spot shows in the line (naxx_horsemen r23: Sir Zeliek's Holy Wrath killed raiders at
+            // Mograine's corner and then at Korth'azz's, and the log could not say where Zeliek stood; Heigan pulled 40 y west, Feugen across).
+            if (m.u->is_dungeon_boss || m.u->is_boss_rank)
+                mob_txt += " @" + std::to_string(int32(m.u->x)) + "," + std::to_string(int32(m.u->y));
         }
 
         uint32 healers = 0, low_mana = 0, casting = 0;

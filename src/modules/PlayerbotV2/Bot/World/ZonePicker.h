@@ -75,4 +75,7 @@ DestinationPick SpreadWithinZone(DestinationPick d, uint8 level, bool alliance, 
 // over the spots. False when none is in reach.
 bool FindGrindSpotNear(bool alliance, uint32 map, float x, float y, uint32 level, uint64 seed, float max_yards, float& ox, float& oy, float& oz);
 
+// The ordinary hostile mobs of `level`'s camps on `map` within `radius` of (x, y), for a bot of that side (GrindSpot.h MobSupplyNear).
+uint32 GrindMobsNear(bool alliance, uint32 map, float x, float y, uint32 level, float radius);
+
 } // namespace Playerbot::V2::World

@@ -1450,7 +1450,8 @@ uint32 PickCombatManaItem(BotSnapshotView const& s, GroupSnapshotView const* g, 
     // A raid healer uses an item whenever it is ready and the restore fits in what the pool is missing: the items are limited by their
     // 2-minute cooldown, not by stock, and a bot that waits for 35% fires them late (MC Geddon n8 run 3: potion and rune both at 33% about
     // 60 s in, the next ones ready at 180 s, the kill at 159 s, four healers dry for the last 30 s).
-    int32 const ceiling = raid_healer ? kHealerManaItemCeilingPct : 20;
+    bool const long_fight = raid_healer && BossFight(s) && g->member_count() > kLongBossFightGroupSize;
+    int32 const ceiling = long_fight ? 100 : raid_healer ? kHealerManaItemCeilingPct : 20;
     if (mana > ceiling)
         return 0;
     if (CombatConsumableUsedRecently(s))

@@ -74,6 +74,10 @@ namespace Playerbot::Raid {
         r.priority.push_back({ 17055, 4 });     // Maexxna Spiderling
         r.dispel.push_back({ 28776, DispelKind::Poison, true });
         r.avoidFrontal.push_back({ 15952, 30.0f, 60.0f, Who::NonTank });
+        // Web Spray (29484) stuns her tank with everyone else for 10 s while she goes on hitting it, every hit landing (no dodge, parry or
+        // block while stunned): 3.2-4.8k a swing on a 12.3k tank (naxx_maexxna r24h, dead 7-9 s into the first spray). The tanks drink a
+        // Greater Stoneshield Potion (+2000 armour, 2 min) when she is engaged, as on Patchwerk.
+        r.resistPotion.push_back({ 15952, 13455, Who::Tank });
 
         // ---------------------------------------------------------------------------------------------------------------
         // NOTH THE PLAGUEBRINGER (15954): Curse of the Plaguebringer 29213 turns into Wrath of the Plaguebringer (4,000 shadow to
@@ -157,8 +161,11 @@ namespace Playerbot::Raid {
         // out of sight too. naxx_patchwerk 1114f and 1114g fought from that lower floor: 89 heals and shots failed for line of sight, the
         // main tank went up into the hall alone and the healers followed it into his reach. His walk comes back east along y -3230 to his
         // spawn, and he is met close to it (naxx_patchwerk 1115a: engaged at 3296,-3236 and fought at 3290-3311,-3232..-3249). The main
-        // tank holds him by his spawn at 3305,-3232, and the ranged stand west of him in the hall, 33 y from the tank (past Hateful Strike's
-        // 18 y rows above, inside 40 y of heals) on the south half.
+        // tank holds him by his spawn at 3305,-3232.
+        // The ranged stand at the hall's east end with the healers, 4 y further east between their corners (3330,-3227 and 3330,-3237): 25 y
+        // from the main tank's post, past Hateful Strike's 18 y and inside every ranged spell's reach to him (30 y + his reach), and they
+        // wait there before the pull (NaxxPrePullPatchwerk). Their post was west of him at 3272,-3240, and from the lower floor the way up
+        // to it runs past him: in the 1115 threat run all 16 walked into his 18 y circle and out again for the whole fight, 0 damage in 90 s.
         // The healers stand at the hall's east end in its two corners, 3326,-3223 and 3326,-3241: 20 y from his spawn and 23-26 y from him
         // where the main tank holds him (west of its post, he comes from the west), and off his walk, so they wait there before the pull
         // (NaxxPrePullPatchwerk) instead of walking 75 y from the lower floor after it (naxx_patchwerk 1115i: 29 of 61 s walking, no heal
@@ -166,7 +173,8 @@ namespace Playerbot::Raid {
         // killed them; the corners keep the 18 y.
         constexpr float kPatchHallZ = 294.1f;
         r.stand.push_back({ 16028, Who::MainTank, 3305.0f, -3232.0f, kPatchHallZ, 5.0f, true, 0 });
-        r.stand.push_back({ 16028, Who::Ranged, 3272.0f, -3240.0f, kPatchHallZ, 5.0f, false, 0 });
+        r.stand.push_back({ 16028, Who::Ranged, 3330.0f, -3227.0f, kPatchHallZ, 4.0f, false, 0, 100.0f, 0.0f, 1 });
+        r.stand.push_back({ 16028, Who::Ranged, 3330.0f, -3237.0f, kPatchHallZ, 4.0f, false, 0, 100.0f, 0.0f, 2 });
         r.stand.push_back({ 16028, Who::Healer, 3326.0f, -3223.0f, kPatchHallZ, 4.0f, false, 0, 100.0f, 0.0f, 1 });
         r.stand.push_back({ 16028, Who::Healer, 3326.0f, -3241.0f, kPatchHallZ, 4.0f, false, 0, 100.0f, 0.0f, 2 });
         // The posts are for a fight in his hall. Pulled anywhere else (Karrz 11-15 live: met at the hall's west end, 3210,-3190, on his
@@ -185,6 +193,9 @@ namespace Playerbot::Raid {
         r.carrierRun.push_back({ 28169, 15.0f, Who::NonTank });
         r.avoidCarrier.push_back({ 28169, 10.0f, Who::NonTank });
         r.avoidCreature.push_back({ 16363, 9.0f, Who::Anyone });
+        // The clouds last, and he stood in them: naxx21 the melee held off him for 61-63 of 90 s (raid:melee_hold, his centre inside a
+        // cloud's 9 y), 36% of his health in 90 s, and the tanks died at 88-104 s. His tank leads him out of them.
+        r.dragOut.push_back({ 15931, 16363, 11.0f });
         r.avoidFrontal.push_back({ 15931, 20.0f, 50.0f, Who::NonTank });
         // Every player the spray hits leaves a Fallout Slime where it stands (classic_boss_grobbulus.cpp SpellHitTarget, one each), so
         // the main tank is the only one in front of him: the off tanks keep the Fallout Slimes from his flank. naxx_grobbulus 1115a: all
@@ -237,8 +248,13 @@ namespace Playerbot::Raid {
         // Frost Aura, Blizzard and Frost Breath: Greater Frost Protection for everyone.
         r.resistPotion.push_back({ 15989, 13456, Who::Anyone });
         r.avoidCreature.push_back({ 16474, 8.0f, Who::Anyone });
-        r.avoidFrontal.push_back({ 15989, 25.0f, 50.0f, Who::NonTank });
-        r.avoidFrontal.push_back({ 15989, 20.0f, 45.0f, Who::NonTank, 180.0f });   // Tail Sweep 15847 behind him
+        // Cleave 19983 is a chain of 10 (SpellEffect: ChainTargets 10), 5 y a jump for a melee spell (Spell::SearchChainTargets): from his
+        // tank to whoever stands within 5 y of the tank, and on. naxx22 1116: 9 healers cleaved 9-23 y from him, a chain through the camp
+        // behind his tank, which the old 50 degree cone left alone. His whole front half is kept clear to 30 y (his tank stands in it, at
+        // his reach; anyone within a jump of it is in it). Tail Sweep 15847 is Onyxia's spell (radius index 10, 30 y; 60 degrees each side
+        // of straight behind, RaidEncounters.h kOnyTailHalfDeg). The raid stands on his flanks between them, or beyond 30 y.
+        r.avoidFrontal.push_back({ 15989, 30.0f, 90.0f, Who::NonTank, 0.0f, 100.0f, 0.0f, true, 6.0f });
+        r.avoidFrontal.push_back({ 15989, 30.0f, kOnyTailHalfDeg, Who::NonTank, 180.0f, 100.0f, 0.0f, true, 6.0f });   // Tail Sweep behind him
 
         // ---------------------------------------------------------------------------------------------------------------
         // KEL'THUZAD (15990): Detonate Mana 27819 on a mana user (the carrier runs, others keep clear), Shadow Fissure 27810

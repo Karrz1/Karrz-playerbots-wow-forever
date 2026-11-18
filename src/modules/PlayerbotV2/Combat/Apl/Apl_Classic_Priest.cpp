@@ -465,6 +465,26 @@ SchoolHint::SchoolChoice const kHealerSchoolChoices[] = {
 bool ShouldHealerSchoolNuke(ApPredicateContext const& ctx) { return SchoolHint::ShouldCast(ctx, kHealerSchoolChoices); }
 void DoHealerSchoolNuke(ApPredicateContext const& ctx, BotIntentEmitter& e) { SchoolHint::DoCast(ctx, e, kHealerSchoolChoices); }
 
+// Shackle Undead: Undead. In a group an add of a 3+ mob pull (never the kill target,
+// the tank's target or a boss); solo an extra attacker. See PickGroupCC.
+constexpr uint32 SHACKLE_UNDEAD = 9484;
+bool ShouldCrowdControl(ApPredicateContext const& ctx)
+{
+    return HasLiveTarget(ctx) && ctx.bot.in_combat() && !ctx.bot.is_moving() && ManaPct(ctx) >= 15
+        && Ready(ctx, SHACKLE_UNDEAD) && !PickGroupCC(ctx, SHACKLE_UNDEAD).IsEmpty();
+}
+void DoCrowdControl(ApPredicateContext const& ctx, BotIntentEmitter& e)
+{
+    e.cast(SHACKLE_UNDEAD, PickGroupCC(ctx, SHACKLE_UNDEAD));
+}
+
+// Healer: Shackle Undead on an add while the group is healthy and mana allows (Playerbot.Behavior.HealerAssist,
+// ClassicHeal::HealerMayCrowdControl). In an instance the group plan picks the mob (PickGroupCC defers to it).
+bool ShouldHealerCrowdControl(ApPredicateContext const& ctx)
+{
+    return ClassicHeal::HealerMayCrowdControl(ctx.bot, LowestFriendOrSelf(ctx).hp_pct) && ShouldCrowdControl(ctx);
+}
+
 ApRule const kHealerRules[] = {
     { ShouldDesperatePrayer,   DoDesperatePrayer,  "classic_heal:desperate_prayer" },
     { ShouldShieldCritical,    DoShieldCritical,   "classic_heal:shield_critical" },
@@ -485,6 +505,7 @@ ApRule const kHealerRules[] = {
     { ShouldInnerFire,         DoInnerFire,        "classic_heal:inner_fire" },
     { ShouldRenew,             DoRenew,            "classic_heal:renew" },
     { ShouldResurrection,      DoResurrection,     "classic_heal:resurrection" },
+    { ShouldHealerCrowdControl, DoCrowdControl,    "classic_heal:shackle_undead" },
     { ShouldHealerSchoolNuke,  DoHealerSchoolNuke, "classic_heal:school_nuke" },
     { ShouldHealerPain,        DoPain,             "classic_heal:shadow_word_pain" },
     { ShouldHealerSmite,       DoSmite,            "classic_heal:smite" },
@@ -569,19 +590,6 @@ SchoolHint::SchoolChoice const kShadowSchoolChoices[] = {
 };
 bool ShouldShadowSchoolNuke(ApPredicateContext const& ctx) { return SchoolHint::ShouldCast(ctx, kShadowSchoolChoices); }
 void DoShadowSchoolNuke(ApPredicateContext const& ctx, BotIntentEmitter& e) { SchoolHint::DoCast(ctx, e, kShadowSchoolChoices); }
-
-// Shackle Undead: Undead. In a group an add of a 3+ mob pull (never the kill target,
-// the tank's target or a boss); solo an extra attacker. See PickGroupCC.
-constexpr uint32 SHACKLE_UNDEAD = 9484;
-bool ShouldCrowdControl(ApPredicateContext const& ctx)
-{
-    return HasLiveTarget(ctx) && ctx.bot.in_combat() && !ctx.bot.is_moving() && ManaPct(ctx) >= 15
-        && Ready(ctx, SHACKLE_UNDEAD) && !PickGroupCC(ctx, SHACKLE_UNDEAD).IsEmpty();
-}
-void DoCrowdControl(ApPredicateContext const& ctx, BotIntentEmitter& e)
-{
-    e.cast(SHACKLE_UNDEAD, PickGroupCC(ctx, SHACKLE_UNDEAD));
-}
 
 ApRule const kShadowRules[] = {
     { ShouldDesperatePrayer,  DoDesperatePrayer,  "classic_shadow:desperate_prayer" },

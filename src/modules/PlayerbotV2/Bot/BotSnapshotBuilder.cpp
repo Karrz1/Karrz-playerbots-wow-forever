@@ -1813,6 +1813,12 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
     // The wider value is truncated into uint8 because spec IDs <= 256 today;
     // when Blizzard expands beyond that we'll widen the field.
     snap->identity.spec    = ::Playerbot::Classic::EffectiveSpecId(p);
+    // A Feral druid (103, the cat) that has no Cat Form yet plays the bear (104): Forever teaches Cat Form only with the Great Cat Spirit
+    // quests at 20 (spell 1309050), Bear Form with Body and Heart at 10. The cat rotation without Cat Form cancelled Bear Form as the
+    // "wrong form" and the druid fought in caster form (DoctorSun, Discord 2026-11-17: low-level feral bots would not tank in form until
+    // forced into it with .aura 5487). Only the rotation, forms and role follow; the talent build and the gear keep the Feral spec.
+    if (::Playerbot::IsVanillaRealm() && p->GetClass() == CLASS_DRUID && snap->identity.spec == 103 && !p->HasSpell(768) && p->HasSpell(5487))
+        snap->identity.spec = 104;
 
     // Infer role from (class, spec). Single source of truth lives in
     // Bot/ClassTables.cpp (IsTankSpec/IsHealerSpec) — also used by
@@ -3427,27 +3433,22 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         for (auto const& it : snap->inventory.bag_items)
         {
             if (it.equip_slot == 0xFF) continue;
-            // Mirror the auto-equip rule's Prot-warrior/paladin weapon exclusion
-            // (State_Idle dungeon_auto_equip / MaintainAutoEquipUpgrades): for
-            // spec 73 (Prot Warrior) / 66 (Prot Paladin) the mainhand + offhand
-            // are owned EXCLUSIVELY by EnsureShieldTankWeapon (the 1H+shield
-            // backfill). The score-based rule NEVER swaps those two slots — a
-            // higher-score 2H would evict the shield and churn 2H<->1H+shield —
-            // so a bag weapon that out-scores the equipped 1H is a PERMANENT
-            // non-upgrade here. Counting it reported a "pending upgrade" that can
-            // never apply: the false 6-pending seen on Prot tanks (owner-flagged
-            // 2026-07-01, the classic offhand-vs-2H false alarm). Exclude them so
-            // this count and the rule agree, as this block's header promises.
-            if ((snap->identity.spec == 73 || snap->identity.spec == 66) &&
-                (it.equip_slot == EQUIPMENT_SLOT_MAINHAND ||
-                 it.equip_slot == EQUIPMENT_SLOT_OFFHAND))
-                continue;
+            // Mirror the auto-equip rules' slot filter (Gear::AutoEquipSlot): a shield
+            // tank (spec 73 Prot Warrior / 66 Prot Paladin) takes only a one-hander in
+            // the main hand and a shield in the off hand there, since a 2H or an
+            // off-hand weapon would churn against EnsureShieldTankWeapon; never a
+            // fishing pole. Counting a weapon the rules never wear reported a
+            // "pending upgrade" that can never apply (the false 6-pending on Prot
+            // tanks, owner-flagged 2026-07-01), so this count and the rules agree.
+            uint8 const dst = ::Playerbot::V2::Gear::AutoEquipSlot(uint16(snap->identity.spec), it.equip_slot, it.entry);
+            if (dst == 0xFF) continue;
             // Defense-in-depth: equip_slot is clamped to <19 at capture, but
             // an OOB read of equipped[19] here is UB — never index past it.
-            if (it.equip_slot >= snap->inventory.equipped.size()) continue;
+            if (dst >= snap->inventory.equipped.size()) continue;
             if (it.item_level == 0)    continue;
             if (it.quality == 0)       continue;   // skip POOR
-            EquippedItem const& cur = snap->inventory.equipped[it.equip_slot];
+            EquippedItem const& cur = snap->inventory.equipped[dst];
+            uint32 const cur_entry = ::Playerbot::V2::Gear::IsFishingPole(cur.entry) ? 0u : cur.entry;   // a fishing pole is no weapon
             // Score-based upgrade test (was pure item_level, which tied — and so
             // refused — quest greens vs starter whites once 12.0 scaling floored
             // both to the same effective ilvl). The stat allocation breaks the tie.
@@ -3455,12 +3456,12 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             if (::Playerbot::V2::Gear::RaidGearActive(snap->identity.level))
             {
                 auto const& eq = snap->inventory.equipped;
-                if (!::Playerbot::V2::Gear::RaidEquipUpgrade(snap->identity.cls, uint16(snap->identity.spec), snap->identity.level, it.equip_slot,
-                                            it.entry, cur.entry, eq[EQUIPMENT_SLOT_MAINHAND].entry, eq[EQUIPMENT_SLOT_OFFHAND].entry,
+                if (!::Playerbot::V2::Gear::RaidEquipUpgrade(snap->identity.cls, uint16(snap->identity.spec), snap->identity.level, dst,
+                                            it.entry, cur_entry, eq[EQUIPMENT_SLOT_MAINHAND].entry, eq[EQUIPMENT_SLOT_OFFHAND].entry,
                                             snap->owner_guid.IsEmpty(), snap->guid.GetCounter()))
                     continue;
             }
-            else if (cur.entry != 0 &&
+            else if (cur_entry != 0 &&
                 EquipFitScore(it.stats, it.item_level, snap->stat_weights) <=
                 EquipFitScore(cur.stats, cur.item_level, snap->stat_weights))
                 continue;

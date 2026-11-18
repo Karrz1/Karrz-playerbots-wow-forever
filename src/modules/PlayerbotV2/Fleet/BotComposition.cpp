@@ -59,6 +59,7 @@ constexpr std::array<RaceWeight, 15> kAllianceRaces = { {
     { RACE_MECHAGNOME,            1 },
     { RACE_EARTHEN_DWARF_ALLIANCE,2 },
     { 86,                         1 },   // Haranir (Midnight) — currently disabled in TC
+    { Fleet::Skyborne::kRaceAlliance, Fleet::Skyborne::kRaceWeight },   // High Order Skyborne (Classic 1.60 only)
 } };
 
 constexpr std::array<RaceWeight, 15> kHordeRaces = { {

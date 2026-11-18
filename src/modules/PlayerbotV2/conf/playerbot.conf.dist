@@ -211,6 +211,13 @@ Playerbot.World.ActivityRadius = 300
 # A valley has a few dozen mobs on a slow respawn: 50 bots left a new character in Deathknell nothing to kill, 8 looked empty.
 # Only bots at the start levels (1-10) of the races that begin there are placed or kept in a start zone.
 Playerbot.World.StartZoneBots = 25
+# Mob supply of a leveling zone: at most one world bot per MobsPerBot ordinary hostile mobs of the player's level (camps within
+# ActivityRadius, from the world DB spawns), never fewer than MobSupplyFloor; the smaller of this and the zone's number wins. A bot
+# kills a mob of its level about every 40 s with rest, so on a 5 minute respawn about 7 spawns feed one bot; 10 leaves the rest for
+# the players (Karrz 2026-11-16, Eastern Plaguelands: "nothing's alive here"). Taken when the zone gets its player; logged as
+# '[world] mob supply'. Capitals and start zones keep their own numbers. MobsPerBot = 0 switches the cap off.
+Playerbot.World.MobsPerBot = 10
+Playerbot.World.MobSupplyFloor = 5
 
 # Spawn rate (bots per spawner tick) while the player is in a capital; 0 = SpawnPerTick. Fills a city faster.
 Playerbot.World.CitySpawnPerTick = 0
@@ -308,8 +315,10 @@ Playerbot.World.Pvp.LevelsAbove = 2
 Playerbot.World.Pvp.AttackBots = 1
 Playerbot.World.Pvp.BorderFriendlyPct = 85
 Playerbot.World.Pvp.ContestedFriendlyPct = 70
+# Contested zones (Plaguelands, Stranglethorn, Hillsbrad, Arathi, Tanaris, ...) are both factions' ground: 70 = about one bot in three
+# around a player there is of the other faction (Karrz 2026-11-16, Eastern Plaguelands). On a normal realm they leave him alone.
 Playerbot.World.BorderFriendlyPct = 100
-Playerbot.World.ContestedFriendlyPct = 100
+Playerbot.World.ContestedFriendlyPct = 70
 # Ambient characters allowed to exist (online or offline). Offline ones are reused before new ones are created.
 # Default: the larger of 4 x MaxBots and 200.
 # Playerbot.World.PoolMax = 200
@@ -378,6 +387,10 @@ Playerbot.World.Town.IdleSec = 20
 # with a player) still quest with him: they accept the quests he shares, do the objectives beside him and hand in with him.
 # 1: the old behaviour, world bots walk to quest hubs, take quests and do them.
 Playerbot.World.Questing = 0
+
+# Scourge Invasion (worldserver Classic.ScourgeInvasion / .scourge on): free level 55+ world bots in a zone under attack fight the
+# minions and cultists there and walk to the nearest necropolis camp. 0 keeps them out of it. Read at the first use (restart).
+Playerbot.World.ScourgeInvasion = 1
 
 # Small kindnesses of world bots for real players they pass: a priest's Fortitude, a mage's Intellect (mana users) or a druid's Mark
 # on a player who lacks it (one per player per BuffCooldownSec, whoever gives it), a heal from a passing priest, druid, paladin or
@@ -726,6 +739,13 @@ Playerbot.Raid.ResistPotions = 0
 #   LooseMobHold      DPS bots hold fire on a raid elite that is loose on a party member.
 #   RaidBuffHold      the tank's 30 s group-buff hold and the 120 s hold for members still
 #                     outside the instance, before a pull / advance. Off: neither holds.
+#   HealerAssist      healer bots in a dungeon or a group in the open world help kill the pull while nobody needs
+#                     healing: damage spells after 3 s without a heal needed at 60%+ mana (instead of 10 s at 90%+),
+#                     and crowd control (Shackle Undead, Hibernate) on an add of a 3+ mob pull while everyone is at
+#                     70%+ health and the healer has 60%+ mana, at most one new hold per 20 s, after the damage
+#                     dealers have taken theirs. A Holy paladin also casts Exorcism on undead / demons and Hammer of
+#                     Wrath at 20%. Raids are unchanged. Off: the old heal-first gates (damage only after 10 s quiet at
+#                     90%+ mana in a dungeon, no crowd control once the healer is in the fight, no Exorcism).
 #   DungeonLoot       loot-roll votes and corpse looting between pulls of a dungeon run.
 #   WarriorStanceDance  protection warrior Battle Stance dance (Mocking Blow, Thunder Clap).
 #   DungeonTactics    Classic dungeons: the generated mob tables (Bot/Dungeon/Tactics, from VMaNGOS data) add their kill order, mandatory
@@ -841,6 +861,7 @@ Playerbot.Behavior.RaidSpacing = 1
 Playerbot.Behavior.SpreadOut = 1
 Playerbot.Behavior.LooseMobHold = 1
 Playerbot.Behavior.RaidBuffHold = 1
+Playerbot.Behavior.HealerAssist = 1
 Playerbot.Behavior.DungeonLoot = 1
 Playerbot.Behavior.WarriorStanceDance = 1
 Playerbot.Behavior.DungeonTactics = 1

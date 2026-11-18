@@ -368,6 +368,8 @@ public:
     bool behavior_spread_out()          const { return bhv_spread_out_; }
     bool behavior_loose_mob_hold()      const { return bhv_loose_mob_hold_; }
     bool behavior_raid_buff_hold()      const { return bhv_raid_buff_hold_; }
+    // Playerbot.Behavior.HealerAssist: grouped healers outside raids also damage and crowd-control while the group is healthy.
+    bool behavior_healer_assist()       const { return bhv_healer_assist_; }
     bool behavior_dungeon_loot()        const { return bhv_dungeon_loot_; }
     bool behavior_warrior_stance_dance() const { return bhv_warrior_stance_dance_; }
     bool behavior_bot_whisperable()     const { return bhv_bot_whisperable_; }
@@ -723,6 +725,7 @@ private:
     bool   bhv_spread_out_           = true;
     bool   bhv_loose_mob_hold_       = true;
     bool   bhv_raid_buff_hold_       = true;
+    bool   bhv_healer_assist_        = true;
     bool   bhv_dungeon_loot_         = true;
     bool   bhv_warrior_stance_dance_ = true;
     bool   bhv_bot_whisperable_      = true;

@@ -3500,6 +3500,16 @@ do
         -- Another add-on is named once per session: ExtraProfessionTabs moving the action bars in a fight got one line per
         -- refused call, a chat full of them on every fight (Discord, arrathem, 2026-11-15), which read as our add-on breaking.
         if addon ~= ADDON then
+            -- "*** ForceTaint_Strong ***" is no add-on but the client's own lock on macros: in a boss fight a macro may only send
+            -- one chat line in a short time, and only to the group or as a whisper to someone in the instance. A macro line such as
+            -- ".aura self 1459" goes out as /say and is refused (Discord, VoldemarGreed 2026-11-17).
+            if type(addon) == "string" and not IsSecret(addon) and addon:find("^%*%*%*") then
+                if not otherBlocked[addon] then
+                    otherBlocked[addon] = true
+                    Print(L["the client refused a macro line in a boss fight: there a macro may only send one line at a time, to /p, /ra or a whisper. For a dot command start the line with /w %s (for example /w %s .aura self 1459 21562)."]:format(SafeName("player") or "YourName", SafeName("player") or "YourName"))
+                end
+                return
+            end
             if type(addon) == "string" and not IsSecret(addon) and not otherBlocked[addon] then
                 otherBlocked[addon] = true
                 Print("the client blocked " .. func .. "() for the add-on " .. addon .. " (" .. (event == "ADDON_ACTION_BLOCKED" and "blocked" or "forbidden") .. "). Further blocked calls of " .. addon .. " are not shown; that add-on causes them, not ForeverBots.")

@@ -69,6 +69,16 @@ bool BotPathTouchesAvoidedLiquid(WorldObject const* source, Movement::PointsArra
         return ClassifyDestinationLiquid(player, x, y, z) != LiquidVerdict::Dry;
     });
 }
+
+// A bot's walks keep clear of closed doors (SFK 2026-11-17: bots pulled the courtyard and the cells through the closed gates).
+// Not on a bot logic thread: the map threads move doors while those run, and the door test reads the map's door models.
+bool BotPathAvoidsClosedDoors(WorldObject const* source)
+{
+    Player const* player = source->ToPlayer();
+    if (!player || !player->GetSession() || !player->GetSession()->IsBot())
+        return false;
+    return !Playerbot::BotMovement::InBotLogicThread();
+}
 }
 
 class playerbot_v2_world : public WorldScript
@@ -424,6 +434,11 @@ public:
         Module::instance().OnRaidSubgroupChanged(group, guid, subgroup);
     }
 
+    void OnMemberRoleSet(Group* group, ObjectGuid setter, ObjectGuid target, uint8 /*oldRole*/, uint8 newRole) override
+    {
+        Module::instance().OnMemberRoleSet(group, setter, target, newRole);
+    }
+
     // A bot that joins a group has the riding and mount its level allows (a world bot a player invited rides with him).
     void OnAddMember(Group* group, ObjectGuid guid) override
     {
@@ -471,4 +486,5 @@ void AddSC_playerbot_v2()
     AddSC_playerbot_v2_selftest_commandscript();
 
     PathGenerator::SetLiquidRouteCheck(&BotPathTouchesAvoidedLiquid);
+    PathGenerator::SetClosedDoorCheck(&BotPathAvoidsClosedDoors);
 }

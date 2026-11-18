@@ -67,6 +67,13 @@ int32 EffectiveItemLevelForLevel(ItemTemplate const* tpl, uint8 level);
 // warriors hold Plate Mail (293) and 13931/14022 hunters hold Mail (413).
 ItemSubclassArmor PreferredArmorForClass(uint8 cls);
 
+// The highest armor tier the class can put on at this level: what the scorer ranks against. On the level-60 (Forever) realm
+// the trainers teach Mail (8737) and Plate Mail (750) at 40 (trainer_spell ReqLevel 40), so below 40 a warrior or paladin
+// wears mail and a hunter or shaman leather. Elsewhere it is PreferredArmorForClass. Ranking against plate a sub-40 warrior
+// cannot wear put mail and leather under the same penalty, and an agility leather piece beat the mail one (DoctorSun,
+// Discord 2026-11-17: a level 21 warrior in leather).
+ItemSubclassArmor WearableArmorForClass(uint8 cls, uint8 level);
+
 // Returns the primary stat (ITEM_MOD_STRENGTH/AGILITY/INTELLECT) for the
 // (class, spec) pair. Hybrid classes (Druid/Monk/Pally/Sham) have spec-
 // dependent primaries; pure classes return their fixed stat.

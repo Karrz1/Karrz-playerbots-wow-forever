@@ -57,6 +57,7 @@ constexpr uint32 SEAL_OF_WISDOM      = 20166;
 constexpr uint32 SEAL_OF_CRUSADER    = 21082;
 constexpr uint32 JUDGEMENT           = 20271;
 constexpr uint32 HAMMER_OF_WRATH     = 24275;
+constexpr uint32 EXORCISM            = 879;     // undead and demons only, 30 y, 15 s cooldown
 constexpr uint32 HOLY_STRIKE         = 678;     // Forever's Retribution strike (rank 1; the cast resolves the highest rank): weapon damage plus Holy
 constexpr uint32 DIVINE_FAVOR        = 20216;   // Holy talent
 
@@ -407,6 +408,28 @@ bool ShouldHealerJudgement(ApPredicateContext const& ctx)
     return HealerMayDps(ctx) && ManaPct(ctx) >= 60 && ShouldJudgement(ctx);
 }
 
+// Playerbot.Behavior.HealerAssist: a Holy paladin's ranged damage under the same may-dps gates, Exorcism on an undead or demon
+// victim (the Plaguelands are full of them) and Hammer of Wrath on one at 20 % or less. The seal and judgement above only fire in
+// melee reach, so without these a healing paladin did no damage from where it stands.
+bool HealerAssistOn() { return Services::Config().behavior_healer_assist(); }
+bool VictimUndeadOrDemon(ApPredicateContext const& ctx)
+{
+    NearbyUnit const* v = ctx.bot.victim_info();
+    return v && (v->creature_type == CREATURE_TYPE_UNDEAD || v->creature_type == CREATURE_TYPE_DEMON);
+}
+bool ShouldHealerExorcism(ApPredicateContext const& ctx)
+{
+    return HealerAssistOn() && HealerMayDps(ctx) && ManaPct(ctx) >= 60 && VictimUndeadOrDemon(ctx)
+        && Ready(ctx, EXORCISM) && ctx.bot.victim_in_spell_range(EXORCISM);
+}
+void DoHealerExorcism(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(EXORCISM, ctx.bot.victim()); }
+bool ShouldHealerHammerOfWrath(ApPredicateContext const& ctx)
+{
+    return HealerAssistOn() && HealerMayDps(ctx) && ManaPct(ctx) >= 60 && VictimHpPct(ctx) <= 20
+        && Ready(ctx, HAMMER_OF_WRATH) && ctx.bot.victim_in_spell_range(HAMMER_OF_WRATH);
+}
+void DoHealerHammerOfWrath(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(HAMMER_OF_WRATH, ctx.bot.victim()); }
+
 ApRule const kHealerRules[] = {
     { ShouldDivineShield,        DoDivineShield,        "classic_pal_heal:divine_shield" },
     { ShouldLayOnHands,          DoLayOnHands,          "classic_pal_heal:lay_on_hands" },
@@ -423,6 +446,8 @@ ApRule const kHealerRules[] = {
     { ShouldBlessing,            DoBlessing,            "classic_pal_heal:blessing" },
     { ShouldHealerSeal,          DoSeal,                "classic_pal_heal:seal" },
     { ShouldHealerJudgement,     DoJudgement,           "classic_pal_heal:judgement" },
+    { ShouldHealerExorcism,      DoHealerExorcism,      "classic_pal_heal:exorcism" },
+    { ShouldHealerHammerOfWrath, DoHealerHammerOfWrath, "classic_pal_heal:hammer_of_wrath" },
 };
 
 // ======================= Protection =======================
@@ -512,10 +537,51 @@ void DoTankSpreadJudgement(ApPredicateContext const& ctx, BotIntentEmitter& e)
             TankThreat::LogSpread(ctx.bot, "Judgement", *t);
 }
 
+// A Retribution or Protection paladin in a group saves a member in trouble (ClassicHeal::HybridMaySaveAlly, Bot/ClassicHealScope.h):
+// leenergetic, Discord 2026-11-17, "When in a DPS spec, Paladins don't cast heals on allies at all". A healer of the group covers the
+// patient while it is alive, on the map, within heal range of him and has mana; with one covering, the paladin steps in only at the
+// last moment. The heal is the fast one (Flash of Light, Holy Light before level 20), planned like a healer's (EmitHeal).
+bool HealerCovers(ApPredicateContext const& ctx, ClassicHeal::Patient const& p)
+{
+    auto const* members = ctx.group.members();
+    if (!members)
+        return false;
+    float px = 0.f, py = 0.f;
+    bool found = false;
+    for (auto const& m : *members)
+        if (m.guid == p.guid) { px = m.x; py = m.y; found = true; break; }
+    for (auto const& m : *members)
+    {
+        if (m.guid == ctx.bot.raw().guid || m.role != Role::Healer || !m.online || !m.is_alive || m.map_id != ctx.bot.map_id())
+            continue;
+        if (m.max_mana > 0 && int64(m.mana) * 100 < int64(m.max_mana) * ClassicHeal::kHybridHealerCoverManaPct)
+            continue;
+        if (found && std::hypot(m.x - px, m.y - py) > ClassicHeal::kHealRange)
+            continue;
+        return true;
+    }
+    return false;
+}
+
+bool ShouldSaveAlly(ApPredicateContext const& ctx)
+{
+    if (!ctx.bot.in_group() || !Ready(ctx, FastHeal(ctx)))
+        return false;
+    ClassicHeal::Patient const p = ClassicHeal::PickPatient(ctx);
+    if (!p.valid || p.guid.IsEmpty() || p.guid == ctx.bot.raw().guid)
+        return false;
+    return ClassicHeal::HybridMaySaveAlly(ctx.bot.raid_rules(), std::min(p.hp_pct, p.actual_pct), HealerCovers(ctx, p), ManaPct(ctx));
+}
+void DoSaveAlly(ApPredicateContext const& ctx, BotIntentEmitter& e)
+{
+    ClassicHeal::EmitHeal(ctx.bot, ctx.group, e, FastHeal(ctx), ClassicHeal::PickPatient(ctx));
+}
+
 ApRule const kTankRules[] = {
     { ShouldDivineShield,        DoDivineShield,        "classic_pal_tank:divine_shield" },
     { ShouldDivineProtection,    DoDivineProtection,    "classic_pal_tank:divine_protection" },
     { ShouldSelfLayOnHands,      DoSelfLayOnHands,      "classic_pal_tank:lay_on_hands" },
+    { ShouldSaveAlly,            DoSaveAlly,            "classic_pal_tank:save_ally" },
     { ShouldRighteousFury,       DoRighteousFury,       "classic_pal_tank:righteous_fury" },
     { ShouldPaladinAura,         DoPaladinAura,         "classic_pal_tank:aura" },
     { ShouldHammerOfJustice,     DoHammerOfJustice,     "classic_pal_tank:hammer_of_justice" },
@@ -578,6 +644,7 @@ ApRule const kRetRules[] = {
     { ShouldDivineShield,        DoDivineShield,        "classic_pal_ret:divine_shield" },
     { ShouldSelfLayOnHands,      DoSelfLayOnHands,      "classic_pal_ret:lay_on_hands" },
     { ShouldRetSelfHeal,         DoRetSelfHeal,         "classic_pal_ret:self_heal" },
+    { ShouldSaveAlly,            DoSaveAlly,            "classic_pal_ret:save_ally" },
     { ShouldPaladinAura,         DoPaladinAura,         "classic_pal_ret:aura" },
     { ShouldBlessing,            DoBlessing,            "classic_pal_ret:blessing" },
     { ShouldCleanse,             DoCleanse,             "classic_pal_ret:cleanse" },

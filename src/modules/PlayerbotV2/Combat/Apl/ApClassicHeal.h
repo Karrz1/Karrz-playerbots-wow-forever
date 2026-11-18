@@ -362,6 +362,9 @@ inline float RankHeal(SpellInfo const* si, uint32 level);
 // Healing-taken multiplier of a group member from its debuffs (Gehennas' Curse, Mortal Strike, Wound Poison, Veil of Shadow ...),
 // read from the spells' MOD_HEALING_PCT effects, floored at 0.1. 1.0 = no reduction. Under -75% every heal lands a quarter: the
 // in-flight cover and the rank choice must count that, or the healers see a tank as "covered" and leave it to die.
+// A stacking debuff counts once per stack, as the core applies it (the aura amount is the base points times the stacks): Gluth's
+// Mortal Wound is -10% a stack, -50% at the five stacks of a tank swap, and counted once it read -10%, so the heals in flight looked
+// almost twice what landed (naxx_gluth 1115 threat run: 2-4 of 12 healers casting while his tank sat at 57-76%, every tank dead).
 inline float HealTakenFactor(GroupSnapshotView const& g, ObjectGuid guid)
 {
     auto const* members = g.members();
@@ -377,7 +380,7 @@ inline float HealTakenFactor(GroupSnapshotView const& g, ObjectGuid guid)
             if (!si) continue;
             for (SpellEffectInfo const& eff : si->GetEffects())
                 if (eff.IsAura(SPELL_AURA_MOD_HEALING_PCT) && eff.BasePoints < 0.0f)
-                    f *= std::max(0.0f, 1.0f + eff.BasePoints / 100.0f);
+                    f *= std::max(0.0f, 1.0f + eff.BasePoints * float(std::max<uint8>(a.stacks, 1)) / 100.0f);
         }
         return std::max(f, 0.1f);
     }
@@ -451,7 +454,8 @@ void ApplyInFlight(BotSnapshotView const& s, GroupSnapshotView const& g, Patient
                 // at once left a tank at 79% to 6292 in flight for a deficit of 4286, three of those heals were then cancelled, and the
                 // tank went on dropping).
                 int32 const horizon = std::max<int32>(int32(last_land - now), int32(kSkipHorizonMs));
-                p.until_land = DamageUntilLand(m.damage_taken_per_s, horizon);
+                // At least the largest recent hit: a boss's spike comes whole, not spread over the rate (DamageSpike).
+                p.until_land = std::max<int64>(DamageUntilLand(m.damage_taken_per_s, horizon), m.damage_spike);
                 break;
             }
     // From the raw health each time (as MakePatient), so a patient handed in
@@ -773,11 +777,13 @@ inline Patient PickPatient(ApPredicateContext const& ctx) { return PickPatient(c
 // stands) and everyone PickPatient would heal within reach. The quiet clock
 // restarts whenever the check was not run for kRaidHealerNeedGapMs (the
 // rotation was busy healing, casting or out of combat), so a healer never
-// nukes straight out of a heal. Dungeons, parties and solo: always true (the
-// rotations' own gates stand). Wands cost no mana and are not gated here.
-constexpr int32  kRaidHealerDpsManaPct = 90;
-constexpr uint32 kRaidHealerDpsQuietMs = 10000;
-constexpr uint32 kRaidHealerNeedGapMs  = 2000;
+// nukes straight out of a heal. Parties outside instances and solo: always
+// true (the rotations' own gates stand). Wands cost no mana and are not gated
+// here.
+// The quiet time and mana floor come from HealerDamageGateFor (Bot/
+// ClassicHealScope.h): a dungeon with Playerbot.Behavior.HealerAssist on uses
+// 3 s and 60 %, a raid (or the switch off) 10 s and 90 %.
+constexpr uint32 kRaidHealerNeedGapMs = 2000;
 
 inline bool RaidHealerMayDamage(BotSnapshotView const& s, GroupSnapshotView const& g)
 {
@@ -802,7 +808,15 @@ inline bool RaidHealerMayDamage(BotSnapshotView const& s, GroupSnapshotView cons
         t.need_eval_ms = now;
         return now - t.need_ms;
     });
-    return since_need >= kRaidHealerDpsQuietMs && ManaPct(s) >= kRaidHealerDpsManaPct;
+    HealerDamageGate const gate = HealerDamageGateFor(s.raid_rules(), Services::Config().behavior_healer_assist());
+    return since_need >= gate.quiet_ms && ManaPct(s) >= gate.mana_pct;
+}
+
+// A healer's own crowd control (HealerMayCrowdControl, Bot/ClassicHealScope.h): in combat, Playerbot.Behavior.HealerAssist on, no
+// raid rules, its mana and everyone it heals (lowest_hp_pct: the rotation's lowest friend or self) high enough.
+inline bool HealerMayCrowdControl(BotSnapshotView const& s, int32 lowest_hp_pct)
+{
+    return s.in_combat() && HealerMayCrowdControl(Services::Config().behavior_healer_assist(), s.raid_rules(), ManaPct(s), lowest_hp_pct);
 }
 
 // Base heal of one rank at the caster's level (no +healing gear: the pick
@@ -1072,7 +1086,7 @@ inline HealPlan PlanHeal(BotSnapshotView const& s, GroupSnapshotView const& g, u
     // Overheal-cancel lockout: not straight back onto the patient a heal was
     // just cancelled on (State_InCombat CancelOverheal) - that is the
     // cast / cancel loop. An emergency there is healed regardless.
-    if (raid && p.actual_pct >= kEmergencyPct && p.hp_pct >= kEmergencyPct && InCancelLockout(s, p.guid))
+    if (p.actual_pct >= kEmergencyPct && p.hp_pct >= kEmergencyPct && InCancelLockout(s, p.guid))
     {
         plan.skip = true;
         return plan;
@@ -1098,6 +1112,16 @@ inline HealPlan PlanHeal(BotSnapshotView const& s, GroupSnapshotView const& g, u
     if (deficit < top_heal / 3.0f * 0.25f)
     {
         plan.skip = true;   // tiny deficit: even the smallest sensible rank mostly overheals
+        return plan;
+    }
+    // The swings forecast on the patient count towards the size of a heal, not towards whether one is needed: a patient who is
+    // missing next to no health right now is not healed yet (tank pressure and emergencies were answered above). Without this a
+    // paladin's Holy Light went out on a player down 1 health to a poison tick and healed 1 (dumpins, leenergetic, Discord
+    // 2026-11-17: "they heal you but only does 1 heal", "heals with no effect, on self too").
+    float const missing_now = float(std::max<int64>(p.max_hp - p.hp - p.inflight, 0)) / HealTakenFactor(g, p.guid);
+    if (missing_now < top_heal / 3.0f * 0.25f)
+    {
+        plan.skip = true;
         return plan;
     }
     float const share = raid ? RaidDeficitShare(save_mana ? std::min(mana, kSaveManaPct - 1) : mana)

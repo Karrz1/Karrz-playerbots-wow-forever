@@ -63,6 +63,7 @@
 #include "Util.h"
 #include "fmt/format.h"
 
+#include "SpellAuraEffects.h"
 #include "SpellAuras.h"
 #include "SpellHistory.h"
 #include "SpellInfo.h"
@@ -181,6 +182,16 @@ struct PullStat
     // capped by the tank's threat, not by its rotation). For the boss's victim: the seconds it was the victim.
     float threat_last = 0.f;
     std::uint32_t threat_peak_pct = 0, threat_capped = 0, victim_seconds = 0;
+    // The seconds counted in <moving>, split by what the raider's own victim was doing: in its melee reach (a step around a target it can
+    // already hit), the victim walking too (a chase), or neither (a walk to a spot). naxx_patchwerk / naxx_gluth 1116 run 4: rogues and
+    // warriors moving 72-91 s of 251 on a boss that stands still, and 157-204 s of 362 on Gluth, with nothing in the log saying why.
+    std::uint32_t moving_in_reach = 0, moving_victim_moving = 0;
+    // ... and for the seconds in reach, the movement generator that moved it and the bot rule fired last (run 5: rogues and the
+    // retribution paladin moving 74-96 s of 246 within reach of Patchwerk, who stands still).
+    std::map<std::string, std::uint32_t> in_reach_movers;
+    // A tank's victim at the last sample: a change is logged with the rule that held its tick (naxx_maexxna r23: the main tank was on a
+    // spiderling 12 y from Maexxna at 39 s, "assigned Maexxna", she was on the second tank, and the log could not say what took it off her).
+    ObjectGuid tank_victim;
     // Damage and healing by spell, the breakdown a combat log parse shows (what each raider's damage came from, how much of a heal was
     // overheal). Added from the map threads, hence the lock. Key: spell id, bit 31 set for the raider's pet; 0 = a melee swing.
     struct SpellTally { std::uint64_t damage = 0; std::uint32_t hits = 0; std::uint64_t heal_raw = 0, heal_eff = 0; std::uint32_t heals = 0; };
@@ -286,6 +297,7 @@ struct Run
     bool checkpoint = false;
     bool has_stage = false;            // a checkpoint with a listed staging spot (ScenarioCheckpoint::stage_*)
     float stage_x = 0.f, stage_y = 0.f, stage_z = 0.f;
+    float route_x = 0.f, route_y = 0.f, route_z = 0.f;   // where the staging route is checked to instead of the creature (ScenarioDef::route_x)
     std::string from_key;
     // Which of the squads running side by side this is (0 = the first): a squad beyond the first is made of characters of its own,
     // with the slot's letter in their names (SquadName).
@@ -827,8 +839,14 @@ constexpr float kArriveClearance = 40.f;
 // is not in the world: his patrol through his own room left no spot in his sight 30 y off the walk (naxx_patchwerk 1114e: the raid landed
 // out of his sight on the floor 1.6 y below, and 9-12 heals per healer failed for line of sight in the first 10 s while the tanks died),
 // and the order goes out while he is still kPatrolOrderYards off, so only his reach matters while he walks past.
+// GetAttackDistance is the reach between the two edges: the core's sight check (Creature::CanStartAttack, IsWithinDistInMap) adds both
+// combat reaches to it, so the clearance carries the boss's reach and a raider's too, and kPatrolPetMargin for the pets standing beside
+// their owners. naxx_grobbulus naxx22 1116: 17 y of clearance (his attack distance is the 5 y minimum, his reach not counted), the raid held
+// 56 s for its blessings, and on his walk past he took a warlock's imp at the edge of the squad, killed it, and evaded with nobody else on
+// his threat list: the run failed at 79 s with him at 100%.
 constexpr float kPatrolClearance = 30.f;
 constexpr float kPatrolSpreadMargin = 12.f;   // the squad's spread round the landing spot (8 y) plus a step
+constexpr float kPatrolPetMargin = 4.f;       // a pet stands up to this far beside its owner
 
 // A dungeon checkpoint lands the squad among the trash the group would meet anyway (it is bot-led from the first second), so it must
 // only be out of every pack's aggro, not 40 y clear: a 5-man has hostiles everywhere (deadmines_full@sneed: the nearest to any candidate
@@ -1327,7 +1345,12 @@ bool PickArrival(Run& run, Player* leader)
         // stands at the instance's entrance, hundreds of yards off, and FindBoss from there found nobody (naxx_thaddius 1115e checked the
         // route to Thaddius again, 129 y straight, and failed the same way). Stalagg and Feugen are his summons, so not in the spawn store.
         float tx = run.boss_x, ty = run.boss_y, tz = run.boss_z;
-        if (run.def->start_add)
+        if (run.route_z != 0.f)
+        {
+            tx = run.route_x; ty = run.route_y; tz = run.route_z;
+            TC_LOG_INFO("playerbot.v2", "[scenario] {} the staging route is checked to {:.1f},{:.1f},{:.1f}, not to the boss", run.def->name, tx, ty, tz);
+        }
+        else if (run.def->start_add)
         {
             Creature* boss = nullptr;
             float bossDist = 50.f;
@@ -1410,7 +1433,8 @@ bool PickArrival(Run& run, Player* leader)
         if (Creature const* boss = FindBoss(run))
         {
             path_id = boss->GetWaypointPathId();
-            patrol_clearance = boss->GetAttackDistance(leader) + kPatrolSpreadMargin;
+            patrol_clearance = boss->GetAttackDistance(leader) + boss->GetCombatReach() + leader->GetCombatReach() + kPatrolSpreadMargin +
+                               kPatrolPetMargin;
         }
         if (!path_id && run.boss_spawn_id)
             if (CreatureAddon const* addon = sObjectMgr->GetCreatureAddon(run.boss_spawn_id))
@@ -1662,13 +1686,49 @@ void LogBuffs(Run const& run)
         if (!p)
             continue;
         std::string auras;
+        // What each buff does to health, by its effects (sta = stamina, sta% / all% = a percent of stamina / of all stats, hp = flat health,
+        // hp% = percent health): naxx_patchwerk 1116 run 5, the tanks at 10.9k with Fortitude, Kings, the Wild, Flask of the Titans,
+        // Mol'dar's and Zandalar on them, about 4k short of what those buffs add on T3, and nothing in the log said which one fell short.
+        std::string health, other;
         for (auto const& [id, app] : p->GetAppliedAuras())
             if (app->IsPositive() && app->GetBase() && !app->GetBase()->IsPassive())
+            {
                 auras += fmt::format("{}{}", auras.empty() ? "" : " ", id);
+                for (AuraEffect const* eff : app->GetBase()->GetAuraEffects())
+                {
+                    if (!eff)
+                        continue;
+                    int32 const misc = eff->GetMiscValue();
+                    char const* kind = nullptr;
+                    switch (eff->GetAuraType())
+                    {
+                        case SPELL_AURA_MOD_STAT:             kind = (misc == STAT_STAMINA || misc < 0) ? "sta" : nullptr; break;
+                        case SPELL_AURA_MOD_PERCENT_STAT:
+                        case SPELL_AURA_MOD_TOTAL_STAT_PERCENTAGE: kind = misc == STAT_STAMINA ? "sta%" : misc < 0 ? "all%" : nullptr; break;
+                        case SPELL_AURA_MOD_INCREASE_HEALTH:
+                        case SPELL_AURA_MOD_INCREASE_HEALTH_2:  kind = "hp"; break;
+                        case SPELL_AURA_MOD_INCREASE_HEALTH_PERCENT:
+                        case SPELL_AURA_MOD_INCREASE_HEALTH_PERCENT2: kind = "hp%"; break;
+                        default: break;
+                    }
+                    if (kind)
+                        health += fmt::format(" {}:{}{:+}", id, kind, eff->GetAmountAsInt());
+                    else if (p->GetPowerType() == POWER_RAGE || m.def.role == ScenarioRoleKind::Tank)
+                        // A tank's other effects too, by aura type / misc value (run 6: Mol'dar's Fortitude 22818 and Songflower 15366 on
+                        // every tank and neither showed as health or stamina).
+                        other += fmt::format(" {}:t{}/{}{:+}", id, uint32(eff->GetAuraType()), misc, eff->GetAmountAsInt());
+                }
+            }
         TC_LOG_INFO("playerbot.v2", "[scenario] buffs {} hp={}/{} mana={}/{} resist fire={} nature={} frost={} shadow={} arcane={} auras [{}]",
                     p->GetName(), p->GetHealth(), p->GetMaxHealth(), p->GetPower(POWER_MANA), p->GetMaxPower(POWER_MANA),
                     p->GetResistance(SPELL_SCHOOL_FIRE), p->GetResistance(SPELL_SCHOOL_NATURE), p->GetResistance(SPELL_SCHOOL_FROST),
                     p->GetResistance(SPELL_SCHOOL_SHADOW), p->GetResistance(SPELL_SCHOOL_ARCANE), auras);
+        TC_LOG_INFO("playerbot.v2", "[scenario] health {} max={} stamina={} (base {}) base health {} flat +{} pct x{:.2f} stamina pct x{:.2f} |{}",
+                    p->GetName(), p->GetMaxHealth(), int32(p->GetStat(STAT_STAMINA)), int32(p->GetCreateStat(STAT_STAMINA)), p->GetCreateHealth(),
+                    int32(p->GetFlatModifierValue(UNIT_MOD_HEALTH, TOTAL_VALUE)), p->GetPctModifierValue(UNIT_MOD_HEALTH, TOTAL_PCT),
+                    p->GetPctModifierValue(UNIT_MOD_STAT_STAMINA, TOTAL_PCT), health.empty() ? " -" : health);
+        if (!other.empty())
+            TC_LOG_INFO("playerbot.v2", "[scenario] effects {}{}", p->GetName(), other);
     }
 }
 
@@ -2471,6 +2531,15 @@ void ReportPull(Run& run, char const* when)
         }
         if (st.mana_min <= 100)
             rules += fmt::format(" | mana avg {}% min {}% seconds under 20% {}", alive ? st.mana_sum / alive : 0u, st.mana_min, st.mana_lt20);
+        if (st.moving)
+            rules += fmt::format(" | moving in its victim's reach {} s, after a moving victim {} s, elsewhere {} s", st.moving_in_reach,
+                                 st.moving_victim_moving, st.moving - std::min(st.moving, st.moving_in_reach + st.moving_victim_moving));
+        if (!st.in_reach_movers.empty())
+        {
+            rules += " | in reach moved by";
+            for (auto const& [k, n] : st.in_reach_movers)
+                rules += fmt::format(" {}={}", k, n);
+        }
         TC_LOG_INFO("playerbot.v2", "[pull_stats] {} {} {} {} damage={} boss={} hits={} seconds={} casting={} moving={} held={} dead={} rules{}",
                     run.def->name, m.def.name, ClassName(m.def.cls), RoleName(m.def.role), st.damage.load(), st.boss_damage.load(), st.hits.load(),
                     st.seconds, st.casting, st.moving, st.held, st.dead, rules.empty() ? " -" : rules);
@@ -2528,10 +2597,45 @@ void SamplePull(Run& run)
                 st.threat_capped += pct >= kThreatCappedPct ? 1u : 0u;
             }
         }
+        if (m.def.role == ScenarioRoleKind::Tank)
+        {
+            Unit* const v = p->GetVictim();
+            ObjectGuid const vg = v ? v->GetGUID() : ObjectGuid::Empty;
+            if (vg != st.tank_victim)
+            {
+                Unit* const was = st.tank_victim.IsEmpty() ? nullptr : ObjectAccessor::GetUnit(*p, st.tank_victim);
+                BotAI* tai = ::Playerbot::Services::Registry().ai(m.id);
+                char const* r = tai ? tai->last_rule_fired() : nullptr;
+                std::string const from = was ? fmt::format("{} ({}) {:.0f}% {:.0f} y{}", was->GetName(), was->GetEntry(), was->GetHealthPct(),
+                                                           p->GetExactDist2d(was), was->GetVictim() == p ? " on it" : "")
+                                             : std::string("-");
+                std::string const to = v ? fmt::format("{} ({}) {:.0f}% {:.0f} y, on {}", v->GetName(), v->GetEntry(), v->GetHealthPct(),
+                                                       p->GetExactDist2d(v), v->GetVictim() ? v->GetVictim()->GetName() : std::string("-"))
+                                         : std::string("-");
+                TC_LOG_INFO("playerbot.v2", "[scenario] {} t={}s tank {} switches from {} to {}, rule={}, boss on {}", run.def->name,
+                            (run.run_ms - run.pull_start_ms) / 1000u, p->GetName(), from, to, r ? r : "-",
+                            boss_victim ? boss_victim->GetName() : std::string("-"));
+                st.tank_victim = vg;
+            }
+        }
         if (p->IsNonMeleeSpellCast(false))
             ++st.casting;
         if (p->isMoving())
+        {
             ++st.moving;
+            if (Unit* v = p->GetVictim())
+            {
+                if (p->IsWithinMeleeRange(v))
+                {
+                    ++st.moving_in_reach;
+                    BotAI* mai = ::Playerbot::Services::Registry().ai(m.id);
+                    char const* r = mai ? mai->last_rule_fired() : nullptr;
+                    ++st.in_reach_movers[fmt::format("gen {} {}", uint32(p->GetMotionMaster()->GetCurrentMovementGeneratorType()), r ? r : "-")];
+                }
+                else if (v->isMoving())
+                    ++st.moving_victim_moving;
+            }
+        }
         if (p->GetMaxPower(POWER_MANA) > 0)
         {
             std::uint32_t const pct = std::uint32_t(std::uint64_t(p->GetPower(POWER_MANA)) * 100u / std::uint64_t(p->GetMaxPower(POWER_MANA)));
@@ -3240,6 +3344,7 @@ bool BeginScenario(std::string const& full_name, int slot, std::string& error)
     {
         run.has_stage = true;
         run.stage_x = def->stage_x; run.stage_y = def->stage_y; run.stage_z = def->stage_z;
+        run.route_x = def->route_x; run.route_y = def->route_y; run.route_z = def->route_z;
     }
     run.from_key = from_key;
     if (run.arrive_entry && !FindBossSpawn(run))

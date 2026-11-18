@@ -1241,7 +1241,7 @@ bool RangedMeleedDefense(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView 
     return true;
 }
 
-// Raid overheal cancel - the "stopcast" technique (Karrz's ike3 healers stop a
+// Group overheal cancel - the "stopcast" technique (Karrz's ike3 healers stop a
 // heal whose target got topped up meanwhile). Direct single-target heals
 // only: no channel, no Chain Heal, no party / area heal (Prayer of Healing's
 // cast target is the priest itself). Mana is spent when a cast completes, so
@@ -1256,12 +1256,13 @@ bool RangedMeleedDefense(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView 
 // freed at once). After a cancel the rotation leaves that patient alone for
 // ClassicHeal::kCancelLockoutMs (an emergency excepted) and the tank pre-heal
 // waits as long, so a cancelled cast is not restarted at once; at most one
-// cancel per 1.5 s.
+// cancel per 1.5 s. Every group, not only raids: a 5-man or a player's party gets the same stop (dumpins, leenergetic, Discord
+// 2026-11-17: a paladin's 2.5 s Holy Light started on a hurt player landed after the player was topped up and "healed You 1").
 bool CancelOverheal(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView const& g, BotIntentEmitter& emit)
 {
     constexpr int64 kWindowMinMs = 200;
     constexpr int64 kWindowMaxMs = 600;
-    if (!s.is_casting() || !s.is_in_raid() || s.in_battleground() || !g.exists()) return false;
+    if (!s.is_casting() || s.in_battleground() || !g.exists()) return false;
     const int64 rem = s.current_cast_remaining().count();
     if (rem < kWindowMinMs) return false;   // lands before a stop would reach the server
     const ObjectGuid tgt = s.current_cast_target();
@@ -1276,11 +1277,23 @@ bool CancelOverheal(BotAI& ai, BotSnapshotView const& s, GroupSnapshotView const
     Combat::ClassicHeal::Patient const p = Combat::ClassicHeal::PatientFor(s, g, tgt);
     if (!p.valid || p.max_hp <= 0 || p.hp <= 0) return false;
     const int64 deficit = p.max_hp - p.hp;
+    // The raid is about to be stunned (RaidOrder::keep_heals): a heal on a tank lands, full or not. naxx_maexxna r24h: three heals on her
+    // tank were stopped at 100% 3 s before Web Spray, the tank stood at 73% when the stun began and died to her swings 7 s into it.
+    if (p.tank && s.raw().raid_order.active && s.raw().raid_order.keep_heals)
+        return false;
     const bool final_window = rem <= kWindowMaxMs;
     // A tank is never stopped early: it is full for a moment between a boss's hits, and a heal let run lands into the next one
     // (naxx_patchwerk 1115h: four "already full" cancels on one tank with 0.7-2.1 s left, each followed by a lockout on that tank,
     // while Hateful Strike and his swings took it from 100% to 79% and lower again within the second).
-    const bool cancel = final_window ? (p.actual_pct >= 95 || float(deficit) < amount * 0.30f)
+    // A patient taking spikes (the largest recent hit, GroupMemberSummary::damage_spike) is not stopped while the next such hit would leave
+    // the heal useful: Hateful Strike lands 9-11.7k on a 10.9k soaker, and 57 stopcasts on soakers at 95%+ came just before the next
+    // strike (naxx_patchwerk 1116 rerun).
+    int64 spike = 0;
+    if (auto const* mems = g.members())
+        for (GroupMemberSummary const& m : *mems)
+            if (m.guid == tgt) { spike = m.damage_spike; break; }
+    const bool spiking = spike > 0 && float(deficit + spike) >= amount * 0.30f;
+    const bool cancel = final_window ? (!spiking && (p.actual_pct >= 95 || float(deficit) < amount * 0.30f))
                                      : (!p.tank && deficit <= 0 && p.incoming <= 0);
     if (!cancel) return false;
     const uint32 now = s.published_at_ms();
@@ -2255,6 +2268,21 @@ bool MeleeSpreadSpot(BotSnapshotView const& s, GroupSnapshotView const& g, Nearb
         }
     // Inside melee reach (reach + ours + 4/3, never under 5): outer rim, jittered 0.5-2 y inward.
     const float outer = std::clamp(v.combat_reach + 2.5f, 3.0f, 6.0f);
+    // In a raid the arc's back is the side away from the victim's own target (its tank), not its facing: a boss turns to every spell
+    // target (Patchwerk to each Hateful Strike soaker, every 1.2 s; Gluth to each chow he eats), and the arc turned with him, so every melee
+    // bot was more than 2 y off its slot again at each 3 s check (naxx_patchwerk 1116 run 5/6: rogues and the retribution paladin moving
+    // 74-96 s of 246 within his reach, all of it point moves; run 6 on Gluth: 79-90 s of 300). The tank stands still, so the slots do too.
+    float front = v.o;
+    if (s.is_in_raid() && !v.victim.IsEmpty() && v.victim != s.guid())
+        if (auto const* mems = g.members())
+            for (auto const& m : *mems)
+                if (m.guid == v.victim && m.is_alive && m.map_id == s.map_id())
+                {
+                    float const dx = m.x - v.x, dy = m.y - v.y;
+                    if (dx * dx + dy * dy > 0.25f)
+                        front = std::atan2(dy, dx);
+                    break;
+                }
     for (uint32 i = 0; i < 4; ++i)
     {
         const uint32 rank = (k + i * 3) % n;   // a blocked slot tries the one three along
@@ -2262,7 +2290,7 @@ bool MeleeSpreadSpot(BotSnapshotView const& s, GroupSnapshotView const& g, Nearb
         // Raid (playtest 2026-10-12): melee stack on the boss's back, nearly on top of each other, unless a boss rule spreads them. A 70 degree
         // arc instead of the 160 degree one of a dungeon pack.
         if (s.is_in_raid())
-            MeleeArcSpot(s.guid().GetCounter(), rank, n, v.x, v.y, v.o, 1.0f, outer, x, y, 1.2217f);
+            MeleeArcSpot(s.guid().GetCounter(), rank, n, v.x, v.y, front, 1.0f, outer, x, y, 1.2217f);
         else
             MeleeArcSpot(s.guid().GetCounter(), rank, n, v.x, v.y, v.o, 1.0f, outer, x, y);
         if (RaidStandPointBlocked(s, x, y, v.z)) continue;
@@ -2396,8 +2424,10 @@ static bool GroupFightPick(BotAI& ai, BotSnapshotView const& s, GroupSnapshotVie
             return false;
         why = cands[pick].on_non_tank ? "loose on a member" : cands[pick].mob.leader_ordered ? "leader's order"
             : cands[pick].mob.leader_target ? "leader's target" : "on a member";
-        // Keep a mob it already holds unless one is loose on a member; switch at most every 2 s.
-        if (cur_ok && (!cands[pick].on_non_tank || cands[cur_idx].on_non_tank))
+        // Keep a mob it already holds unless one is loose on a member, or the leader's own target is loose and the held one is not
+        // it; switch at most every 2 s.
+        bool const to_leader_target = cur_ok && cands[pick].on_non_tank && cands[pick].mob.leader_target && !cands[cur_idx].mob.leader_target;
+        if (cur_ok && !to_leader_target && (!cands[pick].on_non_tank || cands[cur_idx].on_non_tank))
             return false;
     }
     else
@@ -2411,9 +2441,11 @@ static bool GroupFightPick(BotAI& ai, BotSnapshotView const& s, GroupSnapshotVie
         if (pick == GroupFight::kNone)
             return false;
         GroupFight::Candidate const& m = cands[pick].mob;
-        why = m.leader_ordered ? "leader's order" : m.priority_add ? "priority add" : m.tank_target ? "tank's target"
-            : m.leader_target ? "leader's target" : m.on_me ? "on me" : "on a member";
-        if (cur_ok && !m.leader_ordered)
+        why = m.leader_ordered ? "leader's order" : m.priority_add ? "priority add" : m.leader_target ? "leader's target"
+            : m.tank_target ? "tank's target" : m.on_me ? "on me" : "on a member";
+        // A live victim of the fight is kept unless the leader names another or turns to another mob himself: his target is the
+        // group's kill target (Saul, #bot-feedback 2026-11-17: the bots fought every mob on a member but the player's).
+        if (cur_ok && !m.leader_ordered && !(m.leader_target && !cands[cur_idx].mob.leader_target))
             return false;
     }
     if (units[pick]->guid == cur)

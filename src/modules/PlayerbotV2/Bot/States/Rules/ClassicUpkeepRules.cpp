@@ -42,6 +42,8 @@
 #include "Bot/ResistGear.h"
 #include "Services.h"
 #include "SharedDefines.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "Util/ConfigReader.h"
 #include <vector>
 
@@ -205,8 +207,21 @@ bool BlessingsFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
                     if (m.guid == b.target)
                         for (AuraEntry const& a : m.buffs)
                             seen += fmt::format("{}{}:{}s", seen.empty() ? "" : " ", a.spell_id, a.remaining.count() / 1000);
-            TC_LOG_INFO("playerbot.v2", "[raid_support] {} casts spell {} on {} (key {:x}): target's tracked buffs [{}]", s.name(), b.spell,
-                        b.target.GetCounter(), b.key, seen);
+            // A raid's paladin that blesses member by member takes a minute over forty (naxx22 1116: two paladins still owed blessings
+            // 50-84 s past the attack order on three bosses). What keeps it off the Greater Blessings: its Symbols of Kings, whether it
+            // knows Greater Might / Wisdom / Kings, and whether this server's Greater Might applies anything (GreaterBlessingWorks).
+            std::string greater;
+            if (g.is_raid() && (b.key >> 48) == 2)
+            {
+                bool might_works = false;
+                if (SpellInfo const* si = sSpellMgr->GetSpellInfo(25782, DIFFICULTY_NONE))
+                    for (SpellEffectInfo const& eff : si->GetEffects())
+                        might_works = might_works || eff.Effect != SPELL_EFFECT_NONE;
+                greater = fmt::format("; one by one: Symbol of Kings {}, knows Greater Might {} Wisdom {} Kings {}, Greater Might applies {}",
+                                      s.item_count(21177), s.knows_spell(25782), s.knows_spell(25894), s.knows_spell(25898), might_works);
+            }
+            TC_LOG_INFO("playerbot.v2", "[raid_support] {} casts spell {} on {} (key {:x}): target's tracked buffs [{}]{}", s.name(), b.spell,
+                        b.target.GetCounter(), b.key, seen, greater);
         }
     }
     Classic::NoteRaidSupport(Classic::RaidSupportKind::Blessing);

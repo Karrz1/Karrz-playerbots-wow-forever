@@ -608,6 +608,15 @@ void DispatchInGroup(BotAI& ai,
         DungeonHonorCross(snapshot, ai, emit, snapshot.published_at_ms()))
         return;
 
+    // A raid pre-pull spot (Thaddius' platforms, Gothik's sides, Patchwerk's posts) is the raid brain's: idle:raid_prepull walks the
+    // bot there and holds it until the pull, and the brain drops the order once the boss fights. The cohesion moves below (rejoin the
+    // tank past 40 y, converge, formation, follow) would walk it off its spot each tick and the hold back again. naxx_thaddius r25:
+    // once the attack was ordered the whole Feugen side walked to 40 y of the main tank on Stalagg's platform, stood on the ramp
+    // between them (ingroup:dungeon_rejoin_tank / idle:raid_prepull in turn), and the run timed out unpulled.
+    if (auto const& ro = snapshot.raw().raid_order; ro.active && ro.prepull && (ro.move || ro.cast_spell) && snapshot.is_alive() &&
+        !snapshot.in_combat())
+        return;
+
     // Anchor selection:
     //   * Healer (always): stick to the tank. Being out of range to heal
     //     is the most common cause of group wipes from bot positioning.

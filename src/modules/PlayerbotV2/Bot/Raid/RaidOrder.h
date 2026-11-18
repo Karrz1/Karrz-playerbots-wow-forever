@@ -17,7 +17,8 @@ namespace Playerbot {
 
 struct RaidOrder
 {
-    enum class CastKind : uint8_t { None, Taunt, Dispel, Purge, CrowdControl, Nuke, Disarm, StanceDance };
+    // Prepare: a cast ahead of a known hit (a shield or heal over time on the tank before a stun, the tank's own Shield Wall).
+    enum class CastKind : uint8_t { None, Taunt, Dispel, Purge, CrowdControl, Nuke, Disarm, StanceDance, Prepare };
 
     bool active = false;
 
@@ -29,6 +30,9 @@ struct RaidOrder
     bool  move = false;
     float move_x = 0.f, move_y = 0.f, move_z = 0.f;
     char const* move_reason = "";   // static string literal (log/diag only)
+    // The move gets the bot out of something that kills where it stands (a hazard, a cone, lava, a breath it hides from, Heigan's
+    // eruption): a cast under way is stopped for it. Any other move waits for the cast to end; see DispatchRaidOrder.
+    bool move_urgent = false;
     // The bot stands at its encounter role position (a Stand rule, within its tolerance): the generic in-fight formation walk and the
     // clump separation leave it there (each would walk it off the post, and the next brain pass walk it back).
     bool at_post = false;
@@ -87,6 +91,9 @@ struct RaidOrder
     // Remove this aura from the bot (Blessing of Protection on a tank during Nefarian's paladin call).
     uint32_t cancel_aura = 0;
 
+    // A stun on the whole raid comes within seconds (Maexxna's Web Spray): no heal on a tank is stopped as overheal, so every heal in
+    // the air lands before the healers are held for 10 s.
+    bool keep_heals = false;
     // Pause the rotation (Nefarian's priest call). Movement and elected jobs still run.
     bool hold_rotation = false;
 

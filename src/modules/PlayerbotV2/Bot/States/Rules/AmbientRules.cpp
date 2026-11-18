@@ -53,6 +53,7 @@
 #include "Config.h"
 #include "Bot/World/ZonePicker.h"
 #include "GameTime.h"
+#include "WorldStateMgr.h"   // idle:scourge_invasion reads the realm "zone invaded" states
 #include "UnitDefines.h"   // UNIT_NPC_FLAG_FLIGHTMASTER / _QUESTGIVER
 
 #include <string>
@@ -1488,6 +1489,161 @@ bool GrindRoamFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     return false;
 }
 
+// ---------- idle:scourge_invasion ----------
+// The Scourge Invasion world event (classic_world_event_scourge_invasion.cpp, off unless Classic.ScourgeInvasion = 1 or .scourge on):
+// a free level 55+ bot in a zone under attack fights the camp minions near it and, with none in reach, walks to the nearest camp
+// (the event's summoning circles, the same spots on every attack), so a small server still has people at the necropolises.
+// The "invaded" world states are realm wide and WorldStateMgr locks them, so the gate may read them off the world thread.
+// Playerbot.World.ScourgeInvasion = 0 keeps the bots out of it.
+namespace
+{
+struct SiCamp { uint32 zone; uint32 map; float x, y, z; };
+constexpr SiCamp kSiCamps[] =
+{
+    { 618, 1, 6052.6f, -4749.6f, 785.5f },
+    { 618, 1, 7939.6f, -3870.9f, 695.4f },
+    { 618, 1, 7822.9f, -4220.2f, 675.5f },
+    { 618, 1, 7687.9f, -3877.7f, 687.2f },
+    { 618, 1, 6782.0f, -3585.6f, 712.3f },
+    { 618, 1, 6742.2f, -3352.3f, 688.4f },
+    { 618, 1, 6547.4f, -3482.4f, 643.6f },
+    { 618, 1, 6284.7f, -4782.2f, 757.3f },
+    { 618, 1, 6072.1f, -5040.1f, 789.9f },
+    { 440, 1, -8833.6f, -2600.4f, 21.7f },
+    { 440, 1, -7246.0f, -3543.6f, 13.6f },
+    { 440, 1, -7328.9f, -3970.2f, 11.0f },
+    { 440, 1, -7632.0f, -3733.0f, 20.7f },
+    { 440, 1, -8169.9f, -3803.6f, 14.9f },
+    { 440, 1, -8333.9f, -4203.1f, 12.3f },
+    { 440, 1, -8476.2f, -3826.0f, 16.6f },
+    { 440, 1, -8533.5f, -2699.7f, 21.2f },
+    { 440, 1, -8534.2f, -2298.9f, 28.6f },
+    { 16, 1, 3086.5f, -4215.7f, 97.7f },
+    { 16, 1, 3337.5f, -4516.6f, 97.7f },
+    { 16, 1, 3366.3f, -5566.3f, 11.1f },
+    { 16, 1, 3516.3f, -4151.8f, 106.9f },
+    { 16, 1, 3518.3f, -5712.4f, 4.8f },
+    { 16, 1, 3666.5f, -5533.4f, 20.6f },
+    { 4, 0, -11548.5f, -3283.3f, 7.5f },
+    { 4, 0, -11420.0f, -2816.9f, 0.8f },
+    { 4, 0, -11347.7f, -3150.8f, 6.8f },
+    { 4, 0, -11250.5f, -3350.8f, 9.9f },
+    { 4, 0, -11181.7f, -2985.4f, 8.2f },
+    { 4, 0, -11016.3f, -2783.4f, 4.4f },
+    { 139, 0, 1599.8f, -3039.5f, 78.7f },
+    { 139, 0, 1804.4f, -2842.5f, 72.9f },
+    { 139, 0, 1938.6f, -4761.2f, 97.1f },
+    { 139, 0, 1957.1f, -3101.7f, 83.6f },
+    { 139, 0, 1963.3f, -5125.1f, 78.7f },
+    { 139, 0, 2315.2f, -4933.1f, 83.0f },
+    { 46, 0, -8399.8f, -1246.0f, 202.7f },
+    { 46, 0, -8371.1f, -963.3f, 191.0f },
+    { 46, 0, -8032.0f, -981.6f, 122.6f },
+    { 46, 0, -7981.9f, -2433.3f, 129.8f },
+    { 46, 0, -7732.9f, -2232.8f, 135.0f },
+    { 46, 0, -7603.6f, -2596.4f, 135.7f },
+};
+
+int32 SiInvadedWorldState(uint32 zoneId)
+{
+    switch (zoneId)
+    {
+        case 618: return 2259;  // Winterspring
+        case 16:  return 2260;  // Azshara
+        case 4:   return 2261;  // Blasted Lands
+        case 46:  return 2262;  // Burning Steppes
+        case 440: return 2263;  // Tanaris
+        case 139: return 2264;  // Eastern Plaguelands
+        default:  return 0;
+    }
+}
+
+bool SiIsMinion(uint32 entry)
+{
+    switch (entry)
+    {
+        case 16141: case 16298: case 16299:   // Ghoul Berserker, Spectral Soldier, Skeletal Shocktrooper
+        case 14697: case 16379: case 16380:   // the rares (left to players by ShareMobs::LeaveElite when elite)
+        case 16230:                           // Cultist Engineer
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool SiBotsJoin()
+{
+    static bool const join = sConfigMgr->GetBoolDefault("Playerbot.World.ScourgeInvasion", true, true);
+    return join;
+}
+
+bool SiZoneInvaded(uint32 zoneId)
+{
+    int32 const ws = SiInvadedWorldState(zoneId);
+    return ws && WorldStateMgr::GetValue(ws, nullptr) > 0;
+}
+}
+
+bool ScourgeInvasionGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    if (!s.is_free_world_bot() || s.level() < 55) return false;
+    if (!s.is_alive() || s.in_combat() || s.is_casting() || s.hp_pct() < 70) return false;
+    if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground()) return false;
+    if (V2::Parties::Following(s)) return false;
+    if (!SiBotsJoin() || !SiZoneInvaded(s.zone_id())) return false;
+    return true;
+}
+
+bool ScourgeInvasionFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    float bx, by, bz;
+    s.position(bx, by, bz);
+
+    // a minion or cultist in reach: fight it
+    NearbyUnit const* best = nullptr;
+    float bestDist = 50.0f;
+    for (auto const& u : s.nearby_enemies())
+    {
+        if (!u.guid.IsCreature() || !SiIsMinion(u.entry) || u.hp <= 0 || u.untargetable || u.is_pacified) continue;
+        if (u.victim != ObjectGuid::Empty && u.victim != s.guid()) continue;   // someone else's fight
+        if (V2::ShareMobs::LeaveMob(s, u) || V2::ShareMobs::LeaveElite(s, u)) continue;
+        float const d = std::hypot(u.x - bx, u.y - by);
+        if (d < bestDist) { bestDist = d; best = &u; }
+    }
+    if (best)
+    {
+        if (s.raw().movement.is_mounted)
+            emit.dismount();
+        if (emit.start_attack(best->guid))
+        {
+            ai.set_last_rule_fired("idle:scourge_invasion");
+            return true;
+        }
+        return false;
+    }
+
+    // none: to the nearest camp of this zone
+    SiCamp const* camp = nullptr;
+    float campDist = 700.0f;
+    for (SiCamp const& c : kSiCamps)
+    {
+        if (c.zone != s.zone_id() || c.map != s.map_id()) continue;
+        float const d = std::hypot(c.x - bx, c.y - by);
+        if (d < campDist) { campDist = d; camp = &c; }
+    }
+    if (!camp || campDist <= 25.0f)
+        return false;   // at the camp: the engage rule and the wander do the rest
+
+    uint32 const now = s.published_at_ms();
+    if (s.is_moving() || emit.move_to(camp->x, camp->y, camp->z) || emit.move_already_emitted(camp->x, camp->y, camp->z)
+        || States::ChunkedWalkToward(s, ai, emit, camp->x, camp->y, camp->z, "idle:scourge_invasion", now))
+    {
+        ai.set_last_rule_fired("idle:scourge_invasion");
+        return true;
+    }
+    return false;
+}
+
 // ---------- idle:campfire ----------
 // Outdoors at night, a few bots that stand still light a campfire (Basic Campfire, 818); the usual ambient sit does the rest.
 bool CampfireGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32)
@@ -2082,6 +2238,14 @@ void RegisterAmbientRules(IdleRuleRegistry& r)
         rule.priority = 55;    // just above the autoact cascade (50), which fights what is in reach and wanders
         rule.gate     = &GrindRoamGate;
         rule.fire     = &GrindRoamFire;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:scourge_invasion";
+        rule.priority = 57;    // above grind_roam (55) and party_follow's 56: a zone under attack is where a free bot goes
+        rule.gate     = &ScourgeInvasionGate;
+        rule.fire     = &ScourgeInvasionFire;
         r.register_rule(std::move(rule));
     }
     {

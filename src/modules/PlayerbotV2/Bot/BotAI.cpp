@@ -9,6 +9,7 @@
 #include "Player.h"         // EQUIPMENT_SLOT_* for wear_gift_gear
 #include "ObjectMgr.h"      // item templates (required level) for wear_gift_gear
 #include "ItemTemplate.h"
+#include "Gear/BotGearGenerator.h"   // Gear::AutoEquipSlot for wear_gift_gear
 #include "BotIntentEmitter.h"
 #include "BotActivityTier.h"
 #include "Group/GroupSnapshot.h"
@@ -1032,11 +1033,13 @@ void BotAI::wear_gift_gear(BotSnapshotView const& s, BotIntentEmitter& em)
             ++it;   // kept for later
             continue;
         }
-        uint8 const slot = found->equip_slot;
-        // Prot warrior / paladin: the weapon and shield slots belong to EnsureShieldTankWeapon (as in the auto-equip rules).
-        if ((s.spec() == 73 || s.spec() == 66) && (slot == EQUIPMENT_SLOT_MAINHAND || slot == EQUIPMENT_SLOT_OFFHAND))
+        // Prot warrior / paladin: a one-hander goes in the main hand and a shield in the off hand; a two-hander or an off-hand
+        // weapon would push the shield off, so it stays in the bags (as in the auto-equip rules, Gear::AutoEquipSlot). Before
+        // 11-17 every traded weapon and shield stayed in a tank's bags. Never a fishing pole.
+        uint8 const slot = ::Playerbot::V2::Gear::AutoEquipSlot(uint16(s.spec()), found->equip_slot, found->entry);
+        if (slot == 0xFF)
         {
-            TC_LOG_INFO("playerbot.v2", "[gear] {} (bot {}): traded weapon {} left in the bags (tank weapons are set by the tank rule)",
+            TC_LOG_INFO("playerbot.v2", "[gear] {} (bot {}): traded weapon {} left in the bags (a fishing pole, or not a one-hander or shield for a shield tank)",
                 raw.identity.name, s.bot_id(), found->entry);
             it = gift_wear_.erase(it);
             continue;

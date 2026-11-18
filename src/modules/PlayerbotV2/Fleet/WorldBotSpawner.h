@@ -80,6 +80,8 @@ private:
         uint32 zone_bots        = 0;       // target when the player is in a leveling zone (0 = BotsPerPlayer)
         uint32 start_zone_bots  = 25;      // the same in a start zone (Mulgore, Durotar, ...), where a real realm has a few new characters (0 = ZoneBots)
         float  activity_radius  = 300.0f;  // a bot this close to an anchor counts toward it
+        uint32 mobs_per_bot     = 10;      // a leveling zone holds at most one bot per this many mobs of the player's level in reach (0 = off)
+        uint32 supply_floor     = 5;       // ... but never fewer than this
         float  despawn_radius   = 450.0f;  // a bot farther than this from every anchor is logged out
         float  ring_min         = 60.0f;   // spawn ring (placement distance from the anchor)
         float  ring_max         = 220.0f;
@@ -207,6 +209,11 @@ private:
     // players are in it; a place's roll and when it last had a player.
     void PlanPlaces(uint32 now_ms, std::vector<Anchor> const& anchors, std::vector<Anchor> const& keep_anchors);
     uint32 PlaceWantFor(Anchor const& a);
+    // Mob supply cap of a leveling zone (Playerbot.World.MobsPerBot): taken when the zone gets its player (or the player's level
+    // changes), so the number does not move with every step he takes; forgotten with the zone's roll.
+    uint32 SupplyCapFor(Anchor const& a) const;
+    struct SupplyCap { uint8 level = 0; uint32 cap = 0; };
+    mutable std::unordered_map<uint64, SupplyCap> supply_cap_;
     std::unordered_map<uint64, uint32> place_target_, place_players_, zone_roll_, place_seen_ms_;
     std::string plain_logged_;
     std::optional<PopLevel> pop_level_;       // the panel's choice (SetPopulation); loaded once from the database

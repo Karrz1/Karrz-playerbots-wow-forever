@@ -406,6 +406,11 @@ ScopedDeferGridLoads::~ScopedDeferGridLoads()
     t_deferGridLoads = previous_;
 }
 
+bool InBotLogicThread()
+{
+    return t_botLogicThread;
+}
+
 ScopedBotLogicThread::ScopedBotLogicThread() : previous_(t_botLogicThread)
 {
     t_botLogicThread = true;
@@ -762,19 +767,20 @@ bool TryUnstickJump(Player* p, float forward)
 
 // ---- SettleToGround ---------------------------------------------------------
 
-bool SettleToGround(Player* p, float minGap, float maxGap)
+bool HoverGap(Player* p, float minGap, float maxGap, float& ground)
 {
     if (!p || !p->IsInWorld() || !p->IsAlive() || p->IsBeingTeleported())
         return false;
     // Falling needs gravity and nothing else in charge of the bot: not on a taxi, vehicle or transport, not flying or swimming, not
     // already moving (a spline in flight lands where it was told to).
+    // A hover (Levitate, a hover aura) keeps the bot up on purpose.
     if (p->isMoving() || p->IsFlying() || p->IsInFlight() || p->GetVehicle() || p->GetTransport() || p->IsInWater() ||
-        p->HasUnitState(UNIT_STATE_NOT_MOVE) || p->IsFalling())
+        p->HasUnitState(UNIT_STATE_NOT_MOVE) || p->IsFalling() || p->IsHovering() || p->HasAuraType(SPELL_AURA_HOVER))
         return false;
     float const x = p->GetPositionX();
     float const y = p->GetPositionY();
     float const z = p->GetPositionZ();
-    float const ground = p->GetMapHeight(x, y, z + 0.5f, true, maxGap + 1.0f);
+    ground = p->GetMapHeight(x, y, z + 0.5f, true, maxGap + 1.0f);
     if (ground <= INVALID_HEIGHT)
         return false;
     float const gap = z - ground;
@@ -784,6 +790,16 @@ bool SettleToGround(Player* p, float minGap, float maxGap)
     // not a fall (a BG river: the bot sank to the bed and drowned).
     if (float swimZ = 0.f; SwimLevel(p, x, y, z, swimZ))
         return false;
+    return true;
+}
+
+bool SettleToGround(Player* p, float minGap, float maxGap)
+{
+    float ground = INVALID_HEIGHT;
+    if (!HoverGap(p, minGap, maxGap, ground))
+        return false;
+    float const x = p->GetPositionX();
+    float const y = p->GetPositionY();
     // A real player falls client-side; a bot has no client, so nothing ever moves it down. Launch the fall as a spline
     // (the same as MotionMaster::MoveFall does for creatures) so it drops to the floor and every viewer sees it land.
     Movement::MoveSplineInit init(p);

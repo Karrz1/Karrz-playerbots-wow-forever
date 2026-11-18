@@ -658,11 +658,14 @@ void DoDemoRoar(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(DEMORAL
 bool ShouldSwipe(ApPredicateContext const& ctx)
 {
     return HasLiveTarget(ctx) && InBear(ctx) && Rage(ctx) >= 20 && ctx.bot.enemies_within(6.0f) >= 2
-        && Ready(ctx, SWIPE)
+        && Ready(ctx, SWIPE) && ctx.bot.victim_in_spell_range(SWIPE)
         && AoeSafeAroundSelf(ctx.bot, 8.0f, /*damaging*/ true, /*tank*/ true, "Swipe", SWIPE)
         && !TankThreat::AoeRipsOtherTank(ctx.bot, 8.0f, "Swipe");
 }
-void DoSwipe(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(SWIPE); }
+// On the victim: Swipe takes an enemy target (its cone is in front of the bear). Sent with none, the casts failed BAD_TARGETS
+// (naxx_gluth 1118 r4 and r6: a BAD_TARGETS on 779 every 10-14 s in every run, no Swipe damage in any pull_spells, the bear's area
+// threat on its chows nothing at all).
+void DoSwipe(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(SWIPE, ctx.bot.victim()); }
 
 // Faerie Fire (Feral) - free, 30 yd, threat on its own - on the pack mob that
 // needs threat most once the victim has its lead (TankThreat::SpreadTarget:
@@ -929,6 +932,13 @@ bool ShouldHealerLeaveForm(ApPredicateContext const& ctx)
 }
 void DoHealerLeaveForm(ApPredicateContext const& ctx, BotIntentEmitter& e) { DoCancelWrongForm(ctx, e, WantedForm::None); }
 
+// Healer: Hibernate on an add while the group is healthy and mana allows (Playerbot.Behavior.HealerAssist,
+// ClassicHeal::HealerMayCrowdControl). In an instance the group plan picks the mob (PickGroupCC defers to it).
+bool ShouldHealerCrowdControl(ApPredicateContext const& ctx)
+{
+    return ClassicHeal::HealerMayCrowdControl(ctx.bot, LowestFriendOrSelf(ctx).hp_pct) && ShouldCrowdControl(ctx);
+}
+
 ApRule const kHealerRules[] = {
     { ShouldHealerLeaveForm,      DoHealerLeaveForm,   "classic_resto:leave_form" },
     { ShouldNaturesSwiftnessHeal, DoSwiftHealingTouch, "classic_resto:natures_swiftness_touch" },
@@ -942,6 +952,7 @@ ApRule const kHealerRules[] = {
     { ShouldDispel,               DoDispel,            "classic_resto:dispel" },
     { ShouldRegrowthTopUp,        DoRegrowthTopUp,     "classic_resto:regrowth_top_up" },
     { ShouldRejuvenation,         DoRejuvenation,      "classic_resto:rejuvenation" },
+    { ShouldHealerCrowdControl,   DoCrowdControl,      "classic_resto:hibernate" },
     { ShouldHealerSchoolNuke,     DoHealerSchoolNuke,  "classic_resto:school_nuke" },
     { ShouldHealerMoonfire,       DoMoonfire,          "classic_resto:moonfire" },
     { ShouldHealerWrath,          DoWrath,             "classic_resto:wrath" },

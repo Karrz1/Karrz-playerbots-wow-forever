@@ -238,6 +238,7 @@ void ConfigReader::apply_from_loaded_config()
     bhv_spread_out_           = c.GetBoolDefault("Playerbot.Behavior.SpreadOut", true, true);
     bhv_loose_mob_hold_       = c.GetBoolDefault("Playerbot.Behavior.LooseMobHold", true, true);
     bhv_raid_buff_hold_       = c.GetBoolDefault("Playerbot.Behavior.RaidBuffHold", true, true);
+    bhv_healer_assist_        = c.GetBoolDefault("Playerbot.Behavior.HealerAssist", true, true);
     bhv_dungeon_loot_         = c.GetBoolDefault("Playerbot.Behavior.DungeonLoot", true, true);
     bhv_warrior_stance_dance_ = c.GetBoolDefault("Playerbot.Behavior.WarriorStanceDance", true, true);
     bhv_bot_whisperable_      = c.GetBoolDefault("Playerbot.Behavior.BotWhisperable", true, true);

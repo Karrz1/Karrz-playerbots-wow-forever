@@ -584,6 +584,7 @@ ForeverBotsLocale = {
     ["short:Set"] = "Мышью",
     ["Set with the mouse"] = "Поставить мышью",
     ["short:G%d"] = "Г%d",
+    ["the client refused a macro line in a boss fight: there a macro may only send one line at a time, to /p, /ra or a whisper. For a dot command start the line with /w %s (for example /w %s .aura self 1459 21562)."] = "клиент не пропустил строку макроса в бою с боссом: там макрос может отправлять только одну строку за раз, в /p, /ra или шепотом. Для команды с точкой начните строку с /w %s (например /w %s .aura self 1459 21562).",
     ["Tick every bot in this raid group. Click again when they are all ticked to untick them."] = "Отметить всех ботов этой группы рейда. Нажмите еще раз, когда отмечены все, чтобы снять отметку.",
     -- Tank leads (Orders tab)
     ["short:Ignore"] = "Не трогать", -- check

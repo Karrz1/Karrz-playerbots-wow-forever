@@ -111,7 +111,7 @@ inline bool TankNotSecured(BotSnapshotView const& s, NearbyUnit const& u)
     return u.my_threat >= u.tank_threat * ratio;
 }
 
-enum class AoeHazardKind : uint8 { None, CrowdControlled, Unpulled, NotTanked, SchoolAvoided };
+enum class AoeHazardKind : uint8 { None, CrowdControlled, Unpulled, NotTanked, SchoolAvoided, OtherTanksBoss };
 
 inline char const* AoeHazardName(AoeHazardKind k)
 {
@@ -121,6 +121,7 @@ inline char const* AoeHazardName(AoeHazardKind k)
         case AoeHazardKind::Unpulled:        return "unpulled";
         case AoeHazardKind::NotTanked:       return "not_tanked";
         case AoeHazardKind::SchoolAvoided:   return "school_avoided";
+        case AoeHazardKind::OtherTanksBoss:  return "other_tanks_boss";
         default:                             return "none";
     }
 }
@@ -131,11 +132,24 @@ struct AoeHazard
     AoeHazardKind     kind = AoeHazardKind::None;
 };
 
+// A raid boss another tank holds, which this tank is not fighting itself: a tank's AoE that reaches it puts the tank's threat on the boss
+// (Thunder Clap, Demoralizing Shout and Cleave carry extra threat in Defensive Stance), and a boss turns to whoever passes 110% of its
+// tank's threat. naxx_grobbulus r24: the off tanks held the Fallout Slimes beside him, he went from his main tank to an off tank at 57 s
+// and again at 87 s, and the Slime Spray of the new facing put 7 slimes on the tanks at once; the slimes then killed the raid. A tank
+// whose own target is the boss (Patchwerk's soakers) hits him anyway, so its AoE is no hazard there.
+inline bool OtherTanksBoss(BotSnapshotView const& s, NearbyUnit const& u)
+{
+    return s.is_in_raid() && (u.is_dungeon_boss || u.is_boss_rank) && u.unit_in_combat && !u.victim.IsEmpty() && u.victim != s.guid() &&
+           u.guid != s.victim() && ThreatVictim(u.victim_kind) == ThreatVictim::Tank;
+}
+
 // First enemy within `radius` of (cx, cy, cz) an AoE must not hit.
 //   * crowd-controlled (any caster), when the AoE deals damage;
 //   * in a tanked group: a mob nobody has engaged yet (the AoE would pull it);
 //   * for a non-tank in a tanked group: a mob a tank is holding but has not
 //     secured yet (TankNotSecured).
+//   * for a tank in a raid: a boss another tank holds that this tank is not
+//     fighting itself (OtherTanksBoss).
 //   * school_spell != 0: a mob whose raid school hint (PveOrder::SchoolHint)
 //     reflects that spell's school (an Anubisath Sentinel), in or out of a group.
 //     A mob merely immune to it or resisting it is no hazard: the area spell
@@ -184,6 +198,8 @@ inline AoeHazard FindAoeHazard(BotSnapshotView const& s, float cx, float cy, flo
         // Raid only: a party's AoE is not held for the tank's lead (the Unpulled and CC guards above still apply).
         if (tanked && s.is_in_raid() && !me_tank && ThreatVictim(u.victim_kind) == ThreatVictim::Tank && TankNotSecured(s, u))
         { hit = { &u, AoeHazardKind::NotTanked }; return false; }
+        if (tanked && me_tank && OtherTanksBoss(s, u))
+        { hit = { &u, AoeHazardKind::OtherTanksBoss }; return false; }
         return false;
     };
     for (NearbyUnit const& u : s.attackers())
@@ -218,7 +234,8 @@ inline bool AoeSafeAroundSelf(BotSnapshotView const& s, float radius, bool damag
 // Melee AoE (warrior Cleave, Whirlwind) in a raid group: only two of
 // FindAoeHazard's vetoes apply - a crowd-controlled mob within `radius` (the
 // swing breaks the CC) and, for a non-tank, a tank-held mob the tank has not
-// secured yet against this bot. A mob nobody pulled is not one: a melee AoE
+// secured yet against this bot, and for a tank a boss another tank holds that
+// this tank is not fighting (OtherTanksBoss). A mob nobody pulled is not one: a melee AoE
 // reaches a few yards and the bot is already in the pack. Outside raid
 // groups (and in battlegrounds) the rotation's own conditions apply unchanged.
 inline bool MeleeAoeSafe(BotSnapshotView const& s, bool raid_group, float radius, bool caster_is_tank, char const* what)
@@ -239,6 +256,7 @@ inline bool MeleeAoeSafe(BotSnapshotView const& s, bool raid_group, float radius
         if (tanked && !me_tank && u.has_threat_list && u.unit_in_combat
             && ThreatVictim(u.victim_kind) == ThreatVictim::Tank && TankNotSecured(s, u))
         { hit = &u; kind = AoeHazardKind::NotTanked; return true; }
+        if (tanked && me_tank && OtherTanksBoss(s, u)) { hit = &u; kind = AoeHazardKind::OtherTanksBoss; return true; }
         return false;
     };
     bool found = false;

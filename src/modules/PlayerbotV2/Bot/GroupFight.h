@@ -11,7 +11,9 @@
 //   3. Out of reach or out of sight: move until it is not.
 //   4. The leader's orders win: Stop, Flee, Follow, Stay, Pull back given in the last few seconds (or during this fight).
 //      A one-off verb (use, loot) never leaves a lasting state.
-//   5. Tanks pick up aggro: a mob on a non-tank first, then the leader's target.
+//   5. Tanks pick up aggro: a mob on a non-tank first (the leader's own target first among them), then the leader's target.
+//   The leader's target is the group's kill target: the damage dealers take it before the tank's (Saul, #bot-feedback 2026-11-17:
+//   "the tank won't prioritize the player's target"; the defensive bots spread over every mob on a member instead).
 //   6. Out of combat only: Passive, Stay, Follow, formation, leash, follow distance.
 // Every hold that can keep a grouped bot from fighting asks BotAI::group_fight() and steps aside while it is true.
 // Raid maps (20 and 40 players) keep their boss tactics: the gate is off while a boss fights there and covers the trash between the
@@ -147,7 +149,7 @@ constexpr size_t kNone = size_t(-1);
 
 inline size_t PickFreeTarget(std::vector<Candidate> const& c);
 
-// The damage dealer's pick: the leader's order, the script's priority add, the tank's target, the leader's target, then the nearest
+// The damage dealer's pick: the leader's order, the script's priority add, the leader's target, the tank's target, then the nearest
 // mob on a member. A mob on the bot itself is a fallback only (the tank takes it back, rule 5), so the group keeps one kill target.
 // A mob the group holds is left alone while there is anything else to fight; once every mob left is one of the group's holds, the
 // group opens on the nearest (rule 1, everyone fights: wc_cobrahn_led RC10, the mage and hunter stood 6 s beside the sheeped Deviate
@@ -188,15 +190,17 @@ inline size_t PickFreeTarget(std::vector<Candidate> const& c)
     size_t i;
     if ((i = best([](Candidate const& x) { return x.leader_ordered; })) != kNone) return i;
     if ((i = best([](Candidate const& x) { return x.priority_add; })) != kNone) return i;
-    if ((i = best([](Candidate const& x) { return x.tank_target; })) != kNone) return i;
     if ((i = best([](Candidate const& x) { return x.leader_target; })) != kNone) return i;
+    if ((i = best([](Candidate const& x) { return x.tank_target; })) != kNone) return i;
     if ((i = best([](Candidate const& x) { return x.on_member && !x.on_me; })) != kNone) return i;
     return best([](Candidate const& x) { return x.on_me; });
 }
 
-// The tank's pick (rule 5): a mob on a group member who is not a tank, nearest first (the taunt or the pull-off takes it); then the
-// leader's order, then the leader's target, then a mob on a member. A tank that keeps what it has while a loose mob eats the casters is
-// the UBRS 2026-10-28 22:16 fight: both tanks waiting on the raid plan's assignment, six Incarcerators loose on the mages for 18 s.
+// The tank's pick (rule 5): a mob on a group member who is not a tank, the leader's own target first and then the nearest (the taunt or
+// the pull-off takes it); then the leader's order, then the leader's target, then a mob on a member. A tank that keeps what it has while
+// a loose mob eats the casters is the UBRS 2026-10-28 22:16 fight: both tanks waiting on the raid plan's assignment, six Incarcerators
+// loose on the mages for 18 s. The leader's target goes first among the loose mobs: the player opens on a mob, it runs at him, and the
+// tank that took the nearest other loose mob instead left him tanking his own pull (Saul, #bot-feedback 2026-11-17).
 struct TankCandidate
 {
     Candidate mob;
@@ -211,7 +215,8 @@ inline size_t PickTankTarget(std::vector<TankCandidate> const& c)
         Candidate const& m = c[i].mob;
         if (!m.alive || m.crowd_controlled || m.forbidden || !c[i].on_non_tank)
             continue;
-        if (pick == kNone || m.dist < c[pick].mob.dist)
+        if (pick == kNone || (m.leader_target && !c[pick].mob.leader_target) ||
+            (m.leader_target == c[pick].mob.leader_target && m.dist < c[pick].mob.dist))
             pick = i;
     }
     if (pick != kNone)

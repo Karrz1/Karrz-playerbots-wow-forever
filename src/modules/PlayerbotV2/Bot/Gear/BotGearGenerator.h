@@ -144,6 +144,17 @@ bool RaidEquipUpgrade(uint8 cls, uint16 spec, uint8 level, uint8 slot, uint32 ba
                       uint32 cur_entry, uint32 cur_mainhand_entry, uint32 cur_offhand_entry,
                       bool world_bot = false, uint64 bot_id = 0);
 
+// A fishing pole: no weapon to the bots' own gear rules (bots do not fish). A worn one counts as an empty main hand, so any
+// weapon replaces it, and one in the bags is never put on by itself (a player gave "different gear sets" to a tank bot and it
+// tanked with a fishing pole: the pole is a two-hander, so no shield could go on next to it).
+bool IsFishingPole(uint32 entry);
+// The equipment slot the bots' own gear rules (auto-equip, "equip upgrades", traded gear) may put bag item `entry` in, given
+// the slot the server picked for it (`slot`), or 0xFF for none. Never a fishing pole. A shield tank (Protection Warrior 73 /
+// Protection Paladin 66) takes a one-hand weapon in the main hand and a shield in the off hand, and nothing else in those two
+// slots: a two-hander or an off-hand weapon would push the shield off, and EnsureShieldTankWeapon puts it back (the old churn).
+// Item templates only, safe on the snapshot build / bot worker threads.
+uint8 AutoEquipSlot(uint16 spec, uint8 slot, uint32 entry);
+
 // Build per-class candidate pools at module init. Idempotent. Walks
 // sObjectMgr->GetItemTemplateStore() exactly once.
 void Initialize();

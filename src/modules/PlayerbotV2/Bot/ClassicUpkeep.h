@@ -449,6 +449,11 @@ constexpr int32 kBossHealerManaItemPct = 35;
 // ... and the mana % above which it does not even look. The items are on a 2-minute cooldown: spent at 71-81 % (UBRS 20 Oct, both priests)
 // they were on cooldown when the bar ran dry 80 s later, so a healer uses one only when mana is low.
 constexpr int32 kHealerManaItemCeilingPct = 30;
+// A boss fight in a group larger than this (a 20 or 40-man raid) lasts minutes: its healer uses each mana item as soon as the restore fits
+// in what the pool is missing, so the 2-minute cooldown starts early and the item comes back during the fight. At 30% the first ones came
+// late and the second never did (naxx_patchwerk 1116 run 3: healer mana 99 -> 30% in 118 s, one Demonic Rune each, all twelve at 0-2%
+// from 154 s, the raid wiped at 213 s with the boss at 19%). The 5 and 10-man case above is unchanged.
+constexpr size_t kLongBossFightGroupSize = 10;
 
 // ======================= Boss fights (major cooldowns) =======================
 // A boss by its creature data: the dungeon-boss flag or the world-boss rank

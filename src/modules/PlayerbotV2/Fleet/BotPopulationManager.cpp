@@ -766,8 +766,9 @@ static bool EnsureShieldTankWeapon(Player* p)
     if (oh && oh->GetTemplate() &&
         oh->GetTemplate()->GetInventoryType() == INVTYPE_SHIELD)
         return false;
+    // A fishing pole is no tank weapon whatever its inventory type (11-17: a tank given "different gear sets" tanked with one).
     bool const mh_is_2h = mh && mh->GetTemplate() &&
-        mh->GetTemplate()->GetInventoryType() == INVTYPE_2HWEAPON;
+        (mh->GetTemplate()->GetInventoryType() == INVTYPE_2HWEAPON || Gear::IsFishingPole(mh->GetEntry()));
 
     Gear::GearGenerationContext ctx;
     ctx.level  = p->GetLevel();
