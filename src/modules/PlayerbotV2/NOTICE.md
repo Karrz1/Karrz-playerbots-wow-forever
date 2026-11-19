@@ -22,6 +22,28 @@ Public License version 2 (`COPYING` at the repository root), the same terms as T
 - **SimulationCraft (simc)** (GPL-3.0) action lists and talent loadouts were used as
   reference for the retail-era rotations and `sql/playerbot_v2/0004_simc_seed.sql`.
 
+## Licence of each part
+
+**Our own work in the bot module (by Karrz / Karrz1) is licensed GPL-2.0-or-later.** Code that came
+from others keeps its original licence, as listed here:
+
+- **From agatho's PlayerbotV2 (GPL-2.0, "same as TrinityCore"):** in `src/modules/PlayerbotV2/`,
+  the bot API files `Api/PlayerbotAPI`, `Api/PlayerbotMovement` and `Api/BotItemScorer` (moved here
+  from agatho's `src/server/game/Playerbot/`), most of `Threading/`,
+  `Persistence/`, `World/`, `Group/`, `Session/`, the module's own `sql/`, and the original files of
+  `Bot/`, `Combat/`, `Fleet/`, `Travel/` and `Diagnostics/`, plus the first 18 files of
+  `sql/playerbot_v2/`. A file that existed in agatho's `playerbot-v2` branch stays under agatho's
+  terms, even where we have changed it since.
+- **Ported from ike3 / cMaNGOS playerbots, by way of the VMaNGOS-based bot tree (GPL-2.0):** the
+  Classic raid brain in `Bot/Raid/`, battleground paths and objectives in `Bot/Battleground/`,
+  rpg and idle states in `Bot/States/`, the Classic class rotations in `Combat/Apl/Apl_Classic_*`,
+  bot speech lines (`Bot/BotTextMgr`), and parts of travel (`Travel/PortalIndex`,
+  `Travel/TownNpcIndex`, `Travel/UnifiedTravelGraph`). Source comments name the routine each one
+  follows.
+- **By SIN (GPL-2.0, `COPYING` in its folder):** the add-on `Addon/ForeverCombatNameplates`.
+- **Ours from the start:** the add-ons `Addon/ForeverBots` and `Addon/ForeverDots`, `Commands/`,
+  the rest of `Api/`, and every file not named above that was added for WoW Forever.
+
 Keep these notices, and the copyright and licence headers that individual files carry, when
 redistributing. Source files of the module do not carry per-file headers; this notice and
 `COPYING` apply to all of them.
