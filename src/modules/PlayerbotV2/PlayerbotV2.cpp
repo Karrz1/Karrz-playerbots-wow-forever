@@ -10,6 +10,7 @@
 #include "LfgBotFill.h"
 #include "Services.h"
 #include "Fleet/RaidSubgroupPlan.h"
+#include "Fleet/AutoRaid.h"
 #include "Bot/BossCheck.h"
 #include "Bot/BotBridge.h"
 #include "Bot/BotRegistry.h"
@@ -996,6 +997,13 @@ void Module::Init()
     //   - PopulationManager / LfgMediator / BgFiller (Fleet/)
     //   - EncounterRegistry::RegisterAll() (Combat/Encounters/)
 
+    // A player's Add Friend box sends a bot's name as a Battle.net invitation, which the bot's pool account never answers: the core
+    // makes a bot on a pool account a character friend instead.
+    WorldSession::SetAutomatedAccountCheck([](uint32 gameAccountId)
+    {
+        return Services::Initialized() && Services::Accounts().is_pool_account(gameAccountId);
+    });
+
     initialized_ = true;
 
     if (Services::Config().auto_resume_on_boot())
@@ -1079,14 +1087,17 @@ namespace
             bool has_bot = false, has_human = false, any_human_online = false;
             for (auto const& slot : group->GetMemberSlots())
             {
-                if (Services::Lifecycle().is_bot(slot.guid.GetCounter()))
+                Player const* member = ObjectAccessor::FindConnectedPlayer(slot.guid);
+                // a self-bot (`.playerbot self on`) is marked as a bot for the session but is a person on a real client
+                bool const realClient = member && member->GetSession() && !member->GetSession()->IsBot();
+                if (Services::Lifecycle().is_bot(slot.guid.GetCounter()) && !realClient)
                 {
                     has_bot = true;
                 }
                 else
                 {
                     has_human = true;
-                    if (ObjectAccessor::FindConnectedPlayer(slot.guid))
+                    if (member)
                         any_human_online = true;
                 }
             }
@@ -1207,6 +1218,7 @@ void Module::Shutdown()
     BotChatModel::Shutdown();
     BotBridge::Shutdown();
 
+    WorldSession::SetAutomatedAccountCheck(nullptr);
     // Stop threads first; then tear down state.
     Services::Shutdown();
 
@@ -1837,7 +1849,8 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
         }
     }
     {
-        // A raid of a player and companions that fits a party again goes back to one (BotGroupRules::RevertBotRaidToParty).
+        // A raid of a player and companions that fits a party again goes back to one (BotGroupRules::RevertBotRaidToParty), when the module
+        // made it a raid for one more companion (Fleet/AutoRaid.h). A raid its leader made stays one (ZMNC, Discord 2026-11-18).
         static std::chrono::milliseconds last_raid_check{0};
         if (total - last_raid_check >= std::chrono::milliseconds(5000))
         {
@@ -1846,7 +1859,10 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
             for (auto const& [guid, p] : ObjectAccessor::GetPlayers())
             {
                 Group* g = p ? p->GetGroup() : nullptr;
-                if (!g || !g->isRaidGroup() || p->GetSession()->IsBot() || std::ranges::find(to_party, g) != to_party.end())
+                if (g && !g->isRaidGroup())
+                    ::Playerbot::V2::Fleet::AutoRaid::Forget(g->GetGUID());   // a party again (its leader turned it back): a later raid is theirs
+                if (!g || !g->isRaidGroup() || p->GetSession()->IsBot() || std::ranges::find(to_party, g) != to_party.end() ||
+                    !::Playerbot::V2::Fleet::AutoRaid::Made(g->GetGUID()))
                     continue;
                 bool any_bot = false, any_on_raid_map = false;
                 for (GroupReference const& ref : g->GetMembers())
@@ -1856,13 +1872,14 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
                     any_on_raid_map = any_on_raid_map || (m->GetMap() && m->GetMap()->IsRaid());
                 }
                 if (BotGroupRules::RevertBotRaidToParty(true, g->isBGGroup() || g->isBFGroup() || g->isLFGGroup(), g->GetMembersCount(),
-                    MAX_GROUP_SIZE, any_bot, true, any_on_raid_map))
+                    MAX_GROUP_SIZE, any_bot, true, any_on_raid_map, g->IsRaidChosenByLeader()))
                     to_party.push_back(g);
             }
             for (Group* g : to_party)
             {
                 TC_LOG_INFO("playerbot.v2", "[raid_to_party] leader={} members={}", g->GetLeaderName(), g->GetMembersCount());
                 g->ConvertToGroup();
+                ::Playerbot::V2::Fleet::AutoRaid::Forget(g->GetGUID());
             }
         }
     }
@@ -3905,20 +3922,31 @@ void LogPlayerDeath(Player* vp, Unit* killer, BotAI const* vai)
             for (SpellEffectInfo const& eff : si->GetEffects())
                 if (eff.IsEffect(SPELL_EFFECT_SCHOOL_DAMAGE) || eff.IsEffect(SPELL_EFFECT_WEAPON_DAMAGE) ||
                     eff.IsEffect(SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL) || eff.IsEffect(SPELL_EFFECT_NORMALIZED_WEAPON_DMG) ||
-                    eff.IsEffect(SPELL_EFFECT_WEAPON_PERCENT_DAMAGE) || eff.IsEffect(SPELL_EFFECT_HEALTH_LEECH))
+                    eff.IsEffect(SPELL_EFFECT_WEAPON_PERCENT_DAMAGE) || eff.IsEffect(SPELL_EFFECT_HEALTH_LEECH) ||
+                    eff.IsEffect(SPELL_EFFECT_ENVIRONMENTAL_DAMAGE))
                 {
                     spell_data = fmt::format("eff{} type={} bp={} radius={:.0f}", uint32(eff.EffectIndex), uint32(eff.Effect),
                         eff.BasePoints, eff.CalcRadius(killer).Max);
                     break;
                 }
+    // A self-inflicted killing blow with no spell is environmental damage (Player::EnvironmentalDamage deals it as the victim on
+    // itself): drowning, dark-water fatigue, lava or slime, or a fall. Name what the bot stood in so the line says which, instead of
+    // the bare "killer=self spell=melee" of the Drowned City mage (af47-1, 2026-11-19) and the Molten Core lava (2026-10-11).
+    std::string env = "-";
+    if (killer == vp && !hit.spell)
+    {
+        ZLiquidStatus const st = vp->GetLiquidStatus();
+        env = fmt::format("liquid=0x{:X}{}{}{}", uint32(st), vp->IsUnderWater() ? " under_water" : "", vp->IsInWater() ? " in_water" : "",
+            vp->IsFalling() ? " falling" : "");
+    }
     uint32 grp_alive = 0, grp_total = 0;
     CountGroupAlive(vp->GetGroup(), vp, grp_alive, grp_total);
     Playerbot::V2::DeathCause::Note(vp->GetGUID().GetCounter(), fmt::format("{} by {} ({} dmg)", spell_txt, killer_txt, hit.amount));
     TC_LOG_INFO("playerbot.v2",
-        "[bot_death] ts={} {} ({}) map={} pos={:.1f},{:.1f},{:.1f} killer={} spell={} dmg={} overkill={} rule={} killer_at={} spell_data={} class={} grp_alive={}/{}",
+        "[bot_death] ts={} {} ({}) map={} pos={:.1f},{:.1f},{:.1f} killer={} spell={} dmg={} overkill={} rule={} killer_at={} spell_data={} env={} class={} grp_alive={}/{}",
         uint64(GameTime::GetGameTime()), vp->GetName(), vai ? "bot" : "player", vp->GetMapId(),
         vp->GetPositionX(), vp->GetPositionY(), vp->GetPositionZ(), killer_txt, spell_txt, hit.amount, hit.overkill,
-        rule ? rule : "-", killer_at, spell_data, uint32(vp->GetClass()), grp_alive, grp_total);
+        rule ? rule : "-", killer_at, spell_data, env, uint32(vp->GetClass()), grp_alive, grp_total);
 
     if (vai)
     {

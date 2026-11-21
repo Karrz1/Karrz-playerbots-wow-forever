@@ -61,10 +61,12 @@ public:
         // summons (no static spawn) are left out. Replaces hand-typed coordinates that did not match the map.
         a.progression_waypoints = {
             { -151.1f, 414.4f, -72.6f },   // Lord Cobrahn
+            { -64.4f, 319.1f, -106.7f },   // Kresh (in the lake below Cobrahn's ledge)
             { 46.5f, 184.0f, -89.2f },   // Lady Anacondra
             { 36.8f, -241.1f, -79.5f },   // Lord Pythas
             { -285.6f, -313.7f, -69.2f },   // Skum
             { -120.2f, -24.6f, -28.6f },   // Lord Serpentis
+            { -81.9f, 32.3f, -31.0f },   // Verdan the Everliving
         };
         // Boss progression order (encounter sequence). Used by the
         // tank-advance rule for cross-room navigation when no enemies
@@ -72,10 +74,12 @@ public:
         // path-finds toward the first live boss it can reach.
         a.bosses = {
             3669,   // Lord Cobrahn
+            3653,   // Kresh
             3671,   // Lady Anacondra
             3670,   // Lord Pythas
             3674,   // Skum
             3673,   // Lord Serpentis
+            5775,   // Verdan the Everliving
             3654,   // Mutanus the Devourer (final)
         };
         return a;

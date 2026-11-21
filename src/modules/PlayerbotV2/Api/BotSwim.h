@@ -61,6 +61,24 @@ inline bool NeedsSettle(float bot_z, float swim_z)
     return std::fabs(bot_z - swim_z) > kSettleTolerance;
 }
 
+// A point of a route over deep water that lies above the swim z goes down to it. The navmesh holds deep water as polygons on its
+// surface, so a route over it ran on top of the water: a moving or following bot ran on the lake and only sank in once it stood
+// still (NeedsSettle), and a follower that kept moving never did. A point at or under the swim z (a dive to something on the floor,
+// the lake bed) keeps its depth, and so does a point lowered before: a second pass changes nothing.
+constexpr float kRouteLowerSlack = 0.05f;
+inline bool RoutePointNeedsLowering(float point_z, float swim_z)
+{
+    return point_z > swim_z + kRouteLowerSlack;
+}
+
+// A leg of the route whose sample at this z lies this far under the ground there runs through the ground (a lowered point next to
+// a bank: the straight line from the shore down to the swim z can cut into the slope between them).
+constexpr float kRouteGroundSlack = 0.3f;
+inline bool UnderGround(float z, float ground_z)
+{
+    return z < ground_z - kRouteGroundSlack;
+}
+
 // A follower's settle to (dx, dy, dz) from its leader keeps it inside the follow generator's 3D range (combat reaches + follow
 // distance), with a margin so the next leader step does not tip it out at once. Out of range, the generator would path it back up
 // to the surface by the leader at his next step, and the settle would start again.

@@ -344,7 +344,9 @@ bool MaybeUseDefensiveRacial(BotSnapshotView const& s, BotIntentEmitter& emit)
     if (s.race() == RACE_HUMAN)
     {
         constexpr uint32 EVERY_MAN_FOR_HIMSELF = 59752;
-        if (s.knows_spell(EVERY_MAN_FOR_HIMSELF) && s.is_ready(EVERY_MAN_FOR_HIMSELF))
+        // Not while the bot carries an aura the raid keeps on: the racial takes every stun with it, and Sapphiron's Icebolt ending deletes
+        // the ice block the raid hides behind from his Frost Breath (Classic::CarriesKeptAura).
+        if (s.knows_spell(EVERY_MAN_FOR_HIMSELF) && s.is_ready(EVERY_MAN_FOR_HIMSELF) && !Classic::CarriesKeptAura(s))
         {
             // Trigger on any blocking mechanic. Stun=10, Silence=15, Root=18,
             // Sap=21, all share the "we cannot act/cast" property.
@@ -2593,6 +2595,16 @@ void DispatchInCombat(BotAI& ai,
     // Healer role, FC openers on FlagCarrier, etc.).
     ctx.pvp.bg_role = snapshot.raw().bg.bg_role;
 
+    // Carrier check: needed by the victim reposition below, the BG tactical layer and the homeward / gap-close logic further down.
+    bool i_am_carrier = false;
+    if (snapshot.in_battleground())
+    {
+        i_am_carrier = (snapshot.bg_friendly_flag_carrier() == snapshot.raw().guid);
+        if (!i_am_carrier)
+            for (auto const& fc : snapshot.bg_all_friendly_carriers())
+                if (fc == snapshot.raw().guid) { i_am_carrier = true; break; }
+    }
+
     // BG-orphan disengage. When a battleground ends, the core removes every
     // player and teleports them out — but the exit teleport can fail
     // transiently (player loading / mid-teleport) and the Battleground
@@ -2848,6 +2860,28 @@ void DispatchInCombat(BotAI& ai,
     if (SoloFleeTick(ai, snapshot, group, emit, survival_item_used))
         return;
 
+    // ---- Out of a burning liquid ([liquid_escape]) ----
+    // A bot in tar, lava or a slime with a spell walks to the nearest dry ground (the builder's water_escape point) before anything
+    // below moves it or roots it in a cast, everywhere: idle:flee_damaging_liquid only runs out of combat. shapers_full af51 (20 Nov):
+    // the rogue chased an Ironhide Ravasaur into the Tar Pits and swung at it there until the tar killed her (killer=self). The melee
+    // gap-close does not follow a victim standing in such a liquid (chase_blocked below), so the bot stays on the bank.
+    if (snapshot.is_in_damaging_liquid() && snapshot.water_escape_valid() && snapshot.is_alive() &&
+        !snapshot.is_rooted() && !snapshot.on_transport())
+    {
+        if (RaidLogDue(RaidLogKey(snapshot, RaidLogKind::LiquidEscape), snapshot.published_at_ms(), 3000u))
+            TC_LOG_INFO("playerbot.v2", "[liquid_escape] {} leaves a burning liquid for ({:.1f},{:.1f},{:.1f})", snapshot.name(),
+                        snapshot.water_escape_x(), snapshot.water_escape_y(), snapshot.water_escape_z());
+        emit.move_to(snapshot.water_escape_x(), snapshot.water_escape_y(), snapshot.water_escape_z(), /*run*/ true);
+        ai.set_last_rule_fired("combat:leave_damaging_liquid");
+        return;
+    }
+
+    // ---- Out of a fighting mob's area attack ([area_attack_step], State_Idle.cpp) ----
+    // A healer or ranged bot in reach of a mob's Frost Nova / Thunderclap that is not on it steps out before anything below roots it
+    // in a cast (rol_full af52: The Abandoned). Instances only.
+    if (AreaAttackStepOut(snapshot, ai, group, emit))
+        return;
+
     // ---- Ground-hazard step-out ([raid_hazard], State_Idle.cpp) ----
     // A non-tank standing in a hostile damaging ground zone (Rain of Fire,
     // poison cloud, void zone) leaves it before anything below moves it
@@ -2954,8 +2988,12 @@ void DispatchInCombat(BotAI& ai,
                 // no experience: abandoning it leaves the bot idle under its blows. Only props and dummies are dropped.
                 // A boss reads pacified while one of its own spells holds it (Baron Geddon's Inferno roots and pacifies him for the
                 // channel): that is a pause in the fight, not a prop (MC Geddon 2026-10-11: 632 drops, the raid stood off him).
-                const bool fighting_us = snapshot.is_in_instance() &&
-                    ((!vu->is_pacified && !vu->victim.IsEmpty()) || vu->is_dungeon_boss || vu->is_boss_rank);
+                // Out of an instance the same holds for one that is hitting the bot itself: the Enraged Gryphons a flight master calls
+                // give no XP, and dropping them every tick left world bot Beatriz standing under their blows (af52, Light's Hope,
+                // 27 deaths). Props and dummies hit nobody.
+                const bool fighting_us = (snapshot.is_in_instance() &&
+                    ((!vu->is_pacified && !vu->victim.IsEmpty()) || vu->is_dungeon_boss || vu->is_boss_rank))
+                    || (!vu->is_pacified && vu->victim == snapshot.guid());
                 // A target the owner ordered us onto (Attack / Engage) is never dropped for giving no XP: the order is the reason, and
                 // dropping it every tick restarted the rotation (damage_parity 2026-10-11: ~590 drops a leg, white swings and Overpower only).
                 const bool ordered = ai.is_manual_mode(now_ms) && ai.owner_command() == BotAI::OwnerCommand::Engage && ai.owner_target() == vg;
@@ -3133,7 +3171,21 @@ void DispatchInCombat(BotAI& ai,
                 // there and the dungeon positioning cascade owns movement;
                 // their ranged / healers get the formation-aware LoS step
                 // RaidCastLosStep below instead of walking at the victim.)
-                if (!snapshot.is_in_instance() || snapshot.in_battleground())
+                // A flag / orb carrier never walks toward its victim: its job is the run home (BgCarrierHomeward below), and this
+                // step returned before that rule, so a carrier whose chaser fell out of sight or range turned round and walked back to
+                // it, every tick, until it died (Kozhan, Discord 2026-11-19: "flag carriers don't carry the flag, they fight until they
+                // die"). The rotation still fires at whatever is in range while it runs.
+                if (i_am_carrier)
+                {
+                    float cx, cy, cz;
+                    snapshot.position(cx, cy, cz);
+                    const float cd = std::sqrt((vu->x - cx) * (vu->x - cx) + (vu->y - cy) * (vu->y - cy));
+                    const float creach = IsMeleeSpec(snapshot.cls(), snapshot.spec()) ? 38.0f : 30.0f + vu->combat_reach;
+                    if ((!vu->in_los || cd > creach) && RaidLogDue(RaidLogKey(snapshot, RaidLogKind::Escape) ^ 0x63617272u, now_ms, 10000u))
+                        TC_LOG_INFO("playerbot.v2", "[bg_carrier] {} carries the flag: runs home, no step toward victim {} ({}, {:.0f} y)",
+                                    snapshot.name(), vg.ToString(), vu->in_los ? "in sight" : "out of sight", cd);
+                }
+                if ((!snapshot.is_in_instance() || snapshot.in_battleground()) && !i_am_carrier)
                 {
                     float bx, by, bz;
                     snapshot.position(bx, by, bz);
@@ -3445,7 +3497,9 @@ void DispatchInCombat(BotAI& ai,
     // When a group member is genuinely hurt (<65%) on this map and beyond
     // the heal gate, step toward them. Mirrors the melee gap-close.
     // Same self-HP guard as the follow above: a healer under 40% with a mob on it heals itself instead of jogging to a hurt friend.
-    if (snapshot.raw().group.my_role == Role::Healer && !snapshot.is_casting() && snapshot.hp_pct() > 40 && group.exists())
+    // Not a flag / orb carrier: it runs home and heals on the way (the same rule as the victim reposition above).
+    if (snapshot.raw().group.my_role == Role::Healer && !snapshot.is_casting() && snapshot.hp_pct() > 40 && group.exists() &&
+        !i_am_carrier)
     {
         // Not mid-cast (see the follow above). Raid healer: never chase the
         // raid-wide lowest across the room. Close only on its heal_focus
@@ -3529,17 +3583,6 @@ void DispatchInCombat(BotAI& ai,
             if (combat_ms < int64_t(jitter_ms))
                 return;
         }
-    }
-
-    // Carrier check — needed by the BG tactical layer below AND the
-    // homeward/gap-close logic further down (hoisted from there).
-    bool i_am_carrier = false;
-    if (snapshot.in_battleground())
-    {
-        i_am_carrier = (snapshot.bg_friendly_flag_carrier() == snapshot.raw().guid);
-        if (!i_am_carrier)
-            for (auto const& fc : snapshot.bg_all_friendly_carriers())
-                if (fc == snapshot.raw().guid) { i_am_carrier = true; break; }
     }
 
     // ---- Raid tank with no mob yet: wait ----
@@ -4527,8 +4570,9 @@ void DispatchInCombat(BotAI& ai,
                                group.exists() && group.tank() != nullptr)) &&
                              !snapshot.in_battleground() &&
                              ai.effective_role(snapshot) == Role::Healer;
+    // A healer given the group's target (BotSnapshotView::victim_is_group_target) aims its spells at it between heals; it does not chase.
     if (!snapshot.victim().IsEmpty() && !i_am_carrier &&  // BG-P0a: carrier runs home, never chases
-        !raid_healer && IsMeleeSpec(snapshot.cls(), snapshot.spec()))
+        !raid_healer && !snapshot.victim_is_group_target() && IsMeleeSpec(snapshot.cls(), snapshot.spec()))
     {
         constexpr float kFleeLeashYd = 8.0f;   // a fleeing mob this far from the bot is let go
         constexpr uint16 kStuckChaseTicksMax = 50;   // ~5s @ 10Hz combat tier
@@ -4550,16 +4594,22 @@ void DispatchInCombat(BotAI& ai,
             // step-out (or the raid layer) moves the mob; the wait is not a
             // stuck chase.
             // An owner Stay / Hold keeps the bot at its spot too: a mob out of reach is not chased (a mob on the bot lifts the hold).
+            // Nor is a victim standing in a burning liquid (tar, lava), anywhere: the bot waits on the bank for the mob to come out
+            // to it, as a player does ([liquid_escape] above takes it out if it is in already).
+            const bool victim_in_burning_liquid = snapshot.raw().combat.victim_in_damaging_liquid;
             const bool chase_blocked = d2 > kMeleeRange * kMeleeRange &&
                 ((snapshot.is_in_instance() && !snapshot.in_battleground() &&
                   RaidStandPointBlocked(snapshot, vu->x, vu->y, vu->z)) ||
+                 victim_in_burning_liquid ||
                  HeldByOwner(ai, snapshot));
             // Stuck-chase tracking: count ticks where we're out of melee
             // range with the same victim. Reset on different victim or once
             // we close distance. Past the cap → drop the chase to free the
             // bot from terrain-induced infinite gap-close loops.
             if (chase_blocked)
-                ai.set_last_rule_fired(HeldByOwner(ai, snapshot) ? "combat:melee_hold_stay" : "combat:melee_hold_hazard");
+                ai.set_last_rule_fired(HeldByOwner(ai, snapshot)  ? "combat:melee_hold_stay"
+                                       : victim_in_burning_liquid ? "combat:melee_hold_liquid"
+                                                                  : "combat:melee_hold_hazard");
             else if (d2 > kMeleeRange * kMeleeRange && vu->is_fleeing && snapshot.is_in_dungeon() && d2 > kFleeLeashYd * kFleeLeashYd)
             {
                 // A mob running for help is not chased (Deadmines 2026-10-13: the tank followed a fleeing Miner into the next
@@ -4968,7 +5018,18 @@ void DispatchInCombat(BotAI& ai,
                 if (snapshot.has_aura(25780))
                     emit.cancel_aura(25780);
                 break;
-            case CLASS_DRUID:   rotation_spec = 103; break;
+            // The cat, but only for a druid that has Cat Form: Forever teaches it with the Great Cat Spirit quests at 20, and a bear
+            // tank without it ran the cat rotation in caster form (its first rule cancels Bear Form as the wrong form, and Cat Form never
+            // follows). naxx_kelthuzad af52 sweep 1: Mctankda, off the roster of three for the first 50 s, sat at
+            // "classic_cat:leave_wrong_form" with no Cat Form cast in the run, and the Abominations killed it (melee 4530).
+            // Without Cat Form it stays in Bear Form on the bear rotation; its taunts and pick-ups follow the roster (DpsBear).
+            case CLASS_DRUID:
+                if (snapshot.knows_spell(768))
+                    rotation_spec = 103;
+                else if (RaidLogDue(RaidLogKey(snapshot, RaidLogKind::DpsBear), snapshot.published_at_ms(), 30000u))
+                    TC_LOG_INFO("playerbot.v2", "[raid_tank] {} is off the tank roster and has no Cat Form: plays DPS in Bear Form, no taunts",
+                                snapshot.name());
+                break;
             default: break;
         }
     }

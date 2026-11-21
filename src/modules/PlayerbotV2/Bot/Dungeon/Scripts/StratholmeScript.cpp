@@ -7,6 +7,9 @@
 //   src/server/scripts/EasternKingdoms/Stratholme/boss_*.cpp
 
 #include "../DungeonScript.h"
+#include "../../BotSnapshotView.h"
+#include <array>
+#include <limits>
 
 namespace Playerbot {
 
@@ -18,15 +21,16 @@ public:
     uint32_t  map_id() const override { return 329; }
     char const* name() const override { return "stratholme"; }
     // Zero static spawns in the Classic creature data: raised by an event the bots never trigger, so a full clear does not wait for it.
+    // Ramstein the Gorger is not one: the Baron summons him in Slaughter Square once its abominations are dead, which the bots do
+    // (he is on the Undead wing's route below).
     std::vector<uint32_t> event_summoned_bosses() const override
     {
         return {
             10516,   // The Unforgiven: summoned by the Crimson / courtyard event
-            10439,   // Ramstein the Gorger: summoned after the Postmaster event
         };
     }
 
-    DungeonAdvice get_advice(BotSnapshotView const& /*s*/) const override
+    DungeonAdvice get_advice(BotSnapshotView const& s) const override
     {
         DungeonAdvice a;
         a.high_priority_kill_entries = {
@@ -119,31 +123,76 @@ public:
             12889,  // Curse of Tongues
             17831,  // Call of the Grave
         };
-        // Boss progression — NPC entries from TC's stratholme.h.
-        // Stratholme has two wings (Scarlet live + Undead Baron); the
-        // tank-advance scan finds whichever boss is closest as the
-        // bot moves through the dungeon.
-        // The boss route is index for index with the waypoints below: the owed boss is steered to by its waypoint. A boss with no
-        // static spawn (event_summoned_bosses) has no waypoint and is not on it; with one in, every later waypoint answered the
-        // wrong boss.
-        a.bosses = {
-            10558,  // Hearthsinger Forresten
-            11032,  // Commander Malor
-            10811,  // Instructor Galford
-            10440,  // Baron Rivendare (final, Undead wing)
+        // The acolytes: each ziggurat's door opens when its boss dies, and inside, five Thuzadin Acolytes (10399) keep the Ash'ari
+        // Crystal above them alive; the crystal dies with the last of them (classic_mobs_cristal_zuggurat). They stand 57 y of walk
+        // from the route, out of its sight, so the tank walked on from each ziggurat boss and the square never opened. The tank goes
+        // in for them (idle:dungeon_clear_spot).
+        a.clear_spots = {
+            { 10399, 3847.3f, -3750.0f, 145.2f, 15.f },   // Baroness Anastari's ziggurat
+            { 10399, 3839.7f, -3498.3f, 141.3f, 15.f },   // Nerub'enkan's ziggurat
+            { 10399, 4059.1f, -3667.0f, 132.7f, 15.f },   // Maleki the Pallid's ziggurat
         };
-        // Progression waypoints — Strat is two wings sharing one map_id.
-        // Bots default to the Undead Baron path (more frequently run for
-        // Baron's mount). Scarlet wing falls back to boss-Cell scan from
-        // the Service Entrance. Coords approximate from public dumps.
-        // Boss spawn positions from the Classic creature data (VMaNGOS spawn table, map 329), in encounter order; bosses a script
-        // summons (no static spawn) are left out. Replaces hand-typed coordinates that did not match the map.
-        a.progression_waypoints = {
-            { 3595.8f, -3509.9f, 137.5f },   // Hearthsinger Forresten
-            { 3621.1f, -3126.8f, 135.7f },   // Malor the Zealous
-            { 3456.0f, -3103.4f, 136.5f },   // Archivist Galford
-            { 4032.8f, -3333.0f, 115.1f },   // Baron Rivendare
+        // The boss route is the wing the bot stands in, the same as Dire Maul and Scarlet Monastery. One list for both sent a stratud
+        // (service gate) party to Hearthsinger Forresten in the Scarlet half and then straight to Baron Rivendare, past the three
+        // ziggurats whose bosses open Slaughter Square, so the Baron's gate never opened; a stratlive (main gate) party was sent on to
+        // the Baron after Galford, never to Balnazzar. The nearest wing entrance (the stratlive/stratud scenario starts) or boss spawn
+        // names the wing. Boss spawns from the Classic creature data (VMaNGOS spawn table, map 329), in encounter order.
+        //   Scarlet: Forresten (one of his four spawns), Malor, Galford, Grand Crusader Dathrohan (he turns into Balnazzar).
+        //   Undead: Barthilas at the service gate, the three ziggurats (Anastari, Nerub'enkan, Maleki: the instance opens Slaughter
+        //   Square when the Thuzadin Acolyte under each one's crystal is dead), Ramstein where the instance summons him once the
+        //   square's abominations are dead (classic_instance_stratholme TYPE_RAMSTEIN), Rivendare, who cannot be attacked until
+        //   Ramstein is dead.
+        struct Spot { float x, y, z; };
+        struct Wing { std::vector<uint32_t> bosses; std::vector<Spot> spots; Spot entrance; };
+        static std::array<Wing, 2> const wings = {{
+            { { 10558,    // Hearthsinger Forresten
+                11032,    // Malor the Zealous
+                10811,    // Archivist Galford
+                10812 },  // Grand Crusader Dathrohan / Balnazzar (Scarlet final)
+              { { 3595.8f, -3509.9f, 137.5f }, { 3621.1f, -3126.8f, 135.7f }, { 3456.0f, -3103.4f, 136.5f }, { 3413.6f, -3042.0f, 136.5f } },
+              { 3392.92f, -3395.03f, 143.135f } },
+            { { 10435,    // Magistrate Barthilas
+                10436,    // Baroness Anastari
+                10437,    // Nerub'enkan
+                10438,    // Maleki the Pallid
+                10439,    // Ramstein the Gorger (summoned)
+                10440 },  // Baron Rivendare (Undead final)
+              { { 3663.2f, -3619.1f, 138.0f }, { 3855.3f, -3715.8f, 148.2f }, { 3855.0f, -3528.8f, 144.3f }, { 4035.8f, -3647.8f, 135.7f },
+                { 4032.35f, -3380.57f, 119.74f }, { 4032.8f, -3333.0f, 115.1f } },
+              { 3590.87f, -3643.22f, 138.491f } },
+        }};
+        // Ramstein has no spawn until the abominations are dead: the tank holds the square for them instead of waiving him after
+        // the usual 8 s and walking on to the Baron's closed gate.
+        a.owed_boss_holds = { { 10439, 300000 } };
+        auto add = [&a](Wing const& w)
+        {
+            a.bosses.insert(a.bosses.end(), w.bosses.begin(), w.bosses.end());
+            for (Spot const& p : w.spots)
+                a.progression_waypoints.push_back({ p.x, p.y, p.z });
         };
+        // No bot in the map (the GM audit and list commands pass an empty view): both wings.
+        if (s.map_id() != map_id())
+        {
+            for (Wing const& w : wings)
+                add(w);
+            return a;
+        }
+        float px, py, pz;
+        s.position(px, py, pz);
+        Wing const* in = &wings[0];
+        float best = std::numeric_limits<float>::max();
+        for (Wing const& w : wings)
+        {
+            auto consider = [&](Spot const& p)
+            {
+                float const d = (p.x - px) * (p.x - px) + (p.y - py) * (p.y - py);
+                if (d < best) { best = d; in = &w; }
+            };
+            consider(w.entrance);
+            for (Spot const& p : w.spots)
+                consider(p);
+        }
+        add(*in);
         return a;
     }
 };

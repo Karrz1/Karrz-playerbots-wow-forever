@@ -33,6 +33,19 @@ inline uint32_t BuffTrustMs(uint64_t key)
     }
 }
 
+// The core refused the cast the bot noted at `cast_ms` (same spell, same target) at `refused_ms`: the buff never went out, so it is not
+// trusted. Naxx Razuvious r2 af54 (2026-11-20 18:56:46): a Blessing of Wisdom refused NOT_READY (the global cooldown of the blessing before
+// it) was trusted for its three minutes; the raid's attack waited 83 s on that one member until the run gave up. A refusal belongs to the
+// cast only when it comes within kRefusalWindowMs after it (the executor runs the intent within a world update or two).
+constexpr uint32_t kRefusalWindowMs = 10u * 1000u;
+inline bool CastRefusedAfter(uint32_t cast_ms, uint32_t refused_ms)
+{
+    if (cast_ms == 0 || refused_ms == 0)
+        return false;
+    int32_t const after = int32_t(refused_ms - cast_ms);
+    return after >= 0 && after < int32_t(kRefusalWindowMs);
+}
+
 // The bot cast `key` at `cast_ms` (0 = never): still trusted at `now_ms`?
 inline bool BuffCastTrusted(uint64_t key, uint32_t cast_ms, uint32_t now_ms)
 {

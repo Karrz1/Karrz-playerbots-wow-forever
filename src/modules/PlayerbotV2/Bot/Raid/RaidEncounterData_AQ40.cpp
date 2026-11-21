@@ -122,6 +122,11 @@ namespace Playerbot::Raid {
         r.avoidEnemy.push_back({ 15516, 11.0f, Who::Healer });
         r.avoidEnemy.push_back({ 15984, 9.0f, Who::Ranged });
         r.avoidEnemy.push_back({ 15984, 9.0f, Who::Healer });
+        // In a Whirlwind each of them runs at a random raider every 1-2 s (AssignRandomThreat), so the step-out never outruns it: only room
+        // between the raiders keeps one Whirlwind to one victim. aq40_sartura af52 (1120): the casters and healers moved as one clump; at
+        // 38-39 s a Royal Guard's Whirlwind (26686) and hers (26084) went through it and killed 17 of them on one 5 y patch.
+        r.spread.push_back({ 15516, 10.0f, Who::Ranged });
+        r.spread.push_back({ 15516, 10.0f, Who::Healer });
 
         // ---------------------------------------------------------------------------------------------------------------
         // FANKRISS THE UNYIELDING (15510): Mortal Wound 25646 on the tank (aq40/classic_boss_fankriss.cpp): swap at 5. Spawns of
@@ -171,6 +176,10 @@ namespace Playerbot::Raid {
         // Vek'lor's Arcane Burst 568 hits and throws everybody within 10 yd (vanilla data, radius index 13): his casters keep 13.
         r.avoidEnemy.push_back({ 15276, 13.0f, Who::Ranged });
         r.avoidEnemy.push_back({ 15276, 13.0f, Who::Healer });
+        // Vek'lor's Explode Bug 804 (classic_boss_twinemperors.cpp HandleBugSpell) turns a Qiraji Scarab (15316) or Scorpion (15317) within
+        // 20 y hostile, and it goes off as Explode 26059, 15 y (sweep af52 1: Mcwarra at 13 y and Mctankwb at 15 y, both low on health).
+        r.avoidEnemyAura.push_back({ 15316, 804, 17.0f, Who::Anyone });
+        r.avoidEnemyAura.push_back({ 15317, 804, 17.0f, Who::Anyone });
 
         // ---------------------------------------------------------------------------------------------------------------
         // OURO (15517): Sand Blast 26102 to the front, Sweep 26103 around him; while submerged he chases from under a Dirt Mound

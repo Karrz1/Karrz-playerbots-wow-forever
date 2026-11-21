@@ -358,7 +358,8 @@ struct ResetCooldownsIntent {};
 // accept = the owner's gift trade (Playerbot.Behavior.AcceptOwnerTrade): API::accept_owner_trade instead of the decline.
 // A flag on this intent rather than a new IntentBody alternative (the variant is at its size limit).
 // gift = the partner may hand over gifts (owner / group mate); false = fair-price buying and selling only (BotTrade.h).
-struct TradeDeclineIntent    { bool accept = false; ObjectGuid owner; bool gift = true; };
+// from_owner: the partner is the bot's owner, whose every item and coin is a gift (BotTrade::View::from_owner).
+struct TradeDeclineIntent    { bool accept = false; ObjectGuid owner; bool gift = true; bool from_owner = false; };
 // Send a group invite to the named player. Mirrors HandlePartyInviteOpcode
 // — same gating around faction/instance/level/social ignore. Used by the
 // idle:invite_to_group rule so solo bots gather pickup parties at dungeon

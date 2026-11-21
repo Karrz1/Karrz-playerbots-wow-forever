@@ -146,6 +146,10 @@ struct SkipCtx
 bool SkipRecent(void const* ctx, uint64 key)
 {
     SkipCtx const& c = *static_cast<SkipCtx const*>(ctx);
+    // The core refused the last cast of this pick for a passing reason (the global cooldown of the cast before it): cast it again now,
+    // neither the 30 s lockout nor the ledger holds it back (ClassicBuffLedger.h CastRefusedAfter).
+    if (c.ai->buff_cast_refusal(key) == BotAI::BuffCastRefusal::Passing)
+        return false;
     return c.ai->action_recently_tried(BotAI::ActionKind::ClassUpkeep, key, c.now_ms) || c.ai->buff_cast_trusted(key, c.now_ms);
 }
 
@@ -186,7 +190,7 @@ bool BlessingsFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     if (b.key)
     {
         ai.note_action_retry(BotAI::ActionKind::ClassUpkeep, b.key, now_ms);
-        ai.note_buff_cast(b.key, now_ms);
+        ai.note_buff_cast(b.key, now_ms, b.spell, b.target);
     }
     // [raid_support] why this blessing goes out (MC 2026-10-08: 45-105 blessings a minute): the target's tracked buffs as the
     // group snapshot sees them, once per paladin and key per minute.
@@ -247,7 +251,7 @@ bool RaidBuffsFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     if (b.key)
     {
         ai.note_action_retry(BotAI::ActionKind::ClassUpkeep, b.key, now_ms);
-        ai.note_buff_cast(b.key, now_ms);
+        ai.note_buff_cast(b.key, now_ms, b.spell, b.target);
         Classic::NoteAreaBuffCast(s.guid(), b.key, b.area_needy, now_ms);
     }
     // [raid_support] why this class buff goes out (MC Garr 2026-10-10: the druids cast Mark of the Wild over and over): the target's
@@ -701,6 +705,24 @@ bool FightCloakFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const
 }
 
 } // namespace
+
+// A buff round paused on the global cooldown: the bot owes a blessing or class buff it casts at this mana, and only the GCD of the cast
+// before it holds the next one back (BotIntentEmitter::cast's GCD and per-spell lockouts, 1.5 s). The rest rules do not sit the bot down
+// in that gap: the next cast stands it straight up and the drink or meal is lost (Naxx Razuvious r2 af54: a paladin blessing the raid one
+// member at a time sat down to drink at 93-94% mana between blessings and stood up for the next, again and again for two minutes).
+bool ClassicUpkeepCastPending(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
+{
+    if (!UpkeepWindow(s, g) || !BuffManaOk(s))
+        return false;
+    auto const held = [&ai, now_ms](uint32 spell)
+    {
+        return spell != 0 && (ai.gcd_recently_started(now_ms) || ai.cast_recently_emitted(spell, now_ms));
+    };
+    SkipCtx const ctx{ &ai, now_ms };
+    if (held(Classic::PickBlessing(s, g, false, { &SkipRecent, &ctx }).spell))
+        return true;
+    return held(Classic::PickClassBuff(s, g, { &SkipRecent, &ctx }).spell);
+}
 
 void RegisterClassicUpkeepRules(IdleRuleRegistry& r)
 {

@@ -996,9 +996,19 @@ void DispatchInGroup(BotAI& ai,
             else if (leader_fighting && leader_member->map_id == snapshot.map_id() && leader_member->is_casting &&
                      resolves_hostile(leader_member->casting_target))
                 assist_target = leader_member->casting_target;
+            // A member's target the group holds with crowd control (the mage's own sheep) is not one to join (the defend-member
+            // engage below has the smcathedral_full af57 case).
+            auto group_cc_held = [&](ObjectGuid v) -> bool
+            {
+                if (snapshot.raw().pve_order.cc_reserved_mob(v)) return true;
+                for (auto const& u : snapshot.raw().combat.nearby_enemies)
+                    if (u.guid == v) return u.is_cc_locked;
+                return false;
+            };
             if (assist_target.IsEmpty() && !window_limited)
                 for (auto const& m : *members)
-                    if (m.online && m.map_id == snapshot.map_id() && m.in_combat && resolves_hostile(m.victim) && fight_join_ok(m.victim))
+                    if (m.online && m.map_id == snapshot.map_id() && m.in_combat && resolves_hostile(m.victim) && !group_cc_held(m.victim) &&
+                        fight_join_ok(m.victim))
                     { assist_target = m.victim; break; }
         }
         // Defend-member engage (ALL roles, tanks very much included): a mob
@@ -1027,6 +1037,11 @@ void DispatchInGroup(BotAI& ai,
                         if (m.guid == u.victim) { attacks_member = true; victim_member = &m; break; }
                 if (!attacks_member) continue;
                 if (!fight_join_ok(u.guid)) continue;
+                // A mob the group holds or is about to hold with crowd control is not a pull in progress: it reads as on the member
+                // who cast the CC, and every bot that "defended" that member broke the CC at once (smcathedral_full af57: the mage's
+                // Polymorph on a Scarlet Monk of a 9-mob hall pack, the whole group and the mage itself opened on it in the same
+                // second, the pack came in and the tank died). The CC caster renews it; the tank picks it up if it gets loose.
+                if (u.is_cc_locked || dpo.cc_reserved_mob(u.guid)) continue;
                 // Leash (open world and instance trash, never a boss): a Passive bot defends a mob on someone else only while it is within PassiveLeashYd of the leader
                 // or of the member it is on (a healer 30 y back is still defended), and that member is itself near the leader. It
                 // never runs off to a pack the group has not pulled. A mob on the bot itself is always fought.

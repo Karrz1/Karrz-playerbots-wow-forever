@@ -1164,18 +1164,23 @@ end
 
 -- Dungeon finder (".bot dungeon"): pick a dungeon, or any for your level; the server fills the missing roles with your bots at your level
 -- and puts the group inside the dungeon's door. "leave" takes you back to where you queued. The table is the server's default list
--- (Playerbot.Lfg.BotGroups.Activities): the word the server knows the dungeon by, its name, its level range, its party size.
+-- (Playerbot.Lfg.BotGroups.Activities): the word the server knows the dungeon by, its name, its level range, its party size. The WoW
+-- Forever dungeons are in it too, at the levels the client's Group Finder gives them.
 -- Kept on UI, not as file locals: the client's Lua allows a function only 200 locals.
 UI.DUNGEONS = {
-    { "rfc", "Ragefire Chasm", 13, 18 }, { "wc", "Wailing Caverns", 15, 24 }, { "vc", "Deadmines", 17, 26 },
+    { "rfc", "Ragefire Chasm", 13, 18 }, { "hot", "Hall of Thanes", 13, 20 }, { "wc", "Wailing Caverns", 15, 24 },
+    { "rol", "Ruins of Lordaeron", 15, 22 }, { "vc", "Deadmines", 17, 26 },
     { "sfk", "Shadowfang Keep", 20, 30 }, { "bfd", "Blackfathom Deeps", 24, 32 }, { "stocks", "Stormwind Stockades", 24, 32 },
+    { "excav", "Excavation Site: Wetlands", 26, 33 },
     { "gnomer", "Gnomeregan", 29, 38 }, { "rfk", "Razorfen Kraul", 29, 38 }, { "smgy", "Scarlet Monastery: Graveyard", 30, 38 },
-    { "smlib", "Scarlet Monastery: Library", 33, 41 }, { "smarm", "Scarlet Monastery: Armory", 36, 44 },
-    { "smcath", "Scarlet Monastery: Cathedral", 38, 46 }, { "rfd", "Razorfen Downs", 37, 46 }, { "ulda", "Uldaman", 41, 51 },
-    { "zf", "Zul'Farrak", 44, 54 }, { "mara", "Maraudon", 46, 55 }, { "st", "Sunken Temple", 50, 60 },
+    { "smlib", "Scarlet Monastery: Library", 33, 41 }, { "drowned", "The Drowned City", 35, 42 }, { "smarm", "Scarlet Monastery: Armory", 36, 44 },
+    { "smcath", "Scarlet Monastery: Cathedral", 38, 46 }, { "rfd", "Razorfen Downs", 37, 46 }, { "kroldok", "Krol'dok Stronghold", 40, 47 },
+    { "ulda", "Uldaman", 41, 51 },
+    { "zf", "Zul'Farrak", 44, 54 }, { "mara", "Maraudon", 46, 55 }, { "alcaz", "Alcaz Prison", 48, 55 }, { "st", "Sunken Temple", 50, 60 },
     { "brd", "Blackrock Depths", 52, 60 }, { "dme", "Dire Maul: East", 54, 60 }, { "lbrs", "Lower Blackrock Spire", 55, 60 },
+    { "blackmaw", "Blackmaw Hold", 55, 60 },
     { "dmw", "Dire Maul: West", 56, 60 }, { "dmn", "Dire Maul: North", 56, 60 }, { "strat", "Stratholme", 58, 60 },
-    { "scholo", "Scholomance", 58, 60 }, { "ubrs", "Upper Blackrock Spire", 59, 60, 10 },
+    { "scholo", "Scholomance", 58, 60 }, { "shapers", "The Shaper's Terrace", 58, 60 }, { "ubrs", "Upper Blackrock Spire", 59, 60, 10 },
 }
 
 -- The 5-player dungeons for your level, as the server picks "any": those whose range holds it, else the nearest.
@@ -2967,6 +2972,15 @@ do
             Print(L["type /w %s <message> to whisper"]:format(name))
             return
         end
+        -- In a boss fight the client locks chat sent from add-on code: this handler is add-on code, so the SendChatMessage below is
+        -- refused there, also when a macro line "/w Name .aura self 12292" runs it (VoldemarGreed 2026-11-18: "the client blocked
+        -- UNKNOWN() for ForeverBots"). The client's own party and raid chat still go out, and the server runs a dot command from
+        -- any chat line: say so instead of making the refused call.
+        local okLock, locked = pcall(function() return C_ChatInfo and C_ChatInfo.InChatMessagingLockdown and C_ChatInfo.InChatMessagingLockdown() end)
+        if okLock and locked and not IsSecret(locked) then
+            Print(L["boss fight: the game blocks whispers sent by add-ons, so \"/w %s %s\" was not sent. For a dot command use /p or /ra instead (in a macro too), e.g. /ra .aura self 12292"]:format(name, text))
+            return
+        end
         -- Sent straight from the slash handler (no timer, no hook on SendChatMessage): the client's own /w never works in 70205.
         local ok, err = pcall(SendChatMessage, text, "WHISPER", nil, name)
         if not ok then
@@ -3032,6 +3046,11 @@ SlashCmdList.FOREVERBOTS = function(msg)
     end
     if verb == "ping" then
         if Cmd.ns.Net then Cmd.ns.Net.Ping() else Print(L["%s is missing: reinstall the add-on."]:format("ForeverBots_Net.lua")) end
+        return
+    end
+    if verb == "rules" then
+        -- the micro menu's Housing / Adventure Guide game rules as the client sees them (ForeverBots_MicroMenu.lua, issue #18)
+        if Cmd.ns.MicroMenu then Cmd.ns.MicroMenu.Report(Print) else Print(L["%s is missing: reinstall the add-on."]:format("ForeverBots_MicroMenu.lua")) end
         return
     end
     if verb == "minimap" then

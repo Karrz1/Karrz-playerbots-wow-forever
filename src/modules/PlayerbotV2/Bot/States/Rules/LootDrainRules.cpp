@@ -83,6 +83,13 @@ bool HasPendingQuestLoot(Player* p, Creature* c)
     return false;
 }
 
+// A corpse the bot can skin, now or once it has been looted: a creature with skinning loot, not skinned yet, and a skinner.
+bool SkinnableForBot(Player* p, Creature* c)
+{
+    return p->HasSkill(SKILL_SKINNING_LOCAL) && c->GetCreatureDifficulty() && c->GetCreatureDifficulty()->SkinLootID != 0
+        && !c->HasUnitFlag3(UNIT_FLAG3_ALREADY_SKINNED);
+}
+
 bool LootDrainGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
     // A bot a player leads or owns loots only its own quest drops (LootDrainFire): the player takes the rest, so no bot runs off to a
@@ -136,6 +143,9 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     float bx, by, bz; s.position(bx, by, bz);
     bool emitted = false;
     const bool quest_only = s.is_led_by_player();
+    // A bot its player told "gather on" also skins what the group kills once the player has looted the corpse (Alex Black Cat,
+    // Discord 2026-11-19: alts with Skinning never skinned). Only the skin: the corpse's loot stays the player's.
+    const bool skin_for_player = quest_only && ai.gather_ordered() && p->HasSkill(SKILL_SKINNING_LOCAL);
     // Guard for the Phase-2 rotate: remembers the first corpse rotated to
     // the back this tick so the drain loop can't spin on a single corpse.
     ObjectGuid rotate_sentinel;
@@ -147,7 +157,7 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
                 Creature* c = ObjectAccessor::GetCreature(*p, q.front());
                 if (!c || !c->IsInWorld()) { q.pop_front(); continue; }
                 // Led by a player: a corpse with nothing of the bot's quest on it is the player's, never walked to.
-                if (quest_only && !HasPendingQuestLoot(p, c)) { q.pop_front(); continue; }
+                if (quest_only && !HasPendingQuestLoot(p, c) && !(skin_for_player && SkinnableForBot(p, c))) { q.pop_front(); continue; }
                 const float dx = c->GetPositionX() - bx;
                 const float dy = c->GetPositionY() - by;
                 const float dz = c->GetPositionZ() - bz;
@@ -221,7 +231,7 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
                     //   Phase 3: skinning loot present       -> LootIntent, keep.
                     //   Done:    nothing left / not skinnable -> pop.
                     const bool can_skin =
-                        !quest_only &&
+                        (!quest_only || skin_for_player) &&
                         p->HasSkill(SKILL_SKINNING_LOCAL) &&
                         c->GetCreatureDifficulty() &&
                         c->GetCreatureDifficulty()->SkinLootID != 0;
@@ -365,6 +375,18 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
                             q.pop_front();
                             continue;
                         }
+                    }
+                    else if (skin_for_player && can_skin && !c->HasUnitFlag(UNIT_FLAG_SKINNABLE) && !c->HasUnitFlag3(UNIT_FLAG3_ALREADY_SKINNED))
+                    {
+                        // The player has not looted this corpse yet, and it becomes skinnable only then: it waits at the back of the
+                        // queue (the per-corpse deadline above still ends the wait).
+                        if (rotate_sentinel == c->GetGUID())
+                            return;
+                        if (rotate_sentinel.IsEmpty())
+                            rotate_sentinel = c->GetGUID();
+                        q.push_back(q.front());
+                        q.pop_front();
+                        continue;
                     }
                     else
                     {

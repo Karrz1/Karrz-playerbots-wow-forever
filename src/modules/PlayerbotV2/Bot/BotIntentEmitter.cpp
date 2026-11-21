@@ -257,6 +257,109 @@ bool BotIntentEmitter::aoe_denied(uint32 spell_id) const
     return AoeDeny::IsAoe(si->IsPositive(), si->IsAffectingArea(), chain, first ? first : spell_id);
 }
 
+bool BotIntentEmitter::heal_locked(uint32 spell_id) const
+{
+    if (!school_snap_ || !spell_id || (!school_snap_->vitals.heals_locked && !school_snap_->vitals.heal_lock_armed))
+        return false;
+    SpellInfo const* si = sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE);
+    if (!si)
+        return false;
+    // Holy Shock is a dummy whose script heals a friend: a direct heal under Corrupted Mind (Spell::CheckCast). The bot only casts it on
+    // friends as a healer, so it is refused whole; the armed paladin's one heal goes out as Holy Light in its turn (EmitHeal).
+    bool direct = si->GetFirstRankSpell()->Id == 20473 || spell_id == 20929 || spell_id == 20930, hot = false;
+    for (SpellEffectInfo const& eff : si->GetEffects())
+    {
+        if (eff.IsEffect(SPELL_EFFECT_HEAL) || eff.IsEffect(SPELL_EFFECT_HEAL_PCT) || eff.IsEffect(SPELL_EFFECT_HEAL_MAX_HEALTH))
+            direct = true;
+        if (eff.IsAura(SPELL_AURA_PERIODIC_HEAL))
+            hot = true;
+    }
+    if (school_snap_->vitals.heals_locked)
+        return direct || hot;   // the same test as the core's Corrupted Mind check (Spell::CheckCast)
+    if (si->GetFirstRankSpell()->Id == 20473 || spell_id == 20929 || spell_id == 20930)
+        return true;            // armed: not outside the healer's turn, which sends Holy Light
+    return hot && !direct;
+}
+
+bool BotIntentEmitter::keep_out_denied(uint32 spell_id, ObjectGuid target, bool pet, float const* point) const
+{
+    if (!school_snap_)
+        return false;
+    RaidOrder const& o = school_snap_->raid_order;
+    if (!o.active || o.keep_out.empty())
+        return false;
+    SpellInfo const* si = spell_id ? sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE) : nullptr;
+    if (spell_id && (!si || si->IsPositive()))
+        return false;   // heals, buffs, the pet's own Dash or Phase Shift
+    auto const reaches = [&o](float x, float y, float margin)
+    {
+        for (RaidOrder::KeepOutCircle const& c : o.keep_out)
+            if (std::hypot(x - c.x, y - c.y) < c.r + margin)
+                return true;
+        return false;
+    };
+    // Only the snapshot's units are placed: an enemy the bot cannot see is not judged here (the brain's pet_recall still holds).
+    auto const find = [this](ObjectGuid g) -> NearbyUnit const*
+    {
+        if (g.IsEmpty())
+            return nullptr;
+        for (NearbyUnit const& u : school_snap_->combat.attackers)
+            if (u.guid == g)
+                return &u;
+        for (NearbyUnit const& u : school_snap_->combat.nearby_enemies)
+            if (u.guid == g)
+                return &u;
+        return nullptr;
+    };
+    if (pet)
+    {
+        if (o.pet_recall)
+            return true;
+        NearbyUnit const* u = find(target.IsEmpty() ? school_snap_->pet.pet_victim : target);
+        return u && reaches(u->x, u->y, RaidOrder::kPetMargin);
+    }
+    if (!si)
+        return false;   // the bot's own swing or shot: its moves already end outside the circles
+    float radius = 0.0f;
+    uint32 chain = 0;
+    for (SpellEffectInfo const& eff : si->GetEffects())
+    {
+        if (!eff.IsEffect())
+            continue;
+        if (eff.HasRadius(SpellTargetIndex::TargetA))
+            radius = std::max(radius, eff.CalcRadius(nullptr, SpellTargetIndex::TargetA).Max);
+        if (eff.HasRadius(SpellTargetIndex::TargetB))
+            radius = std::max(radius, eff.CalcRadius(nullptr, SpellTargetIndex::TargetB).Max);
+        if (eff.ChainTargets > 0)
+            chain = std::max(chain, uint32(eff.ChainTargets));
+    }
+    bool const area = si->IsAffectingArea() || si->IsTargetingArea() || chain > 1;
+    if (!area)
+        return false;
+    if (radius <= 0.0f)
+        radius = RaidOrder::kAoeMargin;   // a channel that triggers its area pulses (Rain of Fire, Blizzard), or a chain's jumps
+    float x = school_snap_->position.x;
+    float y = school_snap_->position.y;
+    if (point)
+    {
+        x = point[0];
+        y = point[1];
+    }
+    else
+    {
+        ObjectGuid const t = !target.IsEmpty() ? target : si->NeedsExplicitUnitTarget() ? school_snap_->combat.victim : ObjectGuid::Empty;
+        if (!t.IsEmpty() && t != school_snap_->guid)
+        {
+            NearbyUnit const* u = find(t);
+            if (!u)
+                return false;
+            x = u->x;
+            y = u->y;
+        }
+    }
+    return reaches(x, y, radius);
+}
+
 bool BotIntentEmitter::heal_denied(uint32 spell_id, ObjectGuid target) const
 {
     if (!school_snap_ || school_snap_->heal_only.empty() || !spell_id || target.IsEmpty() || target == school_snap_->guid)
@@ -364,6 +467,21 @@ bool BotIntentEmitter::start_attack(ObjectGuid target)
         if (ai_->start_attack_recently_refused(target.GetCounter(), now_ms))
             return false;
     }
+    // An enemy the raid brain forbids this bot is attacked by no rule: the raid layer's own steps honour the list, and so must the
+    // rotations and the combat state's own target picks, or the bot swings at it between two raid passes and the next pass drops it
+    // again. naxx_horsemen af43: resting spare tanks had Mograine forbidden and still opened on him ("attack_start ... last_rule
+    // raid:move"), then "raid:drop_target", over and over, so his marks went round every spare and no swap could be made (2 in 444 s).
+    // The enemy the order itself names to kill (a fight script's focus, a soak or kill target) is the exception: the brain's generic
+    // pass may list it (the order is laid over it later in the pass), and the named one wins, as it did before this check. naxx_gluth
+    // af45: after Decimate every DPS had a 5% chow as its script focus and none hit one (0 "raid:script_focus" starts, against 3 of 3 r11
+    // runs where the DPS killed them that way); he ate 13 chows, 22% -> 84%, and the raid wiped.
+    if (school_snap_ && school_snap_->raid_order.active)
+    {
+        RaidOrder const& ro = school_snap_->raid_order;
+        bool const named = (ro.script_names_target() && target == ro.script_focus) || target == ro.attack_target;
+        if (!named && std::find(ro.forbidden_targets.begin(), ro.forbidden_targets.end(), target) != ro.forbidden_targets.end())
+            return false;
+    }
     uint8 avoid = 0;
     if (school_snap_)
         if (PveOrder::SchoolHint const* h = school_snap_->pve_order.school_hint_for(target))
@@ -432,6 +550,7 @@ bool BotIntentEmitter::start_attack(ObjectGuid target)
                 if (u.guid == target) { in_combat = u.unit_in_combat ? 1 : 0; victim_kind = int(u.victim_kind); break; }
             TC_LOG_INFO("playerbot.v2", "[attack_start] {} attacks {} stance {} last_rule {} mob in_combat {} victim_kind {}",
                         school_snap_->identity.name, target.ToString(), int(ai_->owner_stance()), ai_->last_rule_fired() ? ai_->last_rule_fired() : "none", in_combat, victim_kind);
+            ai_->note_attack_start_logged(target);
         }
     }
     if (pushed && ai_ && school_snap_)
@@ -601,7 +720,7 @@ bool BotIntentEmitter::cast(uint32 spell_id, ObjectGuid target)
         return false;
     // The owner said no to this kind of crowd control ("@warlock no fear"), or to area spells ("aoe off"), or keeps this healer on
     // named players ("focus heal").
-    if (owner_denied(spell_id) || heal_denied(spell_id, target))
+    if (owner_denied(spell_id) || heal_denied(spell_id, target) || heal_locked(spell_id))
         return false;
     if (ai_)
     {
@@ -633,7 +752,7 @@ bool BotIntentEmitter::cast_rank(uint32 spell_id, ObjectGuid target)
     if (ai_ && ai_->mana_break_active(GameTime::GetGameTimeMS()) && HasCastTime(spell_id))
         return false;
     // Same raid school gate, crowd-control orders and per-spell emit dedup as cast(); ranks have their own ids.
-    if (school_blocked(spell_id, target) || owner_denied(spell_id) || heal_denied(spell_id, target))
+    if (school_blocked(spell_id, target) || owner_denied(spell_id) || heal_denied(spell_id, target) || heal_locked(spell_id))
         return false;
     if (ai_)
     {

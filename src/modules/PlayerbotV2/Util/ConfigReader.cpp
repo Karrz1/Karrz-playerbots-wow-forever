@@ -354,7 +354,8 @@ void ConfigReader::apply_from_loaded_config()
         "205312:34:24:32,205568:90:29:38,205824:47:29:38,206080:189:30:38,206336:129:37:46,206592:70:41:51,"
         "206848:209:44:54,207104:349:46:55,207360:109:50:60,207616:230:52:60,207872:229:55:60,208128:429:54:60,"
         "208384:429:56:60,208640:429:56:60,208896:329:58:60,211712:189:36:44,211968:189:38:46,212224:189:33:41,"
-        "214272:229:59:60:10";
+        "214272:229:59:60:10,228864:2998:26:33,229120:2999:15:22,229632:3065:13:20,506368:3001:58:60,506624:2974:55:60,"
+        "506880:2994:48:55,508160:2970:35:42,508416:3039:40:47";
     lfg_bot_groups_activities_ = V2::ParseListedActivities(c.GetStringDefault("Playerbot.Lfg.BotGroups.Activities", kDefaultListedActivities, true));
     lfg_finder_enable_        = c.GetBoolDefault("Playerbot.Lfg.Finder.Enable", true, true);
     // empty = the doors named in DungeonFinderPlan.h

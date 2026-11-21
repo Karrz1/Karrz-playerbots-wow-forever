@@ -5,6 +5,11 @@
 #include "BotChatReactor.h"
 #include "BotChatModel.h"
 #include "BotConversation.h"
+#include "TownLife.h"
+#include "../Api/BotLanguage.h"
+#include "../Fleet/GateDuels.h"
+#include "../Fleet/OwnerRegistry.h"
+#include "SocialMgr.h"
 #include "GuildWhisperInvite.h"
 #include "../LfgBotFill.h"
 
@@ -13,6 +18,7 @@
 #include "BotPersonality.h"
 #include "BotRegistry.h"
 #include "BotTextMgr.h"
+#include "PartyTalk.h"
 #include "TradeTalk.h"
 #include "BotTradeShop.h"
 #include "BotTrade.h"
@@ -121,166 +127,20 @@ std::mutex                                  g_area_react_mtx;
 std::unordered_map<uint64_t, uint32_t>      g_last_area_react_ms;
 constexpr uint32_t kPerAreaReactCooldownMs  = 8u * 1000u;
 
-// Lowercase + collapse whitespace to a single space. Strips leading/trailing
-// whitespace and ASCII punctuation that would otherwise wreck keyword
-// matching ("ty!" → "ty", "thx," → "thx"). Returns at most 256 chars; longer
-// messages are truncated for matching purposes only (the bot's reply doesn't
-// depend on input length).
-std::string Normalize(std::string const& in)
-{
-    std::string out;
-    out.reserve(std::min<size_t>(in.size(), 256));
-    bool last_was_space = true;
-    for (char c : in)
-    {
-        if (out.size() >= 256) break;
-        unsigned char uc = static_cast<unsigned char>(c);
-        // Treat punctuation-like ASCII as whitespace so "ty!" / "thx," normalize cleanly.
-        if (uc == '!' || uc == '?' || uc == '.' || uc == ',' ||
-            uc == ';' || uc == ':' || uc == '(' || uc == ')' ||
-            uc == '\t' || uc == '\r' || uc == '\n' || uc == ' ')
-        {
-            if (!last_was_space) { out.push_back(' '); last_was_space = true; }
-            continue;
-        }
-        out.push_back(char(std::tolower(uc)));
-        last_was_space = false;
-    }
-    while (!out.empty() && out.back() == ' ') out.pop_back();
-    return out;
-}
-
-// Returns true if normalized `hay` contains `needle` as a whole word.
-// "ty" matches "ty", "ty everyone", " ty all" — not "pretty" or "country".
-bool ContainsWord(std::string const& hay, char const* needle)
-{
-    const std::string n = needle;
-    size_t pos = 0;
-    while ((pos = hay.find(n, pos)) != std::string::npos)
-    {
-        const bool left_ok  = (pos == 0) || hay[pos - 1] == ' ';
-        const bool right_ok = (pos + n.size() == hay.size()) || hay[pos + n.size()] == ' ';
-        if (left_ok && right_ok) return true;
-        pos += n.size();
-    }
-    return false;
-}
-
-enum class ReactKind : uint8_t
-{
-    None,
-    Thanks,        // ty / thx / thanks
-    Grats,         // gz / grats / congratulations
-    Laugh,         // lol / haha / lmao / xd
-    Acknowledge,   // pull / go / wait / hold / inc / back / brb — behavioral cues
-    Ready,         // ready / rdy — separate so reply can echo "rdy!" not just "k"
-    Greeting,      // hi / hello / hey — small social opener
-    DirectAddress, // bot's name appears as a whole word
-    LocationQuery, // "where" / "wo bist du" — bot whispers back its current zone
-};
-
-ReactKind ClassifyMessage(std::string const& norm, std::string const& bot_first_name_lower)
-{
-    const bool addressed =
-        !bot_first_name_lower.empty() && bot_first_name_lower.size() >= 3 &&
-        ContainsWord(norm, bot_first_name_lower.c_str());
-
-    // Includes a handful of non-English thanks tokens — the user's server is
-    // German-leaning ("danke") and EU players mix DE/FR/ES freely in /p chat.
-    const bool has_thanks =
-        ContainsWord(norm, "ty")     || ContainsWord(norm, "thx") ||
-        ContainsWord(norm, "thanks") || ContainsWord(norm, "thank") ||
-        ContainsWord(norm, "tyvm")   || ContainsWord(norm, "danke") ||
-        ContainsWord(norm, "merci")  || ContainsWord(norm, "gracias");
-    const bool has_grats =
-        ContainsWord(norm, "gz")     || ContainsWord(norm, "grats") ||
-        ContainsWord(norm, "gratz")  || ContainsWord(norm, "congrats") ||
-        ContainsWord(norm, "congratulations") ||
-        // "Ding!" / "Ding 47" — bots and players announce a level-up
-        // this way. Treat it as a Grats trigger so the rest of the group
-        // congratulates on the ding. "Hark!" prefix from Roleplay-verbose
-        // bot dings is also recognised. Without this, dings dropped into
-        // dead air — humans congratulate every party-ding.
-        ContainsWord(norm, "ding") || ContainsWord(norm, "hark");
-    const bool has_laugh =
-        ContainsWord(norm, "lol")  || ContainsWord(norm, "haha") ||
-        ContainsWord(norm, "lmao") || ContainsWord(norm, "xd")   ||
-        ContainsWord(norm, "rofl");
-    // "gg" / "wp" / "good game" — universal after-kill or end-of-BG line.
-    // Folded into Grats reply pool ("gz!"/"nice"/"well done") since the
-    // sentiment is the same (acknowledging a finish).
-    const bool has_gg =
-        ContainsWord(norm, "gg")        || ContainsWord(norm, "wp") ||
-        ContainsWord(norm, "wellplayed");
-    // Behavioral cues: words real players type to coordinate the pull/pace
-    // of the group. Bots don't execute these (the ;-prefix command path
-    // does), but a one-line acknowledgement reads like a focused human
-    // teammate instead of a silent NPC. "inc"/"incoming" is acknowledged
-    // even though no defensive action follows — silence on "inc" feels
-    // worse than a "k" while the bot keeps doing its job.
-    const bool has_ack =
-        ContainsWord(norm, "pull")    || ContainsWord(norm, "pulling") ||
-        ContainsWord(norm, "go")      || ContainsWord(norm, "wait")    ||
-        ContainsWord(norm, "hold")    || ContainsWord(norm, "stop")    ||
-        ContainsWord(norm, "back")    || ContainsWord(norm, "regroup") ||
-        ContainsWord(norm, "rg")      || ContainsWord(norm, "inc")     ||
-        ContainsWord(norm, "incoming")|| ContainsWord(norm, "afk")     ||
-        ContainsWord(norm, "brb");
-    const bool has_ready =
-        ContainsWord(norm, "ready")   || ContainsWord(norm, "rdy");
-    // Greeting tokens — the kind of thing said when a player joins
-    // /p or just opens the conversation. EU mix again (German/French/
-    // Spanish hello variants). "yo" / "hey" / "hi" / "sup" are also
-    // common in younger-skewed groups.
-    const bool has_greeting =
-        ContainsWord(norm, "hi")    || ContainsWord(norm, "hello") ||
-        ContainsWord(norm, "hey")   || ContainsWord(norm, "yo")    ||
-        ContainsWord(norm, "sup")   || ContainsWord(norm, "hallo") ||
-        ContainsWord(norm, "bonjour") || ContainsWord(norm, "hola") ||
-        ContainsWord(norm, "moin");
-    // Location query — "where are you" / "wo bist du" / "where r u".
-    // Triggers a zone-aware reply ("im in {zone}") instead of the generic
-    // "?" direct-address response. SC-P1c: this is now answered on BOTH the
-    // whisper AND the party path (when the bot is addressed by name) via the
-    // shared BuildLocationReply() helper — previously the party-chat
-    // PickReply had no LocationQuery case, so an addressed "where are you
-    // Aron?" in /p returned silence. It is still only classified as a
-    // LocationQuery when the bot is addressed (a bare party "where do we go
-    // next?" must not trip a zone dump from every bot).
-    const bool has_location_query =
-        ContainsWord(norm, "where") || ContainsWord(norm, "wherer") ||
-        ContainsWord(norm, "wo");
-
-    // When a social keyword AND the bot's name are both present, the social
-    // keyword wins ("gz Aron" → Aron replies "ty!", not "yes?"). When only
-    // the name appears, the address reply ("?", "yes?") fires.
-    if (addressed)
-    {
-        if (has_thanks)         return ReactKind::Thanks;
-        if (has_grats || has_gg) return ReactKind::Grats;
-        if (has_ready)          return ReactKind::Ready;
-        if (has_laugh)          return ReactKind::Laugh;
-        if (has_ack)            return ReactKind::Acknowledge;
-        if (has_location_query) return ReactKind::LocationQuery;
-        if (has_greeting)       return ReactKind::Greeting;
-        return ReactKind::DirectAddress;
-    }
-
-    if (has_thanks)         return ReactKind::Thanks;
-    if (has_grats || has_gg) return ReactKind::Grats;
-    if (has_ready)          return ReactKind::Ready;
-    if (has_laugh)          return ReactKind::Laugh;
-    if (has_ack)            return ReactKind::Acknowledge;
-    if (has_greeting)       return ReactKind::Greeting;
-
-    return ReactKind::None;
-}
+using V2::PartyTalk::ContainsWord;
+using V2::PartyTalk::IsDrinkCue;
+using V2::PartyTalk::IsGoCue;
+using V2::PartyTalk::IsIncCue;
+using V2::PartyTalk::IsPauseCue;
+using V2::PartyTalk::ClassifyMessage;
+using V2::PartyTalk::Normalize;
+using V2::PartyTalk::ReactKind;
 
 // Sub-kind for the Acknowledge reply pool — lets the reply track the
 // kind of cue (pause vs go vs incoming vs general) so a "wait" gets
 // "ok holding" instead of a generic "k". Resolved at React-time from
 // the normalized message and threaded into PickReply.
-enum class AckFlavor : uint8_t { Generic, Pause, Go, Inc, Drink };
+enum class AckFlavor : uint8_t { Generic, Pause, Go, Inc, Drink, Back };
 
 // SC-P2a: politeness-aware pool selector. Picks one of three pools by the
 // bot's Politeness personality field. Rude bots are terse/curt, polite bots
@@ -393,6 +253,12 @@ char const* PickReply(ReactKind k, bool addressed, uint32 sel,
                     };
                     return kPool[sel % (sizeof(kPool) / sizeof(kPool[0]))];
                 }
+                case AckFlavor::Back:
+                {
+                    // Someone is back from a "brb": what a group says.
+                    constexpr char const* kPool[] = { "wb", "wb!", "wb :)", "welcome back", "wb, ready when you are" };
+                    return kPool[sel % (sizeof(kPool) / sizeof(kPool[0]))];
+                }
                 case AckFlavor::Generic:
                 default: break;
             }
@@ -450,13 +316,20 @@ char const* PickReply(ReactKind k, bool addressed, uint32 sel,
 // an addressed LocationQuery too (previously PickReply had no LocationQuery
 // case, so "where are you Aron?" in /p returned silence). `sel` chooses the
 // template + (for politeness) tone. Falls back to a numeric area id when the
-// locale string is empty (rare).
-std::string BuildLocationReply(Player* bot, uint32 sel, Politeness pol)
+// locale string is empty (rare). A Russian asker gets the zone's Russian
+// name when the server has the Russian client data (the "im in {}" frame is
+// translated where the line leaves the server; the name inside it is not).
+std::string BuildLocationReply(Player* bot, Player const* asker, uint32 sel, Politeness pol)
 {
     uint32 const area_id = bot->GetAreaId();
     std::string area_name;
     if (auto const* ae = sAreaTableStore.LookupEntry(area_id))
+    {
         area_name = ae->AreaName[sWorld->GetDefaultDbcLocale()];
+        if (asker && BotLanguage::LangOf(asker) == Locale::Lang::Ru)
+            if (char const* ru = ae->AreaName[LOCALE_ruRU]; ru && *ru)
+                area_name = ru;
+    }
     if (area_name.empty())
         area_name = "area " + std::to_string(area_id);
 
@@ -485,6 +358,52 @@ std::string BuildLocationReply(Player* bot, uint32 sel, Politeness pol)
 // Small talk answered from the bot's real data through BotConversation (how are you, where from, level, class, what doing,
 // group, quest help, directions, professions, guild, jokes, goodbye, ...). Returns false when the line is none of those (the
 // usual reply pools then apply) or when Playerbot.Chatter.Conversation is off.
+// What the bot will do with a duel this player sends next, the same rule as BotAI's duel answer, so "duel?" -> "sure, send it" is
+// kept (a yes is remembered as a promise there) and a no says why.
+V2::DuelAnswer DuelAnswerFor(Player* bot, Player* sender)
+{
+    Map const* map = bot->GetMap();
+    if (bot->InBattleground() || bot->InArena() || (map && (map->IsDungeon() || map->IsRaid() || map->IsBattlegroundOrArena())))
+        return V2::DuelAnswer::NotHere;
+    bool friendly = (bot->GetGroup() && bot->GetGroup()->IsMember(sender->GetGUID()))
+                 || (bot->GetGuildId() != 0 && bot->GetGuildId() == sender->GetGuildId());
+    if (!friendly)
+        if (PlayerSocial* social = bot->GetSocial())
+            friendly = social->HasFriend(sender->GetGUID());
+    if (friendly)
+        return V2::DuelAnswer::Yes;
+    bool const owned = Services::Owners().OwnerCharacter(bot->GetGUID().GetCounter()) != 0;
+    if (!Services::Config().behavior_polite_world_bots() || owned || bot->GetGroup())
+        return V2::DuelAnswer::NotNow;   // it turns the duel down
+    int32 const diff = int32(bot->GetLevel()) - int32(sender->GetLevel());
+    bool const close = Services::Config().gate_duels_enable() ? V2::GateDuels::PlayerDuelOk(bot->GetLevel(), sender->GetLevel())
+                                                              : (diff >= -5 && diff <= 5);
+    if (!close)
+        return V2::DuelAnswer::TooFar;
+    if (!bot->IsAlive() || bot->IsInCombat() || bot->GetHealthPct() < 70.0f)
+        return V2::DuelAnswer::NotNow;
+    return V2::DuelAnswer::Yes;
+}
+
+// What the bot will do with a group invite this player sends next: the polite world bot rule of the invite answer
+// (States/Rules/CoreFlowRules.cpp, GroupInviteAcceptFire), so "wanna group?" -> "sure, invite me" is never followed by "sorry,
+// you're a bit too high level for me" when the invite comes.
+V2::GroupAnswer GroupAnswerFor(Player* bot, Player* sender)
+{
+    if (bot->GetGroup())
+        return V2::GroupAnswer::InGroup;
+    bool const owned = Services::Owners().OwnerCharacter(bot->GetGUID().GetCounter()) != 0;
+    if (!Services::Config().behavior_polite_world_bots() || owned)
+        return V2::GroupAnswer::Yes;
+    if (!bot->IsAlive() || bot->IsInCombat() || bot->InBattleground())
+        return V2::GroupAnswer::NotNow;
+    WorldSession const* ss = sender->GetSession();
+    bool const privileged = ss && (ss->GetSecurity() >= SEC_GAMEMASTER || !Services::Owners().BotsOwnedBy(ss->GetAccountId()).empty());
+    if (int32(sender->GetLevel()) > int32(bot->GetLevel()) + 5 && !privileged)
+        return V2::GroupAnswer::TooHigh;
+    return V2::GroupAnswer::Yes;
+}
+
 V2::ConversationContext MakeConvContext(Player* bot, BotAI* ai, Player* sender)
 {
     static constexpr char const* kClass[] = { "", "warrior", "paladin", "hunter", "rogue", "priest", "death knight", "shaman",
@@ -496,8 +415,18 @@ V2::ConversationContext MakeConvContext(Player* bot, BotAI* ai, Player* sender)
     uint8 const cls = bot->GetClass();
     ctx.class_name  = cls < sizeof(kClass) / sizeof(kClass[0]) && kClass[cls][0] ? kClass[cls] : "adventurer";
     ctx.level       = bot->GetLevel();
+    // A Russian player is answered in Russian (GitHub #12: every whisper got English or "dunno"), with the zone's Russian
+    // name when the server has the Russian client data.
+    ctx.russian = BotLanguage::LangOf(sender) == Locale::Lang::Ru;
     if (auto const* ae = sAreaTableStore.LookupEntry(bot->GetAreaId()))
+    {
         ctx.zone = ae->AreaName[sWorld->GetDefaultDbcLocale()];
+        if (ctx.russian)
+            if (char const* ru = ae->AreaName[LOCALE_ruRU]; ru && *ru)
+                ctx.zone = ru;
+    }
+    ctx.duel = DuelAnswerFor(bot, sender);
+    ctx.group = GroupAnswerFor(bot, sender);
     ctx.in_group = bot->GetGroup() != nullptr;
     ctx.activity = "just hanging around";
     if (ctx.in_group)
@@ -552,52 +481,18 @@ bool BuildSmallTalkReply(Player* bot, BotAI* ai, std::string const& msg, Player*
     // is in the group (and its leader) at once, the same as sending the invite from the list.
     bool const joins = addressed && V2::ConvClassify(norm) == V2::ConvIntent::GroupInvite && V2::LfgBotGroupCanTake(bot, sender);
     if (joins)
+    {
         ctx.in_group = false;
+        ctx.group = V2::GroupAnswer::Yes;
+    }
     if (!V2::ConvReply(ctx, norm, msg, sel, addressed, out))
         return false;
+    // "duel?" -> "sure, send it": the duel this player sends in the next two minutes is accepted (BotAI's duel answer).
+    if (addressed && ctx.duel == V2::DuelAnswer::Yes && V2::ConvClassify(norm) == V2::ConvIntent::Duel)
+        V2::TownLife::PactSet(bot->GetGUID().GetCounter(), sender->GetGUID().GetCounter(), GameTime::GetGameTimeMS());
     if (joins)
         V2::LfgBotGroupJoinRequest(bot, sender);
     return true;
-}
-
-// True when the message carries a pause cue ("wait"/"hold"/"stop"/"back"/
-// "regroup") — real-player shorthand that means "everyone freeze, don't
-// pull yet". back/regroup pause a bit longer because the group is
-// typically reforming after a wipe or repositioning.
-// Distinct from the broader Acknowledge classification because we only
-// want to inject the BotAI pause for these specific tokens, not for
-// "pull"/"go" (which mean the opposite) or "afk"/"brb" (which mean
-// "the SPEAKER is gone", not "the group should hold").
-bool IsPauseCue(std::string const& norm)
-{
-    return ContainsWord(norm, "wait")    ||
-           ContainsWord(norm, "hold")    ||
-           ContainsWord(norm, "stop")    ||
-           ContainsWord(norm, "back")    ||
-           ContainsWord(norm, "regroup") ||
-           ContainsWord(norm, "rg");
-}
-// Drink cue — healer or caster announces a mana break. Triggers a
-// LONGER pause (30s) than the standard wait cue because a real drink
-// from full empty takes ~25s and you want the tank to wait through
-// the whole regen, not just the first sip. Distinct cue lets the
-// reply pool acknowledge specifically ("k drink") and not get mixed
-// with the generic wait reply.
-bool IsDrinkCue(std::string const& norm)
-{
-    return ContainsWord(norm, "drink") ||
-           ContainsWord(norm, "drinking") ||
-           ContainsWord(norm, "mb")  ||   // "mana break"
-           ContainsWord(norm, "oom");     // "out of mana"
-}
-// "go" / "pull" / "pulling" — the inverse cue: clear any pause so a
-// previous "wait" doesn't keep the group frozen indefinitely.
-bool IsGoCue(std::string const& norm)
-{
-    return ContainsWord(norm, "go")      ||
-           ContainsWord(norm, "pull")    ||
-           ContainsWord(norm, "pulling") ||
-           ContainsWord(norm, "engage");
 }
 
 // Pause window — 12s. Long enough to cover a typical "wait, healer is
@@ -732,8 +627,7 @@ void BotChatReactor::React(Player* sender, Group* group, std::string const& msg,
     {
         const bool pause = IsPauseCue(norm);
         const bool go    = IsGoCue(norm);
-        const bool inc   = ContainsWord(norm, "inc") ||
-                           ContainsWord(norm, "incoming");
+        const bool inc   = IsIncCue(norm);
         const bool drink = IsDrinkCue(norm);
         if (pause || go || inc || drink)
         {
@@ -766,7 +660,7 @@ void BotChatReactor::React(Player* sender, Group* group, std::string const& msg,
                         // DungeonFlow: only "go" opens the human-lead release window. "pull" / "pulling" / "engage" are the owner's own
                         // orders (their handlers decide what the autopilot may do); opening the window for every bot on them let the
                         // tank autopilot pull on and run back and the casters wander (Deadmines 2026-10-14).
-                        if (ContainsWord(norm, "go"))
+                        if (V2::PartyTalk::SaysGo(norm))
                             mai->release_owner_lead();
                     }
                 }
@@ -794,10 +688,10 @@ void BotChatReactor::React(Player* sender, Group* group, std::string const& msg,
     // reply for this message uses the same cue context.
     AckFlavor ack_flavor = AckFlavor::Generic;
     if (IsDrinkCue(norm))                       ack_flavor = AckFlavor::Drink;
+    else if (V2::PartyTalk::IsBackCue(norm))     ack_flavor = AckFlavor::Back;
     else if (IsPauseCue(norm))                  ack_flavor = AckFlavor::Pause;
     else if (IsGoCue(norm))                     ack_flavor = AckFlavor::Go;
-    else if (ContainsWord(norm, "inc") ||
-             ContainsWord(norm, "incoming"))    ack_flavor = AckFlavor::Inc;
+    else if (IsIncCue(norm))                    ack_flavor = AckFlavor::Inc;
 
     // `extra_delay_ms` staggers a 2nd addressed bot so a duo doesn't reply on
     // the same tick (SC-P1b multi-name cap fallback).
@@ -835,7 +729,7 @@ void BotChatReactor::React(Player* sender, Group* group, std::string const& msg,
         }
         else if (c.kind == ReactKind::LocationQuery)
         {
-            reply_str = BuildLocationReply(c.bot, sel, pol);
+            reply_str = BuildLocationReply(c.bot, sender, sel, pol);
         }
         else
         {
@@ -1250,7 +1144,7 @@ void BotChatReactor::ReactWhisper(Player* sender, Player* bot, std::string const
     {
         // SC-P1c: shared zone-aware reply builder (also used by the party
         // path now). Resolves the bot's current AreaTable.db2 zone.
-        reply_str = BuildLocationReply(bot, sel, pol);
+        reply_str = BuildLocationReply(bot, sender, sel, pol);
     }
     else
     {
@@ -1584,7 +1478,7 @@ void ReactSpoken(Player* sender, std::string const& msg, bool is_yell,
         if (kind == ReactKind::None && world_say && BotTextMgr::instance().Enabled())
         {
             // A short question, or the speaker's own name, from a player standing next to the bot.
-            question = norm.size() <= 48 && (msg.back() == '?' || (sender_first.size() >= 3 && ContainsWord(norm, sender_first.c_str())));
+            question = V2::PartyTalk::Letters(norm) <= 48 && (msg.back() == '?' || (sender_first.size() >= 3 && ContainsWord(norm, sender_first.c_str())));
             if (question) kind = ReactKind::DirectAddress;
         }
         if (kind == ReactKind::None) continue;
@@ -1617,10 +1511,10 @@ void ReactSpoken(Player* sender, std::string const& msg, bool is_yell,
     // Resolve Acknowledge flavor (rare in /say, but keeps replies consistent).
     AckFlavor ack_flavor = AckFlavor::Generic;
     if (IsDrinkCue(norm))                       ack_flavor = AckFlavor::Drink;
+    else if (V2::PartyTalk::IsBackCue(norm))     ack_flavor = AckFlavor::Back;
     else if (IsPauseCue(norm))                  ack_flavor = AckFlavor::Pause;
     else if (IsGoCue(norm))                     ack_flavor = AckFlavor::Go;
-    else if (ContainsWord(norm, "inc") ||
-             ContainsWord(norm, "incoming"))    ack_flavor = AckFlavor::Inc;
+    else if (IsIncCue(norm))                    ack_flavor = AckFlavor::Inc;
 
     // Prefer an addressed bot; else pick one stably by hash and apply the
     // probabilistic fire gate so not every ambient line is answered.
@@ -1692,7 +1586,7 @@ void ReactSpoken(Player* sender, std::string const& msg, bool is_yell,
     {
     }
     else if (chosen->kind == ReactKind::LocationQuery)
-        reply_str = BuildLocationReply(chosen->bot, sel, pol);
+        reply_str = BuildLocationReply(chosen->bot, sender, sel, pol);
     else
     {
         if (world_say && BotTextMgr::instance().Enabled())

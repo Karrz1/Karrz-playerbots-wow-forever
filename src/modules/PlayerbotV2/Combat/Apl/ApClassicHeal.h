@@ -103,6 +103,8 @@ constexpr int32 kSaveManaPct    = 40;      // AiPlayerbot.MediumMana: 75% defici
 constexpr int32 kRaidTankTopUpPct    = 93; // raid: only a tank's own healers heal a tank at or above this
 constexpr int32 kRaidTankFavourPct   = 80; // raid: a tank at or above this is ranked like any other member
 constexpr int32 kRaidTankBigHealPct  = 50; // raid: the fast / big heal for a tank under this
+constexpr int32 kCorruptedMindHealPct     = 66; // Loatheb, armed Corrupted Mind: the one heal goes to a member at or under this ...
+constexpr int32 kCorruptedMindTankHealPct = 80; // ... or a tank at or under this
 constexpr int32 kRaidLowManaPct      = 25; // raid boss fight: below this mana ...
 constexpr int32 kRaidLowManaCeilPct  = 80; // ... nobody above this is healed, HoTs only on tanks
 constexpr uint32 kCancelLockoutMs    = 1500;
@@ -1118,8 +1120,11 @@ inline HealPlan PlanHeal(BotSnapshotView const& s, GroupSnapshotView const& g, u
     // missing next to no health right now is not healed yet (tank pressure and emergencies were answered above). Without this a
     // paladin's Holy Light went out on a player down 1 health to a poison tick and healed 1 (dumpins, leenergetic, Discord
     // 2026-11-17: "they heal you but only does 1 heal", "heals with no effect, on self too").
+    // Not a raid tank: there the forecast is the boss's next hit, and covering it before it lands is the heal (Maexxna's tank under
+    // Necrotic Poison, Sapphiron's, Patchwerk's soakers). The naxx_maexxna and naxx_sapphiron passes (r27, r28, 18 Nov) ran without this rule;
+    // the release-0138 runs with it wiped both.
     float const missing_now = float(std::max<int64>(p.max_hp - p.hp - p.inflight, 0)) / HealTakenFactor(g, p.guid);
-    if (missing_now < top_heal / 3.0f * 0.25f)
+    if (!(raid && p.tank) && missing_now < top_heal / 3.0f * 0.25f)
     {
         plan.skip = true;
         return plan;
@@ -1588,6 +1593,86 @@ inline bool PayableOrLog(BotSnapshotView const& s, uint32 spell_id, Patient cons
 // same tick cannot both start a heal its deficit only needs once (see the
 // "Heals in flight" block). The heal focus is exempt from the check (the
 // tank healer's duty) but is still claimed, so others see that heal coming.
+// Loatheb's Corrupted Mind (0158): each healer's next heal locks its heals for 60 s, so the raid has one heal per healer a minute. Those
+// heals are spaced evenly over the minute, one at a time across the group: a minute over the living healers apart. naxx_loatheb af38
+// (1119) had eleven healers send theirs within 10 s, then nobody could heal for 50 s. af42 run 2: the gap was counted from the healers
+// seen trying (too few, so 6 s at first) and halved for an emergency, so 20 heals went out in 80 s, every healer was locked at once and the
+// four tanks died in the 23-27 s dry spells that followed (07:43:25-07:44:25). An emergency now waits for its turn like any heal.
+constexpr uint32 kCorruptedMindMinGapMs = 1500;
+
+struct CorruptedMindBook
+{
+    std::mutex mu;
+    std::unordered_map<uint64, uint32> last_heal;   // group guid counter -> when its last such heal went out
+};
+inline CorruptedMindBook& CorruptedMindBookInstance()
+{
+    static CorruptedMindBook book;
+    return book;
+}
+
+// The living healers of the bot's group on its map (the bot itself included).
+inline uint32 CorruptedMindHealers(BotSnapshotView const& s, GroupSnapshotView const& g)
+{
+    uint32 n = 0;
+    bool self = false;
+    if (auto const* members = g.members())
+        for (GroupMemberSummary const& m : *members)
+            if (m.role == Role::Healer && m.online && m.is_alive && m.map_id == s.map_id())
+            {
+                ++n;
+                self = self || m.guid == s.guid();
+            }
+    return n + (self ? 0u : 1u);
+}
+
+// May this armed healer send its heal now? If so the slot is taken (prev_out: the slot's previous time, for CorruptedMindGiveBack when
+// nothing was sent).
+inline bool CorruptedMindTurn(BotSnapshotView const& s, GroupSnapshotView const& g, uint32& prev_out, uint32& gap_out)
+{
+    uint32 const gap = std::max(60000u / std::max(CorruptedMindHealers(s, g), 1u), kCorruptedMindMinGapMs);
+    gap_out = gap;
+    uint32 const now = s.published_at_ms();
+    CorruptedMindBook& book = CorruptedMindBookInstance();
+    std::lock_guard<std::mutex> lock(book.mu);
+    if (book.last_heal.size() > 32)
+        book.last_heal.clear();   // fights long over: nothing reads them again
+    uint32& last = book.last_heal[s.group_guid().GetCounter()];
+    if (last && now - last < gap)
+        return false;
+    prev_out = last;
+    last = now ? now : 1;
+    return true;
+}
+
+inline void CorruptedMindGiveBack(BotSnapshotView const& s, uint32 prev)
+{
+    CorruptedMindBook& book = CorruptedMindBookInstance();
+    std::lock_guard<std::mutex> lock(book.mu);
+    auto it = book.last_heal.find(s.group_guid().GetCounter());
+    if (it != book.last_heal.end())
+        it->second = prev;
+}
+
+// The one heal of the minute is the class's biggest (af38: paladins spent theirs on Flash of Light for 760-990 and priests on Flash Heal
+// for 1370 with a tank 11800 short); mana does not matter when the next heal is a minute away. Falls back to the rotation's spell.
+inline uint32 CorruptedMindHealSpell(BotSnapshotView const& s, uint32 spell)
+{
+    uint32 big = 0;
+    switch (s.cls())
+    {
+        case CLASS_PRIEST:  big = 2060; break;   // Greater Heal
+        case CLASS_DRUID:   big = 5185; break;   // Healing Touch
+        case CLASS_PALADIN: big = 635;  break;   // Holy Light
+        case CLASS_SHAMAN:  big = 331;  break;   // Healing Wave
+        default: break;
+    }
+    return big && s.resolve_rank(big) ? big : spell;
+}
+
+inline bool EmitHealPlanned(BotSnapshotView const& s, GroupSnapshotView const& g, BotIntentEmitter& e,
+                            uint32 spell, Patient const& p, bool top_rank);
+
 inline bool EmitHeal(BotSnapshotView const& s, GroupSnapshotView const& g, BotIntentEmitter& e,
                      uint32 spell, Patient const& p)
 {
@@ -1597,12 +1682,41 @@ inline bool EmitHeal(BotSnapshotView const& s, GroupSnapshotView const& g, BotIn
     // 2026-10-10: feared healers stepped up the ranks on every refused cast).
     if (s.cannot_heal())
         return false;
+    if (!s.heal_lock_armed())
+        return EmitHealPlanned(s, g, e, spell, p, false);
+    // Loatheb's Corrupted Mind: the armed healer's next heal locks its heals for 60 s, so that one heal goes only where it is needed (a
+    // patient missing a third of its health, a tank missing a fifth, or an emergency), in its turn (CorruptedMindTurn), and is the
+    // class's biggest heal at its top rank.
+    if (!NeedsFastHeal(p) && p.hp_pct > kCorruptedMindHealPct && !(p.tank && p.hp_pct <= kCorruptedMindTankHealPct))
+        return false;
+    uint32 prev = 0, gap = 0;
+    if (!CorruptedMindTurn(s, g, prev, gap))
+        return false;
+    uint32 const big = CorruptedMindHealSpell(s, spell);
+    bool const sent = EmitHealPlanned(s, g, e, big, p, true);
+    if (!sent)
+        CorruptedMindGiveBack(s, prev);
+    else
+        TC_LOG_INFO("playerbot.v2", "[raid_corrupted_mind] {} spends its heal: spell {} on {}{} at {}% (gap {} ms)", s.name(),
+                    s.resolve_rank(big), p.guid.GetCounter(), p.tank ? " (tank)" : "", p.actual_pct, gap);
+    return sent;
+}
+
+inline bool EmitHealPlanned(BotSnapshotView const& s, GroupSnapshotView const& g, BotIntentEmitter& e,
+                            uint32 spell, Patient const& p, bool top_rank)
+{
     ObjectGuid const target = p.guid.IsEmpty() ? s.guid() : p.guid;
     if (!RaidHealing(s) || !HealClaimsOn())
     {
         HealPlan plan = PlanHeal(s, g, spell, p);
         if (plan.skip)
             return false;
+        if (uint32 const top = top_rank ? s.resolve_rank(spell) : 0u)
+            if (SpellInfo const* topInfo = sSpellMgr->GetSpellInfo(top, DIFFICULTY_NONE))
+            {
+                plan.rank = top;
+                plan.est = ExpectedHeal(topInfo, s);
+            }
         if (uint32 const afford = AffordableRank(s, spell, plan.rank); afford != (plan.rank ? plan.rank : s.resolve_rank(spell)))
         {
             if (!afford)
@@ -1643,6 +1757,12 @@ inline bool EmitHeal(BotSnapshotView const& s, GroupSnapshotView const& g, BotIn
         HealPlan plan = PlanHeal(s, g, spell, q);
         if (plan.skip)
             return false;
+        if (uint32 const top = top_rank ? s.resolve_rank(spell) : 0u)
+            if (SpellInfo const* topInfo = sSpellMgr->GetSpellInfo(top, DIFFICULTY_NONE))
+            {
+                plan.rank = top;
+                plan.est = ExpectedHeal(topInfo, s);
+            }
         if (uint32 const afford = AffordableRank(s, spell, plan.rank); afford != (plan.rank ? plan.rank : s.resolve_rank(spell)))
         {
             if (!afford)

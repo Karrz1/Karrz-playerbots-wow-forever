@@ -36,6 +36,18 @@
 
 namespace
 {
+// Two pieces that may not be worn together because they share an item limit category that counts equipped items with room for one
+// (Rune of Duty and Rune of Perfection, category 714 "Rune of Battle"): Player::CanEquipItem refuses the second with
+// EQUIP_ERR_ITEM_MAX_LIMIT_CATEGORY_EQUIPPED_EXCEEDED_IS (90) and the paired slot stays empty (af54 log, 20 Nov: 83 refusals of 21565-21568
+// in trinket slot 2).
+bool SharesSingleEquipLimit(ItemTemplate const* a, ItemTemplate const* b)
+{
+    if (!a || !b || !a->GetItemLimitCategory() || a->GetItemLimitCategory() != b->GetItemLimitCategory())
+        return false;
+    ItemLimitCategoryEntry const* limit = sItemLimitCategoryStore.LookupEntry(a->GetItemLimitCategory());
+    return limit && limit->Flags == ITEM_LIMIT_CATEGORY_MODE_EQUIP && limit->Quantity <= 1;
+}
+
 // The highest effective item level raid gear may reach: Playerbot.Gear.RaidIlvlCap when set (> 0), else the cap of
 // Playerbot.Gear.MaxTier (default 2 = Blackwing Lair). Approximate Classic item level ceilings per raid tier
 // (not derived from the item store, which was not reachable): pre-raid dungeon gear ~58-63, MC / Onyxia up to ~76,
@@ -304,16 +316,39 @@ static bool InSeason(uint32 entry)
     return false;
 }
 
-// The item rules that do not change while the server runs; the gear pools are built from these at start.
-static bool IsBotWearableAnyDay(uint32 entry)
+constexpr uint32 kFirstNonVanillaItemId = 25000;
+
+// Every item id from kFirstNonVanillaItemId up that this realm's world data gives out: loot tables, vendors and quest rewards.
+// Forever adds its own dungeon and quest gear there (ids 240000+, e.g. 273033 from Atrexis the Grave Knight).
+static std::unordered_set<uint32> const& RealmHandedOutItems()
+{
+    static std::unordered_set<uint32> const s_items = []
+    {
+        std::unordered_set<uint32> items;
+        WorldDatabasePreparedStatement* stmt = WorldDatabase.GetPreparedStatement(WORLD_SEL_BOT_REALM_ITEMS);
+        for (uint8 i = 0; i < 15; ++i)
+            stmt->setUInt32(i, kFirstNonVanillaItemId);
+        if (PreparedQueryResult r = WorldDatabase.Query(stmt))
+            do items.insert((*r)[0].GetUInt32()); while (r->NextRow());
+        TC_LOG_INFO("playerbot.v2", "[BotGearGenerator] {} non-vanilla items handed out by this realm: bots keep them once they have them",
+                    items.size());
+        return items;
+    }();
+    return s_items;
+}
+
+// The item rules that do not change while the server runs. The gear pools are built from these at start with
+// realm_items_ok = false (bots are dressed in vanilla's own items); a piece a bot already got in play (looted, bought,
+// quest reward) passes with realm_items_ok = true when the realm itself hands it out.
+static bool IsBotWearableAnyDay(uint32 entry, bool realm_items_ok = false)
 {
     if (!HolidayClothesAllowed() && HolidayItems().count(entry))
         return false;
 
-    constexpr uint32 kClassicCap = 60, kFirstNonVanillaItemId = 25000;
+    constexpr uint32 kClassicCap = 60;
     if (MaxPlayerLevel() > kClassicCap)
         return true;
-    if (entry >= kFirstNonVanillaItemId)
+    if (entry >= kFirstNonVanillaItemId && !(realm_items_ok && RealmHandedOutItems().count(entry)))
         return false;
     // Honor-rank rewards (Warlord's / Field Marshal's sets...): the server doesn't enforce the rank, so an Alliance
     // human warrior wore the Horde rank 14 set and drew like an orc (Testwar, 2026-10-05)
@@ -323,7 +358,7 @@ static bool IsBotWearableAnyDay(uint32 entry)
 
 bool IsBotWearableItemId(uint32 entry)
 {
-    return IsBotWearableAnyDay(entry) && InSeason(entry);
+    return IsBotWearableAnyDay(entry, /*realm_items_ok*/ true) && InSeason(entry);
 }
 
 // A whole word "Test" or "Deprecated" in the name, any case: developer items that ship in the item data. The same holds for the placeholders
@@ -610,6 +645,17 @@ uint8 AutoEquipSlot(uint16 spec, uint8 slot, uint32 entry)
     return 0xFF;
 }
 
+bool ShieldGoesOnShieldTank(uint16 spec, uint8 slot, uint32 bag_entry, uint32 worn_entry)
+{
+    if ((spec != 73 && spec != 66) || slot != EQUIPMENT_SLOT_OFFHAND)
+        return false;
+    ItemTemplate const* bag = sObjectMgr->GetItemTemplate(bag_entry);
+    if (!bag || bag->GetInventoryType() != INVTYPE_SHIELD)
+        return false;
+    ItemTemplate const* worn = worn_entry ? sObjectMgr->GetItemTemplate(worn_entry) : nullptr;
+    return !worn || worn->GetInventoryType() != INVTYPE_SHIELD;
+}
+
 int32 LiveRaidIlvlCap() { return RaidIlvlCap(); }
 int32 LiveWorldIlvlCap() { return WorldIlvlCap(); }
 
@@ -665,6 +711,13 @@ bool WorldPvpSet(uint64 bot_id)
     return WorldPvpSetBot(bot_id);
 }
 
+float LevellingArmorFactor(uint32 entry, uint8 cls, uint16 spec, uint8 level)
+{
+    if (!entry)
+        return 1.0f;
+    return ::Playerbot::Gear::ArmorTypeFitFactor(sObjectMgr->GetItemTemplate(entry), cls, spec, level);
+}
+
 bool RaidGearActive(uint8 level)
 {
     constexpr uint32 kClassicCap = 60;
@@ -702,6 +755,24 @@ bool RaidEquipUpgrade(uint8 cls, uint16 spec, uint8 level, uint8 slot, uint32 ba
         if (ItemTemplate const* oh = sObjectMgr->GetItemTemplate(cur_offhand_entry))
             cur_score += ::Playerbot::Gear::ScoreItemRaid(oh, cls, spec, level, EQUIPMENT_SLOT_OFFHAND);
     return cur_score <= 0 ? bag_score > cur_score : float(bag_score) >= float(cur_score) * kRaidUpgradeRatio;
+}
+
+bool TwoHandBeatsWornPair(uint8 cls, uint16 spec, uint8 level, uint32 bag_entry, uint32 cur_mainhand_entry, uint32 cur_offhand_entry)
+{
+    ItemTemplate const* bag = sObjectMgr->GetItemTemplate(bag_entry);
+    if (!bag || bag->GetInventoryType() != INVTYPE_2HWEAPON || !cur_offhand_entry || cls == 0 || cls >= MAX_CLASSES)
+        return true;
+    ItemTemplate const* oh = sObjectMgr->GetItemTemplate(cur_offhand_entry);
+    if (!oh)
+        return true;
+    ItemTemplate const* mh = cur_mainhand_entry ? sObjectMgr->GetItemTemplate(cur_mainhand_entry) : nullptr;
+    int32 const bag_score = ::Playerbot::Gear::ScoreItemRaid(bag, cls, spec, level, EQUIPMENT_SLOT_MAINHAND);
+    if (bag_score <= -100000)
+        return false;
+    int32 pair = std::max(0, ::Playerbot::Gear::ScoreItemRaid(oh, cls, spec, level, EQUIPMENT_SLOT_OFFHAND));
+    if (mh)
+        pair += std::max(0, ::Playerbot::Gear::ScoreItemRaid(mh, cls, spec, level, EQUIPMENT_SLOT_MAINHAND));
+    return bag_score > pair;
 }
 
 std::string PlanEquipOrder(::Playerbot::BotSnapshot const& snap, std::string const& bot_name, std::string const& arg, std::vector<EquipOrderPick>& picks)
@@ -822,7 +893,8 @@ std::string PlanEquipOrder(::Playerbot::BotSnapshot const& snap, std::string con
             better = RaidEquipUpgrade(cls, spec, level, slot, it.entry, cur_entry, equipped[EQUIPMENT_SLOT_MAINHAND].entry,
                                       equipped[EQUIPMENT_SLOT_OFFHAND].entry);
         else
-            better = cur_entry == 0 || EquipFitScore(it.stats, it.item_level, snap.stat_weights) > EquipFitScore(cur.stats, cur.item_level, snap.stat_weights);
+            better = cur_entry == 0 || EquipFitScore(it.stats, it.item_level, snap.stat_weights) * LevellingArmorFactor(it.entry, cls, spec, level) >
+                                       EquipFitScore(cur.stats, cur.item_level, snap.stat_weights) * LevellingArmorFactor(cur_entry, cls, spec, level);
         if (!better) continue;
         if (ItemTemplate const* t = sObjectMgr->GetItemTemplate(it.entry); !t || ::Playerbot::Gear::IsPvpItem(t)) continue;
         taken[slot] = true;
@@ -1011,6 +1083,8 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
             // distinct item. A fallback below restores the duplicate when it is
             // legal and nothing else qualifies.
             if (twin && tpl->GetId() == twin->GetId()) continue;
+            // Nor a piece that shares a one-equipped limit category with it: the second equip would be refused.
+            if (SharesSingleEquipLimit(tpl, twin)) continue;
             // Shield-tank mainhand: never a 2H (see shield_tank note above).
             if (shield_tank && slot == EQUIPMENT_SLOT_MAINHAND &&
                 tpl->GetInventoryType() == INVTYPE_2HWEAPON)
@@ -1030,7 +1104,12 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
             // units so the pick lands near what the bot actually wears.
             // A rogue wields two weapons: a shield or a held-in-off-hand caster item (Royal Scepter of Vek'lor, the tier 3 damage_parity
             // rogue 2026-10-11) leaves the off hand dead, dual_wield false and the rogue at a third of its damage. Whatever the gear mode.
-            if (slot == EQUIPMENT_SLOT_OFFHAND && ::Playerbot::Gear::OffhandMustBeWeapon(ctx.cls, ctx.spec) && tpl->GetClass() != ITEM_CLASS_WEAPON) continue;
+            // Only once the bot can dual wield: before that a weapon cannot go there at all, and a shield beats an empty off hand.
+            if (slot == EQUIPMENT_SLOT_OFFHAND && can_dual_wield && ::Playerbot::Gear::OffhandMustBeWeapon(ctx.cls, ctx.spec)
+                && tpl->GetClass() != ITEM_CLASS_WEAPON) continue;
+            // A weapon in the off hand needs Dual Wield, on every path: the levelling pass had no such check, so a warrior below Dual Wield
+            // got Left-Handed Brass Knuckles (15906) that the equip then refused with error 14 on every regear (af54 log, 11-20).
+            if (slot == EQUIPMENT_SLOT_OFFHAND && !can_dual_wield && tpl->GetClass() == ITEM_CLASS_WEAPON) continue;
             int32 ilvl = ::Playerbot::Gear::EffectiveItemLevelForLevel(tpl, ctx.level);
             int32 combined;
             if (raid)
@@ -1039,7 +1118,6 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
                 bool const pvp_piece = pvp_slot && ::Playerbot::Gear::IsPvpItem(tpl) && tpl->GetQuality() >= ITEM_QUALITY_RARE;
                 if ((!pvp_piece && ::Playerbot::Gear::IsPvpItem(tpl)) || ilvl > raid_cap) continue;
                 if (!pvp_piece && ctx.world_bot() && tpl->GetQuality() >= ITEM_QUALITY_EPIC && !WorldEpicAllowed(ctx.bot_id, slot)) continue;
-                if (slot == EQUIPMENT_SLOT_OFFHAND && !can_dual_wield && tpl->GetClass() == ITEM_CLASS_WEAPON) continue;
                 int32 const fit = ::Playerbot::Gear::ScoreItemRaid(tpl, ctx.cls, ctx.spec, ctx.level, slot);
                 if (fit <= -100000) continue;
                 // Rare / epic of the raid-prep levels outrank everything else, whatever the stats; the rest only fill a slot
@@ -1053,7 +1131,6 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
             else if (owned_lv)
             {
                 if (!Owned::PieceAllowed(int32(tpl->GetQuality()), ilvl, ctx.level, owned_band) || ::Playerbot::Gear::IsPvpItem(tpl)) continue;
-                if (slot == EQUIPMENT_SLOT_OFFHAND && !can_dual_wield && tpl->GetClass() == ITEM_CLASS_WEAPON) continue;
                 int32 const fit = OwnedSlotScore(tpl, ctx.cls, ctx.spec, ctx.level, slot);
                 if (fit <= -100000) continue;
                 combined = fit;
@@ -1157,7 +1234,7 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
         // empty slot, but only when the item may actually be worn twice - for a
         // unique-equipped piece the second equip would be refused and we would
         // have produced a pick that can never land.
-        if (!best && twin && !twin->HasFlag(ITEM_FLAG_UNIQUE_EQUIPPABLE) && twin->GetMaxCount() != 1)
+        if (!best && twin && !twin->HasFlag(ITEM_FLAG_UNIQUE_EQUIPPABLE) && twin->GetMaxCount() != 1 && !SharesSingleEquipLimit(twin, twin))
             best = twin;
 
         // A tier leg whose main hand stays empty fights with fists (damage_parity 147 shaman, t1: no weapon, 107 dps): say which filter emptied the pool.
@@ -1335,8 +1412,17 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
                     if (other != 255 && other != slot)
                         if (auto held = std::ranges::find(out, other, &GearItem::slot); held != out.end())
                             in_pair.push_back(held->item_entry);
+                // ... nor a piece that shares a one-equipped limit category with one of them (Rune of Duty next to Rune of Perfection).
+                auto const pair_limited = [&](ItemTemplate const* tpl)
+                {
+                    for (uint32 const other : in_pair)
+                        if (SharesSingleEquipLimit(tpl, sObjectMgr->GetItemTemplate(other)))
+                            return true;
+                    return false;
+                };
                 auto cur_pick = std::ranges::find(out, slot, &GearItem::slot);
-                bool const cur_dup = cur_pick != out.end() && std::ranges::find(in_pair, cur_pick->item_entry) != in_pair.end();
+                bool const cur_dup = cur_pick != out.end() && (std::ranges::find(in_pair, cur_pick->item_entry) != in_pair.end()
+                    || pair_limited(sObjectMgr->GetItemTemplate(cur_pick->item_entry)));
                 int32 best_score = cur_dup ? std::numeric_limits<int32>::min() : score_of(slot);
                 // The weapon slots log what the slot holds and why each pool candidate was refused or what it scored (174 kept item 4696 in the off
                 // hand with three pool pieces on offer, and nothing said why).
@@ -1354,7 +1440,7 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
                         continue;
                     uint32 const entry = resolve(e.name);
                     ItemTemplate const* tpl = entry ? sObjectMgr->GetItemTemplate(entry) : nullptr;
-                    if (!tpl || std::ranges::find(in_pair, entry) != in_pair.end() || !InventoryTypeFitsSlot(slot, tpl->GetInventoryType()))
+                    if (!tpl || std::ranges::find(in_pair, entry) != in_pair.end() || pair_limited(tpl) || !InventoryTypeFitsSlot(slot, tpl->GetInventoryType()))
                     {
                         note(e.name, entry, !tpl ? "refused: no item template" : "refused: taken or does not fit the slot");
                         continue;

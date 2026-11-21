@@ -29,16 +29,16 @@ uint32 HunterPetEntryForRace(uint32 race);
 // Faction-generic fallback pets, used when HunterPetEntryForRace returns 0
 // (allied races / unmapped races). Standard starter beasts that exist in
 // every TC creature_template.
-constexpr uint32 GenericAllianceHunterPet = 299;   // Stormpike Wolf (Dun Morogh wolf, lvl 1-2)
-constexpr uint32 GenericHordeHunterPet    = 5826;  // Mottled Boar (Valley of Trials, lvl 1-2)
+constexpr uint32 GenericAllianceHunterPet = 299;   // Young Wolf (Elwynn Forest)
+constexpr uint32 GenericHordeHunterPet    = 3099;  // Dire Mottled Boar (Valley of Trials; 5826 was Geolord Mottle, a quilboar)
 
 // A world (ambient) hunter's own first pet, stable per bot: one of the faction's classic starter beasts picked by guid, so a street of
 // hunters is not all one race's beast. Creature entries of HunterPetEntryForRace's classic races; the caller's tameable check still
 // decides whether the pick exists as a beast in this data. `fallback` (the race's pet) is returned for an owned bot (guid 0).
 inline uint32 VariedHunterPetEntry(bool alliance, uint64 guid, uint32 fallback)
 {
-    static constexpr uint32 kAlliance[] = { 299, 1132, 2031, 299, 1132 };      // wolf, boar, spider
-    static constexpr uint32 kHorde[]    = { 5826, 1908, 2956, 2952, 5826, 1908 }; // boar, wolf, plainstrider, raptor
+    static constexpr uint32 kAlliance[] = { 299, 1126, 2031, 1998, 113 };            // wolf, boar, cat, spider, boar
+    static constexpr uint32 kHorde[]    = { 3099, 1508, 2956, 3122, 2958, 3126 };    // boar, wolf, plainstrider, raptor, wolf, scorpid
     if (!guid)
         return fallback;
     uint64 h = guid * 0x9E3779B97F4A7C15ull;

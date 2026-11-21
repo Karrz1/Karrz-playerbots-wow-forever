@@ -22,6 +22,10 @@ class DireMaulScript final : public DungeonScript
 public:
     uint32_t  map_id() const override { return 429; }
     char const* name() const override { return "dire_maul"; }
+    // Fengus's Chest (179516, by Guard Fengus in the North wing) holds the Gordok Courtyard Key (18266, gameobject_loot_template
+    // 16523), the only thing that opens the Gordok Courtyard Door (177219, lock 1563) on the way to Guard Slip'kik. The Gordok Inner
+    // Door's key (18268) drops from Guard Mol'dar.
+    std::vector<uint32_t> key_chests() const override { return { 179516 }; }
 
     DungeonAdvice get_advice(BotSnapshotView const& s) const override
     {
@@ -71,6 +75,17 @@ public:
         // wings share map 429 but do not join inside; the nearest wing entrance (the dmeast/dmwest/dmnorth scenario starts) or boss
         // spawn names the wing, the same as the Scarlet Monastery script. Boss spawns from the Classic creature data (VMaNGOS spawn
         // table, map 429), in encounter order; a boss a script summons (no static spawn) is left out.
+        // The Conservatory Door (176907) to Alzzin opens when the party tells Ironbark the Redeemed (14241) it is ready: Old Ironbark
+        // (11491, at -56.6,-269.1) becomes him once Zevrim Thornhoof is dead, and the gossip script sets instance data 5
+        // (classic_instance_dire_maul.cpp TYPE_SPEAK_ECORCEFER), which opens the door. The route to Alzzin passes 71 y from him.
+        // Pusillin, the East wing's first boss, is not attackable where he stands: a player talks to him (gossip 5709, "If you want
+        // the key, you'll have to catch me!") and he runs off down the west corridor (path 820004000) to be caught. Nobody talked to
+        // him, so the tank stood on his spot with him out of reach and the run never got past him (dmeast_full af56: 4500 s, no boss
+        // down, the tank walking back and forth over his spot from 770 s on).
+        a.door_talks = {
+            { 14241, -56.59f, -269.12f, -57.87f, 11492, { 11490 } },
+            { 14354, 83.4f, -198.4f, -4.0f, 14354, {}, 0, 30.f },   // Pusillin, on the route: talked to once the advance has him
+        };
         struct Spot { float x, y, z; };
         struct Wing { std::vector<uint32_t> bosses; std::vector<Spot> spots; Spot entrance; };
         static std::array<Wing, 3> const wings = {{

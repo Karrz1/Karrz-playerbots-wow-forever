@@ -32,6 +32,10 @@ namespace Playerbot::Raid {
         // Conflagration is a cone: vanilla data gives 23023 the front-cone target (24) with a 30 yd radius, so everybody but the tank
         // stays out of the sector in front of him (the tank takes it and hands him over, above).
         r.avoidFrontal.push_back({ 12435, 30.0f, 50.0f, Who::NonTank });
+        // A raider carrying Conflagration burns everyone next to it (16806, 300 fire a tick, cast by the carrier) while it is
+        // disoriented and wanders. bwl_razorgore af53: three melee killed each other this way in a row (0.6-5.2 y apart), and
+        // the tanks took 12-17k from it. Everybody but the tanks keeps 8 y off a carrier until it burns out.
+        r.avoidCarrier.push_back({ 23023, 8.0f, Who::NonTank });
         // War Stomp 24375 (classic_boss_razorgore.cpp:49), the same stun as the Wyrmguard's below: casters and healers keep 18 yards
         // (in phase 1 that also keeps them off the possessed Razorgore).
         r.avoidEnemy.push_back({ 12435, 18.0f, Who::Ranged });

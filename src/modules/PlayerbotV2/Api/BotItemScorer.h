@@ -105,6 +105,11 @@ char const* RaidRoleName(RaidRole role);
 // item spells' auras (+healing, +damage, +attack power, hit, crit, mp5...) that are not item stats.
 int32 ScoreItemRaid(ItemTemplate const* tpl, uint8 cls, uint16 spec, uint8 level, uint8 slot);
 
+// The share of its worth an armor piece keeps for this wearer: 1 for its own armor type, a fifth less a tier under the best type it
+// can put on at `level` (two fifths for a tank), 1 for anything that is not a head-to-feet armor piece (Bot/Gear/ArmorTypeFit.h).
+// ScoreItemRaid applies it; the levelling gear compares (EquipFitScore: item level and weighted stats, no armor) multiply by it.
+float ArmorTypeFitFactor(ItemTemplate const* tpl, uint8 cls, uint16 spec, uint8 level);
+
 // The item's resistance points in `school` (SpellSchools: holy 1, fire 2, nature 3, frost 4, shadow 5, arcane 6) for a wearer at `level`:
 // the school's own resistance stat plus resistance to all schools, as the wearer gets them. 0 when it carries none.
 int32 ResistPoints(ItemTemplate const* tpl, uint8 school, uint8 level);

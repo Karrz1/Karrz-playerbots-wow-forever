@@ -85,6 +85,17 @@ bool DispatchRaidOrder(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em
     if (o.area_trigger)
         emit.enter_area_trigger(o.area_trigger);
 
+    // The pet stands in a keep-out circle (Kel'Thuzad's alcoves): back to its owner and passive, so neither its chase nor its own pick
+    // takes it deeper; the emitter sends it at nothing until it is out (BotIntentEmitter::keep_out_denied). The rest of the tick still runs.
+    if (o.pet_recall && !s.pet_guid().IsEmpty())
+    {
+        BotSnapshot const& raw = s.raw();
+        if (raw.pet.pet_react != 0 /*REACT_PASSIVE*/)
+            emit.pet_set_react_state(0);
+        if (!s.pet_victim().IsEmpty() || raw.pet.pet_react != 0)
+            emit.pet_set_command_state(1 /*COMMAND_FOLLOW*/);
+    }
+
     // Razorgore's Orb of Domination: the brain walked the bot into reach, now take control.
     if (!o.use_object.IsEmpty())
     {
@@ -144,7 +155,11 @@ bool DispatchRaidOrder(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em
     // straight back in. The brain sets the flag every plan while the hazard is up; it clears when the circle closes. (MC Geddon n8 run 4: six
     // melee left the Inferno circle, the rotation sent them back at second six, and the last tick killed all six at 17-20 y; the flag had
     // been set for every plan and nothing read it.) An elected job (a dispel) still runs.
-    if (o.hold_melee && o.cast_kind == RaidOrder::CastKind::None)
+    // A victim the brain has since forbidden is not held on: step 4 takes the bot off it to its fallback (a melee bot's target in a resting
+    // pack's reach, left for one it can reach: naxx_kelthuzad 0072, the melee held on the Soul Weavers for 90 s).
+    bool const victimForbidden = !s.victim().IsEmpty() &&
+        std::find(o.forbidden_targets.begin(), o.forbidden_targets.end(), s.victim()) != o.forbidden_targets.end();
+    if (o.hold_melee && o.cast_kind == RaidOrder::CastKind::None && !victimForbidden)
     {
         // The victim stays selected: the brain raises the flag only while the victim stands in the hazard, so dropping it would clear the flag
         // and the rotation would walk back in on the next plan.
@@ -207,10 +222,17 @@ bool DispatchRaidOrder(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em
 
     // 4. Never-target / crowd-controlled / reflecting enemies, and the swap enemy for a debuffed tank.
     ObjectGuid const victim = s.victim();
-    bool const forbidden = !victim.IsEmpty() &&
+    // The enemy the order names to kill (step 3b's script focus, step 5's soak target) is never dropped here as forbidden, so a bot sent
+    // onto it stays on it (BotIntentEmitter::start_attack lets it through the same way).
+    bool const victimNamed = !victim.IsEmpty() && ((o.script_names_target() && victim == o.script_focus) || victim == o.attack_target);
+    bool const forbidden = !victim.IsEmpty() && !victimNamed &&
         std::find(o.forbidden_targets.begin(), o.forbidden_targets.end(), victim) != o.forbidden_targets.end();
+    // A fallback the brain also forbids is no fallback: switching to it was refused (or dropped next tick) every tick (naxx_horsemen af43:
+    // "raid:switch_target" onto a forbidden horseman, then "raid:drop_target").
+    bool const fallbackForbidden = !o.fallback_target.IsEmpty() &&
+        std::find(o.forbidden_targets.begin(), o.forbidden_targets.end(), o.fallback_target) != o.forbidden_targets.end();
     // An idle DPS bot picks up the fallback too, unless its owner told it to stay.
-    bool const idleDps = victim.IsEmpty() && !o.fallback_target.IsEmpty() && !ai.holding_position(s.published_at_ms());
+    bool const idleDps = victim.IsEmpty() && !o.fallback_target.IsEmpty() && !fallbackForbidden && !ai.holding_position(s.published_at_ms());
     // An idle tank (its enemy is airborne or dead) takes the brain's ground target, unless that target is one it must not attack:
     // Gluth's chow tanks have him forbidden and a chow for their soak target, and the ground target (him) taken here first was dropped
     // as forbidden next tick, over and over, so the soak step below never ran (naxx_gluth r25: Mctankwc on Gluth 56 y off and off
@@ -226,7 +248,7 @@ bool DispatchRaidOrder(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em
     }
     if (forbidden || idleDps)
     {
-        if (!o.fallback_target.IsEmpty() && o.fallback_target != victim)
+        if (!o.fallback_target.IsEmpty() && !fallbackForbidden && o.fallback_target != victim)
         {
             if (emit.start_attack(o.fallback_target))
             {

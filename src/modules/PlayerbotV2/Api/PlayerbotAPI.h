@@ -188,6 +188,12 @@ public:
 
     // The vanilla riding-trainer mount and the epic mount of a race (false for races without an entry). A bot rides its own race's.
     static bool RaceMountSpells(uint8 race, uint32& normal, uint32& swift);
+    // The race whose vanilla mount `spell_id` is (its riding-trainer and swift mounts and its PvP war mount), 0 for any other spell.
+    // Mounts are account-wide here, so a pool bot knows the mounts of every race on its account: it must ride only its own race's.
+    static uint8 MountRaceOf(uint32 spell_id);
+    // Whether a character of `race` rides mount `spell_id`: any mount that is no race's, its own race's, and for a race without vanilla
+    // mounts of its own those of its faction's races.
+    static bool RacePermitsMount(uint8 race, uint32 spell_id);
     // Milliseconds until a cast of `spell_id` (highest known rank unless `exact_rank`) clears
     // the spell's own cooldown and the global cooldown, read from the spell history. 0 when
     // nothing is running. Feeds the per-spell back-off after SPELL_FAILED_NOT_READY.
@@ -417,7 +423,8 @@ public:
     Result accept_owner_trade(ObjectGuid owner);
     // One step of a trade window with `partner`: gifts for the owner / group mates (`gift_ok`), otherwise buying and selling at the
     // fair price (BotTrade.h). Called every tick while the window is open.
-    Result trade_with(ObjectGuid partner, bool gift_ok);
+    // from_owner: the partner is the bot's owner; everything he hands over is a gift (BotTrade::View::from_owner).
+    Result trade_with(ObjectGuid partner, bool gift_ok, bool from_owner = false);
 
     // Accept (or decline) a pending battleground invite popup. Mirrors
     // HandleBattleFieldPortOpcode's accept-invite branch end-to-end:

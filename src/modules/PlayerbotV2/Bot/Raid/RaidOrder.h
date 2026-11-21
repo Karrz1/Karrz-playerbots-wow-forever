@@ -25,6 +25,9 @@ struct RaidOrder
     // Out-of-combat orders before a pull (Gothik's side split, a rogue disarming a Suppression Device). Only the move and
     // cast fields are set; consumed by the idle rule idle:raid_prepull, which also keeps the bot from following its owner.
     bool prepull = false;
+    // The pre-pull order waits for its moment at its spot (Razuvious' opening priest stands out of his sight until his patrol has taken him
+    // far enough from its cast spot): the scenario's Attack waits for it as for a spot still being walked to.
+    bool prepull_wait = false;
 
     // Encounter movement (hazard escape, carrier run, spread, role position).
     bool  move = false;
@@ -68,6 +71,18 @@ struct RaidOrder
 
     // A NoAoe rule enemy is within 40 yards (Garr's Firesworn).
     bool no_aoe = false;
+
+    // The live RaidRules::keepOut circles (Kel'Thuzad's alcoves, Onyxia's cave mouths). The brain clamps the bot's own moves out of them;
+    // these keep its pet and its area spells out too (BotIntentEmitter::keep_out_denied): no pet attack or harmful pet spell at an enemy
+    // within kPetMargin of a circle, no area spell aimed at an enemy or a point within kAoeMargin of one.
+    // naxx_kelthuzad kt3 (0107-0109): a hunter's Wolf or a warlock's Voidwalker / Felhunter woke five of the six alcoves that woke, 13-21 y
+    // deep in them; the sixth woke to a Rain of Fire (11678) on an add at its edge. Each time the raid died.
+    struct KeepOutCircle { float x = 0.f, y = 0.f, r = 0.f; };
+    static constexpr float kPetMargin = 8.0f;    // a pet's melee reach and chase step round its target
+    static constexpr float kAoeMargin = 10.0f;   // the widest area spell the bots aim at a target (Rain of Fire 8, Hurricane 10)
+    std::vector<KeepOutCircle> keep_out;
+    // The bot's pet stands in a keep-out circle (the brain sees the pet; the snapshot does not place it): called back to its owner, passive.
+    bool pet_recall = false;
 
     // Melee soak (Patchwerk): keep attacking this enemy whatever the rotation would pick.
     ObjectGuid attack_target;
@@ -118,8 +133,12 @@ struct RaidOrder
         std::vector<ObjectGuid> keep;
         keep.swap(forbidden_targets);
         keep.clear();
+        std::vector<KeepOutCircle> keepCircles;
+        keepCircles.swap(keep_out);
+        keepCircles.clear();
         *this = RaidOrder{};
         forbidden_targets.swap(keep);
+        keep_out.swap(keepCircles);
     }
 };
 

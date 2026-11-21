@@ -15,6 +15,8 @@
 #include <string_view>
 #include <vector>
 
+#include "TradeTalk.h"
+
 namespace Playerbot::V2::ChannelTalk
 {
 
@@ -104,7 +106,9 @@ inline std::vector<std::string> Words(std::string const& lower)
     std::string cur;
     for (char c : lower)
     {
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '\'')
+        // a byte of a UTF-8 letter (Cyrillic) is part of the word too: a Russian line used to come out with no words at all,
+        // so a Russian question in General was never answered, not even by the AI program (GitHub #12, 2026-11-17)
+        if (std::isalnum(static_cast<unsigned char>(c)) || static_cast<unsigned char>(c) >= 0x80 || c == '\'')
             cur += c;
         else if (!cur.empty())
         {
@@ -177,7 +181,7 @@ inline Ask Parse(std::string const& raw)
     Ask a;
     std::uint32_t entry = 0;
     std::string link_name;
-    std::string const lower = Lower(StripLinks(raw, entry, link_name));
+    std::string const lower = TradeTalk::FoldRussian(Lower(StripLinks(raw, entry, link_name)));
     std::vector<std::string> const w = Words(lower);
     if (w.empty())
         return a;
@@ -248,14 +252,23 @@ inline Ask Parse(std::string const& raw)
 
     std::string const& f = w.front();
     bool const question = raw.find('?') != std::string::npos || f == "where" || f == "how" || f == "anyone" || f == "does"
-        || f == "what" || f == "who" || f == "is" || f == "can" || HasPhrase(lower, "anyone know");
+        || f == "what" || f == "who" || f == "is" || f == "can" || HasPhrase(lower, "anyone know")
+        // the same in Russian: где, как, кто (кто-нибудь), что, куда, подскажите / подскажи
+        || f == "\xD0\xB3\xD0\xB4\xD0\xB5" || f == "\xD0\xBA\xD0\xB0\xD0\xBA" || f == "\xD0\xBA\xD1\x82\xD0\xBE"
+        || f == "\xD1\x87\xD1\x82\xD0\xBE" || f == "\xD0\xBA\xD1\x83\xD0\xB4\xD0\xB0"
+        || f == "\xD0\xBF\xD0\xBE\xD0\xB4\xD1\x81\xD0\xBA\xD0\xB0\xD0\xB6\xD0\xB8\xD1\x82\xD0\xB5"
+        || f == "\xD0\xBF\xD0\xBE\xD0\xB4\xD1\x81\xD0\xBA\xD0\xB0\xD0\xB6\xD0\xB8";
     if (question && w.size() >= 2)
     {
         a.kind = Kind::Question;
         return a;
     }
     if (w.size() <= 4 && (f == "hi" || f == "hello" || f == "hey" || f == "heya" || f == "hiya" || f == "yo" || f == "sup" || f == "greetings"
-                          || f == "evening" || f == "morning" || f == "o"))
+                          || f == "evening" || f == "morning" || f == "o"
+                          // привет, прив, здравствуйте, здарова, хай
+                          || f == "\xD0\xBF\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82" || f == "\xD0\xBF\xD1\x80\xD0\xB8\xD0\xB2"
+                          || f == "\xD0\xB7\xD0\xB4\xD1\x80\xD0\xB0\xD0\xB2\xD1\x81\xD1\x82\xD0\xB2\xD1\x83\xD0\xB9\xD1\x82\xD0\xB5"
+                          || f == "\xD0\xB7\xD0\xB4\xD0\xB0\xD1\x80\xD0\xBE\xD0\xB2\xD0\xB0" || f == "\xD1\x85\xD0\xB0\xD0\xB9"))
         a.kind = Kind::Greeting;
     return a;
 }

@@ -343,6 +343,7 @@ ForeverBotsLocale = {
     ["battleground: the whisper to %s could not be sent%s; right-click %s and choose Whisper (Forever Bots)"] = "поле боя: шепот для %s не отправлен%s; щелкните правой кнопкой по %s и выберите Шепот (Forever Bots)",
     [" (type /w %s <message>)"] = " (введите /w %s <сообщение>)",
     ["whisper to %s failed: %s"] = "шепот игроку %s не удался: %s",
+    ["boss fight: the game blocks whispers sent by add-ons, so \"/w %s %s\" was not sent. For a dot command use /p or /ra instead (in a macro too), e.g. /ra .aura self 12292"] = "бой с боссом: игра блокирует шепот от аддонов, поэтому \"/w %s %s\" не отправлен. Для команды с точкой используйте /p или /ra (и в макросе), например /ra .aura self 12292",
     ["bot confirmations in chat: %s"] = "подтверждения ботов в чате: %s",
     ["shown"] = "включено",
     ["hidden (shown in the Bots panel status line)"] = "скрыто (отображается в строке состояния панели ботов)",

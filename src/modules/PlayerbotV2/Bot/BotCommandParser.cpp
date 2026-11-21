@@ -1,6 +1,7 @@
 ﻿#include "BotCommandParser.h"
 #include "Api/BotLanguage.h"
 #include "GroupOrderText.h"   // ClassifyGroupOrder: which refused whispers get an answer
+#include "BotBridgeFormat.h"   // Bridge::SafeOrder: the orders an unowned bot takes from its group
 #include "GroupControl.h"
 #include "BotIntent.h"
 #include "BotIntentEmitter.h"
@@ -55,6 +56,9 @@
 #include "SpellInfo.h"     // SpellInfo for /spell <id>
 #include "SpellMgr.h"      // sSpellMgr for /spell lookup
 #include "Bag.h"  // MAX_BAG_SIZE for /mailitem bag walk
+#include "TradeData.h"     // "enchant <item>" opens a trade
+#include "TradePackets.h"
+#include "WorldSession.h"
 #include "Group.h"
 #include "Chat.h"
 #include "Map.h"
@@ -2954,7 +2958,20 @@ bool BotCommandParser::DispatchSingle(Player* sender, Player* bot, std::string c
     // [owner_order]: one line per order a bot receives (source, raw text, the order state it
     // left), so an ignored order is visible in the log. Unrecognised / refused text is throttled
     // per bot (whispered chatter reaches here too). Chat handlers can run on map-update threads.
-    bool const authorized = IsAuthorized(sender, bot);
+    // A bot nobody owns (a world bot that took a player's invite, a listed group's bot) takes from its group only the group orders
+    // (follow, stay, attack, formation, the owner words party chat takes: GroupOrderText.cpp) and the orders a bridge reply may give
+    // (Bridge::SafeOrder: craft, sell junk, tactics, ...). The rest of the parser is an owner's: from any group member "mailsend",
+    // "mailitem", "ah", "guildbank", "tele" or "abandonall" mailed out the bot's gold and gear, sold it, moved it or dropped its
+    // quests (Playerbot.Interact.AcceptInvitesFrom = anyone lets every player group with a world bot). Its owner and a GM keep every
+    // order.
+    bool authorized = IsAuthorized(sender, bot);
+    if (authorized && Services::Owners().GetOwner(bot->GetGUID().GetCounter()).account_id == 0 &&
+        !(sender->GetSession() && sender->GetSession()->GetSecurity() >= SEC_GAMEMASTER) &&
+        !::Playerbot::V2::ClassifyGroupOrder(msg, Services::Config().behavior_owner_commands()))
+    {
+        std::string norm, why;
+        authorized = ::Playerbot::Bridge::SafeOrder(msg, norm, why);
+    }
     bool const handled = authorized && DispatchSingleImpl(sender, bot, msg);
     // A whispered order the bot may not take was dropped without a word, so the player could not tell it from a broken command
     // (Gremloc 11-08: "gear" and "equip upgrades" got no answer). Say why, for the order words only (small talk still goes to the
@@ -3043,6 +3060,144 @@ static bool OrderEquip(Player* sender, Player* bot, std::string const& n)
     }
     Push(bot, WhisperIntent{sender->GetName(), reply});
     TC_LOG_INFO("playerbot.v2", "[owner_order] [gear] {} <- {}: \"{}\" -> {} swap(s)", bot->GetName(), sender->GetName(), n, picks.size());
+    return true;
+}
+
+// The piece "enchant <...>" names: an item link or id, a slot word ("chest", "cloak", "weapon"), or words of its name. Worn gear first,
+// then the bags.
+static Item* FindEnchantPiece(Player* bot, std::string const& arg)
+{
+    uint32 entry = 0;
+    if (size_t const p = arg.find("item:"); p != std::string::npos)
+    {
+        for (size_t i = p + 5; i < arg.size() && std::isdigit(static_cast<unsigned char>(arg[i])) && entry < 100000000u; ++i)
+            entry = entry * 10 + uint32(arg[i] - '0');
+    }
+    else if (std::all_of(arg.begin(), arg.end(), [](unsigned char c) { return std::isdigit(c) != 0; }) && arg.size() < 10)
+        entry = uint32(std::stoul(arg));
+    std::string words = arg;
+    if (size_t const a = arg.find('['); a != std::string::npos)
+        if (size_t const b = arg.find(']', a); b != std::string::npos)
+            words = arg.substr(a + 1, b - a - 1);
+    if (!entry)
+    {
+        static std::pair<char const*, uint8> const kSlots[] = {
+            { "head", EQUIPMENT_SLOT_HEAD }, { "helm", EQUIPMENT_SLOT_HEAD }, { "neck", EQUIPMENT_SLOT_NECK },
+            { "shoulder", EQUIPMENT_SLOT_SHOULDERS }, { "shoulders", EQUIPMENT_SLOT_SHOULDERS }, { "back", EQUIPMENT_SLOT_BACK },
+            { "cloak", EQUIPMENT_SLOT_BACK }, { "cape", EQUIPMENT_SLOT_BACK }, { "chest", EQUIPMENT_SLOT_CHEST }, { "wrist", EQUIPMENT_SLOT_WRISTS },
+            { "wrists", EQUIPMENT_SLOT_WRISTS }, { "bracers", EQUIPMENT_SLOT_WRISTS }, { "hands", EQUIPMENT_SLOT_HANDS },
+            { "gloves", EQUIPMENT_SLOT_HANDS }, { "waist", EQUIPMENT_SLOT_WAIST }, { "belt", EQUIPMENT_SLOT_WAIST }, { "legs", EQUIPMENT_SLOT_LEGS },
+            { "pants", EQUIPMENT_SLOT_LEGS }, { "feet", EQUIPMENT_SLOT_FEET }, { "boots", EQUIPMENT_SLOT_FEET }, { "ring", EQUIPMENT_SLOT_FINGER1 },
+            { "finger", EQUIPMENT_SLOT_FINGER1 }, { "weapon", EQUIPMENT_SLOT_MAINHAND }, { "main hand", EQUIPMENT_SLOT_MAINHAND },
+            { "mainhand", EQUIPMENT_SLOT_MAINHAND }, { "off hand", EQUIPMENT_SLOT_OFFHAND }, { "offhand", EQUIPMENT_SLOT_OFFHAND },
+            { "shield", EQUIPMENT_SLOT_OFFHAND } };
+        std::string w = words;
+        if (w.rfind("my ", 0) == 0) w.erase(0, 3);
+        if (w.rfind("your ", 0) == 0) w.erase(0, 5);
+        for (auto const& [word, slot] : kSlots)
+            if (w == word)
+                return bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+    }
+    std::vector<Item*> pieces;
+    for (uint8 s = EQUIPMENT_SLOT_START; s < EQUIPMENT_SLOT_END; ++s)
+        if (Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, s))
+            pieces.push_back(it);
+    for (uint8 s = INVENTORY_SLOT_ITEM_START; s < INVENTORY_SLOT_ITEM_END; ++s)
+        if (Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, s))
+            pieces.push_back(it);
+    for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+        if (Bag* bag = bot->GetBagByPos(b))
+            for (uint32 s = 0; s < bag->GetBagSize(); ++s)
+                if (Item* it = bag->GetItemByPos(uint8(s)))
+                    pieces.push_back(it);
+    auto name_of = [](Item const* it)
+    {
+        std::string n = it->GetTemplate()->GetName(DEFAULT_LOCALE);
+        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        return n;
+    };
+    if (entry)
+    {
+        for (Item* it : pieces)
+            if (it->GetEntry() == entry)
+                return it;
+        return nullptr;
+    }
+    if (words.empty())
+        return nullptr;
+    for (Item* it : pieces)
+        if (name_of(it) == words)
+            return it;
+    for (Item* it : pieces)
+        if (name_of(it).find(words) != std::string::npos)
+            return it;
+    return nullptr;
+}
+
+// "enchant <item link, name or slot>": the owner puts an enchant on one of the bot's pieces, worn or in its bags. The bot opens a
+// trade with him, puts the piece in the "will not be traded" slot and accepts once his enchant is on it (TradeShop::StoreEnchantJob,
+// TradeShop::Step); nothing changes hands. Its owner only: anyone else could not even see what the window is for.
+static bool OrderEnchant(Player* sender, Player* bot, std::string const& n)
+{
+    auto say = [&](std::string const& text) { Push(bot, WhisperIntent{ sender->GetName(), text }); };
+    BotId const bot_id = bot->GetGUID().GetCounter();
+    if (Services::Owners().GetOwner(bot_id).account_id == 0 ||
+        !Services::Owners().IsOwner(bot_id, sender->GetSession() ? sender->GetSession()->GetAccountId() : 0, sender->GetGUID().GetCounter()))
+    {
+        say("only the player i belong to can enchant my gear");
+        return true;
+    }
+    std::string arg = n.size() > 7 ? n.substr(7) : std::string();
+    while (!arg.empty() && arg.front() == ' ') arg.erase(arg.begin());
+    while (!arg.empty() && arg.back() == ' ') arg.pop_back();
+    if (arg.empty())
+    {
+        say("enchant what? link the piece, or say its name or slot (chest, cloak, weapon...)");
+        return true;
+    }
+    Item* const piece = FindEnchantPiece(bot, arg);
+    if (!piece)
+    {
+        say("i can't find that, not worn and not in my bags");
+        return true;
+    }
+    std::string const name = piece->GetTemplate()->GetName(DEFAULT_LOCALE);
+    // As "trade me" (BotBridge RunTrade): a window already open between the two of them is used, the trade handler makes the rest of
+    // the checks (faction, logging out, already trading).
+    TradeData* const open = bot->GetTradeData();
+    bool const same_window = open && open->GetTrader() == sender;
+    if (open && !same_window)
+    {
+        say("i'm trading with someone else right now");
+        return true;
+    }
+    if (!same_window && sender->GetTradeData())
+    {
+        say("you're already trading with someone");
+        return true;
+    }
+    if (sender->GetMap() != bot->GetMap() || !bot->IsWithinDistInMap(sender, TRADE_DISTANCE - 1.0f))
+    {
+        say("come closer so we can trade");
+        return true;
+    }
+    if (!same_window)
+    {
+        WorldPacket packet(CMSG_INITIATE_TRADE);
+        WorldPackets::Trade::InitiateTrade init(std::move(packet));
+        init.Guid = sender->GetGUID();
+        bot->GetSession()->HandleInitiateTradeOpcode(init);
+    }
+    TradeData* const window = bot->GetTradeData();
+    if (!window || window->GetTrader() != sender)
+    {
+        say("the trade did not open");
+        return true;
+    }
+    ::Playerbot::TradeShop::StoreEnchantJob(bot, sender->GetGUID(), piece->GetGUID(), window->GetSerial());
+    say(name + " goes in the bottom slot of the trade: put your enchant on it and accept");
+    TC_LOG_INFO("playerbot.v2", "[owner_order] [enchant] {} <- {}: \"{}\" -> {} ({}) in the not-traded slot, window {}", bot->GetName(),
+        sender->GetName(), n, name, piece->IsEquipped() ? "worn" : "bags", window->GetSerial());
     return true;
 }
 
@@ -3277,6 +3432,10 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
     if ((normalized.rfind("talent", 0) == 0 || normalized.rfind("change talent", 0) == 0 || normalized.rfind("set talent", 0) == 0)
         && OrderTalentCode(sender, bot, normalized))
         return true;
+
+    // The owner enchants one of the bot's pieces through a trade window: enchant <item link, name or slot>. Whispered to one bot only.
+    if (normalized.rfind("enchant ", 0) == 0 && t_direct_whisper)
+        return OrderEnchant(sender, bot, normalized);
 
     // Gear orders: equip <item|upgrades|best>, use your best gear.
     if (normalized == "equip" || normalized.rfind("equip ", 0) == 0 || normalized == "use your best gear" ||
@@ -5956,7 +6115,8 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
     }
     if (cmd == "gather" || cmd == "gather_all" || cmd == "gatherall")
     {
-        // gather on   — picks the herbs and ore veins near it as it follows you, with the gathering skills it has (GatheringRules.cpp)
+        // gather on   — picks the herbs and ore veins near it as it follows you, with the gathering skills it has (GatheringRules.cpp),
+        //               and skins what the group kills once you have looted it (LootDrainRules.cpp)
         // gather off  — leaves them alone again (the default)
         // gather      — toggle. gather_all sets every bot of the group. Memory only; clearprefs turns it off.
         bool const all = cmd != "gather";
@@ -5982,18 +6142,17 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
             return true;
         }
         self_ai->set_gather_ordered(desired);
-        bool const herb = bot->HasSkill(SKILL_HERBALISM), mine = bot->HasSkill(SKILL_MINING);
+        std::string what;
+        for (auto const& [skill, word] : { std::pair{ SKILL_HERBALISM, "herbs" }, std::pair{ SKILL_MINING, "ore" }, std::pair{ SKILL_SKINNING, "skins" } })
+            if (bot->HasSkill(skill))
+                what += (what.empty() ? "" : ", ") + std::string(word);
         std::string reply;
         if (!desired)
             reply = "Gather: OFF";
-        else if (herb && mine)
-            reply = "Gather: ON (herbs and ore)";
-        else if (herb)
-            reply = "Gather: ON (herbs)";
-        else if (mine)
-            reply = "Gather: ON (ore)";
+        else if (!what.empty())
+            reply = fmt::format("Gather: ON ({})", what);
         else
-            reply = "Gather: ON, but I have no Herbalism or Mining";
+            reply = "Gather: ON, but I have no Herbalism, Mining or Skinning";
         Push(bot, WhisperIntent{sender->GetName(), reply});
         return true;
     }
@@ -7436,6 +7595,24 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
             return true;
         }
         uint32 const want_entry = args.empty() ? 0u : uint32(args.front());
+        // The name in any client language: a Russian player names a crate in Russian while its database name is English (zorin44,
+        // Discord 19 Nov: party bots never took the quest crates). Case-insensitive for Cyrillic too, as .lookup does.
+        std::wstring want_w;
+        bool const have_want_w = Utf8toWStr(want, want_w);
+        if (have_want_w)
+            wstrToLower(want_w);
+        auto name_fits = [&](GameObject const* go)
+        {
+            if (!have_want_w)
+                return Normalize(go->GetGOInfo()->name).find(want) != std::string::npos;
+            if (Utf8FitTo(go->GetGOInfo()->name, want_w))
+                return true;
+            if (GameObjectLocale const* loc = sObjectMgr->GetGameObjectLocale(go->GetEntry()))
+                for (std::string const& name : loc->Name)
+                    if (!name.empty() && Utf8FitTo(name, want_w))
+                        return true;
+            return false;
+        };
         std::list<GameObject*> nearby;
         Trinity::GameObjectInRangeCheck check(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), 30.0f);
         Trinity::GameObjectListSearcher<Trinity::GameObjectInRangeCheck> searcher(bot, nearby, check);
@@ -7447,7 +7624,7 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
             if (!go || !go->isSpawned() || go->HasFlag(GO_FLAG_NOT_SELECTABLE))
                 continue;
             bool const match = want_entry != 0 ? go->GetEntry() == want_entry
-                                               : Normalize(go->GetGOInfo()->name).find(want) != std::string::npos;
+                                               : name_fits(go);
             if (!match)
                 continue;
             float const d = bot->GetDistance(go);
@@ -7456,6 +7633,16 @@ bool BotCommandParser::DispatchSingleImpl(Player* sender, Player* bot, std::stri
         if (!best)
         {
             Push(bot, WhisperIntent{sender->GetName(), fmt::format("Use: no '{}' within 30 yards of me.", want)});
+            return true;
+        }
+        // A quest chest (crate, sack, flower) the bot cannot open: API::use_game_object refuses it without a word, so say why here instead
+        // of walking over and standing there.
+        if (best->GetGoType() == GAMEOBJECT_TYPE_CHEST && !best->ActivateToQuest(bot))
+        {
+            Push(bot, WhisperIntent{sender->GetName(), fmt::format("Use: {} holds nothing for me (I don't have its quest, or I have "
+                "what it gives already).", best->GetGOInfo()->name)});
+            TC_LOG_INFO("playerbot.v2", "[owner_use] {} refuses {} (entry {}): no quest of the bot's needs it", bot->GetName(),
+                best->GetGOInfo()->name, best->GetEntry());
             return true;
         }
         BotAI* ai = Services::Registry().ai(bot->GetGUID().GetCounter());

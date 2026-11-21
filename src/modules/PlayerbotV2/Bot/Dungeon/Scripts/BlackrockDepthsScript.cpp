@@ -24,9 +24,34 @@ public:
         };
     }
 
+    // The Grim Guzzler's Bar Door (170571, lock 739, no key) to Ambassador Flamelash opens only after Plugger Spazzring's event: a
+    // player steals his Dark Iron Ale Mugs or Grim Guzzler Boars (classic_go_bar_ale_mug), and at the third theft he attacks. His death
+    // wakes Phalanx and the patrol that opens the door. Plugger, Ribbly and Phalanx stand friendly until then, so the route waives
+    // them and the tank stands at Plugger, a few yards from the mugs, where he takes them.
+    std::vector<uint32_t> key_chests() const override { return { 165738, 165739 }; }
+
     DungeonAdvice get_advice(BotSnapshotView const& /*s*/) const override
     {
         DungeonAdvice a;
+        // The Tomb of the Seven: the exit door (170577, lock 85) on the way to the Lyceum opens when Doom'rel dies. A player starts the
+        // fight with "Your bondage is at an end, Doom'rel. I challenge you!" (gossip 1947, classic_boss_doomrel); the six dwarves come
+        // one by one, then Doom'rel himself. Asked once Flamelash is dead, with Doom'rel alive.
+        a.door_talks = {
+            { 9039, 1281.14f, -282.15f, -78.14f, 9039, { 9156 } },   // Doom'rel -> the Tomb of the Seven
+        };
+        // The Shadowforge Lock (161460, lock 680) opens the Giant Doors (its SmartAI activates them), which the route goes through
+        // on the way to Lord Incendius (seq 59-61) and again later; no other way leads there. It stands 66 y from the route, behind
+        // the East Garrison Door (170570, the same key). The route passes that door at 11 y (seq 50), just inside the hand-door
+        // reach, so it is listed too: the tank walks up to it and opens it on his way.
+        // The two Shadowforge Braziers in the Lyceum (lock 799): the first lit sets the Lyceum going, the second opens the Golem Rooms
+        // to Magmus (classic_go_shadowforge_brazier); the far one is 82 y from the route. The Shadowforge Torch drops from the
+        // Lyceum's Shadowforge Flame Keepers.
+        a.key_uses = {
+            { 170570,  560.53f,  -51.82f, -60.09f, 11000 },   // the East Garrison Door, with the Shadowforge Key
+            { 161460,  615.61f,  -49.78f, -60.06f, 11000 },   // the Shadowforge Lock, with the Shadowforge Key
+            { 174744, 1330.14f, -508.86f, -88.87f, 11885 },   // Shadowforge Brazier (west), with a Shadowforge Torch
+            { 174745, 1431.13f, -508.94f, -88.87f, 11885 },   // Shadowforge Brazier (east)
+        };
         a.high_priority_kill_entries = {
             8894,   // Anvilrage Medic
             8904,   // Shadowforge Senator

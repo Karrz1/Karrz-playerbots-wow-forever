@@ -21,7 +21,8 @@ public:
     DungeonAdvice get_advice(BotSnapshotView const& /*s*/) const override
     {
         DungeonAdvice a;
-        // Encounter order of the instance script. The live route between the bosses is not known (INFERRED).
+        // The shortest walk from the landing that ends at Mugg, on the 3039 navmesh (Toof stands on the way from Nar'gurk to
+        // Mugg); the 0046 route walks it.
         a.bosses = {
             258966,   // Slavecrusher Grox
             258972,   // Twilight Commander Zarmok
@@ -29,13 +30,14 @@ public:
             258964,   // Nar'gurk
             258968,   // Overlord Mugg
         };
-        // The waypoints are the boss spawns (world DB), index for index with the bosses above.
+        // The waypoints are the boss spawns (world 2026_11_19_66: where the live combat logs put them), index for index with
+        // the bosses above.
         a.progression_waypoints = {
-            { -7455.6f, -3769.8f, 146.4f },   // Slavecrusher Grox
-            { -7370.9f, -3985.6f, 166.8f },   // Twilight Commander Zarmok
-            { -7544.9f, -4177.6f, 157.2f },   // Handler Ashka
-            { -7367.2f, -4323.9f, 168.6f },   // Nar'gurk
-            { -7328.9f, -4008.9f, 269.1f },   // Overlord Mugg
+            { -7488.8f, -3874.4f, 127.6f },   // Slavecrusher Grox
+            { -7504.3f, -4082.4f, 151.5f },   // Twilight Commander Zarmok
+            { -7247.9f, -4493.9f, 177.5f },   // Handler Ashka
+            { -7317.9f, -4019.7f, 264.4f },   // Nar'gurk
+            { -6831.8f, -4583.3f, 241.3f },   // Overlord Mugg
         };
         return a;
     }

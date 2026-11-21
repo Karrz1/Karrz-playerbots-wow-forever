@@ -267,6 +267,51 @@ ObjectGuid TankToShield(ApPredicateContext const& ctx)
     }
     return ObjectGuid::Empty;
 }
+// Loatheb's Corrupted Mind: a priest with its one heal of the minute spent (or waiting for its turn) still has Power Word: Shield, which
+// absorbs and is no heal, so the lock does not stop it. Under Corrupted Mind the shields go out without the mana, swing and full-health
+// gates of the tank rule (heals are what is short, not mana): first the tank he is hitting, then a raider Inevitable Doom (29204, one tick
+// of 2550 shadow) would kill. Weakened Soul keeps it to one shield per target every 15 s, whichever priest cast it, so the priests take
+// turns by themselves. naxx_loatheb af40 (1119): 16 of the 43 deaths were Doom ticks, and the shield rule was gated off by anyone at 40%.
+constexpr uint32 kInevitableDoomAura = 29204;
+constexpr int32  kDoomShieldHp       = 2550 + 1000;   // the tick, and what a shield of ours roughly absorbs
+ObjectGuid CorruptedMindShieldTarget(ApPredicateContext const& ctx)
+{
+    if (!ctx.bot.heals_locked() && !ctx.bot.heal_lock_armed())
+        return ObjectGuid::Empty;
+    auto const* members = ctx.group.members();
+    if (!members || !ctx.bot.in_combat())
+        return ObjectGuid::Empty;
+    float bx, by, bz; ctx.bot.position(bx, by, bz);
+    auto shieldable = [&](GroupMemberSummary const& m)
+    {
+        return m.online && m.is_alive && m.map_id == ctx.bot.map_id() && m.max_hp > 0
+            && ClassicHeal::Dist2(m.x, m.y, m.z, bx, by, bz) <= 40.0f * 40.0f
+            && !TargetHasMyAura(ctx, POWER_WORD_SHIELD, m.guid) && !TargetHasMyAura(ctx, WEAKENED_SOUL, m.guid)
+            && !ClassicHeal::MemberHasDebuff(ctx.group, m.guid, WEAKENED_SOUL) && !ClassicHeal::ShieldClaimedByOther(ctx.bot, m.guid);
+    };
+    for (GroupMemberSummary const& m : *members)
+        if (ClassicHeal::IsTank(ctx.bot, m) && shieldable(m) && m.hp < m.max_hp)
+        {
+            ClassicHeal::Patient const p = ClassicHeal::PatientFor(ctx.bot, ctx.group, m.guid);
+            if (p.valid && p.incoming > 0)
+                return m.guid;   // the tank taking his swings
+        }
+    for (GroupMemberSummary const& m : *members)
+        if (shieldable(m) && m.hp <= kDoomShieldHp && ClassicHeal::MemberHasDebuff(ctx.group, m.guid, kInevitableDoomAura))
+            return m.guid;
+    return ObjectGuid::Empty;
+}
+bool ShouldShieldCorruptedMind(ApPredicateContext const& ctx)
+{
+    return Ready(ctx, POWER_WORD_SHIELD) && !CorruptedMindShieldTarget(ctx).IsEmpty();
+}
+void DoShieldCorruptedMind(ApPredicateContext const& ctx, BotIntentEmitter& e)
+{
+    ObjectGuid const t = CorruptedMindShieldTarget(ctx);
+    if (!t.IsEmpty() && e.cast(POWER_WORD_SHIELD, t))
+        ClassicHeal::NoteShieldCast(ctx.bot, t);
+}
+
 bool ShouldShieldTank(ApPredicateContext const& ctx)
 {
     return Ready(ctx, POWER_WORD_SHIELD) && LowestFriendOrSelf(ctx).hp_pct > 40 && !TankToShield(ctx).IsEmpty();
@@ -424,7 +469,7 @@ void DoPowerInfusion(ApPredicateContext const& ctx, BotIntentEmitter& e)
 // for a quiet spell at 90%+ mana (ClassicHeal::RaidHealerMayDamage).
 bool HealerMayWand(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && ctx.bot.in_combat() && WoundedCount(ctx, 90) == 0 && LowestFriendOrSelf(ctx).hp_pct > 90;
+    return HasLiveTarget(ctx) && (ctx.bot.in_combat() || ctx.bot.victim_is_group_target()) && WoundedCount(ctx, 90) == 0 && LowestFriendOrSelf(ctx).hp_pct > 90;
 }
 bool HealerMayDps(ApPredicateContext const& ctx)
 {
@@ -489,6 +534,7 @@ ApRule const kHealerRules[] = {
     { ShouldDesperatePrayer,   DoDesperatePrayer,  "classic_heal:desperate_prayer" },
     { ShouldShieldCritical,    DoShieldCritical,   "classic_heal:shield_critical" },
     { ClassicHeal::ShouldControlDispel, ClassicHeal::DoControlDispel, "classic_heal:dispel_control" },   // a hexed tank holds no threat
+    { ShouldShieldCorruptedMind, DoShieldCorruptedMind, "classic_heal:shield_corrupted_mind" },
     { ShouldShieldTank,        DoShieldTank,       "classic_heal:shield_tank" },
     { ShouldRenewTank,         DoRenewTank,        "classic_heal:renew_tank" },
     { ShouldInnerFocus,        DoInnerFocus,       "classic_heal:inner_focus" },

@@ -41,7 +41,20 @@ enum class ConvIntent : uint8_t
     Compliment,
     Goodbye,
     Greeting,        // only answered here for someone the bot knows (see ConversationContext::knows_sender)
+    Duel,            // "duel?" - answered as ConversationContext::duel says the bot will act
+    WantTrade,       // "wanna trade?" - what the player is after (the bot's sale list is "what do you have")
+    Thanks,
+    AreYouBot,       // "are you a bot?" - a player's answer
+    LikeIt,          // "do you like wow forever?"
+    Help,            // "can you help me?"
 };
+
+// What the bot does with a duel the player sends next (BotAI's duel answer): the chat says the same thing.
+enum class DuelAnswer : uint8_t { Yes, NotNow, TooFar, NotHere };
+
+// What the bot does with a group invite the player sends next (the invite rule's polite decline): "wanna group?" -> "sure,
+// invite me" only when the invite will be taken. InGroup is also what in_group says.
+enum class GroupAnswer : uint8_t { Yes, InGroup, TooHigh, NotNow };
 
 struct ConversationContext
 {
@@ -59,6 +72,9 @@ struct ConversationContext
     uint32_t bot_seed = 0;                 // stable per bot: drives its writing style
     ConvTone tone = ConvTone::Neutral;
     ConvLength length = ConvLength::Normal;
+    bool russian = false;                  // the player reads Russian (BotLanguage::LangOf): the answer is written in Russian
+    DuelAnswer duel = DuelAnswer::NotNow;
+    GroupAnswer group = GroupAnswer::Yes;  // in_group wins over it
 };
 
 // Answers a line the rules did not understand. Called on the world thread; an implementation must not block - return false when
@@ -70,7 +86,7 @@ public:
     virtual bool TryReply(ConversationContext const& ctx, std::string const& message, std::string& out) = 0;
 };
 
-// Lower-cases, folds punctuation to spaces, collapses whitespace (max 256 chars). BotChatReactor's own Normalize is equivalent.
+// Lower-cases (Russian letters too, ё as е), folds punctuation to spaces, collapses whitespace (max 256 chars).
 std::string ConvNormalize(std::string const& in);
 
 // Classifies a normalized line. `slot` receives the destination keyword for Directions (lower-case), else empty.

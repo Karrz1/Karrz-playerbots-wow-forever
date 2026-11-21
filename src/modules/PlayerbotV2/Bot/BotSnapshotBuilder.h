@@ -9,6 +9,7 @@
 #include "BotSnapshot.h"
 #include <memory>
 
+class GameObject;
 class Player;
 
 namespace Playerbot {
@@ -33,5 +34,9 @@ public:
     // everywhere it is used).
     static std::shared_ptr<BotSnapshot const> Build(Player* p, BotAI* bot_ai, SnapshotVer next_version, TickId tick);
 };
+
+// A shut door a player opens by hand, that the tank opens when he reaches it (Deadmines Heavy Doors, a dungeon's hand_doors).
+// Map thread.
+bool DoorOpenedByHand(GameObject const* go);
 
 } // namespace Playerbot

@@ -1,4 +1,5 @@
 #include "PlayerbotMigrationMgr.h"
+#include "MigrationLint.h"
 #include "BuiltInConfig.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
@@ -122,6 +123,16 @@ bool PlayerbotMigrationMgr::apply_one(uint32 version, std::string const& sql_pat
     if (sql.empty())
     {
         TC_LOG_ERROR("playerbot.v2", "[PlayerbotV2] Migration {} not found at {}", version, sql_path);
+        return false;
+    }
+
+    // A {SHARED} table name in a statement for the character database would reach MySQL as written (only shared statements are
+    // substituted) and stop the server on an assert. Refuse the file, before any of it runs, with the line to fix.
+    if (size_t const bad = MigrationLint::SharedTokenOutsideShared(sql))
+    {
+        TC_LOG_ERROR("playerbot.v2", "[PlayerbotV2] Migration {} ({}) line {} names {{SHARED}} but the file has no `-- @target: shared` "
+                     "line before it, so it would run on the character database. Nothing of it was run. Add the target line.",
+                     version, sql_path, bad);
         return false;
     }
 

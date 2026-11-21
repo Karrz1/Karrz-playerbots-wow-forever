@@ -143,8 +143,15 @@ void BotSession::SendPacket(WorldPacket const* packet, bool /*forced*/)
     }
 }
 
-bool BotSession::Update(uint32 /*diff*/, PacketFilter& /*updater*/)
+bool BotSession::Update(uint32 /*diff*/, PacketFilter& updater)
 {
+    // Map::Update calls this too, for every player on the map (a MapSessionFilter pass, on a map update thread when
+    // MapUpdate.Threads > 1, while the map walks its players). As in the base, everything below belongs to the world pass only
+    // (BotSessionMgr::Update, WorldSessionFilter): the logout removes and deletes the player, and the query callbacks and the
+    // charter signing reach groups, guilds and other maps. A bot has no packets for the map pass to handle.
+    if (!updater.ProcessUnsafe())
+        return true;
+
     // Base WorldSession::Update walks the socket recv queue and ends with
     // `if (!m_Socket[REALM]) return false;` — which would fire every tick
     // for a socketless bot, causing the mgr to reap us immediately. So we

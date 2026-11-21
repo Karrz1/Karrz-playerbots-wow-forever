@@ -5,6 +5,7 @@
 #include "MotionMaster.h"   // ship rides clear the bot's movement before boarding
 #include "../Util/SlowCall.h"
 #include "BotPopulationManager.h"
+#include "AutoRaid.h"   // a raid made here for one more companion may go back to a party
 #include "ClassicSpec.h"
 #include "SoakAnchors.h"
 #include "CompanionRole.h"
@@ -30,6 +31,7 @@
 #include "../Bot/ClassTables.h"  // IsTankSpec / TankSpecForClass etc.
 #include "../Bot/Formation.h"   // companion slots
 #include "../Bot/World/HunterPetsByRace.h"   // companion hunter pet
+#include "PetDefines.h"   // PetStable (HunterOwnsAnyPet)
 #include "../Threading/IntentQueue.h"
 #include "../Threading/SnapshotPublisher.h"   // `.bot delete`: forget the bot before its row goes
 #include "../Threading/TickScheduler.h"
@@ -80,6 +82,14 @@
 namespace Playerbot::V2::Fleet {
 
 namespace {
+
+// A person at the keyboard: the character is online on a real game client. A self-bot (`.playerbot self on`) is marked as a bot for
+// the session, so the bot mark alone does not tell a player's own character from a bot (Discord 11-20, Oxide: self on dropped the
+// leader's companions and with them the group).
+bool OnRealClient(Player const* member)
+{
+    return member && member->GetSession() && !member->GetSession()->IsBot();
+}
 
 // An owner whose group is bigger than the instance they just entered (or the open world they walked out into) is told once; nobody is kicked
 // (Playerbot.Behavior.InstanceGroupCap). Owner = a real player with a grouped companion. 2 s cadence.
@@ -522,6 +532,7 @@ void BotPopulationManager::OnWorldTick(uint32 now_ms)
     const uint32 slow_pipelines_ms = getMSTimeDiff(t_pipelines_start, getMSTime());
     { SLOW_CALL("DrainCompanionSetups"); DrainCompanionSetups(); }
     DrainBringChecks();
+    DrainPetGrants();
     DrainCompanionReleases();
     DrainLedWorldBotReleases();
     WarnOversizedInstanceGroups(now_ms);
@@ -1062,6 +1073,8 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
         Item* cur = p->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
         if (!cur && !fill_empty[slot]) continue;     // an earlier swap in this loop already moved it
         uint32 const bad_entry = cur ? cur->GetEntry() : 0;
+        // Why the piece is bad, read before any swap moves it: the log used to call every one "no ItemModifiedAppearance".
+        bool const unrenderable = cur && !::Playerbot::IsItemRenderableInSlot(cur, p, slot);
         char const* outcome = nullptr;
 
         // 1. Swap in the generated piece for this slot. CanEquipNewItem is
@@ -1137,9 +1150,10 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
             changed = true;
             if (bad_entry)
                 TC_LOG_INFO("playerbot.v2",
-                    "[GearHeal] {} L{}: slot {} item {} has no ItemModifiedAppearance "
-                    "(client cannot render) - {}",
-                    p->GetName(), uint32(p->GetLevel()), uint32(slot), bad_entry, outcome);
+                    "[GearHeal] {} L{}: slot {} item {} {} - {}",
+                    p->GetName(), uint32(p->GetLevel()), uint32(slot), bad_entry,
+                    unrenderable ? "has no ItemModifiedAppearance (client cannot render)" : "is not bot-wearable (non-vanilla, honor rank or out of season)",
+                    outcome);
             else
                 TC_LOG_INFO("playerbot.v2", "[GearHeal] {} L{}: empty slot {} - {}", p->GetName(), uint32(p->GetLevel()), uint32(slot), outcome);
         }
@@ -1321,16 +1335,83 @@ void BotPopulationManager::CompanionUpkeep(BotId id, Player* p)
     }
 }
 
+// A hunter's pet anywhere: out, dismissed or unsummoned for a moment, in an active or stable slot, or unslotted.
+static bool HunterOwnsAnyPet(Player const* p)
+{
+    if (!p->GetPetGUID().IsEmpty() || p->GetTemporaryUnsummonedPetNumber())
+        return true;
+    PetStable const* stable = p->GetPetStable();
+    if (!stable)
+        return false;
+    return stable->CurrentPetIndex || !stable->UnslottedPets.empty()
+        || std::ranges::any_of(stable->ActivePets, [](Optional<PetStable::PetInfo> const& pet) { return pet.has_value(); })
+        || std::ranges::any_of(stable->StabledPets, [](Optional<PetStable::PetInfo> const& pet) { return pet.has_value(); });
+}
+
 void BotPopulationManager::GrantCompanionStarterPet(BotId id, Player* p)
 {
-    if (p->GetClass() != CLASS_HUNTER || p->GetLevel() < 10 || Services::Owners().StarterPetGranted(id))
+    // A player's own alt brought with `.playerbot summon` keeps what the player gave it, as in CompanionUpkeep.
+    if (p->GetClass() != CLASS_HUNTER || p->GetLevel() < 10 || IsPlayersOwnCharacter(p))
         return;
+    // Granted once, but a hunter bot with no pet anywhere (none out, dismissed, stabled or unslotted) gets one again: a bot cannot tame a
+    // beast of its own, so a petless hunter companion stays petless for good. The grant used to be marked even when the beast was not
+    // tameable in this data (the race table named quilboars and a murloc for orcs, trolls and undead), and those companions have the mark
+    // in playerbot_v2_character with no pet at all.
+    bool const granted = Services::Owners().StarterPetGranted(id);
+    if (granted && HunterOwnsAnyPet(p))
+    {
+        pending_pet_grants_.erase(id);
+        return;
+    }
     using PetResult = ::Playerbot::API::StarterPetResult;
-    PetResult const r = ::Playerbot::API(p).grant_starter_hunter_pet(World::StarterHunterPetEntry(p->GetRace(), p->GetTeam() == ALLIANCE));
-    // Tamed or already has a pet: done for good. A pet the owner later abandons is not replaced. Unavailable (no
-    // tameable beast in this data) is not retried every pass either. NotNow (mounted, in combat...) waits for the next.
-    if (r != PetResult::NotNow)
+    bool const alliance = p->GetTeam() == ALLIANCE;
+    PetResult r = ::Playerbot::API(p).grant_starter_hunter_pet(World::StarterHunterPetEntry(p->GetRace(), alliance));
+    if (r == PetResult::Unavailable)
+        r = ::Playerbot::API(p).grant_starter_hunter_pet(alliance ? World::GenericAllianceHunterPet : World::GenericHordeHunterPet);
+    if (r == PetResult::Tamed && granted)
+        TC_LOG_INFO("playerbot.v2", "[hunter_pet] {} L{} had the starter pet mark but no pet: tamed a new one", p->GetName(), uint32(p->GetLevel()));
+    // Tamed or already has a pet: marked. Unavailable (neither beast tameable in this data) is tried again on the next upkeep. NotNow
+    // (still being teleported to the owner, in combat, mounted...) is tried again every second (DrainPetGrants): the grant beside the
+    // bring always met the bot mid teleport, so a new hunter companion waited for the 5 minute upkeep with no pet (TestPlayer
+    // bot-pets-fight, af56: a hired level 60 hunter had no pet for the whole 4 minute run, its warlock's Voidwalker was out at once).
+    if (r == PetResult::Tamed || r == PetResult::HasPet)
         Services::Owners().MarkStarterPetGranted(id);
+    if (r == PetResult::NotNow)
+        pending_pet_grants_.try_emplace(id, getMSTime());
+    else
+        pending_pet_grants_.erase(id);
+}
+
+void BotPopulationManager::DrainPetGrants()
+{
+    if (pending_pet_grants_.empty())
+        return;
+    constexpr uint32 kPetGrantRetryMs = 1000u;
+    // After this the 5 minute upkeep (CompanionUpkeep) is what tries it again.
+    constexpr uint32 kPetGrantGiveUpMs = 10u * 60u * 1000u;
+    uint32 const now = getMSTime();
+    if (last_pet_grant_try_ms_ && getMSTimeDiff(last_pet_grant_try_ms_, now) < kPetGrantRetryMs)
+        return;
+    last_pet_grant_try_ms_ = now;
+    std::vector<std::pair<uint64, uint32>> const waiting(pending_pet_grants_.begin(), pending_pet_grants_.end());
+    for (auto const& [id, since] : waiting)
+    {
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
+        if (!p)
+        {
+            pending_pet_grants_.erase(id);
+            continue;
+        }
+        if (getMSTimeDiff(since, now) > kPetGrantGiveUpMs)
+        {
+            TC_LOG_INFO("playerbot.v2", "[hunter_pet] {} L{}: no pet could be given for {} min (in combat, mounted or travelling); the upkeep tries again",
+                p->GetName(), uint32(p->GetLevel()), kPetGrantGiveUpMs / 60000u);
+            pending_pet_grants_.erase(id);
+            continue;
+        }
+        if (p->IsInWorld())
+            GrantCompanionStarterPet(id, p);
+    }
 }
 
 void BotPopulationManager::EnsureBotHunterPet(Player* p)
@@ -1358,6 +1439,12 @@ void BotPopulationManager::EnsureBotHunterPet(Player* p)
     if (r == PetResult::Unavailable && entry != race_entry)   // the varied beast is not tameable in this data: the race's own
     {
         entry = race_entry;
+        r = ::Playerbot::API(p).grant_starter_hunter_pet(entry);
+    }
+    uint32 const generic = p->GetTeam() == ALLIANCE ? World::GenericAllianceHunterPet : World::GenericHordeHunterPet;
+    if (r == PetResult::Unavailable && entry != generic)      // nor the race's: the faction's own
+    {
+        entry = generic;
         r = ::Playerbot::API(p).grant_starter_hunter_pet(entry);
     }
     if (r == PetResult::NotNow)
@@ -1395,7 +1482,7 @@ void BotPopulationManager::DrainLedWorldBotReleases()
             bool has_human = false;
             for (GroupReference const& ref : g->GetMembers())
                 if (Player const* m = ref.GetSource())
-                    if (m != bot && !Services::Lifecycle().is_bot(m->GetGUID().GetCounter())) { has_human = true; break; }
+                    if (m != bot && (OnRealClient(m) || !Services::Lifecycle().is_bot(m->GetGUID().GetCounter()))) { has_human = true; break; }
             if (has_human || g->isBGGroup() || g->isBFGroup() || g->isLFGGroup())
                 continue;       // a player has it again (invited in the same moment), or it is not an ordinary group: leave it
             g->RemoveMember(bot->GetGUID());
@@ -1794,7 +1881,10 @@ std::string JoinOwnerGroup(Player* owner, Player* bot)
         sGroupMgr->AddGroup(group);
     }
     if (group->IsFull() && !group->isRaidGroup())
+    {
         group->ConvertToRaid();
+        AutoRaid::Mark(group->GetGUID());
+    }
     if (group->IsFull())
         return "your raid is full (" + std::to_string(group->GetMembersCount()) + " members)";
     if (!group->AddMember(bot))
@@ -2433,6 +2523,26 @@ static uint32 RaidRegearPass(Player* p, bool& refused_any, bool only_over_cap = 
                         TC_LOG_INFO("playerbot.v2", "[gear] {} owns the pick {} but the swap into slot {} was refused (can equip: {})", p->GetName(), g.item_entry, uint32(g.slot),
                                     uint32(p->CanEquipItem(g.slot, eq_dest, owned, true)));
                     }
+                    // The unique pick is already worn in the twin slot (a ring or trinket on the other finger / in the other trinket slot, from
+                    // an earlier gear pass whose pick for that slot this pass did not beat): the plan wants it here. Swap the two slots, so the
+                    // piece sits where the plan puts it and the twin slot's own pick gets its turn on the next pass, instead of a refusal on
+                    // every regear (af54: Legionnaire's / Protector's Band 19512 / 19515, error 17 on finger 2).
+                    else if (owned && owned->GetBagSlot() == INVENTORY_SLOT_BAG_0 && owned->GetSlot() != g.slot)
+                    {
+                        uint8 const twin = g.slot == EQUIPMENT_SLOT_FINGER1 ? EQUIPMENT_SLOT_FINGER2 : g.slot == EQUIPMENT_SLOT_FINGER2 ? EQUIPMENT_SLOT_FINGER1 :
+                                           g.slot == EQUIPMENT_SLOT_TRINKET1 ? EQUIPMENT_SLOT_TRINKET2 : g.slot == EQUIPMENT_SLOT_TRINKET2 ? EQUIPMENT_SLOT_TRINKET1 : 0xFF;
+                        if (twin != 0xFF && owned->GetSlot() == twin)
+                        {
+                            p->SwapItem((uint16(INVENTORY_SLOT_BAG_0) << 8) | twin, (uint16(INVENTORY_SLOT_BAG_0) << 8) | g.slot);
+                            if (p->GetItemByPos(INVENTORY_SLOT_BAG_0, g.slot) == owned)
+                            {
+                                ++changed;
+                                TC_LOG_INFO("playerbot.v2", "[gear] {} moves the pick {} it wears in slot {} to slot {}", p->GetName(), g.item_entry, uint32(twin),
+                                            uint32(g.slot));
+                                continue;
+                            }
+                        }
+                    }
                 }
                 refused_any = true;
                 continue;
@@ -2938,10 +3048,13 @@ void BotPopulationManager::CompanionGroupHygiene(uint32 now_ms)
             return;
         // The owner is in the group when a member is the bound character, or, for an account-wide binding, any character of the owning account
         // (offline members count: the slots are read, not the online references). Not a bot: a companion's own account may be the owner's.
+        // The owner's own character driven as a self-bot is marked as a bot for the session and still counts: it is on the owner's client.
         bool owner_in = false;
         for (auto const& slot : g->GetMemberSlots())
         {
-            if (slot.guid == p->GetGUID() || Services::Lifecycle().is_bot(slot.guid.GetCounter()))
+            if (slot.guid == p->GetGUID())
+                continue;
+            if (Services::Lifecycle().is_bot(slot.guid.GetCounter()) && !OnRealClient(ObjectAccessor::FindConnectedPlayer(slot.guid)))
                 continue;
             if (ob.player_guid != 0 ? slot.guid.GetCounter() == ob.player_guid
                                     : sCharacterCache->GetCharacterAccountIdByGuid(slot.guid) == ob.account_id)
@@ -2988,7 +3101,7 @@ void BotPopulationManager::BgGroupHygiene(uint32 now_ms)
             bool has_human = false;
             for (GroupReference const& ref : g->GetMembers())
                 if (Player const* m = ref.GetSource())
-                    if (!Services::Lifecycle().is_bot(m->GetGUID().GetCounter())) { has_human = true; break; }
+                    if (OnRealClient(m) || !Services::Lifecycle().is_bot(m->GetGUID().GetCounter())) { has_human = true; break; }
             if (!has_human)
                 continue;
             TC_LOG_INFO("playerbot.v2", "[bg_group_leave] {} (bot {}) is in a BG and in a regular group led by {} ({} members): leaving it",
@@ -4273,11 +4386,19 @@ void BotPopulationManager::ProtectFromKick(uint64 guid_low, uint32 duration_ms)
             it = (int32(it->second - now) < 0) ? kick_protect_until_ms_.erase(it) : std::next(it);
 }
 
+void BotPopulationManager::SetHeld(uint64 guid_low, bool held)
+{
+    if (held)
+        held_.insert(guid_low);
+    else
+        held_.erase(guid_low);
+}
+
 bool BotPopulationManager::IsKickProtected(uint64 guid_low, uint32 now_ms) const
 {
     // A scenario bot is held for the whole run, not for a lease: the damage_parity runs last longer than the ten minutes it was staged
     // with, and the logout that came as that lease ran out ended every one of them at about 11 minutes.
-    if (Pool::IsScenarioBot(guid_low))
+    if (Pool::IsScenarioBot(guid_low) || held_.contains(guid_low))
         return true;
     auto it = kick_protect_until_ms_.find(guid_low);
     return it != kick_protect_until_ms_.end() && int32(it->second - now_ms) > 0;

@@ -229,8 +229,9 @@ std::string LanguageLine(std::string const& setting, std::string const& msg)
     return " Always reply in " + setting + ".";
 }
 
-std::string BuildSystemPrompt(Player* bot, V2::ConversationContext const& ctx, BotChatModel::Channel channel,
-                              std::string const& language, std::string const& msg, std::string const& extra, bool date)
+// What the game knows about the bot and this talk: who it is, where, doing what, and who talks to it on which channel. The
+// outside program gets only this (its own rules say how to answer); the model here gets it with the rules below.
+std::string BuildFacts(Player* bot, V2::ConversationContext const& ctx, BotChatModel::Channel channel, bool date)
 {
     std::string p = "You are " + ctx.self_name + ", a level " + std::to_string(ctx.level);
     if (char const* race = RaceName(bot->GetRace()); *race)
@@ -260,9 +261,28 @@ std::string BuildSystemPrompt(Player* bot, V2::ConversationContext const& ctx, B
         p += " You are in a raid group and " + ctx.sender_name + " says something in raid chat.";
     else
         p += " You are in a party and " + ctx.sender_name + " says something in party chat.";
+    if (date)
+    {
+        // The server's real clock: a small model otherwise makes a date up.
+        tm const t = TimeBreakdown(GameTime::GetGameTime());
+        char buf[96];
+        if (std::strftime(buf, sizeof(buf), "%A %d %B %Y, %H:%M (%Z)", &t))
+            p += std::string(" The real date and time now is ") + buf + ".";
+    }
+    return p;
+}
+
+std::string BuildSystemPrompt(Player* bot, V2::ConversationContext const& ctx, BotChatModel::Channel channel,
+                              std::string const& language, std::string const& msg, std::string const& extra, bool date)
+{
+    std::string p = BuildFacts(bot, ctx, channel, date);
+    // Not "if you don't know something, say so": small models took it as the answer to everything, and a player who asked
+    // "wanna group?", "duel?" or "trade?" got "i dont know", "no idea", "how should i know?" (cyborgx5, GitHub #12, 2026-11-17).
     p += " Answer as a real player typing in game chat: one short line, under 20 words, casual, no emojis, no actions in"
-         " asterisks, no quotation marks, no name prefix. Never say you are a bot or a program. If you don't know"
-         " something, say so briefly rather than making it up. Don't invent quests, items or places.";
+         " asterisks, no quotation marks, no name prefix. Answer what was asked: to a question about you, use the facts"
+         " above; to an invite, a duel or a trade, say yes or no in your own words; to small talk, talk back. Never say you"
+         " are a bot or a program. Don't invent quests, items or places: when you really can't tell, ask back or say what"
+         " you would do instead.";
     switch (ctx.tone)
     {
         case V2::ConvTone::Rude:   p += " You are blunt and a bit grumpy."; break;
@@ -273,14 +293,6 @@ std::string BuildSystemPrompt(Player* bot, V2::ConversationContext const& ctx, B
         p += " You type as little as possible.";
     else if (ctx.length == V2::ConvLength::Chatty)
         p += " You enjoy a chat.";
-    if (date)
-    {
-        // The server's real clock: a small model otherwise makes a date up.
-        tm const t = TimeBreakdown(GameTime::GetGameTime());
-        char buf[96];
-        if (std::strftime(buf, sizeof(buf), "%A %d %B %Y, %H:%M (%Z)", &t))
-            p += std::string(" The real date and time now is ") + buf + ".";
-    }
     p += LanguageLine(language, msg);
     if (!extra.empty())
         p += " " + extra;
@@ -398,7 +410,11 @@ bool BotChatModel::Ask(Player* bot, Player* sender, V2::ConversationContext cons
         // Same limits as the model above; the outside program answers in replies.jsonl and BotBridge says the answer.
         char const* const ch = channel == Channel::Whisper ? "whisper" : channel == Channel::Party ? "party"
                              : channel == Channel::Raid ? "raid" : "say";
-        std::string const prompt = BuildSystemPrompt(bot, ctx, channel, cfg.language, msg, cfg.extra_prompt, cfg.date_in_prompt);
+        // Only the facts: the program has its own rules for how to answer, the language and the bot's manner. This prompt's
+        // rules went in as "facts" too, and its "say you don't know" won over them (GitHub #12).
+        std::string prompt = BuildFacts(bot, ctx, channel, cfg.date_in_prompt);
+        if (!cfg.extra_prompt.empty())
+            prompt += " " + cfg.extra_prompt;
         if (!BotBridge::ReportChat(bot, sender, ch, msg, prompt))
             return false;
         g_last_ask[id] = now;

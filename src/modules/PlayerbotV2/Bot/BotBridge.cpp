@@ -14,6 +14,7 @@
 #include "Quest/QuestOrders.h"
 #include "Quest/QuestRefusal.h"
 #include "Raid/RaidVoice.h"
+#include "../Api/BotLanguage.h"
 #include "../Api/PlayerbotAPI.h"
 #include "../Api/BotTradeShop.h"
 #include "../Diagnostics/ScenarioHuman.h"
@@ -2100,36 +2101,44 @@ Player* MomentListener(Player* bot)
     return first;
 }
 
-// The language of the player's game client ("ruRU", "enUS"): the program answers a Russian client in Russian when his line
-// gives no language of its own (a moment, "ok", a link). GLIPT greeted his group in Russian and got English (2026-11-09).
-std::string ClientLocale(Player const* player)
+// The language a player reads the bots in ("ruRU", "enUS"): his `.bot language` choice, else his game client's
+// (BotLanguage::LangOf, the same as every translated bot line). Not the session's DBC locale: on a realm without the
+// Russian client data that is the realm's own (enUS), so a Russian client was told to the program as enUS and got English
+// street talk, posts and moments (cyborgx5, GitHub #12, 2026-11-16).
+char const* ReaderLocale(Player const* player)
 {
-    WorldSession const* s = player ? player->GetSession() : nullptr;
-    LocaleConstant const l = s ? s->GetSessionDbcLocale() : LOCALE_enUS;
-    return l < TOTAL_LOCALES ? localeNames[l] : "enUS";
+    return BotLanguage::LangOf(player) == Locale::Lang::Ru ? "ruRU" : "enUS";
 }
 
-// The language most real players on the bot's map play in, for lines no one player asked for (a street talk, a General or
-// Trade post): a Russian realm got English posts (Geshka, 2026-11-09). No player there: the realm's own language.
+// The program answers a Russian client in Russian when his line gives no language of its own (a moment, "ok", a link).
+// GLIPT greeted his group in Russian and got English (2026-11-09).
+std::string ClientLocale(Player const* player)
+{
+    return ReaderLocale(player);
+}
+
+// The language most of these real players read; none: the realm's own (one line goes to all of them).
+template <typename Players>
+std::string MostReadLocale(Players const& players)
+{
+    uint32 ru = 0, en = 0;
+    for (Player const* p : players)
+        if (p && p->GetSession() && !Services::Registry().has(p->GetGUID().GetCounter()))
+            ++(BotLanguage::LangOf(p) == Locale::Lang::Ru ? ru : en);
+    if (!ru && !en)
+        return sWorld->GetDefaultDbcLocale() == LOCALE_ruRU ? "ruRU" : "enUS";
+    return ru > en ? "ruRU" : "enUS";
+}
+
+// The language most real players on the bot's map read, for lines no one player asked for (a street talk, a General or
+// Trade post): a Russian realm got English posts (Geshka, 2026-11-09).
 std::string ListenersLocale(Player const* bot)
 {
-    std::array<uint32, TOTAL_LOCALES> count{};
+    std::vector<Player const*> players;
     if (Map* map = bot ? bot->GetMap() : nullptr)
         for (MapReference const& ref : map->GetPlayers())
-        {
-            Player const* p = ref.GetSource();
-            if (p && p->GetSession() && !Services::Registry().has(p->GetGUID().GetCounter()))
-            {
-                LocaleConstant const l = p->GetSession()->GetSessionDbcLocale();
-                if (l < TOTAL_LOCALES)
-                    ++count[l];
-            }
-        }
-    std::size_t best = std::size_t(sWorld->GetDefaultDbcLocale());
-    for (std::size_t l = 0; l < count.size(); ++l)
-        if (count[l] > count[best])
-            best = l;
-    return best < TOTAL_LOCALES ? localeNames[best] : "enUS";
+            players.push_back(ref.GetSource());
+    return MostReadLocale(players);
 }
 
 void WriteMoment(ConfigReader::BridgeConfig const& cfg, Moment const& m, uint32 now_ms)
@@ -2588,15 +2597,10 @@ uint64 BotBridge::AskRaidLine(Player* bot, std::string const& what, std::string 
     Group const* group = bot->GetGroup();
     std::string const channel = group->isRaidGroup() ? "raid" : "party";
     // The language most of the group's real players read (one line goes to all of them).
-    std::array<uint32, TOTAL_LOCALES> count{};
+    std::vector<Player const*> members;
     for (GroupReference const& ref : group->GetMembers())
-        if (Player const* m = ref.GetSource(); m && m->GetSession() && !Services::Registry().has(m->GetGUID().GetCounter()))
-            if (LocaleConstant const l = m->GetSession()->GetSessionDbcLocale(); l < TOTAL_LOCALES)
-                ++count[l];
-    std::size_t best = 0;
-    for (std::size_t l = 0; l < count.size(); ++l)
-        if (count[l] > count[best])
-            best = l;
+        members.push_back(ref.GetSource());
+    std::string const locale = MostReadLocale(members);
     Event e;
     e.type = "raid_line";
     FillBot(e, bot, 0);
@@ -2606,7 +2610,7 @@ uint64 BotBridge::AskRaidLine(Player* bot, std::string const& what, std::string 
     e.fields.emplace_back("mood", mood);
     e.fields.emplace_back("role", role);
     e.fields.emplace_back("channel", channel);
-    e.fields.emplace_back("locale", best < TOTAL_LOCALES ? localeNames[best] : "enUS");
+    e.fields.emplace_back("locale", locale);
     e.numbers.emplace_back("delay_ms", delay_ms);
     e.numbers.emplace_back("wait_ms", wait_ms);
     if (Services::Config().bridge().swearing)

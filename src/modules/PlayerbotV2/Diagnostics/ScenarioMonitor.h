@@ -58,7 +58,7 @@ struct ScenarioSample
     bool swim_flag = false;                // it has the swimming movement flag
 };
 
-enum class ScenarioFailKind : std::uint8_t { Idle, Stray, OutOfBounds, WrongMap, HealerOom, Death, GroupStalled, Wipe, Timeout, SetupFailed, GroupBroken, BossReset, DpsHold, HealerNoRest, SupportMissing, GroupIdle, FollowLost, Water };
+enum class ScenarioFailKind : std::uint8_t { Idle, Stray, OutOfBounds, WrongMap, HealerOom, Death, GroupStalled, Wipe, Timeout, SetupFailed, GroupBroken, BossReset, DpsHold, HealerNoRest, SupportMissing, GroupIdle, FollowLost, Water, BossSkipped };
 
 inline char const* ToString(ScenarioFailKind k)
 {
@@ -82,6 +82,7 @@ inline char const* ToString(ScenarioFailKind k)
         case ScenarioFailKind::GroupIdle:    return "group_idle";
         case ScenarioFailKind::FollowLost:   return "follow_lost";
         case ScenarioFailKind::Water:        return "water";
+        case ScenarioFailKind::BossSkipped:  return "boss_skipped";
     }
     return "?";
 }
@@ -504,6 +505,8 @@ public:
     void NoteTimeout(std::uint32_t now_ms, std::string const& what) { Fail(ScenarioFailKind::Timeout, "", what, now_ms); }
     // A support job the content calls for (a Tranquilizing Shot on Magmadar's Frenzy, a curse removed in Lucifron's room) was never done.
     void NoteSupportMissing(std::uint32_t now_ms, std::string const& what) { Fail(ScenarioFailKind::SupportMissing, "", what, now_ms); }
+    // A whole-dungeon run reached its last boss with a boss of the way still alive: the dungeon is not cleared.
+    void NoteBossSkipped(std::uint32_t now_ms, std::string const& what) { Fail(ScenarioFailKind::BossSkipped, "", what, now_ms); }
     // A line for the result that is not a failure (counts the run measured).
     void NoteInfo(std::string const& line) { tolerated_.push_back(line); }
 
@@ -543,7 +546,8 @@ public:
         {
             bool const ends_run = f.kind == ScenarioFailKind::Wipe || f.kind == ScenarioFailKind::Timeout || f.kind == ScenarioFailKind::SetupFailed ||
                                   f.kind == ScenarioFailKind::GroupBroken || f.kind == ScenarioFailKind::BossReset || f.kind == ScenarioFailKind::GroupStalled ||
-                                  f.kind == ScenarioFailKind::WrongMap || f.kind == ScenarioFailKind::SupportMissing;   // a wrong map or an unmet support check is not about the bots' play
+                                  f.kind == ScenarioFailKind::WrongMap || f.kind == ScenarioFailKind::SupportMissing ||   // a wrong map or an unmet support check is not about the bots' play
+                                  f.kind == ScenarioFailKind::BossSkipped;   // a dungeon with a boss left standing is not completed
             if (ends_run)
                 kept.push_back(std::move(f));
             else

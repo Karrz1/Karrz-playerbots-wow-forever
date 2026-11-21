@@ -6,7 +6,7 @@
 //     kill a bot), higher than every utility / questing rule.
 //   - idle:group_convert_to_raid (priority 860) — leader auto-converts to
 //     raid when inside a raid map.
-//   - Acceptance family: group_invite_accept (855), guild_invite_accept (997, above the owner orders),
+//   - Acceptance family: group_invite_accept (996) and guild_invite_accept (997), both above the owner orders,
 //     lfg_proposal_accept (850), bg_port_accept (847). All preempt the inline
 //     cascade so the bot reacts the moment the invite/proposal/port arrives.
 // All these register at priority >= 700 so they fire from the high-priority
@@ -241,7 +241,7 @@ bool GroupInviteAcceptFire(BotSnapshotView const& s, BotAI& ai,
     if (s.group_invite_leader_is_real())
     {
         InvitePolicy::Inviter const who{ true, s.group_invite_leader_owner(), s.group_invite_leader_gm(), s.group_invite_leader_friend(),
-                                         s.group_invite_leader_guildmate() };
+                                         s.group_invite_leader_guildmate(), s.group_invite_bot_owned() };
         InvitePolicy::From const policy = Services::Config().accept_invites_from();
         if (!InvitePolicy::Accepts(policy, who))
         {
@@ -302,6 +302,16 @@ bool GuildInviteAcceptFire(BotSnapshotView const& s, BotAI& ai,
                            GroupSnapshotView const&,
                            BotIntentEmitter& emit, uint32)
 {
+    // A bot that belongs to a player joins its owner's guild only: any guild master could otherwise pull someone's companion
+    // or his own alt (played as a bot) into a guild. The owner can still order "gaccept" for another invite.
+    if (s.guild_invite_bot_owned() && !s.guild_invite_to_owner_guild())
+    {
+        TC_LOG_INFO("playerbot.v2", "[guild_invite] {} declines the invite to guild {}: not its owner's guild", s.name(), s.guild_invite_id());
+        emit.guild_decline_invite();
+        ai.set_guild_invite_acked(true);
+        ai.set_last_rule_fired("idle:guild_invite_decline");
+        return true;
+    }
     TC_LOG_INFO("playerbot.v2", "[guild_invite] {} accepts the invite to guild {}", s.name(), s.guild_invite_id());
     emit.guild_accept_invite();
     ai.set_guild_invite_acked(true);
@@ -1224,7 +1234,11 @@ void RegisterCoreFlowRules(IdleRuleRegistry& r)
     {
         IdleRule rule;
         rule.name     = "idle:group_invite_accept";
-        rule.priority = 855;
+        // 996 (was 855): above the owner orders (960-994), as for the guild invite below. An owned bot out of a group with its owner
+        // near fires idle:owner_escort (960) every tick, which consumed the tick, so an invite to it was never answered: a stranger's
+        // invite was neither declined nor accepted and stayed open, and its owner's invite then got "already in group" (botauth r3).
+        // Answering moves nothing, so it may run before them; it only fires once per invite.
+        rule.priority = 996;
         rule.gate     = &GroupInviteAcceptGate;
         rule.fire     = &GroupInviteAcceptFire;
         r.register_rule(std::move(rule));

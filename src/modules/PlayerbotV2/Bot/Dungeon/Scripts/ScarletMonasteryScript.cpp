@@ -135,6 +135,11 @@ public:
             4300,   // Scarlet Wizard
             4297,   // Scarlet Conjuror
         };
+        // High Inquisitor Fairbanks, the Cathedral's first boss, stands in a room behind the Secret Door (97700), which only the Torch
+        // on the wall beside it (97701) opens: the torch's SmartAI opens the door when it is used (2026_10_12_31). The tank uses it as
+        // the SFK cell lever (idle:dungeon_use_gate_lever), while Fairbanks is alive within 40 y of it. The Chapel Door and Herod's
+        // Door are opened with The Scarlet Key, and the levers beside them stand on the far side, so they are not listed here.
+        a.use_go_entries = { 97701 };
         // The boss route is the wing the bot stands in, not the whole map. One list for all four wings sent a party entering the
         // Library to Vishas first: Loksey was in sight, the route owed the earliest boss, Vishas, and the tank walked to the
         // Graveyard (RC10 smlibrary_loksey and smarmory_herod: out of bounds at 1786,1124 within 11 s of the start, the party left

@@ -171,11 +171,19 @@ float ThreatShareAfterDrop(uint32_t mapId, uint32_t entry)
     return rules ? ThreatShareAfterDrop(*rules, entry) : 1.0f;
 }
 
-int PriorityFor(RaidRules const& rules, uint32_t entry)
+int PriorityFor(RaidRules const& rules, uint32_t entry, float hpPct)
 {
     for (Priority const& rule : rules.priority)
-        if (rule.enemy == entry && rule.who == Who::Anyone && !rule.gateEnemy)
+    {
+        if (rule.enemy != entry || rule.who != Who::Anyone)
+            continue;
+        if (!rule.gateEnemy)
             return rule.value;
+        // Gated on itself: only with the enemy's health in hand. Without it every Zombie Chow read as never a target (the -1 entry after
+        // its gated 5% one), Decimate's 5% chows too, and the DPS were sent off them every plan (naxx_gluth 1118 r6, r7).
+        if (rule.gateEnemy == entry && hpPct >= 0.0f && hpPct <= rule.hpMax && hpPct >= rule.hpMin)
+            return rule.value;
+    }
     return 1;
 }
 

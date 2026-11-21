@@ -104,6 +104,7 @@ public:
             10502,  // Lady Illucia Barov
             10507,  // The Ravenian
             10432,  // Vectus
+            11622,  // Rattlegore (the Reliquary's bone pit, below Vectus's room)
             10508,  // Ras Frostwhisper
         };
         // Progression waypoints — Scholo (classic) is multi-floor with
@@ -120,6 +121,7 @@ public:
             { 266.0f, 0.9f, 75.3f },   // Lady Illucia Barov
             { 103.3f, -1.7f, 75.2f },   // The Ravenian
             { 143.5f, 99.1f, 104.7f },   // Vectus
+            { 137.1f, 171.7f, 96.0f },   // Rattlegore
             { -25.1f, 141.3f, 83.9f },   // Ras Frostwhisper
         };
         return a;

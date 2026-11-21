@@ -145,6 +145,7 @@ static void NoteCcOnset(Player const* bp)
         SpellInfo const* si = a->GetSpellInfo();
         uint64 const mech = si->GetAllEffectsMechanicMask();
         if (!(mech & ((1ull << MECHANIC_STUN) | (1ull << MECHANIC_FEAR) | (1ull << MECHANIC_HORROR) | (1ull << MECHANIC_SLEEP) |
+                      (1ull << MECHANIC_DISORIENTED) |
                       (1ull << MECHANIC_CHARM) | (1ull << MECHANIC_DAZE) | (1ull << MECHANIC_FREEZE) | (1ull << MECHANIC_SAPPED))))
             continue;
         Unit const* caster = a->GetCaster();
@@ -153,6 +154,14 @@ static void NoteCcOnset(Player const* bp)
                                  caster->GetEntry(), bp->GetDistance(caster), a->GetDuration());
         else
             auras += fmt::format(" spell {} (no caster), {}ms", si->Id, a->GetDuration());
+    }
+    // No aura with a crowd-control mechanic (bwl_razorgore af53: bots confused by Conflagration logged nothing useful): name every
+    // aura the bot has, so the one that confuses it can still be read off the line.
+    if (auras.empty())
+    {
+        auras = " no crowd-control aura; auras:";
+        for (auto const& kv : bp->GetAppliedAuras())
+            auras += fmt::format(" {}", kv.second->GetBase()->GetId());
     }
     TC_LOG_INFO("playerbot.v2", "[bot_cc_onset] {} is {} at ({:.0f},{:.0f}):{}", bp->GetName(),
                 bp->HasUnitState(UNIT_STATE_FLEEING) ? "feared" : bp->HasUnitState(UNIT_STATE_CONFUSED) ? "confused" : "stunned",
@@ -175,6 +184,15 @@ struct IntentVisitor
         if (api.last_cast_fail() != 0)
             if (Player const* bp = api.player())
                 Combat::ClassicHeal::ReleaseHealClaim(bp->GetGUID().GetCounter(), i.target, GameTime::GetGameTimeMS());
+        // A refused cast takes back the trust the buff rules gave it when they sent it (BotAI::note_buff_cast, ClassicBuffLedger.h): the
+        // global cooldown of the blessing before it or another cast still running pass, range and line of sight do not.
+        if (bot_ai && (r != Result::Ok || api.last_cast_fail() != 0))
+        {
+            uint32 const fail = api.last_cast_fail();
+            bool const passing = fail == uint32(SPELL_FAILED_NOT_READY) || fail == uint32(SPELL_FAILED_SPELL_IN_PROGRESS)
+                || fail == uint32(SPELL_FAILED_INTERRUPTED) || (fail == 0 && (r == Result::NotReady || r == Result::Locked));
+            bot_ai->note_cast_refused(i.spell_id, i.target, GameTime::GetGameTimeMS(), passing);
+        }
         if (r == Result::Ok && bot_ai)
             bot_ai->set_last_cast_spell_id(i.spell_id);
         if (r == Result::Ok)
@@ -367,7 +385,7 @@ struct IntentVisitor
     Result operator()(SetRaidTargetIconIntent const& i){ return api.set_raid_target_icon(i.symbol, i.target); }
     Result operator()(ActivateSpecIntent const& i)     { return api.activate_spec(i.spec_id); }
     Result operator()(ResetCooldownsIntent const&)     { return api.reset_all_cooldowns(); }
-    Result operator()(TradeDeclineIntent const& i)     { return i.accept ? api.trade_with(i.owner, i.gift) : api.decline_trade(); }
+    Result operator()(TradeDeclineIntent const& i)     { return i.accept ? api.trade_with(i.owner, i.gift, i.from_owner) : api.decline_trade(); }
     Result operator()(UseItemByEntryIntent const& i)   { return api.use_item_by_entry(i.item_entry, i.target); }
     Result operator()(UseItemIntent const& i)          { return api.use_item_by_slot(i.bag, i.slot, i.target); }
     Result operator()(LootIntent const& i)              { return api.loot_corpse(i.corpse_or_object, i.quest_only); }

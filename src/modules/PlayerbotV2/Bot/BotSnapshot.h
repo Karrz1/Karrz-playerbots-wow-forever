@@ -281,6 +281,9 @@ struct NearbyUnit
     // reach (Spell::GetMinMaxRange), so the rule-side range gate
     // (BotSnapshotView::in_spell_range) needs it. Hostile units (attackers + nearby_enemies).
     float      combat_reach = 0.f;
+    // The widest harmful spell this creature casts on every enemy around itself (Frost Nova, Thunderclap), yards; 0 = none known.
+    // Healers and ranged keep out of it (State_InCombat [area_attack_step], the drink gates). Hostile units (attackers + nearby_enemies).
+    float      self_aoe_radius = 0.f;
     bool       is_casting;
     uint32     casting_spell_id;
     Ms         cast_remaining;
@@ -426,6 +429,15 @@ struct NearbyUnit
     // master Victor Nefarius' Shadow Command turned (bwl_nefarian 1111b: the tanks reserved the warlocks' Succubus, Voidwalker and
     // Felhunter as "pack mobs not pulled yet" and held for them, 5-22 times a run). Main nearby-enemy scan only.
     bool       player_owned = false;
+    // A creature a player summoned (a TempSummon whose summoner is a player) that is not the player's own: Maexxna's Web Wrap (16486), summoned
+    // by the raider it holds. It never fights (its script ignores line of sight and attacks), so it never reads as engaged: the tanks reserved
+    // it as a pack mob "not pulled yet" and held for it (naxx_maexxna r27). Main nearby-enemy scan only.
+    bool       player_summoned = false;
+    // Unit::IsHostileTo(bot). The scan takes every unfriendly unit, neutral ones too: the Twin Emperors' Qiraji Scarabs and Scorpions stand
+    // in the room as neutral bugs (faction 7) until a twin mutates or explodes one, and the tanks reserved them as pack mobs "not pulled
+    // yet" and held, so Vek'lor stayed on the tank holding Vek'nilash and shot him dead at 14 s (aq40_twins af52 sweep 1). A neutral
+    // creature never joins a pull. Main nearby-enemy scan only.
+    bool       hostile = true;
 
     // Player-only: Player::GetGuildId(). 0 for non-players or guildless
     // players. Used by Phase B `idle:guild_recruit_nearby` to identify
@@ -838,6 +850,10 @@ struct VitalsState
     bool is_rooted    = false;
     bool is_feared    = false;   // fleeing (fear): every spell but the fear-breaking few is refused
     bool is_confused  = false;
+    // Corrupted Mind (Loatheb): heals_locked while the 60 s lock (SPELL_AURA_OVERRIDE_CLASS_SCRIPTS, misc value 4327) is on the bot,
+    // when the core fizzles its healing spells; heal_lock_armed while it carries the aura whose next heal starts that lock.
+    bool heals_locked    = false;
+    bool heal_lock_armed = false;
 
     // PvP context flags.
     bool is_pvp        = false;
@@ -962,6 +978,10 @@ struct GuildState
     // CMSG_GUILD_INVITE_BY_NAME.
     bool   has_invite            = false;
     uint64 invite_id             = 0;
+    // The bot has an owner binding, and the invite is to the guild of its owner's character (online): the only guild invite a bot
+    // with an owner takes by itself (idle:guild_invite_accept).
+    bool   invite_bot_owned      = false;
+    bool   invite_to_owner_guild = false;
     // Bot's currently-joined guild id (Player::GetGuildId). 0 = guildless.
     uint64 id                    = 0;
     // Bot's rank id in their current guild (0=GM, 1=Officer, ...).
@@ -1390,6 +1410,12 @@ struct CombatTargetsState
     bool                    victim_pos_known = false;
     float                   victim_x = 0.0f, victim_y = 0.0f, victim_z = 0.0f;
     float                   victim_reach = 0.0f;
+    // The victim is not the bot's own: a healer with none was given the group's target (the leader's or the tank's, BotSnapshotBuilder
+    // healer victim seeding) for its ranged damage rules between heals. It does not walk in or start a melee swing for it.
+    bool                    victim_group_target = false;
+    // The victim stands in a liquid that burns a player (tar, lava: BotMovement::LiquidHurts at its spot). A melee bot does not follow it
+    // in (State_InCombat chase_blocked): shapers_full af51, the rogue chased an Ironhide Ravasaur into the Tar Pits and died there.
+    bool                    victim_in_damaging_liquid = false;
     ObjectGuid              current_target;
     // True only when current_target resolves to a LIVE unit the bot could
     // legally attack (IsValidAttackTarget on the world thread). Autonomy
@@ -1441,6 +1467,11 @@ struct CombatTargetsState
         raid_group = false;
         chase_nopath_target = ObjectGuid::Empty;
         victim = ObjectGuid::Empty;
+        victim_pos_known = false;
+        victim_x = victim_y = victim_z = 0.0f;
+        victim_reach = 0.0f;
+        victim_group_target = false;
+        victim_in_damaging_liquid = false;
         current_target = ObjectGuid::Empty;
         current_target_hostile = false;
         attackers.clear();
@@ -1589,6 +1620,15 @@ struct NearbyObject
     uint16     gather_skill  = 0;
     uint16     gather_req    = 0;
     bool       gather_ready  = false;
+    // DOOR (type 0) only, and only such a door is in the list: shut (GO_READY) and one a player opens by hand. Its lock has an Open,
+    // Quick Open or Open Kneeling case that asks for no skill and no item, and it is not locked, unselectable or held by a condition
+    // (the Deadmines Heavy Doors 17153 and 17154, lock 86). A door that a boss, a lever or a script opens is not one.
+    bool       hand_door     = false;
+    // A shut door whose lock takes a key this bot carries (Lock.db2 LOCK_KEY_ITEM: the Gordok Courtyard and Inner Doors in Dire Maul):
+    // the key's item entry, 0 for any other object. Such a door is in the list as a hand_door too, for this bot only.
+    uint32     key_item      = 0;
+    // CHEST (type 3) only: one the bot's dungeon lists as holding a door key (DungeonScript::key_chests), spawned and not yet opened.
+    bool       key_chest     = false;
     // RITUAL (type 18) without an owner (the Altar of the Keepers / of Archaedas in Uldaman, the Blackrock Altar in UBRS): true when
     // a person in the bot's group has used it, it still needs more users, and this bot is one of the group's bots picked to fill the
     // missing places (in guid order, the same pick in every bot's snapshot), so no more bots go than places are open.
@@ -1662,6 +1702,8 @@ struct EnvironmentState
     bool  is_underwater        = false;
     float water_surface_z      = 0.0f;
     bool  is_in_damaging_liquid = false;
+    // Also set in a liquid that burns (tar, lava, is_in_damaging_liquid), wherever the bot is: idle:flee_damaging_liquid and the combat
+    // step-out walk to it. A random 25 y heading from the middle of the Tar Pits ended in tar again and the move gate refused it (af51).
     // Open-world water-escape FOCUS (FIX #12). When the bot is in swim-water the
     // builder resolves the nearest DRY navmesh footing (NearestNavPoint excludes
     // water/magma); idle:water_escape drives straight to it and PREEMPTS all
@@ -1847,6 +1889,7 @@ struct SocialEventsState
     bool       group_invite_leader_gm = false;
     bool       group_invite_leader_friend = false;       // on the bot's friend list
     bool       group_invite_leader_guildmate = false;
+    bool       group_invite_bot_owned = false;           // this bot has an owner binding (InvitePolicy::Inviter::bot_owned)
 
     void reset() { *this = SocialEventsState{}; }
 };

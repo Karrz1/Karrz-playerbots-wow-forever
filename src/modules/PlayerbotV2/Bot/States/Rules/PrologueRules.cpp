@@ -1498,6 +1498,13 @@ bool PullBackTick(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
     // Hold
     if (!s.in_combat() && now_ms - p.phase_ms > 3000u && !tu->unit_in_combat)
         return finish("combat over");
+    // A mob of the pack that came in on a group member, not on the tank, is the tank's to pick up now; waiting on the pull target
+    // left it there. dmnorth_full af56: the tank pulled a Gordok Mage-Lord, which stayed 35 y off casting (stands off), and held at
+    // the return point for its 8 s while the two Gordok Brutes of its pack beat the priest from 100% to 31% 3-6 y from the tank;
+    // the priest's heals then went to itself, a Mastiff pack came in and the tank died 7 s later. The same test ends the Retreat at
+    // the point and a retake (pack_on_group_at_point above).
+    if (NearbyUnit const* u = pack_on_group_at_point())
+        return finish_for_pack(*u);
     const float td2 = d2xy(bx, by, tu->x, tu->y);
     bool others = false;   // something besides the pull target is on us
     for (auto const& u : s.raw().combat.attackers)

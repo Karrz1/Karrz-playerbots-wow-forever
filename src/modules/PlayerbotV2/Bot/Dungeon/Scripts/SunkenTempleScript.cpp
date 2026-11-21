@@ -56,36 +56,61 @@ public:
         a.dangerous_auras = {
             12480,  // Sleep (Shade of Eranikus) — interrupted by damage
         };
-        // Boss progression — NPC entries from TC's sunken_temple.h.
-        // ST is a 2-tier troll dungeon; the dragonkin tier (5719-5722)
-        // is fought sequentially before Jammal'an at the bottom and
-        // Hakkar/Eranikus at the apex.
-        // The boss route is index for index with the waypoints below: the owed boss is steered to by its waypoint. A boss with no
-        // static spawn (event_summoned_bosses) has no waypoint and is not on it; with one in, every later waypoint answered the
-        // wrong boss.
+        // How the temple opens (classic_instance_sunken_temple):
+        //   The six Atal'ai Statues on the lower floor, used in the order S, N, SW, SE, NW, NE, raise Atal'alarion in the pit
+        //   below them; a statue used out of turn springs a trap. Each used in turn turns unselectable. Atal'alarion is an encounter
+        //   of the instance, so a temple with him alive never counted as cleared. The tank uses them (idle:dungeon_key_use, in
+        //   order, tank only); the statues are 370-540 y of walk apart, each on its own ledge.
+        //   The six Atal'ai Defenders (Zolo, Gasher, Loro, Hukku, Zul'Lor, Mijan), each on his own balcony 23 y above the upper floor
+        //   at the top of its own stairs, open Jammal'an's forcefield (149431) and make Jammal'an and Ogom attackable when the last
+        //   of them dies. The route stays on the floors and never went up, so the tank stood at the forcefield for good. The tank
+        //   goes up for them (idle:dungeon_clear_spot, reach widened to the whole temple: 300-450 y of walk between balconies).
+        //   Jammal'an's death makes the Shade of Eranikus attackable and brings out Weaver and Dreamscythe (hidden till then).
+        // Spawn positions from the Classic data (VMaNGOS spawn tables, map 109).
+        a.key_uses = {
+            { 148830, -515.6f, 95.3f, -148.7f, 0, 0, 0, 250.f, 70.f, true, true },   // Atal'ai Statue, S
+            { 148831, -419.8f, 94.5f, -148.7f, 0, 0, 0, 250.f, 70.f, true, true },   // N
+            { 148832, -491.4f, 136.0f, -148.7f, 0, 0, 0, 250.f, 70.f, true, true },  // SW
+            { 148833, -491.5f, 53.5f, -148.7f, 0, 0, 0, 250.f, 70.f, true, true },   // SE
+            { 148834, -443.9f, 136.1f, -148.7f, 0, 0, 0, 250.f, 70.f, true, true },  // NW
+            { 148835, -443.4f, 53.8f, -148.7f, 0, 0, 0, 250.f, 70.f, true, true },   // NE
+        };
+        a.clear_spots = {
+            { 5715, -405.5f, 60.5f, -67.1f, 10.f, 400.f, 130.f },    // Hukku
+            { 5717, -406.2f, 131.1f, -66.9f, 10.f, 400.f, 130.f },   // Mijan
+            { 5716, -467.4f, 166.0f, -66.7f, 10.f, 400.f, 130.f },   // Zul'Lor
+            { 5712, -528.6f, 130.2f, -66.8f, 10.f, 400.f, 130.f },   // Zolo
+            { 5713, -528.0f, 59.5f, -66.7f, 10.f, 400.f, 130.f },    // Gasher
+            { 5714, -467.2f, 26.3f, -67.0f, 10.f, 400.f, 130.f },    // Loro
+        };
+        // The boss route, index for index with the waypoints below (the 0053 route walks them in this order): Atal'alarion in the
+        // pit, Morphaz and Hazzas, Jammal'an, Weaver and Dreamscythe (their spawn points; they walk a path once they come out), the
+        // Shade of Eranikus. The old list had Weaver and Dreamscythe first, before they exist.
+        // The six Defenders are kill spots above, not entries here: the owed boss is bosses[n] for n instance encounters done, and
+        // they are not encounters of the instance (its eight encounters are the seven below and the Avatar). As entries, every
+        // later kill would point the owed index back at a dead Defender, and the tank would walk back up the balconies to wait
+        // out each one.
         a.bosses = {
-            5719,   // Morphaz (Green Dragonkin)
-            5720,   // Weaver
-            5721,   // Dreamscythe
+            8580,   // Atal'alarion (the statues)
+            5719,   // Morphaz
             5722,   // Hazzas
-            5710,   // Jammal'an the Prophet
+            5710,   // Jammal'an the Prophet (the six Defenders)
+            5720,   // Weaver (comes out at Jammal'an's death)
+            5721,   // Dreamscythe (comes out at Jammal'an's death)
             5709,   // Shade of Eranikus (final)
         };
-        // Progression waypoints — boss spawn positions from world.creature
-        // (map 109), in encounter order. Weaver (5720), Dreamscythe (5721)
-        // and the Avatar of Hakkar (8443) are script-spawned with no
-        // creature rows, so they contribute no waypoint; the pathfinder
-        // routes the corridors between the remaining anchors.
-        // Boss spawn positions from the Classic creature data (VMaNGOS spawn table, map 109), in encounter order; bosses a script
-        // summons (no static spawn) are left out. Replaces hand-typed coordinates that did not match the map.
         a.progression_waypoints = {
-            { -671.6f, 73.3f, -90.8f },   // Morphaz
-            { -425.1f, 105.8f, -90.8f },   // Weaver
-            { -508.8f, 85.1f, -90.9f },   // Dreamscythe
-            { -670.1f, 68.7f, -90.8f },   // Hazzas
+            { -466.5f, 95.2f, -188.9f },   // Atal'alarion
+            { -671.6f, 73.3f, -90.8f },    // Morphaz
+            { -670.1f, 68.7f, -90.8f },    // Hazzas
             { -426.7f, -85.7f, -88.1f },   // Jammal'an the Prophet
-            { -658.4f, -35.8f, -90.8f },   // Shade of Eranikus
+            { -425.1f, 105.8f, -90.8f },   // Weaver
+            { -508.8f, 85.1f, -90.9f },    // Dreamscythe
+            { -660.0f, -34.0f, -90.7f },   // Shade of Eranikus
         };
+        // Atal'alarion is hidden until the six statues are used (a long walk round the lower floor), Weaver and Dreamscythe until
+        // Jammal'an dies: the tank waits for them at their waypoints instead of waiving them after the usual 8 s.
+        a.owed_boss_holds = { { 8580, 600000 }, { 5720, 120000 }, { 5721, 120000 } };
         return a;
     }
 };

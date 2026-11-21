@@ -3,6 +3,9 @@
 // Only invites from real players are weighed: a bot's invite (a pickup group, a listed bot group, the dungeon finder) is the bot
 // system's own and always goes through. The bot's owner and a game master are always answered, whatever the setting, so an owner's
 // companions and a GM's tests never stop working. Each step takes the ones before it: guild = friends and guild members.
+// A bot that belongs to a player (a companion, an alt played as a bot, .playerbot self) takes a player's invite from its owner
+// and a GM only, whatever the setting: with "anyone" a stranger could pull someone else's character into his group, lead it about and
+// sell it things through the group trade (BotAI: a group mate's trade is bought at the fair price).
 //
 // Pure, tested in tests/game/ClassicBotParties.cpp. The rule that answers the invite is idle:group_invite_accept (CoreFlowRules.cpp).
 #pragma once
@@ -37,12 +40,15 @@ struct Inviter
     bool gm = false;          // game master or higher
     bool friend_ = false;     // on the bot's friend list
     bool guildmate = false;   // in the bot's guild
+    bool bot_owned = false;   // the bot belongs to a player's account (an owner binding)
 };
 
 inline bool Accepts(From policy, Inviter const& i)
 {
     if (!i.real || i.owner || i.gm)
         return true;
+    if (i.bot_owned)
+        return false;
     switch (policy)
     {
         case From::Anyone:  return true;

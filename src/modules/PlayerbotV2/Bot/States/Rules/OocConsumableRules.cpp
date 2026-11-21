@@ -24,6 +24,7 @@
 #include "Bot/DrinkSayRule.h"
 #include "Bot/RecoverRules.h"   // Classic::LedMaySitDown
 #include "Bot/States/MaintainHelpers.h"   // States::DungeonLootRoll
+#include "Bot/Gear/BotGearGenerator.h"   // LevellingArmorFactor
 #include "SharedDefines.h"
 #include "RaceMask.h"        // RACE_UNDEAD_PLAYER
 #include "GameTime.h"
@@ -358,6 +359,9 @@ bool OocEatFoodGate(BotSnapshotView const& s, BotAI& ai,
     {
         if (s.raw().movement.is_moving)
             return false;
+        // Between two blessings or class buffs of a round: the next cast would stand the bot straight back up (ClassicUpkeepCastPending).
+        if (!Classic::IsEating(s) && !Classic::IsDrinking(s) && ClassicUpkeepCastPending(s, ai, g, now_ms))
+            return false;
         // Not while the group walks on, nor straight back down after the follow got it up.
         if (LedRest(s, ai) && !Classic::LedMaySitDown({ Classic::IsEating(s) || Classic::IsDrinking(s), ai.since_rest_broken_ms(now_ms),
                                                      ai.since_anchor_moved_ms(now_ms) }))
@@ -613,13 +617,28 @@ bool EquipUpgradeFire(BotSnapshotView const& s, BotAI& ai,
         if (it.item_level == 0) continue;
         if (it.quality == 0) continue;
         if (ai.equip_recently_tried(it.entry, equip_now_ms)) continue;
-        EquippedItem const& cur = s.equipped(it.equip_slot);
-        if (ai.gear_slot_held(it.equip_slot, s.map_id(), cur.entry)) continue;
+        // The slot filter of the other auto-equip rules (Gear::AutoEquipSlot): a shield tank takes a one-hander in the main hand
+        // only and a shield in the off hand, never a fishing pole. The server's slot for a one-hander is the hand with the lower
+        // item level, often the shield's: this rule alone skipped the filter and put the weapon over the shield (DoctorSun 11-21).
+        uint8 const dst = ::Playerbot::V2::Gear::AutoEquipSlot(uint16(s.spec()), it.equip_slot, it.entry);
+        if (dst == 0xFF || dst >= s.raw().inventory.equipped.size()) continue;
+        EquippedItem const& cur = s.equipped(dst);
+        if (ai.gear_slot_held(dst, s.map_id(), cur.entry)) continue;
         // A piece a player chose for the bot (trade or "equip <item>") stays on.
-        if (ai.worn_is_kept(it.equip_slot, cur.entry)) continue;
-        const float score_new = ScoreItem(it.stats, it.item_level, weights, dps_w);
+        if (ai.worn_is_kept(dst, cur.entry)) continue;
+        if (::Playerbot::V2::Gear::ShieldGoesOnShieldTank(uint16(s.spec()), dst, it.entry, cur.entry))
+        {
+            emit.equip_item(it.bag, it.slot, dst);
+            ai.note_equip_try(it.entry, equip_now_ms);
+            ai.set_last_rule_fired("idle:equip_upgrade");
+            return true;
+        }
+        // Each side keeps the share of its worth its armor type has for this bot (a leather chest on a mail-wearing warrior).
+        const float score_new = ScoreItem(it.stats, it.item_level, weights, dps_w) *
+                                ::Playerbot::V2::Gear::LevellingArmorFactor(it.entry, s.cls(), uint16(s.spec()), s.level());
         const float score_cur = (cur.entry != 0)
-            ? ScoreItem(cur.stats, cur.item_level, weights, dps_w)
+            ? ScoreItem(cur.stats, cur.item_level, weights, dps_w) *
+                  ::Playerbot::V2::Gear::LevellingArmorFactor(cur.entry, s.cls(), uint16(s.spec()), s.level())
             : 0.0f;
         // Swap margin scales with the CURRENT item's score. The old flat
         // max(50, 5%) floor demanded a ~+50-score jump on a scale where
@@ -631,7 +650,7 @@ bool EquipUpgradeFire(BotSnapshotView const& s, BotAI& ai,
         // through.
         const float margin = std::max(2.0f, score_cur * 0.05f);
         if (score_new <= score_cur + margin) continue;
-        emit.equip_item(it.bag, it.slot, it.equip_slot);
+        emit.equip_item(it.bag, it.slot, dst);
         ai.note_equip_try(it.entry, equip_now_ms);
         ai.set_last_rule_fired("idle:equip_upgrade");
         return true;

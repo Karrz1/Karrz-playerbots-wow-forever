@@ -51,7 +51,16 @@ struct Gift
     uint32 stamp_ms = 0;
 };
 
+struct EnchantJob
+{
+    ObjectGuid partner;
+    ObjectGuid item;
+    uint64 serial = 0;      // the bot's TradeData::GetSerial of the window it opened for this
+    uint32 stamp_ms = 0;
+};
+
 std::mutex g_mtx;
+std::unordered_map<uint64, EnchantJob> g_enchant_jobs;                // bot -> the piece its owner is enchanting in the open window
 std::unordered_map<uint64, Delivery> g_deliveries;                     // bot -> the craft order waiting to be handed over
 std::unordered_map<uint64, Gift> g_gifts;                              // bot -> what its owner asked for, for the window it opened
 std::unordered_map<uint64, Shelf> g_shelves;                           // (bot << 32) | buyer
@@ -364,6 +373,64 @@ void StoreGift(Player const* bot, ObjectGuid partner, std::vector<ObjectGuid> it
     g_gifts[bot->GetGUID().GetCounter()] = Gift{ partner, std::move(items), GameTime::GetGameTimeMS() };
 }
 
+void StoreEnchantJob(Player const* bot, ObjectGuid partner, ObjectGuid item, uint64 serial)
+{
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (g_enchant_jobs.size() > 4096) g_enchant_jobs.clear();
+    g_enchant_jobs[bot->GetGUID().GetCounter()] = EnchantJob{ partner, item, serial, GameTime::GetGameTimeMS() };
+}
+
+namespace {
+
+// One step of a window opened for an enchant order: the piece goes in the "will not be traded" slot (the server lets a bound or worn
+// item sit there, as HandleSetTradeItemOpcode does), then the bot waits for his enchant and accepts. The enchant goes on when both
+// have accepted (HandleAcceptTradeOpcode casts it on the slot's item); a change on either side clears both accepts, so the bot
+// accepts again on the next step.
+Result StepEnchant(Player* bot, TradeData* mine, TradeData* his, Player* partner, EnchantJob const& job)
+{
+    Item* item = bot->GetItemByGuid(job.item);
+    if (!item || !(Player::IsEquipmentPos(item->GetPos()) || Player::IsInventoryPos(item->GetPos())))
+    {
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_enchant_jobs.erase(bot->GetGUID().GetCounter());
+        }
+        BotLanguage::Whisper(bot, partner, "i don't have that piece on me any more");
+        bot->TradeCancel(true);
+        return Result::ServerRefused;
+    }
+    if (mine->GetItem(TRADE_SLOT_NONTRADED) != item)
+    {
+        mine->UpdateClientStateIndex();
+        mine->SetItem(TRADE_SLOT_NONTRADED, item);
+        TC_LOG_INFO("playerbot.v2", "[trade] bot {} put {} in the not-traded slot for {} to enchant", bot->GetName(), NameOf(item->GetTemplate()),
+            partner->GetName());
+        return Result::Locked;
+    }
+    if (!his->GetSpell() || mine->IsAccepted())
+        return Result::Locked;
+    uint32 const spell = his->GetSpell();
+    WorldPacket data(CMSG_ACCEPT_TRADE);
+    data << uint32(his->GetServerStateIndex());
+    WorldPackets::Trade::AcceptTrade accept(std::move(data));
+    accept.Read();
+    bot->GetSession()->HandleAcceptTradeOpcode(accept);
+    if (!bot->GetTradeData())
+    {
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_enchant_jobs.erase(bot->GetGUID().GetCounter());
+        }
+        TC_LOG_INFO("playerbot.v2", "[trade] bot {}: {} enchanted {} (spell {})", bot->GetName(), partner->GetName(), NameOf(item->GetTemplate()), spell);
+    }
+    else
+        TC_LOG_INFO("playerbot.v2", "[trade] bot {} accepted {}'s enchant (spell {}) on {}, waiting for him", bot->GetName(), partner->GetName(), spell,
+            NameOf(item->GetTemplate()));
+    return Result::Ok;
+}
+
+} // namespace
+
 void StoreDelivery(Player const* bot, ObjectGuid requester, uint32 entry)
 {
     std::lock_guard<std::mutex> lk(g_mtx);
@@ -461,13 +528,37 @@ bool HasRoomFor(Player* bot, std::vector<Item*>& items)
 
 } // namespace
 
-Result Step(Player* bot, TradeData* mine, TradeData* his, bool gift_ok)
+Result Step(Player* bot, TradeData* mine, TradeData* his, bool gift_ok, bool from_owner)
 {
     Player* partner = mine->GetTrader();
     if (!partner) return Result::Locked;
 
+    // A window the bot opened for its owner's enchant order is only for that (StoreEnchantJob). Any other window ends the order.
+    {
+        bool enchant = false;
+        EnchantJob job;
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            auto it = g_enchant_jobs.find(bot->GetGUID().GetCounter());
+            if (it != g_enchant_jobs.end())
+            {
+                if (GameTime::GetGameTimeMS() - it->second.stamp_ms > kShelfLifeMs || it->second.serial != mine->GetSerial() ||
+                    it->second.partner != partner->GetGUID())
+                    g_enchant_jobs.erase(it);
+                else
+                {
+                    job = it->second;
+                    enchant = true;
+                }
+            }
+        }
+        if (enchant)
+            return StepEnchant(bot, mine, his, partner, job);
+    }
+
     BotTrade::View v;
     v.gift_partner = gift_ok;
+    v.from_owner = gift_ok && from_owner;
     std::vector<Item*> his_items;
     v.his = Lines(bot, his, /*mark_upgrades*/ true, &his_items);
     v.his_money = his->GetMoney();

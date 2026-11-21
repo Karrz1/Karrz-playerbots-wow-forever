@@ -21,13 +21,18 @@ struct FinderDungeonInfo
     char const* name = "";          // as the 1.60 client names it (GroupFinderActivity.db2)
     char const* keys = "";          // short words players type, space separated
     uint32 entrance = 0;            // areatrigger_teleport id of the dungeon's own door (a wing's door for Scarlet Monastery / Dire Maul)
+    uint32 landing = 0;             // world_safe_locs id of the landing inside, for a WoW Forever dungeon: its door is a server
+                                    // areatrigger (areatrigger_template_actions, teleport to this landing), not areatrigger_teleport
 };
 
 // Every dungeon of the default Playerbot.Lfg.BotGroups.Activities table. The activity ids were read from the client's
 // GroupFinderActivity.db2 (813-815 Dire Maul East/West/North, 816 Stratholme Main Gate, 827-829 Scarlet Monastery Armory/
 // Cathedral/Library). The entrance is named here because ObjectMgr::GetMapEntranceTrigger returns any one of several doors of
 // a map (Scarlet Monastery has four, Dire Maul six, Gnomeregan, Uldaman, Stratholme and Maraudon two or three).
-inline constexpr std::array<FinderDungeonInfo, 25> kFinderDungeons = {{
+// The WoW Forever dungeons follow (activity ids from the 70938 client's GroupFinderActivity.db2: 894-897, and 1978-1980, 1985 and
+// 1986 in its section the extractor decrypted). They are entered by a server areatrigger whose action teleports to the landing named
+// here, the same spot a player's own walk through the door lands on. City of Dalaran (896) is left out: it has no way in yet.
+inline constexpr std::array<FinderDungeonInfo, 33> kFinderDungeons = {{
     { 203776, "Wailing Caverns",               "wc",                       228 },
     { 204032, "Scholomance",                   "scholo",                  2567 },
     { 204288, "Ragefire Chasm",                "rfc",                     2230 },
@@ -53,6 +58,14 @@ inline constexpr std::array<FinderDungeonInfo, 25> kFinderDungeons = {{
     { 211968, "Scarlet Monastery - Cathedral", "smcath cath cathedral",    610 },
     { 212224, "Scarlet Monastery - Library",   "smlib lib library",        614 },
     { 214272, "Upper Blackrock Spire",         "ubrs",                    1468 },
+    { 228864, "Excavation Site: Wetlands",     "excav excavation dig",       0, 1104104 },
+    { 229120, "Ruins of Lordaeron",            "rol lordaeron",              0, 1104100 },
+    { 229632, "Hall of Thanes",                "hot thanes",                 0, 1104102 },
+    { 506368, "The Shaper's Terrace",          "shapers terrace",            0, 1104128 },
+    { 506624, "Blackmaw Hold",                 "blackmaw bmh",               0, 1104126 },
+    { 506880, "Alcaz Prison",                  "alcaz",                      0, 1104124 },
+    { 508160, "The Drowned City",              "drowned dc",                 0, 1104120 },
+    { 508416, "Krol'dok Stronghold",           "kroldok krol",               0, 1104122 },
 }};
 
 inline FinderDungeonInfo const* FinderDungeonFor(uint32 activity)
@@ -157,7 +170,8 @@ inline std::vector<FinderEntrance> ParseFinderEntrances(std::string_view text)
     return out;
 }
 
-// The door of a dungeon: the configured one, else the one named above, else 0 (the map's first known entrance is used then).
+// The door of a dungeon: the configured one, else the one named above, else 0 (the landing below, else the map's first known entrance).
+// A configured door also wins over a Forever dungeon's landing.
 inline uint32 FinderEntranceTrigger(uint32 activity, std::vector<FinderEntrance> const& overrides)
 {
     for (FinderEntrance const& e : overrides)
@@ -165,6 +179,15 @@ inline uint32 FinderEntranceTrigger(uint32 activity, std::vector<FinderEntrance>
             return e.trigger;
     FinderDungeonInfo const* info = FinderDungeonFor(activity);
     return info ? info->entrance : 0;
+}
+
+// The landing inside a WoW Forever dungeon (a world_safe_locs id), used when no door of its own is named or configured; else 0.
+inline uint32 FinderLandingSafeLoc(uint32 activity, std::vector<FinderEntrance> const& overrides)
+{
+    if (FinderEntranceTrigger(activity, overrides))
+        return 0;
+    FinderDungeonInfo const* info = FinderDungeonFor(activity);
+    return info ? info->landing : 0;
 }
 
 // A queued group waits for its bots to join; it goes in when it is complete, or when the wait is over with at least one bot

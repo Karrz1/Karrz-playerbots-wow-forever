@@ -63,9 +63,14 @@ enum class RaidLogKind : uint8
     Interrupt = 32, Tranq = 33, FearHold = 34, // [raid_interrupt], [raid_tranq], [raid_threat] fear hold
     Hazard = 48, Los = 49, Cone = 50,          // [raid_hazard], [raid_los], [raid_cone] (State_Idle)
     TankHazard = 51,                           // [raid_hazard] tank variant (State_Idle)
+    LiquidEscape = 52,
+    AreaAttack = 53,                           // [area_attack_step] out of a mob's Frost Nova reach (State_Idle)                         // [liquid_escape] out of a burning liquid in a fight (State_InCombat)
     TankSpread = 64, TankAoeHold = 65,         // [raid_tank] (Combat/Apl/ApTankThreat.h)
     TankDance = 66,                            // [raid_tank] warrior Battle Stance dance (Apl_Classic_Warrior)
     DemoSkip = 67,                             // [raid_tank] Demoralizing Shout / Roar not cast on a boss (ApTankThreat.h)
+    SwipeSkip = 68,                            // [raid_tank] a bear with a pack on it did not Swipe (Apl_Classic_Druid)
+    PackKeepOut = 69,                          // [raid_tank] a resting mob in a keep-out circle is no pack mob (PveGroupCoordinator, keyed by the mob)
+    DpsBear = 70,                              // [raid_tank] a druid off the tank roster without Cat Form plays DPS in Bear Form (State_InCombat)
 };
 
 inline uint64 RaidLogKey(BotSnapshotView const& s, RaidLogKind k)

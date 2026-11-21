@@ -40,6 +40,15 @@ public:
         { if (fight_denied(body.spell_id, body.target, true)) return false; }
         if constexpr (std::is_same_v<T, GroundTargetSpellIntent>)
         { if (fight_denied(body.spell_id, ObjectGuid::Empty, false)) return false; }
+        // The raid's keep-out circles (RaidOrder::keep_out): the pet stays out, and no area spell reaches in.
+        if constexpr (std::is_same_v<T, PetAttackIntent>)
+        { if (keep_out_denied(0, body.target, true)) return false; }
+        if constexpr (std::is_same_v<T, PetCastSpellIntent>)
+        { if (keep_out_denied(body.spell_id, body.target, true)) return false; }
+        if constexpr (std::is_same_v<T, CastSpellIntent>)
+        { if (keep_out_denied(body.spell_id, body.target, false)) return false; }
+        if constexpr (std::is_same_v<T, GroundTargetSpellIntent>)
+        { float const point[2] = { body.x, body.y }; if (keep_out_denied(body.spell_id, ObjectGuid::Empty, false, point)) return false; }
         Intent i;
         i.id              = ++(*next_id_);
         i.bot_id          = bot_id_;
@@ -265,7 +274,7 @@ public:
     { return emit(SetRaidTargetIconIntent{symbol, target}); }
     bool activate_spec(uint32 spec_id) { return emit(ActivateSpecIntent{spec_id}); }
     bool trade_decline()  { return emit(TradeDeclineIntent{}); }
-    bool trade_accept_owner(ObjectGuid owner) { return emit(TradeDeclineIntent{ true, owner, true }); }
+    bool trade_accept_owner(ObjectGuid owner, bool from_owner) { return emit(TradeDeclineIntent{ true, owner, true, from_owner }); }
     // Trade with a stranger at the fair price: no gifts taken.
     bool trade_bargain(ObjectGuid partner) { return emit(TradeDeclineIntent{ true, partner, false }); }
 
@@ -479,9 +488,17 @@ private:
     // attack or harmful spell at one of those mobs (no explicit target: the bot's victim or selection, the pet's victim for a pet
     // spell), or a spell that hits more than one enemy while one of them is near (fight_ignore_near). A friendly spell always goes.
     bool fight_denied(uint32 spell_id, ObjectGuid target, bool pet) const;
+    // The raid's keep-out circles (RaidOrder::keep_out: Kel'Thuzad's alcoves): a pet attack or harmful pet spell while the pet is called
+    // back (pet_recall) or at an enemy within RaidOrder::kPetMargin of a circle; an area or chain spell of the bot's whose area (centred
+    // on its target, its ground point `point` (x, y), or the bot) reaches into one. The bot's own single-target attacks and spells go.
+    bool keep_out_denied(uint32 spell_id, ObjectGuid target, bool pet, float const* point = nullptr) const;
     // The owner's "focus heal <names>" (snapshot heal_only): a heal, heal over time or absorb on anyone else is not sent. A cast
     // with no target or on the bot itself always goes.
     bool heal_denied(uint32 spell_id, ObjectGuid target) const;
+    // Loatheb's Corrupted Mind (snapshot heals_locked / heal_lock_armed): under the 60 s lock the core fizzles every healing spell, so
+    // none is sent and the rotation falls through to its next rule. While the bot still has its one heal of the minute (armed), a
+    // heal over time alone is not sent either: it would spend that heal on a fraction of what a direct heal lands.
+    bool heal_locked(uint32 spell_id) const;
     void note_school_cast(uint32 spell_id, ObjectGuid target);
     // Avoided part of the pet's damage schools on `target` (0 = no hold).
     uint8 pet_hold_mask(ObjectGuid target) const;

@@ -16,6 +16,7 @@
 #include "../Raid/RaidHealSlots.h"
 #include "../Raid/RaidHealGroups.h"
 #include "../ClassicUpkeep.h"
+#include "../ThreatDiscipline.h"
 #include "../ThreatLimits.h"
 #include "MarkCc.h"
 #include "PrePullCc.h"
@@ -417,6 +418,33 @@ void PveGroupCoordinator::Update(uint32 now_ms)
                             if (u.entry == rule.enemy && u.hp > 0 && u.unit_in_combat)
                                 want = std::max<size_t>(want, size_t(rule.count) + 1);
                 }
+            // Every engaged enemy whose tank hands it over at a debuff's stacks (RaidRules::tankSwap) needs a taker of its own beside its
+            // tank: the one swap tank of engaged + 1 serves only one of them. naxx_horsemen af39: four horsemen, each handed over at three
+            // marks, ran on a roster of five while three more tank bots played DPS; the one spare could take nobody, and no swap was cast
+            // in either run.
+            if (Raid::RaidRules const* rules = Raid::RulesForMap(b.map_id); rules && !rules->tankSwap.empty())
+            {
+                size_t swapped = 0;
+                std::vector<ObjectGuid> counted;
+                for (auto const& sn : snaps)
+                {
+                    if (sn->position.map_id != b.map_id) continue;
+                    for (auto const& u : sn->combat.nearby_enemies)
+                    {
+                        if (std::find(engaged.begin(), engaged.end(), u.guid) == engaged.end() ||
+                            std::find(counted.begin(), counted.end(), u.guid) != counted.end())
+                            continue;
+                        for (Raid::TankSwap const& rule : rules->tankSwap)
+                            if (u.entry == rule.enemy)
+                            {
+                                counted.push_back(u.guid);
+                                ++swapped;
+                                break;
+                            }
+                    }
+                }
+                want = std::max<size_t>(want, engaged.size() + swapped);
+            }
             auto live_tank = [&](uint64 low)
             {
                 for (auto const& e : mem)
@@ -553,8 +581,33 @@ void PveGroupCoordinator::Update(uint32 now_ms)
             for (auto const& [tlow, want] : tank_quota)
                 if (tlow != main_tank && tlow != off_tank)
                     spare_tanks.push_back(tlow);
+            // A tank that an engaged enemy is hitting has its healer before one that holds nothing: the spares that hold a mob first, and
+            // an off tank that holds nothing goes behind them while one does (RaidHealSlots.h HeldTanksFirst). Not in a soak fight, whose
+            // soakers take the boss's strikes without being his victim. naxx_horsemen af52-1: four tanks held the four horsemen and four
+            // waited, the 8 tank slots went in roster order, so the off tank and three waiting spares had a healer each while Zeliek's tank
+            // had none and Blaumeux's one.
+            uint64 slot_off_tank = off_tank;
+            if (!soak_fight)
+            {
+                std::unordered_set<uint64> held_tanks;
+                for (auto const& sn : snaps)
+                {
+                    if (sn->position.map_id != b.map_id) continue;
+                    for (auto const& u : sn->combat.nearby_enemies)
+                        if (u.hp > 0 && u.unit_in_combat && !u.is_player && u.victim.IsPlayer())
+                            held_tanks.insert(u.victim.GetCounter());
+                }
+                auto const reordered = Raid::HeldTanksFirst(off_tank, spare_tanks,
+                                                            [&](uint64 t) { return held_tanks.count(t) != 0; });
+                if (reordered.second != spare_tanks || reordered.first != off_tank)
+                    TC_LOG_DEBUG("playerbot.v2", "[raid_heal] group {} tank slots: held tanks first ({} of {} spare tanks hold a mob, off tank {} {})",
+                                 bkey, std::count_if(spare_tanks.begin(), spare_tanks.end(), [&](uint64 t) { return held_tanks.count(t) != 0; }),
+                                 spare_tanks.size(), off_tank, held_tanks.count(off_tank) ? "holds one" : "holds none");
+                slot_off_tank = reordered.first;
+                spare_tanks = reordered.second;
+            }
             std::vector<uint64> const slots = soak_fight ? Raid::SoakHealSlotOrder(main_tank, off_tank, spare_tanks, budget)
-                                                         : Raid::HealSlotOrder(main_tank, off_tank, spare_tanks, budget);
+                                                         : Raid::HealSlotOrder(main_tank, slot_off_tank, spare_tanks, budget);
             // Sticky: a healer keeps its tank while that tank still has a
             // slot for it, so one healer dying doesn't shuffle the rest
             // across the room. Free slots then go to unassigned healers
@@ -2241,6 +2294,57 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                 assign(t, *best, best->loose ? "loose_nearest" : "nearest");
             }
         }
+        // -- A loose mob the encounter ranks above a tank's mob takes that tank ----
+        // Every tank held a Vekniss Hatchling (priority 5) when a Spawn of Fankriss (priority 6) came in on a healer: it stayed loose
+        // 14 s, enraged (15-25 s after its engage) and hit for 9-21k (aq40_fankriss af52 sweep 1: Spawn 654 engaged 08:54:29, taken
+        // 08:54:43 only when Fankriss himself freed a tank). The tank in reach holding the lowest-ranked mob drops it for the loose
+        // one; the dropped mob goes back to the pool. A boss, a mob the rules give the second tank, a kill mark and a symbol tank
+        // keep their tank, and the swap never runs between equal ranks, so it cannot go back and forth.
+        if (Raid::RaidRules const* const prio_rules = Raid::RulesForMap(map_id))
+        {
+            auto prio_of = [&](Mob const& m) -> int
+            {
+                float const pct = m.u->max_hp > 0 ? 100.0f * float(m.u->hp) / float(m.u->max_hp) : -1.0f;
+                return Raid::PriorityFor(*prio_rules, m.u->entry, pct);
+            };
+            for (auto const& m : mobs)
+            {
+                if (!m.loose || is_taken(m.u->guid) || cc_owned(m) || Raid::NoTank(map_id, m.u->entry) || m.u->is_dungeon_boss ||
+                    m.u->is_boss_rank)
+                    continue;
+                int const want = prio_of(m);
+                if (want <= 1) continue;
+                Member const* best = nullptr;
+                int best_prio = want;
+                float best_d2 = kTankAssignRange * kTankAssignRange;
+                for (Member const* t : tanks)
+                {
+                    if (!t->is_bot || !t->alive || user_sym.count(t->guid_low) || raid_forbids(t->guid_low, m.u->guid)) continue;
+                    auto sit = sticky.find(t->guid_low);
+                    if (sit == sticky.end()) continue;
+                    Mob const* held = find_mob(sit->second);
+                    if (!held || held->u->is_dungeon_boss || held->u->is_boss_rank || Raid::OffTankMob(map_id, held->u->entry)) continue;
+                    if (mk_grp && (sit->second == mk_grp->GetTargetIcon(7) || sit->second == mk_grp->GetTargetIcon(6))) continue;
+                    int const have = prio_of(*held);
+                    if (have >= want) continue;
+                    const float dx = m.u->x - t->src->x, dy = m.u->y - t->src->y;
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 > kTankAssignRange * kTankAssignRange) continue;
+                    if (best && (have > best_prio || (have == best_prio && d2 >= best_d2))) continue;
+                    best = t;
+                    best_prio = have;
+                    best_d2 = d2;
+                }
+                if (!best) continue;
+                auto sit = sticky.find(best->guid_low);
+                TC_LOG_INFO("playerbot.v2", "[raid_tank] group={} map={} {} drops {} ({}) for loose {} ({}): priority {} over {}",
+                    group_low, map_id, best->src->name, sit->second.GetEntry(), sit->second.GetCounter(), MobName(m.u->entry),
+                    m.u->guid.GetCounter(), want, best_prio);
+                taken.erase(std::remove(taken.begin(), taken.end(), sit->second), taken.end());
+                sticky.erase(sit);
+                assign(best, m, "outranks");
+            }
+        }
         // -- The owner's skull and cross are held by a tank -----------------------
         // They are the owner's kill calls, and a mob nobody tanks is on a healer or a mage while the raid burns it (n78 Majordomo: the
         // skull moved onto a sheeped Healer, the sheep broke, and no tank took it; then the cross Healer ran loose for 20 s and killed
@@ -2322,7 +2426,9 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                 (boss_c->GetCreatureTemplate()->flags_extra & CREATURE_FLAG_EXTRA_NO_TAUNT) != 0;
             for (Member const* t : tanks)
             {
-                if (!t->is_bot || user_sym.count(t->guid_low)) continue;
+                // Not a tank the raid brain forbids him (a Four Horsemen spare tank waits for its taunt): sent anyway, it took him and dropped
+                // him on the next pass, and took the next one (naxx_horsemen r25: the main tank cycled through all four for 20 s).
+                if (!t->is_bot || user_sym.count(t->guid_low) || raid_forbids(t->guid_low, m.u->guid)) continue;
                 if (by_threat)
                 {
                     Player* tp = ObjectAccessor::FindConnectedPlayer(t->src->guid);
@@ -2369,6 +2475,34 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
         if (!mobs.empty())
         {
             std::vector<NearbyUnit const*> pack;
+            // The encounter's keep-out circles that hold now (RaidRules::keepOut: the zone's enemy alive and fighting, as the raid brain
+            // reads them). A resting mob inside one is no pack mob: the raid never goes there, and its neighbour in the fight does not
+            // bring it (Kel'Thuzad's alcoves: no resting add searches for help, a sent add never calls for it, classic_kt_p1AddAI; each wakes
+            // only for a raider within 30 y). naxx_kelthuzad af52 sweep 1: the three spare tanks were reserved resting Abominations of
+            // the alcoves 51 times and held for them while the sent Abominations and Soul Weavers reached the raid untanked.
+            std::vector<Raid::KeepOut const*> keep_out;
+            if (Raid::RaidRules const* ko_rules = Raid::RulesForMap(map_id))
+                for (Raid::KeepOut const& zone : ko_rules->keepOut)
+                {
+                    bool active = false;
+                    for (auto const& sn : snaps)
+                    {
+                        if (sn->position.map_id != map_id) continue;
+                        for (auto const& u : sn->combat.nearby_enemies)
+                            if (u.entry == zone.enemy && u.hp > 0 && u.unit_in_combat) { active = true; break; }
+                        if (active) break;
+                    }
+                    if (active) keep_out.push_back(&zone);
+                }
+            auto in_keep_out = [&](NearbyUnit const& u) -> Raid::KeepOut const*
+            {
+                for (Raid::KeepOut const* zone : keep_out)
+                {
+                    const float dx = u.x - zone->x, dy = u.y - zone->y;
+                    if (dx * dx + dy * dy <= zone->radius * zone->radius) return zone;
+                }
+                return nullptr;
+            };
             for (auto const& sn : snaps)
             {
                 if (sn->position.map_id != map_id) continue;
@@ -2378,7 +2512,21 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                     // A player's pet is no pack mob: one that reads as an enemy belongs to a raider under a mind control and goes back to
                     // its master's side when the charm ends (bwl_nefarian 1111b: the tanks reserved the warlocks' pets and held for them).
                     if (u.player_owned) continue;
+                    // Nor a creature a raider summoned that never fights: Maexxna's Web Wraps (NearbyUnit::player_summoned).
+                    if (u.player_summoned) continue;
+                    // Nor a neutral creature: it never joins a pull (the Twin Emperors' bugs, NearbyUnit::hostile).
+                    if (!u.hostile) continue;
+                    // Nor an add the DPS burn down (RaidRules::noTank): no tank waits for one (naxx_kelthuzad r25: the spare tanks were
+                    // reserved resting Soldiers of an alcove, marked them with raid icons and held while the sent adds reached the raid).
+                    if (Raid::NoTank(map_id, u.entry)) continue;
                     if (!u.victim.IsEmpty() || find_mob(u.guid) || (u.is_cc_locked && member_of(u.cc_caster))) continue;
+                    if (Raid::KeepOut const* zone = in_keep_out(u))
+                    {
+                        if (RaidLogDue((uint64(u.guid.GetCounter()) << 8) | uint64(RaidLogKind::PackKeepOut), now_ms, 30000u))
+                            TC_LOG_INFO("playerbot.v2", "[raid_tank] group={} map={} {} ({}) rests in a keep-out circle ({:.0f},{:.0f} r {:.0f}): no pack mob",
+                                group_low, map_id, MobName(u.entry), u.guid.GetCounter(), zone->x, zone->y, zone->radius);
+                        continue;
+                    }
                     bool known = false;
                     for (NearbyUnit const* p : pack)
                         if (p->guid == u.guid) { known = true; break; }
@@ -2693,7 +2841,11 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             // A mob the encounter's rules mark "never a DPS target" (Majordomo: he surrenders when the adds die) is no focus, with or
             // without adds engaged this tick.
             Raid::RaidRules const* const focus_rules = Raid::RulesForMap(map_id);
-            auto never_target = [&](NearbyUnit const& u) { return focus_rules && Raid::PriorityFor(*focus_rules, u.entry) < 0; };
+            auto never_target = [&](NearbyUnit const& u)
+            {
+                float const pct = u.max_hp > 0 ? float(int64_t(u.hp) * 100) / float(u.max_hp) : -1.0f;
+                return focus_rules && Raid::PriorityFor(*focus_rules, u.entry, pct) < 0;
+            };
             for (auto const& m : mobs)
             {
                 if (never_target(*m.u)) continue;

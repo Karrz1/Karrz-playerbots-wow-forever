@@ -8,6 +8,7 @@ the real program uses; only nothing is written to the server.
     python bot_bridge_eval.py --model qwen2.5:14b --out results-qwen14b.json
     python bot_bridge_eval.py --model qwen2.5:3b --compare results-qwen14b.json
     python bot_bridge_eval.py --url http://192.168.1.20:11434/v1 --model qwen2.5:14b --runs 3
+    python bot_bridge_eval.py --model qwen2.5:7b --lang ru --runs 3      (only the Russian player's lines)
 
 Each case (bot_bridge_eval_cases.jsonl) is one line a player says to a bot, with what a good answer must do: the right
 language, the right action (or none), words it must or must not say. The score per case is the share of its checks that
@@ -37,6 +38,29 @@ DEFAULT_EVENT = {
 }
 
 
+def server_facts(event):
+    """The "prompt" the server sends with a player's line (BotChatModel.cpp BuildFacts), from the case's own fields, so the
+    test asks the model the way the game does. A case may give its own "prompt"."""
+    p = "You are %s, a level %s %s %s playing World of Warcraft Classic (the original 2004 Azeroth, levels 1-60)." % (
+        event.get("bot", "the bot"), event.get("level", "?"), str(event.get("race", "")).lower(), str(event.get("class", "adventurer")).lower())
+    if event.get("area") or event.get("zone"):
+        p += " You are in %s." % (event.get("area") or event.get("zone"))
+    if event.get("doing"):
+        p += " Right now you are %s." % event["doing"]
+    who = event.get("from", "someone")
+    channel = event.get("channel", "whisper")
+    known = bool(event.get("from_is_owner")) or channel in ("party", "raid")
+    if channel == "whisper":
+        p += " %s%s whispers you." % (who, ", who is in your group," if known else ", a player you don't know,")
+    elif channel == "raid":
+        p += " You are in a raid group and %s says something in raid chat." % who
+    elif channel == "party":
+        p += " You are in a party and %s says something in party chat." % who
+    else:
+        p += " %s is standing next to you and says something to you out loud." % who
+    return p
+
+
 def load_program(path):
     spec = importlib.util.spec_from_file_location("bot_bridge_ollama", path)
     mod = importlib.util.module_from_spec(spec)
@@ -56,6 +80,14 @@ def load_cases(path):
             except ValueError as e:
                 sys.exit("%s line %d: %s" % (path, n, e))
     return cases
+
+
+def case_lang(case):
+    """The language of the player in a case: a Russian client (or a line in Russian) is ru, everything else en."""
+    event = case.get("event", {})
+    if str(event.get("locale", "")).lower() == "ruru" or case.get("expect", {}).get("lang") == "ru":
+        return "ru"
+    return "en"
 
 
 def has_word(say, word):
@@ -100,6 +132,8 @@ def main():
     ap.add_argument("--cases", default=os.path.join(HERE, "bot_bridge_eval_cases.jsonl"))
     ap.add_argument("--program", default=os.path.join(HERE, "bot_bridge_ollama.py"))
     ap.add_argument("--only", default="", help="only cases whose id or category starts with this")
+    ap.add_argument("--lang", default="", choices=["", "en", "ru"],
+                    help="only the cases of a player of this language (ru: a ruRU client or a line that wants Russian)")
     ap.add_argument("--out", default="", help="result file (default eval-<model>-<date>.json here)")
     ap.add_argument("--compare", default="", help="an earlier result file: cases that got worse are listed")
     ap.add_argument("--think", action="store_true")
@@ -110,7 +144,8 @@ def main():
     api.no_think = not opts.think
     if not api.check():
         sys.exit("No model service at %s (start Ollama, or give --url)." % opts.url)
-    cases = [c for c in load_cases(opts.cases) if not opts.only or c["id"].startswith(opts.only) or c.get("cat", "").startswith(opts.only)]
+    cases = [c for c in load_cases(opts.cases) if (not opts.only or c["id"].startswith(opts.only) or c.get("cat", "").startswith(opts.only))
+             and (not opts.lang or case_lang(c) == opts.lang)]
     folder = tempfile.mkdtemp(prefix="bot-eval-")
     minds = b.Minds(os.path.join(folder, "minds"))
     replies = []
@@ -125,6 +160,7 @@ def main():
                 b.history.clear()
             b.player_russian.clear()
             event = dict(DEFAULT_EVENT, **case["event"])
+            event.setdefault("prompt", server_facts(event))
             event.update({"id": len(results) + 1, "_seen": time.time(), "_folder": folder})
             replies.clear()
             t0 = time.time()
@@ -149,7 +185,7 @@ def main():
     for r in results:
         by_cat.setdefault(r["cat"], []).append(r["score"])
     times.sort()
-    summary = {"model": opts.model, "url": opts.url, "date": time.strftime("%Y-%m-%d %H:%M"), "cases": len(cases), "runs": opts.runs,
+    summary = {"model": opts.model, "url": opts.url, "lang": opts.lang or "all", "date": time.strftime("%Y-%m-%d %H:%M"), "cases": len(cases), "runs": opts.runs,
                "score": round(100 * total / n, 1), "median_s": round(times[len(times) // 2], 2) if times else 0,
                "slowest_s": round(times[-1], 2) if times else 0,
                "by_category": {k: round(100 * sum(v) / len(v), 1) for k, v in sorted(by_cat.items())}}

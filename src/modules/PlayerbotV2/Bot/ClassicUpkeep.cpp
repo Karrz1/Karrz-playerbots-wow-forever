@@ -1207,6 +1207,12 @@ bool SafeToRecover(BotSnapshotView const& s, GroupSnapshotView const* g)
         if (EnemyBlocksRecovery(ours || !members, Dist2(u.x, u.y, u.z, bx, by, bz)))
             return false;
     }
+    // Nobody sits down inside the reach of a fighting mob's area attack (NearbyUnit::self_aoe_radius, 5 y spare): a drink there is
+    // broken by the first Frost Nova and the drinker stands frozen in it (rol_full af52, The Abandoned).
+    for (NearbyUnit const& u : s.raw().combat.nearby_enemies)
+        if (u.hp > 0 && u.unit_in_combat && u.self_aoe_radius > 0.f &&
+            Dist2(u.x, u.y, u.z, bx, by, bz) < (u.self_aoe_radius + 5.0f) * (u.self_aoe_radius + 5.0f))
+            return false;
     return true;
 }
 
@@ -1423,10 +1429,36 @@ RecoveryPick PickRecovery(BotSnapshotView const& s, int32 start_hp, int32 start_
     return {};
 }
 
+bool CarriesKeptAura(BotSnapshotView const& s)
+{
+    for (AuraEntry const& a : s.raw().auras.own_auras)
+        if (a.is_harmful && Raid::KeepsAura(s.map_id(), a.spell_id))
+            return true;
+    return false;
+}
+
 uint32 PickCombatHealthItem(BotSnapshotView const& s, GroupSnapshotView const& g)
 {
     int32 const hp = s.hp_pct();
-    if (hp > kCombatHealthItemPct || hp <= 0 || s.is_casting() || !ConsumablesAllowed(s))
+    if (hp <= 0 || s.is_casting() || !ConsumablesAllowed(s))
+        return 0;
+    // Loatheb's Inevitable Doom (29204): one tick of 2550 shadow when it runs out (10 s), on the whole raid, first at 2 min and then every
+    // 30 s (15 s after the seventh). His Corrupted Mind leaves each healer one heal a minute, so the raid cannot be topped up before it:
+    // a bot that the tick would kill uses its healthstone or potion in the last seconds, whatever its health in percent (2550 is a third
+    // to a half of a raider's health in Naxxramas). Before 0158 the bots waited for 30% and died to the tick from 40%.
+    if (AuraEntry const* doom = s.find_aura(kInevitableDoom);
+        doom && doom->remaining.count() <= kInevitableDoomItemMs && s.hp() <= kInevitableDoomDamage + kInevitableDoomMargin)
+    {
+        if (CombatConsumableUsedRecently(s))
+            return 0;
+        if (uint32 const stone = BestConsumable(s, ConsumableKind::Healthstone))
+            return stone;
+        return BestConsumable(s, ConsumableKind::HealingPotion);
+    }
+    // Loatheb: each healer has one heal a minute (Corrupted Mind), so a raider does not wait for 30%: naxx_loatheb af40 (1119), the main tank's
+    // potion went at 22% (05:52:52), the 957 it healed was gone in two swings and he died at 05:53:37; at half health it buys a heal's wait.
+    int32 const item_pct = s.current_boss_entry() == kLoathebEntry ? kLoathebHealthItemPct : kCombatHealthItemPct;
+    if (hp > item_pct)
         return 0;
     // A heal is about to land: keep the item unless the bot is critical.
     if (hp > 20 && HealIncoming(s, g))
@@ -2104,6 +2136,7 @@ bool BossFears(uint32 map_id, uint32 creature_entry)
         { 409, 11982 },   // Molten Core: Magmadar (Panic)
         { 469, 11583 },   // Blackwing Lair: Nefarian (Bellowing Roar)
         { 249, 10184 },   // Onyxia's Lair: Onyxia (Bellowing Roar)
+        { 533, 15932 },   // Naxxramas: Gluth (Terrifying Roar every 20 s, 20 y round him)
     };
     for (FearBoss const& b : kFearBosses)
         if (b.map == map_id && b.entry == creature_entry)

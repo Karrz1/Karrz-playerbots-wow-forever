@@ -150,6 +150,16 @@ bool RaidHazardDetour(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emi
 // gap-close, melee gap-close) rejects such a point. Definition in State_Idle.cpp.
 bool RaidStandPointBlocked(BotSnapshotView const& s, float x, float y, float z);
 
+// A fighting mob's area attack around itself reaches (x, y, z): an alive hostile in the bot's scan (attackers + nearby_enemies),
+// in combat, whose NearbyUnit::self_aoe_radius + margin covers the point on the same floor. The mob, or null. Definition in
+// State_Idle.cpp.
+NearbyUnit const* InMobAreaAttack(BotSnapshotView const& s, float x, float y, float z, float margin);
+
+// Out of a fighting mob's area attack ([area_attack_step]): a healer or ranged bot inside the reach of a mob's Frost Nova /
+// Thunderclap (InMobAreaAttack) that is not on it walks out to the edge plus a few yards, staying in reach of its anchor tank.
+// Instances only. True when it emitted a step or holds one under way (caller consumes the tick). Definition in State_Idle.cpp.
+bool AreaAttackStepOut(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit);
+
 // In-fight raid formation: a ranged DPS / healer re-takes its own arc slot behind the anchor tank once the tank has moved it more
 // than a few yards away (the boss pulled back or repositioned). True when it emitted a move or holds one in flight. Definition in
 // State_Idle.cpp.

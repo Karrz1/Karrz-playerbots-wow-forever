@@ -98,12 +98,30 @@ inline int CapitalFactionOfZone(uint32_t zone)
     }
 }
 
+// The faction a zone belongs to: every home (starter) zone, and the border zones that are one faction's (Ashenvale, Stonetalon and
+// Desolace have towns of both and belong to nobody). 1 = Alliance, 2 = Horde, 0 = nobody's.
+inline int OwnerFactionOfZone(uint32_t zone)
+{
+    switch (zone)
+    {
+        case 12: case 1: case 141: case 38: case 40: return 1;    // Elwynn, Dun Morogh, Teldrassil, Loch Modan, Westfall
+        case 148: case 44: case 10: case 11: return 1;           // Darkshore, Redridge, Duskwood, Wetlands
+        case 14: case 215: case 85: case 130: return 2;          // Durotar, Mulgore, Tirisfal, Silverpine
+        case 17: case 8: return 2;                               // Barrens, Swamp of Sorrows
+        default: return 0;
+    }
+}
+
 // Faction of one bot around an anchor standing in `zone`: in a capital it is always the capital's own faction, whoever the anchor is
-// (a Horde player visiting Ironforge meets Alliance bots); elsewhere the zone share relative to the anchor.
+// (a Horde player visiting Ironforge meets Alliance bots). In a zone that belongs to one faction the share (HomeFriendlyPct,
+// BorderFriendlyPct) is of that faction: a Horde player questing in Alliance land met nothing but Horde bots there, because the share
+// followed him (Discord 11-20, 61881: "more Alliance bots in those areas"). Elsewhere the zone share relative to the anchor.
 inline bool BotIsAllianceInZone(uint32_t zone, bool anchor_alliance, uint32_t roll, uint32_t pct)
 {
     if (int const capital = CapitalFactionOfZone(zone))
         return capital == 1;
+    if (int const owner = OwnerFactionOfZone(zone))
+        return BotIsAlliance(owner == 1, roll, pct);
     return BotIsAlliance(anchor_alliance, roll, pct);
 }
 

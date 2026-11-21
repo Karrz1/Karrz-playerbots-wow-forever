@@ -972,6 +972,17 @@ void BotAI::update_group_fight(BotSnapshotView s, GroupSnapshotView g)
 void BotAI::dispatch_primary(BotSnapshotView s, GroupSnapshotView g,
                               BotIntentEmitter& em)
 {
+    attack_log_target_ = ObjectGuid::Empty;
+    dispatch_state(s, g, em);
+    // The rule that started an attack (af52: world bot Beatriz opened on the Light's Hope flight master 12617 out of combat, with the
+    // last rule wander_to_quest_hub / look_at_npc, and died 27 times to the Enraged Gryphons it calls; no log named the attacking rule).
+    if (!attack_log_target_.IsEmpty())
+        TC_LOG_INFO("playerbot.v2", "[attack_rule] {} attacks {} in state {}: rule {}", s.name(), attack_log_target_.ToString(), uint32(state_),
+            rule_fire_seq_ != attack_log_seq_ && last_rule_fired_ ? last_rule_fired_ : "none named");
+}
+
+void BotAI::dispatch_state(BotSnapshotView s, GroupSnapshotView g, BotIntentEmitter& em)
+{
     switch (state_)
     {
         case BotState::LoggingIn:    States::DispatchLoggingIn(*this, s, g, em);    break;
@@ -1140,6 +1151,8 @@ void BotAI::dispatch_layers(BotSnapshotView s, GroupSnapshotView g,
         else if (!s.duel_initiator_is_real() && !s.has_owner_character() && !s.in_group()
                  && V2::TownLife::PactHolds(s.bot_id(), s.duel_initiator().GetCounter(), s.published_at_ms()))
             em.duel_accept();   // another world bot asked for this duel (idle:town_duel)
+        else if (polite && V2::TownLife::PactHolds(s.bot_id(), s.duel_initiator().GetCounter(), s.published_at_ms(), 120000u))
+            em.duel_accept();   // it told this player "sure, send it" a moment ago (BotChatReactor, GitHub #12)
         else if (polite)
         {
             // Answer a moment after the request (0-2 s, per bot), once; the verdict is stable for a minute so a
@@ -1195,8 +1208,10 @@ void BotAI::dispatch_layers(BotSnapshotView s, GroupSnapshotView g,
     {
         // A gift trade from the owner or a player in the bot's own group or raid (gear, potions, money): accepted once he has
         // accepted, see API::trade_with. Gear that is an upgrade is a gift and worn by the auto-equip rules afterwards; anything
-        // else he puts in is bought at the fair price. Everyone else falls to the cases below.
-        em.trade_accept_owner(s.raw().social_events.trade_partner_guid);
+        // else a group mate puts in is bought at the fair price, while everything from the owner is a gift. Everyone else falls
+        // to the cases below.
+        em.trade_accept_owner(s.raw().social_events.trade_partner_guid,
+                              !s.raw().owner_guid.IsEmpty() && s.raw().social_events.trade_partner_guid == s.raw().owner_guid);
     }
     else if (s.has_trade_request() && s.trade_partner_is_real() && !s.has_owner_character() && !s.in_group())
     {

@@ -24,6 +24,9 @@
 #include <unordered_map>
 #include <vector>
 
+class Creature;
+class Unit;
+
 namespace Playerbot::Raid {
 
 class Brain
@@ -120,5 +123,9 @@ private:
 
 // The single instance (owned here so the raid layer stays self-contained).
 Brain& GetBrain();
+
+// How near `who` an idle creature starts its fight on it, between the two edges like Creature::GetAttackDistance (the sight check,
+// IsWithinDistInMap, adds both combat reaches): its script's own sight check where the script has one, else the core's aggro distance.
+float IdleAggroReach(Creature const* creature, Unit const* who);
 
 } // namespace Playerbot::Raid

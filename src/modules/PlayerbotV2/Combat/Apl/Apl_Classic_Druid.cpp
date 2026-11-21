@@ -387,7 +387,8 @@ ApRule const kBalanceRules[] = {
 
 // Cat Form cast from Bear / Moonkin / Travel / Aquatic Form fails NOT_SHAPESHIFT
 // (capture 2026-10-07): leave the other form first, Cat Form follows next tick.
-bool ShouldLeaveWrongFormCat(ApPredicateContext const& ctx) { return WrongFormAura(ctx, WantedForm::Cat) != 0; }
+// Only with Cat Form to go to: without it the cancel leaves the druid in caster form for the whole fight.
+bool ShouldLeaveWrongFormCat(ApPredicateContext const& ctx) { return ctx.bot.knows_spell(CAT_FORM) && WrongFormAura(ctx, WantedForm::Cat) != 0; }
 void DoLeaveWrongFormCat(ApPredicateContext const& ctx, BotIntentEmitter& e) { DoCancelWrongForm(ctx, e, WantedForm::Cat); }
 
 bool ShouldCatForm(ApPredicateContext const& ctx)
@@ -563,12 +564,20 @@ bool BearVictimSecured(ApPredicateContext const& ctx)
     return v->hp <= 0 || k == ThreatVictim::Me || k == ThreatVictim::Tank;
 }
 
+// A bear off the raid's tank roster (PveOrder::raid_dps_tank, a druid without Cat Form: State_InCombat) plays DPS in Bear Form: it takes no
+// mob off anyone, so no taunt, no pick-up of loose mobs and no Faerie Fire spread for threat. The roster tanks and the plan own those.
+bool BearHoldsMobs(ApPredicateContext const& ctx)
+{
+    auto const& po = ctx.bot.raw().pve_order;
+    return !(po.active && po.raid_dps_tank);
+}
+
 // Challenging Roar when 3+ loose attackers are within 10 yd (the owner) - only
 // those no other tank was given, and never with a crowd-controlled mob in
 // reach (TankThreat::AreaTauntWorth).
 bool ShouldChallengingRoar(ApPredicateContext const& ctx)
 {
-    return ctx.bot.in_combat() && InBear(ctx) && Rage(ctx) >= 15 && Ready(ctx, CHALLENGING_ROAR)
+    return BearHoldsMobs(ctx) && ctx.bot.in_combat() && InBear(ctx) && Rage(ctx) >= 15 && Ready(ctx, CHALLENGING_ROAR)
         && TankThreat::AreaTauntWorth(ctx.bot, 10.0f, "Challenging Roar");
 }
 void DoChallengingRoar(ApPredicateContext const& ctx, BotIntentEmitter& e)
@@ -581,7 +590,7 @@ void DoChallengingRoar(ApPredicateContext const& ctx, BotIntentEmitter& e)
 
 bool ShouldGrowl(ApPredicateContext const& ctx)
 {
-    return ctx.bot.in_combat() && InBear(ctx) && Ready(ctx, GROWL) && ctx.bot.taunt_candidate(GrowlRange(ctx)) != nullptr;
+    return BearHoldsMobs(ctx) && ctx.bot.in_combat() && InBear(ctx) && Ready(ctx, GROWL) && ctx.bot.taunt_candidate(GrowlRange(ctx)) != nullptr;
 }
 void DoGrowl(ApPredicateContext const& ctx, BotIntentEmitter& e)
 {
@@ -601,7 +610,7 @@ void DoGrowl(ApPredicateContext const& ctx, BotIntentEmitter& e)
 // attacker and build threat on it (Maul / Swipe below).
 bool ShouldBearPickUpLoose(ApPredicateContext const& ctx)
 {
-    if (!ctx.bot.in_combat() || !InBear(ctx)) return false;
+    if (!BearHoldsMobs(ctx) || !ctx.bot.in_combat() || !InBear(ctx)) return false;
     // An assigned raid mob is always ours to hold; a loose mob only once
     // the current one is secured.
     if (!ctx.bot.assigned_tank_mob() && !BearVictimSecured(ctx)) return false;
@@ -657,10 +666,19 @@ void DoDemoRoar(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(DEMORAL
 // tank's mobs).
 bool ShouldSwipe(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && InBear(ctx) && Rage(ctx) >= 20 && ctx.bot.enemies_within(6.0f) >= 2
-        && Ready(ctx, SWIPE) && ctx.bot.victim_in_spell_range(SWIPE)
-        && AoeSafeAroundSelf(ctx.bot, 8.0f, /*damaging*/ true, /*tank*/ true, "Swipe", SWIPE)
+    if (!HasLiveTarget(ctx) || !InBear(ctx) || ctx.bot.enemies_within(6.0f) < 2)
+        return false;
+    bool const rage = Rage(ctx) >= 20;
+    bool const ready = Ready(ctx, SWIPE);
+    bool const ok = rage && ready && ctx.bot.victim_in_spell_range(SWIPE) && AoeSafeAroundSelf(ctx.bot, 8.0f, /*damaging*/ true, /*tank*/ true, "Swipe", SWIPE)
         && !TankThreat::AoeRipsOtherTank(ctx.bot, 8.0f, "Swipe");
+    // Why a bear with a pack on it did not Swipe: Gluth's druid chow tank held 6-8 chows and cast it once in a run (naxx_gluth 1118 r4).
+    // The safety vetoes log their own lines; this one gives the rage and readiness. One line per bear every 10 s, in instances.
+    if (!ok && ctx.bot.is_in_instance() && ctx.bot.in_combat()
+        && RaidLogDue(RaidLogKey(ctx.bot, RaidLogKind::SwipeSkip), ctx.bot.published_at_ms(), 10000u))
+        TC_LOG_INFO("playerbot.v2", "[raid_tank] {} skips Swipe: {} enemies within 6 y, rage {}, ready {}", ctx.bot.name(),
+                    ctx.bot.enemies_within(6.0f), Rage(ctx), ready ? 1 : 0);
+    return ok;
 }
 // On the victim: Swipe takes an enemy target (its cone is in front of the bear). Sent with none, the casts failed BAD_TARGETS
 // (naxx_gluth 1118 r4 and r6: a BAD_TARGETS on 779 every 10-14 s in every run, no Swipe damage in any pull_spells, the bear's area
@@ -677,7 +695,7 @@ NearbyUnit const* BearSpreadTarget(ApPredicateContext const& ctx)
 }
 bool ShouldBearSpreadFaerieFire(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && InBear(ctx) && Ready(ctx, FAERIE_FIRE_FERAL) && BearSpreadTarget(ctx) != nullptr;
+    return BearHoldsMobs(ctx) && HasLiveTarget(ctx) && InBear(ctx) && Ready(ctx, FAERIE_FIRE_FERAL) && BearSpreadTarget(ctx) != nullptr;
 }
 void DoBearSpreadFaerieFire(ApPredicateContext const& ctx, BotIntentEmitter& e)
 {
@@ -896,7 +914,7 @@ void DoTranquility(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(TRAN
 // the five-second rule).
 bool HealerMayDps(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && ctx.bot.in_combat() && WoundedCount(ctx, 90) == 0 && LowestFriendOrSelf(ctx).hp_pct > 90
+    return HasLiveTarget(ctx) && (ctx.bot.in_combat() || ctx.bot.victim_is_group_target()) && WoundedCount(ctx, 90) == 0 && LowestFriendOrSelf(ctx).hp_pct > 90
         && ClassicHeal::RaidHealerMayDamage(ctx.bot, ctx.group);
 }
 

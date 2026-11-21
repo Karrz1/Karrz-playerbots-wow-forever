@@ -284,7 +284,8 @@ Playerbot.World.MaxLevel = 60
 Playerbot.World.FriendlyPct = 100
 # World PvP mix by zone (Fleet/WorldFactionMix.h): contested zones (Plaguelands, Stranglethorn, Hillsbrad, Arathi, ...) hold a real share
 # of the opposing faction at the player's level; capitals and home zones stay mostly the player's own. Unlisted zones use FriendlyPct.
-# ZoneMix = 0 gives FriendlyPct everywhere.
+# ZoneMix = 0 gives FriendlyPct everywhere. In a zone that is one faction's (home zones; Darkshore, Redridge, Duskwood, Wetlands,
+# Barrens, Swamp of Sorrows) the Home/Border share is of that zone's faction, so a Horde player in Westfall meets Alliance bots.
 Playerbot.World.ZoneMix = 1
 Playerbot.World.CapitalFriendlyPct = 100
 Playerbot.World.HomeFriendlyPct = 100

@@ -28,6 +28,7 @@
 #include "DatabaseEnv.h"
 #include "GameTime.h"
 #include "Item.h"
+#include "MotionMaster.h"
 #include "Group.h"
 #include "Language.h"
 #include "Log.h"
@@ -1246,6 +1247,10 @@ void HandleSelfToggle(uint32 client_seq, WorldSession* sess,
         else if (action == HumanLoginAction::SkipThisLogin)
             Services::Lifecycle().unmark_as_bot_transient(id);
         Services::Owners().ClearOwner(id);
+        // The bot logic's last move (a path to a quest giver, a follow, a chase) is a server spline the client cannot steer out of:
+        // it kept the character for up to a minute after `off` (Discord 11-20, Oxide). Stop it before handing control back.
+        me->GetMotionMaster()->Clear();
+        me->StopMoving();
         // Return movement control to the WoW client — the human takes
         // the wheel back. Pairs with the on-branch SetClientControl.
         me->SetClientControl(me, true);
@@ -1774,8 +1779,15 @@ bool OnAddonWhisper(Player* sender, Player* /*receiver*/,
         // LOGIN_REQ/LOGOUT_REQ are whitelisted alongside SUMMON: an account
         // with zero owned bots may still log a same-account marked alt in or
         // out (the handlers enforce same-account/ownership themselves).
+        // ROSTER_REQ too: it lists only the sender's own bots, so an account
+        // without any gets an empty roster ("0 bots") instead of silence. Dropped,
+        // the "Your bots" window said "No answer from the server (timeout)"
+        // while bots played on in the player's group (Seniron, Discord
+        // 2026-11-20, two players on one home server: most likely the bots
+        // belong to the other player's account).
         auto owned = Services::Owners().BotsOwnedBy(sess->GetAccountId());
         if (owned.empty()
+            && mtype != "ROSTER_REQ"
             && mtype != "ALTS_REQ"
             && mtype != "SUMMON"
             && mtype != "LOGIN_REQ"

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <deque>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <array>
 #include <initializer_list>
@@ -52,6 +53,10 @@ struct ScenarioRoutePoint
     // leg begins; he goes there at the swim z (lake_swim). hold_s: once the squad is with him he stays this long before going on.
     bool water = false;
     std::uint32_t hold_s = 0;
+    // attack_entry: once he is at the point with the squad, he selects the nearest living creature of this entry within 80 y, says
+    // "attack" as a player does and fights it; the leg goes on when it is dead. Every 5 s of the fight each member's state is logged
+    // ([scenario_water_fight]); no kill in 90 s fails the run (vile_reef_fight). 0 = no fight.
+    std::uint32_t attack_entry = 0;
 };
 
 struct ScenarioCheckpoint
@@ -95,6 +100,12 @@ struct ScenarioDef
     std::uint8_t resist_school = 0;
     // A piece every raider wears for the fight whatever it scores (the Onyxia Scale Cloak against the drakes' Shadow Flame); 0 = none.
     std::uint32_t wear_entry = 0;
+    // An item the tank carries into the run, as a party that has done the dungeon's key quest or an earlier wing comes with it; 0 = none.
+    // A dungeon door key: The Scarlet Key (7146, Doan's Strongbox in the Library) for Herod's Door, the Chapel Door and Stratholme's
+    // Scarlet Bastion, the Key to the City for Stratholme's gates, the Shadowforge Key, the Skeleton Key, the Staff of Prehistoria. A
+    // party without it stops at the door, as players do; the bot that carries it opens the door (BotSnapshotBuilder KeyForShutDoor).
+    // carry_entry_b: a second item, carried the same way (Blackrock Depths: the Shadowforge Torch for the Lyceum's braziers).
+    std::uint32_t carry_entry = 0, carry_entry_b = 0;
     // Staging kills every hostile on the map but the goal boss, its formation and these entries (the boss's own adds); 0 = none.
     std::uint32_t keep_entry = 0;
     std::uint32_t keep_entry_b = 0, keep_entry_c = 0;
@@ -111,6 +122,12 @@ struct ScenarioDef
     std::uint32_t order_delay_ms = 0;
     // A whole-dungeon clear to the last boss: long, so `runall` with no filter leaves it out (`runall full` or `run <name>` starts it).
     bool full_clear = false;
+    // A whole-dungeon clear whose bosses can fall in any order: the goal is reached when the goal boss and every checkpoint boss are
+    // dead, not at the goal boss's death. The Scarlet Monastery Cathedral: Mograine and Whitemane are one fight (she raises him at
+    // half health, either can fall last), and the hall's trash, fleeing, brings Mograine on before the tank has been to Fairbanks
+    // behind the secret door (smcathedral_full af56: Whitemane fell at 1554 s with Mograine back up and Fairbanks not yet visited,
+    // the run ended there and failed both as skipped). false = the goal boss's death ends the run.
+    bool goal_after_checkpoints = false;
     // The damage_parity family (goal Parity): which measurement (Parity::Kind: 1 damage legs, 2 finisher sweep, 3 talent audit) and how long a
     // damage leg measures. 0 = not a parity scenario.
     std::uint8_t parity = 0;
@@ -141,6 +158,12 @@ struct ScenarioDef
     // script despawns him the moment he spawns): when the attack is due the main tank sends it, and the attack waits for the boss to
     // be alive within 400 y (up to 30 s). 0 = none.
     std::uint32_t start_event = 0;
+    // A goal boss that a creature of the room summons when a player comes near it (Ouro's Spawner 15957 casts Summon Ouro 26061 on a player
+    // within 25 y; Ouro has no spawn row): the raid is placed from the summoner's spawn as from a boss's, staging leaves the summoner alive,
+    // and when the attack is due the summoner casts summoner_spell, as its script does when the main tank walks up, and the attack waits
+    // for the boss (up to 30 s). 0 = none.
+    std::uint32_t summoner_entry = 0;
+    std::uint32_t summoner_spell = 0;
     // A fight the raid opens on one of the boss's adds (Bloodlord Mandokir waits on his raptor, immune, until his Vilebranch Speaker dies):
     // when the attack is due and a living one stands within 400 y of the main tank, the order is onto the nearest one instead of the boss.
     // The goal stays the boss's death. 0 = the order is onto the boss.
@@ -155,6 +178,17 @@ struct ScenarioDef
     std::uint8_t start_gossip_steps = 0;
     std::int32_t start_npc_action = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> start_instance_data;
+    // A boss whose way in a raid opens on its way there (Thaddius: Gluth's death unlocks his door, 181121, and the first raider at it opens
+    // it): once the trash is cleared and before the landing, the instance gets entry_instance_data (SetData type, value: the earlier bosses'
+    // deaths, which the clearing's despawns never report), then the door entry_door nearest the landing is opened, as that raider
+    // does. Without it the door stays shut and locked, and a route through it is no route (bot paths are kept clear of closed doors).
+    // Empty / 0 = none.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> entry_instance_data;
+    std::uint32_t entry_door = 0;
+    // A fight of several bosses pulled together, each by its own tank (the Four Horsemen): at the attack order the next tanks are sent onto
+    // the kept companions (keep_entry, keep_entry_b, keep_entry_c) with the main tank, one each, as a raid's tanks charge together. false =
+    // the main tank opens alone.
+    bool open_each = false;
     // A goal boss the fight summons later (Nefarian, once 40 drakonids of Victor Nefarius's phase 1 are dead): after the start above the raid
     // fights on its own, with no Hold, and the attack order waits up to this long for the boss to be alive. 0 = the boss is there at the order.
     std::uint32_t goal_wait_ms = 0;
@@ -223,12 +257,12 @@ inline constexpr DungeonRow kDungeons[] = {
     { "smlibrary_loksey36",   "Scarlet Monastery Library: level 36 party to Houndmaster Loksey", 189, 253.672f, -206.624f, 18.6773f, 270.f, 36, 3974, "Houndmaster Loksey", 20 },
     { "smarmory_herod",       "Scarlet Monastery Armory: level 36 party to Herod",         189,  1608.1f,   -318.919f,   18.6714f, 270.f, 36,  3975, "Herod",              25 },
     { "smcathedral_mograine", "Scarlet Monastery Cathedral: level 38 party to Mograine",   189,   853.179f, 1319.18f,    18.6714f,  90.f, 38,  3976, "Scarlet Commander Mograine", 25 },
-    // The Drowned City (Forever, map 2970), built without a sniff (2026_11_11_30: every spawn spot INFERRED): the cave landing (world_safe_locs
-    // 1104120) to the first boss up the climb.
+    // The Drowned City (Forever, map 2970; the spawns are the live kill spots of 2026_11_19_67): the cave landing (world_safe_locs 1104120)
+    // to the first boss up the climb.
     { "dc_zulalai",           "The Drowned City: level 38 party to Zul'Alai",            2970, -13296.7f, 2232.3f, -47.5f, 91.f, 38, 258905, "Zul'Alai",           25 },
     { "rfd_glutton",          "Razorfen Downs: level 40 party to Glutton",                 129,  2593.68f,   1111.23f,    50.9518f, 270.f, 40,  8567, "Glutton",            25 },
-    // Krol'dok Stronghold (Forever, map 3039), built without a sniff (2026_11_11_33: every spawn spot INFERRED, the trash PLACEHOLDER): the cave
-    // landing (world_safe_locs 1104122) to the first boss on the walk up.
+    // Krol'dok Stronghold (Forever, map 3039; the trash and its spots are the live ones of 2026_11_19_66): the cave landing (world_safe_locs
+    // 1104122) to the first boss on the walk up.
     { "kroldok_grox",         "Krol'dok Stronghold: level 43 party to Slavecrusher Grox", 3039, -7659.97f, -3713.1f, 157.51f, 18.f, 43, 258966, "Slavecrusher Grox", 25 },
     { "uldaman_revelosh",     "Uldaman: level 44 party to Revelosh",                       70,   -228.859f,    46.1018f,  -46.0186f,  90.f, 44,  6910, "Revelosh",           20 },
     { "maraudon_noxxion",     "Maraudon (orange): level 46 party to Noxxion",              349,  1016.83f,  -458.52f,   -43.4737f, 360.f, 46, 13282, "Noxxion",            25 },
@@ -291,6 +325,40 @@ inline constexpr RaidRow kMcRaid[] = {
     { "Mcshad",   ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Dps,    2 },
 };
 
+// The Four Horsemen take eight tanks, as a Classic raid brings: each horseman's tank hands him over at three marks to one that does not
+// carry his mark (RaidRules::tankSwap), and with four tanks there is never a free one, so each tank stacked its own horseman's mark (and
+// its neighbour's) until it died. Four of the melee DPS (warriors and the Retribution paladin) stay home; the rest is the Molten Core raid.
+inline constexpr RaidRow kHorsemenRaid[] = {
+    { "Mctankw",  ScnRace::Human,    ScnClass::Warrior, ScenarioRoleKind::Tank,   6 },
+    { "Mctankd",  ScnRace::NightElf, ScnClass::Druid,   ScenarioRoleKind::Tank,   2 },
+    { "Mcheals",  ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Healer, 5 },
+    { "Mchealp",  ScnRace::Human,    ScnClass::Paladin, ScenarioRoleKind::Healer, 4 },
+    { "Mchealdr", ScnRace::NightElf, ScnClass::Druid,   ScenarioRoleKind::Healer, 3 },
+    { "Mcmage",   ScnRace::Human,    ScnClass::Mage,    ScenarioRoleKind::Dps,    5 },
+    { "Mclock",   ScnRace::Human,    ScnClass::Warlock, ScenarioRoleKind::Dps,    5 },
+    { "Mcrogue",  ScnRace::Human,    ScnClass::Rogue,   ScenarioRoleKind::Dps,    4 },
+    { "Mchunt",   ScnRace::Dwarf,    ScnClass::Hunter,  ScenarioRoleKind::Dps,    4 },
+    { "Mcshad",   ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Dps,    2 },
+};
+
+// Loatheb's Corrupted Mind leaves each healer one heal a minute, so a Classic raid brought 14-16 healers for him. With the Molten Core
+// raid's 12 healers (one heal every 5 s at best, about 600 healing a second) his melee (5491-7280 every 1.48 s, vanilla data) killed the
+// tanks one after another (naxx_loatheb af38-af40, 1119). Two more holy priests and a restoration druid take the places of the two shadow
+// priests and a warlock: 4 tanks, 15 healers, 21 DPS.
+inline constexpr RaidRow kLoathebRaid[] = {
+    { "Mctankw",  ScnRace::Human,    ScnClass::Warrior, ScenarioRoleKind::Tank,   3 },
+    { "Mctankd",  ScnRace::NightElf, ScnClass::Druid,   ScenarioRoleKind::Tank,   1 },
+    { "Mcheals",  ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Healer, 7 },
+    { "Mchealp",  ScnRace::Human,    ScnClass::Paladin, ScenarioRoleKind::Healer, 4 },
+    { "Mchealdr", ScnRace::NightElf, ScnClass::Druid,   ScenarioRoleKind::Healer, 4 },
+    { "Mcmage",   ScnRace::Human,    ScnClass::Mage,    ScenarioRoleKind::Dps,    5 },
+    { "Mclock",   ScnRace::Human,    ScnClass::Warlock, ScenarioRoleKind::Dps,    4 },
+    { "Mcrogue",  ScnRace::Human,    ScnClass::Rogue,   ScenarioRoleKind::Dps,    4 },
+    { "Mchunt",   ScnRace::Dwarf,    ScnClass::Hunter,  ScenarioRoleKind::Dps,    4 },
+    { "Mcwarr",   ScnRace::Dwarf,    ScnClass::Warrior, ScenarioRoleKind::Dps,    3 },
+    { "Mcret",    ScnRace::Human,    ScnClass::Paladin, ScenarioRoleKind::Dps,    1 },
+};
+
 inline std::vector<ScenarioMember> RaidSquad(RaidRow const* rows, std::size_t n)
 {
     std::vector<ScenarioMember> squad;
@@ -319,6 +387,8 @@ struct RaidBossRow
     std::uint32_t wear_entry = 0;       // see ScenarioDef::wear_entry
     std::uint32_t start_object = 0;     // see ScenarioDef::start_object
     std::uint32_t start_event = 0;      // see ScenarioDef::start_event
+    std::uint32_t summoner_entry = 0;   // see ScenarioDef::summoner_entry
+    std::uint32_t summoner_spell = 0;
     std::uint32_t start_add = 0;        // see ScenarioDef::start_add
     float clear_formation_beyond = 0.f; // see ScenarioDef::clear_formation_beyond
     float stage_x = 0.f, stage_y = 0.f, stage_z = 0.f;   // a listed landing spot instead of the ring search; see ScenarioDef::stage_x
@@ -326,6 +396,12 @@ struct RaidBossRow
     // The instance data of the bosses a raid kills before this one (SetData type, value), set at the attack: see ScenarioDef::start_instance_data.
     std::array<std::pair<std::uint32_t, std::uint32_t>, 8> start_data{};
     std::uint8_t start_data_n = 0;
+    // The way in a raid opens before this boss (SetData type, value, set before the landing, and a door it opens): see
+    // ScenarioDef::entry_instance_data.
+    std::array<std::pair<std::uint32_t, std::uint32_t>, 4> entry_data{};
+    std::uint8_t entry_data_n = 0;
+    std::uint32_t entry_door = 0;
+    bool open_each = false;             // see ScenarioDef::open_each
 };
 
 // A row whose fight keeps two or three kinds of creature alive (the bug trio, the Four Horsemen): the extra ones, without spelling out
@@ -378,6 +454,14 @@ constexpr RaidBossRow StartsOnEvent(RaidBossRow r, std::uint32_t event_id)
     return r;
 }
 
+// A row whose boss a creature of the room summons when a player comes near (ScenarioDef::summoner_entry): Ouro's Spawner.
+constexpr RaidBossRow SummonedBy(RaidBossRow r, std::uint32_t summoner_entry, std::uint32_t summoner_spell)
+{
+    r.summoner_entry = summoner_entry;
+    r.summoner_spell = summoner_spell;
+    return r;
+}
+
 // A row whose fight the raid opens on one of the boss's adds (ScenarioDef::start_add): Mandokir's Vilebranch Speaker.
 constexpr RaidBossRow OpensOn(RaidBossRow r, std::uint32_t add_entry)
 {
@@ -414,6 +498,24 @@ constexpr RaidBossRow After(RaidBossRow r, std::initializer_list<std::pair<std::
     for (auto const& d : data)
         if (r.start_data_n < r.start_data.size())
             r.start_data[r.start_data_n++] = d;
+    return r;
+}
+
+// A row whose way in a raid opens on its way there (ScenarioDef::entry_instance_data): the earlier bosses' deaths, set before the landing,
+// and the door then opened. Thaddius: Gluth's death unlocks his door.
+constexpr RaidBossRow ComesThrough(RaidBossRow r, std::uint32_t door_entry, std::initializer_list<std::pair<std::uint32_t, std::uint32_t>> data)
+{
+    r.entry_door = door_entry;
+    for (auto const& d : data)
+        if (r.entry_data_n < r.entry_data.size())
+            r.entry_data[r.entry_data_n++] = d;
+    return r;
+}
+
+// A row whose boss and kept companions are each opened by a tank of its own at the order (ScenarioDef::open_each): the Four Horsemen.
+constexpr RaidBossRow OpensEach(RaidBossRow r)
+{
+    r.open_each = true;
     return r;
 }
 
@@ -483,11 +585,16 @@ inline ScenarioDef MakeRaidScenario(RaidBossRow const& r, RaidEntrance const& e,
     d.wear_entry = r.wear_entry;
     d.start_object = r.start_object;
     d.start_event = r.start_event;
+    d.summoner_entry = r.summoner_entry;
+    d.summoner_spell = r.summoner_spell;
     d.start_add = r.start_add;
     d.clear_formation_beyond = r.clear_formation_beyond;
     d.stage_x = r.stage_x; d.stage_y = r.stage_y; d.stage_z = r.stage_z;
     d.route_x = r.route_x; d.route_y = r.route_y; d.route_z = r.route_z;
     d.start_instance_data.assign(r.start_data.begin(), r.start_data.begin() + r.start_data_n);
+    d.entry_instance_data.assign(r.entry_data.begin(), r.entry_data.begin() + r.entry_data_n);
+    d.entry_door = r.entry_door;
+    d.open_each = r.open_each;
     d.order_attack = true;
     d.order_delay_ms = 20000;
     return d;
@@ -705,12 +812,18 @@ inline constexpr RaidBossRow kAq40Bosses[] = {
     Sight({ "aq40_fankriss", "Temple of Ahn'Qiraj: 40 level 60 raiders to Fankriss the Unyielding (Mortal Wound tank swap, spawns, hatchlings)",
       15510, "Fankriss the Unyielding", 20 }, 108.f),   // sees 100 y
     // Viscidus's Poison Shock and Poison Bolt Volley are nature: the other nature resistance fight of the temple.
-    Resist(Sight({ "aq40_viscidus", "Temple of Ahn'Qiraj: 40 level 60 raiders to Viscidus (frost to freeze, melee to shatter, globs, toxin clouds)",
-      15299, "Viscidus",               25 }, 103.f), ScnSchool::Nature),   // sees 95 y
+    // He takes anyone within 95 y (no line of sight needed), and his whole room is nearer than that: the ring search's spots 99-115 y out all
+    // lay beyond its walls (aq40_viscidus af52 sweep 1: 160 spots, none with floor). The raid waits on the ledge at the room's north end,
+    // where the ramp from the tunnel comes in, 110 y from him (vmaps 0531: floor -25.3), a straight 110 y walk down to him.
+    Staged(Resist(Sight({ "aq40_viscidus", "Temple of Ahn'Qiraj: 40 level 60 raiders to Viscidus (frost to freeze, melee to shatter, globs, toxin clouds)",
+      15299, "Viscidus",               25 }, 103.f), ScnSchool::Nature), -7990.0f, 1035.0f, -25.3f),   // sees 95 y
     Resist(Sight({ "aq40_huhuran", "Temple of Ahn'Qiraj: 40 level 60 raiders to Princess Huhuran (Frenzy tranquilized, Noxious Poison, the 30% volley)",
       15509, "Princess Huhuran",       20 }, 88.f), ScnSchool::Nature),   // sees 80 y, no line of sight needed; worn in nature resistance
     { "aq40_twins",    "Temple of Ahn'Qiraj: 40 level 60 raiders to the Twin Emperors (physical on Vek'nilash, casters on Vek'lor, teleports)",
       15275, "Emperor Vek'nilash",   25, 15276 },   // Emperor Vek'lor
+    // Ouro has no spawn row: his Spawner (15957) summons him (26061) when a player comes within 25 y, and he comes up in combat with the raid.
+    SummonedBy({ "aq40_ouro", "Temple of Ahn'Qiraj: 40 level 60 raiders to Ouro (Sweep, Sand Blast on the tank, submerge and the dirt mounds, scarabs, Berserk)",
+      15517, "Ouro",                   20 }, 15957, 26061),
     { "aq40_cthun",    "Temple of Ahn'Qiraj: 40 level 60 raiders to C'Thun (the eye and Dark Glare, tentacles, the stomach)",
       15727, "C'Thun",                 30 },
 };
@@ -734,8 +847,10 @@ inline constexpr RaidBossRow kNaxxBosses[] = {
       15936, "Heigan the Unclean",     20 },
     { "naxx_loatheb",    "Naxxramas: 40 level 60 raiders to Loatheb (spores, Corrupted Mind heal rotation)",
       16011, "Loatheb",                25 },
-    { "naxx_razuvious",  "Naxxramas: 40 level 60 raiders to Instructor Razuvious (priests control the understudies that tank him)",
-      16061, "Instructor Razuvious",   20, 16803 },   // Deathknight Understudy
+    // The fight opens on a priest's Mind Control on an understudy (RaidMechanics_Naxx.cpp, NaxxPrePullRazuvious); the main tank's order is
+    // onto a free understudy, never onto him: he kills a raid tank in 3 s (naxx_razuvious r22).
+    OpensOn({ "naxx_razuvious",  "Naxxramas: 40 level 60 raiders to Instructor Razuvious (priests control the understudies that tank him)",
+      16061, "Instructor Razuvious",   20, 16803 }, 16803),   // Deathknight Understudy
     // Gothik stands on his balcony (2642.1,-3387.0,285.5); his room's floor, where the combat gate stands (2692.07,-3360.78,267.5), is 18 y
     // below it. The ring search landed the raid at the balcony's height (2670.9,-3359.2,285.8, naxx-data-1114a), where the raid brain's
     // side split does not count it in the room: no split, and he reset at his first speech for fewer than 10 players on a side (naxx21,
@@ -744,8 +859,13 @@ inline constexpr RaidBossRow kNaxxBosses[] = {
     // (GothAnchor's first try): the way half the raid walks before the pull.
     RoutesTo(Staged({ "naxx_gothik",     "Naxxramas: 40 level 60 raiders to Gothik the Harvester (the side split, waves, the gate, teleports)",
       16060, "Gothik the Harvester",   25 }, 2691.2f, -3387.0f, 267.7f), 2692.1f, -3342.8f, 267.5f),
-    Sight(Keeps({ "naxx_horsemen", "Naxxramas: 40 level 60 raiders to the Four Horsemen (marks, the tank rotation, Void Zones, Meteor)",
-      16062, "Highlord Mograine", 25, 16063 }, 16064, 16065), 83.f),   // Zeliek, Korth'azz, Blaumeux; they see 75 y
+    // The four stand together in the middle of the room (Mograine's spawn 2524.3,-2951.3) and run at whoever is hit first. With only the
+    // main tank opening from the landing (2573,-3018, the Korth'azz/Mograine side) all four came to the raid there, and Blaumeux and Zeliek
+    // were dragged 100-117 y back across the room to their corners: at 18 s both still stood in the middle of the raid, Zeliek loose on a
+    // healer, and by the third mark most raiders carried stacks of three or four horsemen (af54 r2-2: 27 of 40 deaths to marks 4 and 5).
+    // Each horseman's own tank opens on him, as a raid's four tanks charge together, and drags him the 54-69 y from the middle to his corner.
+    OpensEach(Sight(Keeps({ "naxx_horsemen", "Naxxramas: 40 level 60 raiders to the Four Horsemen (marks, the tank rotation, Void Zones, Meteor)",
+      16062, "Highlord Mograine", 25, 16063 }, 16064, 16065), 83.f)),   // Zeliek, Korth'azz, Blaumeux; they see 75 y
     // His formation in the world DB spans the hall's trash (Bile Retchers 16018, 16017, 16021, 16029, 3000-3171 x, up to 300 y from him),
     // which the clearing left; it joined the fight on his patrol and Bile Vomit killed 21 (naxx_patchwerk 1114c). Cleared like trash.
     // His walk runs through his room on the raised floor (z 294.1), and no ring spot both sees him and keeps off it: the raid landed out
@@ -757,8 +877,13 @@ inline constexpr RaidBossRow kNaxxBosses[] = {
     // there before he dies. The raid waits at the hall's west end instead, on its own floor (z 294.1): a complete 48.5 y route to his
     // spawn, away from the gate (PC check on the map 533 navmesh, 2026-11-18). It is in his hall, so if his walk reaches it during the
     // hold he is pulled early: watch the first run for that.
+    // It did: his walk (path 800882980) runs west from his spawn through 3257.4,-3230.4, 3 y from that spot, out to 3107,-3145 and back.
+    // naxx_patchwerk sweep-1 (af52): he came through 7 s after the landing, opened on a healer still sitting to eat, killed it and a
+    // priest at 0 s, and was fought at the hall's west end with the healers 21 y off and stuck leaving his circle (most of them at 1-3
+    // heals a minute); 43 died. The raid now waits at the hall's east end (3328,-3232, the ranged and healer posts' floor, z 294.1), 23 y
+    // past the east end of his walk (3305,-3231.8) and 20 y from his spawn: he walks home toward it and the main tank meets him at its post.
     Staged(ClearsFormation({ "naxx_patchwerk",  "Naxxramas: 40 level 60 raiders to Patchwerk (Hateful Strike soaked by three off tanks)",
-      16028, "Patchwerk",              15 }, 20.f), 3260.0f, -3232.0f, 294.1f),
+      16028, "Patchwerk",              15 }, 20.f), 3328.0f, -3232.0f, 294.1f),
     { "naxx_grobbulus",  "Naxxramas: 40 level 60 raiders to Grobbulus (Mutating Injection carrier runs, poison clouds, Slime Spray cone)",
       15931, "Grobbulus",              20 },
     // Gluth sees 49 y (MoveInLineOfSight, classic_boss_gluth.cpp) from his spawn 3283.1,-3157.0 in the middle of his room. The raid lands
@@ -772,8 +897,13 @@ inline constexpr RaidBossRow kNaxxBosses[] = {
     // (Thaddius Door 3421.9,-3017.5,295.6): the ring search landed it on his own walkway, which the slime pit and a 15 y wall cut off from
     // both add platforms (1115c: no path up, 0/5 killed). From the door both platforms are a walk (103 y to Stalagg's), and the raid brain
     // splits the raid onto them before the pull (RaidMechanics_Naxx.cpp, Thaddius).
-    Staged(OpensOn(Keeps({ "naxx_thaddius", "Naxxramas: 40 level 60 raiders to Thaddius (Stalagg and Feugen first, Static Field, Polarity Shift sides)",
-      15928, "Thaddius", 25, 15929 }, 15930), 15929), 3421.9f, -3017.5f, 295.6f),   // Stalagg, Feugen
+    // That spot is the door itself (Thaddius Door 181121, world DB state closed): it stays shut and locked until Gluth is dead
+    // (classic_instance_naxxramas.cpp, UpdateManualDoor on TYPE_GLUTH 11), and the clearing despawns Gluth without a death. With bot paths
+    // kept clear of closed doors, af54 r2-1/r2-2 failed their setup at 0 s, Stalagg up on his platform: "no walkable route to the creature
+    // (path type 0x8, length 89 y for 87 y straight)", where the map 533 navmesh has a complete 101 y route. Gluth is set dead and the
+    // door opened, as a raid coming from Gluth's room finds it.
+    Staged(ComesThrough(OpensOn(Keeps({ "naxx_thaddius", "Naxxramas: 40 level 60 raiders to Thaddius (Stalagg and Feugen first, Static Field, Polarity Shift sides)",
+      15928, "Thaddius", 25, 15929 }, 15930), 15929), 181121, { { 11u, 3u } }), 3421.9f, -3017.5f, 295.6f),   // Stalagg, Feugen; Gluth DONE
     // Sapphiron has no creature row: the instance summons him at his lair once the raid touches his bones (GO_SAPPHIRON_SPAWN, Birth in
     // classic_boss_sapphiron.cpp; EVENT_SPAWN_SAPPHIRON at aSapphPositions, classic_naxxramas.h). The runner summons him there, as for
     // Ragnaros. Frost Aura (28529) on the whole raid, Life Drain, Blizzard, Cleave and Tail Sweep on the ground, then the air phase every 40 s
@@ -798,8 +928,11 @@ inline ScenarioDef MakeNaxxKelThuzadScenario()
     d.start_npc_action = 1;        // CLASSIC_NAXX_ACTION_KT_START
     // The raid stands in the middle round him, as in Classic, away from the alcoves: placed by the ring search 40 y out (3707,-5104), it
     // stood within reach of an alcove's resting Soldiers, pulled them at 3 s and lost 33 raiders to their Dark Blast by 12 s
-    // (naxx_kelthuzad 1114c). He is immune and passive in phase 1, so 10 y from him is safe; same floor (z 142).
-    d.stage_x = 3736.4f; d.stage_y = -5113.4f; d.stage_z = 142.0f;
+    // (naxx_kelthuzad 1114c). He is immune and passive in phase 1; same floor (z 142).
+    // The middle is the room's, not his: he sits at 3746,-5113, 46 y from the east and south-east alcoves, and the old landing beside him
+    // (3736,-5113) was 48 y from one and 52 y from another, against the 62-64 y every alcove keeps from the room's middle, the pull portal at
+    // 3716,-5107 (classic_boss_kelthuzad.cpp ktPullPortal, ktAlcoves). The raid lands 4 y east of the portal (60-68 y from the alcoves), which despawns 7 s in.
+    d.stage_x = 3720.4f; d.stage_y = -5107.8f; d.stage_z = 142.0f;
     d.goal_wait_ms = 8u * 60u * 1000u;   // phase 2 opens 5:35 after the start
     return d;
 }
@@ -818,7 +951,10 @@ inline std::vector<ScenarioDef> MakeOtherRaidScenarios()
     for (RaidBossRow const& r : kAq40Bosses)
         v.push_back(MakeRaidScenario(r, kAq40Entrance, squad40()));
     for (RaidBossRow const& r : kNaxxBosses)
-        v.push_back(MakeRaidScenario(r, kNaxxEntrance, squad40()));
+        v.push_back(MakeRaidScenario(r, kNaxxEntrance, std::string_view(r.name) == "naxx_horsemen"
+                                                           ? RaidSquad(kHorsemenRaid, sizeof(kHorsemenRaid) / sizeof(kHorsemenRaid[0]))
+                                                           : std::string_view(r.name) == "naxx_loatheb"
+                                                           ? RaidSquad(kLoathebRaid, sizeof(kLoathebRaid) / sizeof(kLoathebRaid[0])) : squad40()));
     v.push_back(MakeNaxxKelThuzadScenario());
     return v;
 }
@@ -1055,6 +1191,41 @@ inline ScenarioDef MakeLakeSwimScenario()
     return d;
 }
 
+// ---- vile_reef_fight: an ordered fight under water (Discord 2026-11-16, Gefest: at the Vile Reef in Stranglethorn, "when given the
+// command to attack, the companions freeze") ----
+// The squad lands on the water above the Vile Reef. The rogue leads like a player: he swims down into the deep water, and once the squad is
+// with him he selects the nearest Saltscale Warrior (871, on the reef at 55-75 y under the surface), says "attack" and fights it, then a
+// second one. Every member must fight: the [scenario_water_fight] lines show each one's distance, swim flag, motion and victim every 5 s,
+// and a Saltscale left alive 90 s after the order fails the run. The water check of lake_swim applies (no drowning, no bobbing).
+// Where the squad lands: the open water over the reef (-12200, 640); the deep spot is searched for when the leg begins.
+inline ScenarioDef MakeVileReefFightScenario()
+{
+    ScenarioDef d{};
+    d.name = "vile_reef_fight";
+    d.summary = "Vile Reef: level 45 party ordered onto Saltscale murlocs under water: every bot swims down and fights, none freezes or drowns";
+    d.level = 45;
+    d.squad = StandardParty();
+    d.map = 0;
+    d.x = -12200.f; d.y = 640.f; d.z = 1.f;   // the water's surface over the reef
+    d.o = 0.f;
+    d.goal = ScenarioGoalKind::FollowRoute;
+    d.goal_name = "";
+    d.timeout_ms = 12u * 60u * 1000u;
+    d.limits.expected_map = 0;
+    d.limits.bounds = { true, d.x - 400.f, d.x + 400.f, d.y - 400.f, d.y + 400.f, -150.f, 100.f };
+    d.limits.stray_yards = 200.f;
+    d.limits.idle_ms = 180000;
+    d.limits.stall_ms = 240000;
+    d.limits.water_under_ms = 0;          // a fight on the reef is under water on purpose: breath is the drowning check's job
+    d.limits.water_flips = 6;
+    d.limits.water_noswim_ms = 5000;
+    d.stand_in = "Scnrogue";
+    d.player_lead = true;
+    d.route = { { "the deep water over the Vile Reef", -12200.f, 640.f, -60.f, true, 0, 871 },
+                { "a second Saltscale on the reef", -12200.f, 640.f, -60.f, true, 0, 871 } };
+    return d;
+}
+
 inline std::vector<ScenarioDef> const& ScenarioCatalogue()
 {
     static std::vector<ScenarioDef> const defs = []
@@ -1113,6 +1284,275 @@ inline std::vector<ScenarioDef> const& ScenarioCatalogue()
                 v.push_back(std::move(y));
             }
         }
+        // Krol'dok Stronghold (Forever, map 3039), the cave landing to Overlord Mugg: Slavecrusher Grox, Twilight Commander Zarmok, War
+        // Handler Ashka with her wolves, Nar'gurk, Bossman Toof and his shamans, Mugg (the 0046 route and KroldokStrongholdScript's
+        // order; the spawns are the live kill spots of 2026_11_19_66). Bot-led, at 43.
+        {
+            static constexpr DungeonRow kKroldok = { "kroldok_full", "Krol'dok Stronghold: level 43 party, the cave to Overlord Mugg",
+                                                     3039, -7659.97f, -3713.1f, 157.51f, 18.f, 43, 258968, "Overlord Mugg", 75 };
+            ScenarioDef d = MakeDungeonScenario(kKroldok);
+            // The spawns and the route span x -7660..-6826, y -4588..-3713, z 124..265; 50 y around them.
+            d.limits.bounds = { true, -7710.f, -6776.f, -4638.f, -3663.f, 74.f, 315.f };
+            d.full_clear = true;
+            // Staging spots: crumbs of the 0046 route 35-50 y of walk before each boss.
+            d.checkpoints = { { "grox", 258966, -7519.87f, -3851.64f, 124.14f },
+                              { "zarmok", 258972, -7477.29f, -4062.44f, 152.30f },
+                              { "ashka", 259281, -7264.91f, -4471.41f, 176.44f },
+                              { "nargurk", 258964, -7305.20f, -4040.53f, 263.75f },
+                              { "toof", 264773, -7184.47f, -4408.93f, 243.96f },
+                              { "mugg", 258968, -6867.02f, -4573.96f, 242.73f } };
+            v.push_back(std::move(d));
+        }
+        // Ruins of Lordaeron (Forever, map 2999), the entrance to Bjork: Witherfang, The Baron, The Abandoned (the statue), Rath'mael,
+        // Bjork (the RuinsOfLordaeronScript order; the spawns are the official sniff's, world 2026_10_11_01). Bot-led, at 18. A
+        // player's tank-led group stalled here with no boss to walk to before the script existed.
+        {
+            static constexpr DungeonRow kRol = { "rol_full", "Ruins of Lordaeron: level 18 party, entrance to Bjork",
+                                                 2999, 1804.15f, 149.174f, 70.399f, 266.f, 18, 256097, "Bjork", 60 };
+            ScenarioDef d = MakeDungeonScenario(kRol);
+            d.full_clear = true;
+            // No route yet, so no route crumbs to stage on: the runner searches a ring round each boss. The Abandoned has no spawn
+            // (the statue summons him), so he has no checkpoint: a checkpoint starts the squad in sight of its creature's spawn.
+            d.checkpoints = { { "witherfang", 250483 }, { "baron", 250660 }, { "rathmael", 250657 }, { "bjork", 256097 } };
+            v.push_back(std::move(d));
+        }
+        // The Drowned City (Forever, map 2970), the cave landing to Min'loth the Serpent: Zul'Alai, Var'Taka, Captain Dreadrise,
+        // Deathless Marrow, the Primeval Elemental in the flooded quarter's pool, Min'loth (the 0047 route and DrownedCityScript's
+        // order; the spawns are the live kill spots of 2026_11_19_67). Bot-led, at 38.
+        {
+            static constexpr DungeonRow kDrowned = { "drowned_full", "The Drowned City: level 38 party, the cave to Min'loth the Serpent",
+                                                     2970, -13296.7f, 2232.3f, -47.5f, 91.f, 38, 260243, "Min'loth the Serpent", 90 };
+            ScenarioDef d = MakeDungeonScenario(kDrowned);
+            // The spawns and the route span x -13733..-13064, y 2214..3339, z -63..13; 50 y around them.
+            d.limits.bounds = { true, -13783.f, -13014.f, 2164.f, 3389.f, -113.f, 63.f };
+            d.full_clear = true;
+            // Staging spots: crumbs of the 0047 route 35-50 y of walk before each boss.
+            d.checkpoints = { { "zulalai", 258905, -13282.03f, 2464.53f, -3.20f },
+                              { "vartaka", 258924, -13545.44f, 2781.87f, -13.42f },
+                              { "dreadrise", 260042, -13109.33f, 2698.67f, -33.55f },
+                              { "marrow", 260202, -13321.27f, 3038.13f, -7.66f },
+                              { "primeval", 263886, -13536.00f, 2592.00f, 0.05f },
+                              { "minloth", 260243, -13365.33f, 3338.67f, 0.18f } };
+            v.push_back(std::move(d));
+        }
+        // Whole-dungeon runs of the classic dungeons, entrance to the last boss, bot-led (a player's report: tank-led groups get stuck in
+        // about 4 of 10 runs, and only Deadmines had a whole-dungeon scenario, so a sweep could not show where). The goal is the last
+        // fixed-spawn boss (Mutanus and Atal'alarion are event summons, so Verdan and Eranikus); the checkpoints are the bosses in the
+        // order of the map's dungeon script, logged as they fall, so a stall shows as the first checkpoint not down. Bounds: the map's
+        // dungeon route (playerbot_shared_data / 0034-0036, Dire Maul's 0050) and the entrance, 50 y around, z 50 below and above. Scholomance has no
+        // route, so it keeps the wide default box. Event bosses on the way (Aku'mai's fires, Archaedas, the Zul'Farrak stairs, the
+        // Sunken Temple trolls, the Ring of Law) are part of what the sweep tests.
+        {
+            struct FullRun
+            {
+                DungeonRow row; ScenarioBounds bounds; std::vector<ScenarioCheckpoint> checkpoints;
+                std::uint32_t carry_entry = 0, carry_entry_b = 0;
+                bool goal_after_checkpoints = false;   // see ScenarioDef::goal_after_checkpoints
+            };
+            static FullRun const kClassicFull[] = {
+                { { "rfc_full", "Ragefire Chasm: level 14 party, entrance to Bazzalan",
+                    389, 0.797643f, -8.23429f, -15.5288f, 270.f, 14, 11519, "Bazzalan", 40 },
+                  { true, -418.f, 51.f, -104.f, 265.f, -111.f, 35.f },
+                  { { "oggleflint", 11517 }, { "taragaman", 11520 }, { "jergosh", 11518 }, { "bazzalan", 11519 } } },
+                { { "wc_full", "Wailing Caverns: level 20 party, entrance to Verdan the Everliving",
+                    43, -158.441f, 131.601f, -74.2552f, 335.f, 20, 5775, "Verdan the Everliving", 60 },
+                  { true, -372.f, 108.f, -364.f, 544.f, -157.f, 23.f },
+                  { { "anacondra", 3671 }, { "kresh", 3653 }, { "cobrahn", 3669 }, { "pythas", 3670 }, { "skum", 3674 }, { "serpentis", 3673 },
+                    { "verdan", 5775 } } },
+                { { "sfk_full", "Shadowfang Keep: level 24 party, entrance to Archmage Arugal",
+                    33, -228.191f, 2111.41f, 76.8904f, 70.f, 24, 4275, "Archmage Arugal", 50 },
+                  { true, -346.f, -32.f, 2053.f, 2351.f, 25.f, 206.f },
+                  { { "rethilgore", 3914 }, { "razorclaw", 3886 }, { "silverlaine", 3887 }, { "springvale", 4278 }, { "odo", 4279 },
+                    { "fenrus", 4274 }, { "nandos", 3927 }, { "arugal", 4275 } } },
+                { { "bfd_full", "Blackfathom Deeps: level 26 party, entrance to Aku'mai",
+                    48, -150.234f, 106.594f, -39.779f, 255.f, 26, 4829, "Aku'mai", 60 },
+                  { true, -899.f, -100.f, -504.f, 360.f, -107.f, 33.f },
+                  { { "ghamoora", 4887 }, { "gelihast", 6243 }, { "kelris", 4832 }, { "akumai", 4829 } } },
+                { { "stockade_full", "Stormwind Stockade: level 27 party, entrance to Bazil Thredd",
+                    34, 48.9849f, 0.483882f, -16.3942f, 360.f, 27, 1716, "Bazil Thredd", 30 },
+                  { true, -1.f, 222.f, -161.f, 167.f, -85.f, 34.f },
+                  { { "targorr", 1696 }, { "kam", 1666 }, { "hamhock", 1717 }, { "dextren", 1663 }, { "bazil", 1716 } } },
+                { { "smgraveyard_full", "Scarlet Monastery Graveyard: level 30 party, entrance to Bloodmage Thalnos",
+                    189, 1687.27f, 1050.09f, 18.6773f, 90.f, 30, 4543, "Bloodmage Thalnos", 30 },
+                  { true, 70.f, 2019.f, -497.f, 1482.f, -58.f, 83.f },
+                  { { "vishas", 3983 }, { "thalnos", 4543 } } },
+                { { "rfk_full", "Razorfen Kraul: level 31 party, entrance to Charlga Razorflank",
+                    47, 1942.27f, 1544.23f, 83.3055f, 75.f, 31, 4421, "Charlga Razorflank", 60 },
+                  { true, 1892.f, 2241.f, 1361.f, 2027.f, 11.f, 136.f },
+                  { { "aggem", 4424 }, { "jargba", 4428 }, { "ramtusk", 4420 }, { "agathelos", 4422 }, { "charlga", 4421 } } },
+                { { "gnomeregan_full", "Gnomeregan: level 32 party, entrance to Mekgineer Thermaplugg",
+                    90, -329.098f, -3.20722f, -152.851f, 170.f, 32, 7800, "Mekgineer Thermaplugg", 75 },
+                  { true, -942.f, -277.f, -156.f, 750.f, -381.f, -96.f },
+                  { { "grubbis", 7361 }, { "fallout", 7079 }, { "electrocutioner", 6235 }, { "pummeler", 6229 }, { "thermaplugg", 7800 } } },
+                { { "smlibrary_full", "Scarlet Monastery Library: level 33 party, entrance to Arcanist Doan",
+                    189, 253.672f, -206.624f, 18.6773f, 270.f, 33, 6487, "Arcanist Doan", 35 },
+                  { true, 70.f, 2019.f, -497.f, 1482.f, -58.f, 83.f },
+                  { { "loksey", 3974 }, { "doan", 6487 } } },
+                // Herod's Door (101854) is the only way into Herod's room and the Chapel Door (104591) the only way to Mograine and
+                // Whitemane; both spawn shut and locked, and their lock (299) takes The Scarlet Key (7146, Doan's Strongbox in the
+                // Library), Lockpicking 175 or a blast. The lever by each door is on the room's side. The tank comes with the key, as a
+                // party that has done the Library, and opens the door with it (BotSnapshotBuilder KeyForShutDoor).
+                { { "smarmory_full", "Scarlet Monastery Armory: level 37 party, entrance to Herod",
+                    189, 1608.1f, -318.919f, 18.6714f, 270.f, 37, 3975, "Herod", 35 },
+                  { true, 70.f, 2019.f, -497.f, 1482.f, -58.f, 83.f },
+                  { { "herod", 3975 } }, 7146 },
+                { { "smcathedral_full", "Scarlet Monastery Cathedral: level 38 party, entrance to High Inquisitor Whitemane",
+                    189, 853.179f, 1319.18f, 18.6714f, 90.f, 38, 3977, "High Inquisitor Whitemane", 40 },
+                  { true, 70.f, 2019.f, -497.f, 1482.f, -58.f, 83.f },
+                  { { "fairbanks", 4542 }, { "mograine", 3976 }, { "whitemane", 3977 } }, 7146, 0, true },
+                // Tuten'kash and Plaguemaw come from the gong and the Belnistrasz event (no static spawn), so they are no checkpoint.
+                { { "rfd_full", "Razorfen Downs: level 40 party, entrance to Amnennar the Coldbringer",
+                    129, 2593.68f, 1111.23f, 50.9518f, 270.f, 40, 7358, "Amnennar the Coldbringer", 60 },
+                  { true, 2281.f, 2643.f, 622.f, 1161.f, -24.f, 113.f },
+                  { { "glutton", 8567 }, { "mordresh", 7357 }, { "amnennar", 7358 } } },
+                { { "uldaman_full", "Uldaman: level 44 party, entrance to Archaedas",
+                    70, -228.859f, 46.1018f, -46.0186f, 90.f, 44, 2748, "Archaedas", 75 },
+                  { true, -403.f, 216.f, -4.f, 505.f, -104.f, 26.f },
+                  { { "revelosh", 6910 }, { "baelog", 6906 }, { "ironaya", 7228 }, { "sentinel", 7023 }, { "stonekeeper", 7206 },
+                    { "galgann", 7291 }, { "grimlok", 4854 }, { "archaedas", 2748 } },
+                  7733 },   // Staff of Prehistoria: the Keystone (124371, lock 359) that opens the Seal of Khaz'Mul to Ironaya takes only it
+                { { "maraudon_full", "Maraudon: level 48 party, orange entrance to Princess Theradras",
+                    349, 1016.83f, -458.52f, -43.4737f, 360.f, 48, 12201, "Princess Theradras", 90 },
+                  // Bounds: the 0053 route, which goes on from the outer caves into the inner ones (the old box held only the outer).
+                  { true, -154.f, 1180.f, -523.f, 303.f, -246.f, 19.f },
+                  { { "noxxion", 13282 }, { "razorlash", 12258 }, { "vyletongue", 12236 }, { "celebras", 12225 }, { "landslide", 12203 },
+                    { "gizlock", 13601 }, { "rotgrip", 13596 }, { "theradras", 12201 } } },
+                { { "zf_full", "Zul'Farrak: level 48 party, entrance to Chief Ukorz Sandscalp",
+                    209, 1212.67f, 842.04f, 8.93346f, 360.f, 48, 7267, "Chief Ukorz Sandscalp", 60 },
+                  { true, 1163.f, 1962.f, 649.f, 1313.f, -41.f, 105.f },
+                  { { "antusul", 8127 }, { "theka", 7272 }, { "zumrah", 7271 }, { "velratha", 7795 }, { "ukorz", 7267 } } },
+                { { "st_full", "Sunken Temple: level 50 party, entrance to the Shade of Eranikus",
+                    109, -315.903f, 100.197f, -131.849f, 180.f, 50, 5709, "Shade of Eranikus", 120 },
+                  // Bounds: the 0053 route, down to Atal'alarion's pit (z -189). 120 min: the six statues and the six balconies are
+                  // each a climb of their own, about 5 km of walk with the route.
+                  { true, -728.f, -239.f, -146.f, 323.f, -239.f, -37.f },
+                  { { "atalarion", 8580 }, { "hukku", 5715 }, { "mijan", 5717 }, { "zullor", 5716 }, { "zolo", 5712 }, { "gasher", 5713 },
+                    { "loro", 5714 }, { "morphaz", 5719 }, { "hazzas", 5722 }, { "jammalan", 5710 }, { "weaver", 5720 },
+                    { "dreamscythe", 5721 }, { "eranikus", 5709 } } },
+                { { "brd_full", "Blackrock Depths: level 56 party, entrance to Emperor Dagran Thaurissan",
+                    230, 456.929f, 34.0923f, -68.0896f, 270.f, 56, 9019, "Emperor Dagran Thaurissan", 150 },
+                  { true, 262.f, 1435.f, -886.f, 234.f, -142.f, 7.f },
+                  { { "gerstahn", 9018 }, { "roccor", 9025 }, { "grebmar", 9319 }, { "incendius", 9017 }, { "angerforge", 9033 },
+                    { "argelmach", 8983 }, { "plugger", 9499 }, { "flamelash", 9156 }, { "doomrel", 9039 }, { "magmus", 9938 },
+                    { "emperor", 9019 } },
+                  // The Shadowforge Key: the Shadowforge Gate, the East Garrison Door and the Shadowforge Lock that opens the Giant Doors
+                  // (170559, 170570, 161460; lock 680: the key, Lockpicking 250 or a blast), the way past Incendius and Angerforge, and
+                  // the Lyceum door (170558, lock 680) past the Tomb of the Seven. The Shadowforge Torch: the two Shadowforge Braziers
+                  // (174744, 174745, lock 799) in the Lyceum, both lit open the Golem Rooms to Magmus. The Lyceum's Shadowforge Flame
+                  // Keepers drop it (80 %), but to whoever loots the body; the run tests the lighting, not the loot roll.
+                  11000, 11885 },
+                // Lower Spire only: the way on to Upper Blackrock Spire opens for a player holding the Seal of Ascension.
+                { { "lbrs_full", "Lower Blackrock Spire: level 58 party, entrance to Overlord Wyrmthalak",
+                    229, 78.3534f, -226.841f, 49.7662f, 270.f, 58, 9568, "Overlord Wyrmthalak", 90 },
+                  { true, -249.f, 157.f, -627.f, -177.f, -68.f, 141.f },
+                  { { "omokk", 9196 }, { "voshgajin", 9236 }, { "voone", 9237 }, { "smolderweb", 10596 }, { "zigris", 9736 },
+                    { "halycon", 10220 }, { "wyrmthalak", 9568 } } },
+                // Upper Spire only, from the same entrance: up the stairs and through the Dragonspine Door, which opens for a player
+                // holding the Seal of Ascension; the seven rune rooms (every Summoner and Veteran dead opens Emberseer In); the
+                // Blackrock Altar, three players at once, wakes Pyroguard Emberseer; the stadium event (walk in: the waves, then Gyth
+                // and Rend off his back; won, the exit portcullis opens); the Beast; General Drakkisath. Bounds: the Upper Spire part
+                // of the route (seq 145-226 of 0052), 50 y around, z 50 below and above.
+                { { "ubrs_full", "Upper Blackrock Spire: level 60 party, entrance to General Drakkisath",
+                    229, 78.3534f, -226.841f, 49.7662f, 270.f, 60, 10363, "General Drakkisath", 120 },
+                  { true, -22.f, 274.f, -614.f, -177.f, -1.f, 173.f },
+                  { { "emberseer", 9816 }, { "gyth", 10339 }, { "rend", 10429 }, { "beast", 10430 }, { "drakkisath", 10363 } },
+                  // The Seal of Ascension: the Dragonspine Door opens while a living player holding it is near (the instance's
+                  // update, and area trigger 2046 on the stairs). A party earns it on a quest chain; the run tests the Spire, not the
+                  // chain.
+                  12344 },
+                // Dire Maul, one run per wing from its entrance (the 0050 route). Each wing has a way on a player opens and the bots
+                // do not yet: East, the Conservatory Door to Alzzin (talk to Old Ironbark once Zevrim is dead); West, Immol'thar's
+                // force field (kill the guards of all five pylons); North, the Gordok Courtyard and Inner Doors (the keys from
+                // Fengus's Chest and Guard Mol'dar). A party that stops there shows that gate.
+                { { "dmeast_full", "Dire Maul East: level 57 party, entrance to Alzzin the Wildshaper",
+                    429, -203.166f, -322.997f, -2.72467f, 270.f, 57, 11492, "Alzzin the Wildshaper", 75 },
+                  { true, -253.f, 885.f, -579.f, 871.f, -170.f, 89.f },
+                  { { "pusillin", 14354 }, { "hydrospawn", 13280 }, { "lethtendris", 14327 }, { "zevrim", 11490 }, { "alzzin", 11492 } } },
+                { { "dmwest_full", "Dire Maul West: level 58 party, entrance to Prince Tortheldrin",
+                    429, 33.1083f, 158.977f, -3.47126f, 45.f, 58, 11486, "Prince Tortheldrin", 90 },
+                  { true, -253.f, 885.f, -579.f, 871.f, -170.f, 89.f },
+                  { { "tendris", 11489 }, { "kalendris", 11487 }, { "illyanna", 11488 }, { "immolthar", 11496 }, { "tortheldrin", 11486 } } },
+                { { "dmnorth_full", "Dire Maul North: level 58 party, entrance to King Gordok",
+                    429, 254.92f, -19.463f, -2.5596f, 315.f, 58, 11501, "King Gordok", 75 },
+                  { true, -253.f, 885.f, -579.f, 871.f, -170.f, 89.f },
+                  { { "moldar", 14326 }, { "kreeg", 14322 }, { "fengus", 14321 }, { "slipkik", 14323 }, { "kromcrush", 14325 },
+                    { "chorush", 14324 }, { "gordok", 11501 } } },
+                { { "scholo_full", "Scholomance: level 58 party, entrance to Darkmaster Gandling",
+                    289, 190.819f, 126.329f, 137.227f, 360.f, 58, 1853, "Darkmaster Gandling", 120 },
+                  { true, -409.f, 791.f, -474.f, 726.f, -163.f, 437.f },
+                  { { "jandice", 10503 }, { "rattlegore", 11622 }, { "ravenian", 10507 }, { "polkelt", 10901 }, { "vectus", 10432 },
+                    { "krastinov", 11261 }, { "illucia", 10502 }, { "alexei", 10504 }, { "ras", 10508 }, { "gandling", 1853 } },
+                  13873 },   // the Skeleton Key: the Viewing Room Door (175167, lock 1199) on the way down takes only it
+                { { "stratlive_full", "Stratholme (main gate): level 58 party, entrance to Balnazzar",
+                    329, 3392.92f, -3395.03f, 143.135f, 90.f, 58, 10813, "Balnazzar", 90 },
+                  { true, 3343.f, 4086.f, -3766.f, -2887.f, 65.f, 198.f },
+                  { { "forresten", 10558 }, { "malor", 11032 }, { "galford", 10811 } },
+                  // Balnazzar is Grand Crusader Dathrohan (10812) until he turns.
+                  // The Scarlet Key: the Hall of the High Command and the Bastion Door (176194, 175967; lock 299) to Galford and Dathrohan.
+                  7146 },
+                { { "stratud_full", "Stratholme (service gate): level 58 party, entrance to Baron Rivendare",
+                    329, 3590.87f, -3643.22f, 138.491f, 315.f, 58, 10440, "Baron Rivendare", 150 },
+                  // 150 min: after the three ziggurats the Slaughter Square sends its 13 abominations one at a time (35-45 s apart),
+                  // then Ramstein, 34 undead and the Black Guard, before the Baron's door opens.
+                  { true, 3343.f, 4086.f, -3766.f, -2887.f, 65.f, 198.f },
+                  { { "barthilas", 10435 }, { "anastari", 10436 }, { "nerubenkan", 10437 }, { "maleki", 10438 }, { "ramstein", 10439 },
+                    { "rivendare", 10440 } },
+                  // The Key to the City (Magistrate Barthilas drops it): the Service Entrance Gate the run starts at and both Gauntlet
+                  // Gates (175368, 175357, 175356; lock 879: the key, Lockpicking 300 or a blast). A party without it comes in by the
+                  // main gate and takes it from Barthilas.
+                  12382 },
+            };
+            for (FullRun const& f : kClassicFull)
+            {
+                ScenarioDef d = MakeDungeonScenario(f.row);
+                d.limits.bounds = f.bounds;
+                d.full_clear = true;
+                d.checkpoints = f.checkpoints;
+                d.carry_entry = f.carry_entry;
+                d.carry_entry_b = f.carry_entry_b;
+                d.goal_after_checkpoints = f.goal_after_checkpoints;
+                v.push_back(std::move(d));
+            }
+        }
+        // The Hall of Thanes (Forever, map 3065), the landing to Durgen Dirgehammer: Faldrim Anvilmar (round by the north, the straight
+        // hall's Iron Doors are shut), Magmatus, Plunder, and through the Vault Door the tank opens to Durgen (the 0049 route and
+        // HallOfThanesScript's order). Bot-led, at 16.
+        {
+            static constexpr DungeonRow kHot = { "hot_full", "Hall of Thanes: level 16 party, the landing to Durgen Dirgehammer",
+                                                 3065, -95.62f, -0.16f, 510.94f, 0.f, 16, 261319, "Durgen Dirgehammer", 45 };
+            ScenarioDef d = MakeDungeonScenario(kHot);
+            // The route spans x -96..352, y -196..78, z 486..511; 50 y around it.
+            d.limits.bounds = { true, -146.f, 402.f, -246.f, 128.f, 436.f, 561.f };
+            d.full_clear = true;
+            // Staging spots: crumbs of the 0049 route 33-50 y of walk before each boss (Durgen's is inside the Vault Door).
+            d.checkpoints = { { "faldrim", 261306, 81.73f, 39.87f, 500.23f },
+                              { "magmatus", 261316, 125.33f, -176.80f, 487.68f },
+                              { "plunder", 261311, 140.69f, -34.45f, 501.99f },
+                              { "durgen", 261319, 319.29f, -2.31f, 501.55f } };
+            v.push_back(std::move(d));
+        }
+        // City of Dalaran (Forever, map 2959), the sewer landing to the Shade of the Archmage: Atrexis and Lyn in the sewers, then up
+        // into the city to Mana Devourer, the three square bosses (Arcane Anomaly, Arcanic Enigma, Unstable Sentinel), Fel Ancient behind
+        // the Prismatic Doors, and through the Portal To the Violet Chamber to the Shade (the 0048 route and CityOfDalaranScript's order).
+        // Bot-led, at 33 (the Shade's level).
+        {
+            static constexpr DungeonRow kCod = { "cod_full", "City of Dalaran: level 33 party, the sewers to the Shade of the Archmage",
+                                                 2959, 309.8f, 384.0f, 67.5f, 223.f, 33, 246020, "Shade of the Archmage", 75 };
+            ScenarioDef d = MakeDungeonScenario(kCod);
+            // The route spans x 71..456, y 176..396, z 58..295 (the Violet Chamber is at z 294); 50 y around it.
+            d.limits.bounds = { true, 21.f, 506.f, 125.f, 446.f, 8.f, 345.f };
+            d.full_clear = true;
+            // Staging spots: crumbs of the 0048 route 30-50 y of walk before each boss; the Shade's is where the portal lands.
+            d.checkpoints = { { "atrexis", 247126, 214.87f, 342.47f, 64.55f },
+                              { "lyn", 247032, 236.27f, 221.78f, 64.11f },
+                              { "devourer", 246008, 128.80f, 337.42f, 101.80f },
+                              { "anomaly", 245999, 120.18f, 223.96f, 106.16f },
+                              { "enigma", 246016, 326.36f, 198.89f, 90.80f },
+                              { "sentinel", 246017, 337.11f, 240.00f, 92.02f },
+                              { "felancient", 246003, 280.27f, 302.35f, 94.95f },
+                              { "shade", 246020, 440.00f, 360.00f, 294.00f } };
+            v.push_back(std::move(d));
+        }
         // Deadmines, entrance to Edwin VanCleef: Rhahk'Zor, Sneed, Gilnid, the door and cannon, Mr. Smite, Greenskin, VanCleef. The
         // floor plan box covers the whole instance (VanCleef's ship is at y -877). Bot-led, the standard five; a run of 45 minutes.
         {
@@ -1140,6 +1580,67 @@ inline std::vector<ScenarioDef> const& ScenarioCatalogue()
             v.push_back(std::move(d));
             v.push_back(std::move(p));
         }
+        // Alcaz Prison (Forever, map 2994), the landing on the entrance stair to Blazeroar: Overseer Wrex, Katerina the Cleaner, The
+        // Questioner, Tidemistress Ca'zass, Blazeroar (the route and AlcazPrisonScript's order). Bot-led, the standard five at 53.
+        {
+            static constexpr DungeonRow kAlcaz = { "alcaz_full", "Alcaz Prison: level 53 party, entrance to Blazeroar",
+                                                   2994, -8796.8f, 2838.1f, 29.9f, 90.f, 53, 255702, "Blazeroar", 45 };
+            ScenarioDef d = MakeDungeonScenario(kAlcaz);
+            // The prison's creature spawns span x -8916..-8728, y 2838..3003, z 5..30; 50 y around them.
+            d.limits.bounds = { true, -8966.f, -8678.f, 2788.f, 3053.f, -20.f, 80.f };
+            d.full_clear = true;
+            // Staging spots: crumbs of the 0043 route 30-40 y of walk before each boss.
+            d.checkpoints = { { "wrex", 255391, -8762.13f, 2882.13f, 15.31f },
+                              { "katerina", 257016, -8823.64f, 2889.6f, 15.58f },
+                              { "questioner", 256236, -8852.4f, 2889.38f, 14.02f },
+                              { "cazass", 255997, -8763.29f, 2924.71f, 6.69f },
+                              { "blazeroar", 255702, -8837.6f, 2968.53f, 7.04f } };
+            v.push_back(std::move(d));
+        }
+        // Blackmaw Hold (Forever, map 2974), the landing in the entrance tunnel to Varrox Bleakhoof: Withermaw, Bonesnout the
+        // Unbroken, Impaan the Imprisoner, the Unbound Spirit (Elder Bramblesnap's ritual starts when the party comes near), the
+        // Blackmaw Behemoth with Clawbert, Elder Shaman Bloodmane, Varrox (the route and BlackmawHoldScript's order). Bot-led, at 57.
+        {
+            static constexpr DungeonRow kBlackmaw = { "blackmaw_full", "Blackmaw Hold: level 57 party, entrance to Varrox Bleakhoof",
+                                                      2974, 3470.f, 3690.f, 301.9f, 90.f, 57, 247234, "Varrox Bleakhoof", 75 };
+            ScenarioDef d = MakeDungeonScenario(kBlackmaw);
+            // The hold's creature spawns span x 3255..3745, y 2819..3712, z 136..361; 50 y around them.
+            d.limits.bounds = { true, 3205.f, 3795.f, 2769.f, 3762.f, 86.f, 411.f };
+            d.full_clear = true;
+            // Staging spots: crumbs of the 0044 route 35-60 y of walk before each boss.
+            d.checkpoints = { { "withermaw", 247195, 3701.07f, 3371.38f, 289.5f },
+                              { "bonesnout", 247198, 3424.16f, 3379.36f, 254.1f },
+                              { "impaan", 247206, 3317.33f, 3529.87f, 347.07f },
+                              { "spirit", 247231, 3293.4f, 2942.53f, 210.16f },
+                              { "behemoth", 247207, 3622.4f, 2892.76f, 172.65f },
+                              { "bloodmane", 247209, 3521.33f, 2971.67f, 146.29f },
+                              { "varrox", 247234, 3571.87f, 2869.2f, 169.49f } };
+            v.push_back(std::move(d));
+        }
+        // The Shaper's Terrace (Forever, map 3001), the landing beside the client's trigger of the dungeon to Nanaya: Venomridge, Bolt,
+        // Cinder, Tor'Rel and Izha'Rel, Snowtalon, Vitrix, Titanosaur, Thunderhoof, King Op, the Direhorn Matriarch, Nanaya (the route
+        // and ShapersTerraceScript's order). Bot-led, at 59.
+        {
+            static constexpr DungeonRow kShapers = { "shapers_full", "The Shaper's Terrace: level 59 party, entrance to Nanaya",
+                                                     3001, -5792.65f, -1252.98f, -5.95f, 75.f, 59, 261809, "Nanaya", 90 };
+            ScenarioDef d = MakeDungeonScenario(kShapers);
+            // The terrace's creature spawns span x -6038..-5496, y -1829..-554, z -6..113; 50 y around them.
+            d.limits.bounds = { true, -6088.f, -5446.f, -1879.f, -504.f, -56.f, 163.f };
+            d.full_clear = true;
+            // Staging spots: crumbs of the 0045 route 35-55 y of walk before each boss.
+            d.checkpoints = { { "venomridge", 261813, -5882.29f, -1233.07f, 6.88f },
+                              { "bolt", 262081, -5920.0f, -1226.67f, 9.37f },
+                              { "cinder", 261974, -5909.07f, -821.07f, 98.06f },
+                              { "torrel", 261811, -5728.0f, -736.0f, 31.33f },
+                              { "snowtalon", 262297, -5685.33f, -650.67f, 20.0f },
+                              { "vitrix", 272561, -5536.91f, -820.75f, 18.66f },
+                              { "titanosaur", 253201, -5664.93f, -1409.13f, 30.66f },
+                              { "thunderhoof", 261812, -5983.73f, -1547.64f, 7.57f },
+                              { "kingop", 261993, -5988.62f, -1808.44f, 44.53f },
+                              { "direhorn", 262127, -5770.35f, -1758.24f, 21.19f },
+                              { "nanaya", 261809, -5813.33f, -1589.33f, 37.33f } };
+            v.push_back(std::move(d));
+        }
         for (RaidBossRow const& r : kMcBosses)
             v.push_back(MakeMcScenario(r));
         v.push_back(MakeOnyScenario());
@@ -1149,6 +1650,7 @@ inline std::vector<ScenarioDef> const& ScenarioCatalogue()
         v.push_back(MakeBwlNefarianScenario());
         v.push_back(MakeBrmFollowScenario());
         v.push_back(MakeLakeSwimScenario());
+        v.push_back(MakeVileReefFightScenario());
         for (ScenarioDef& d : MakeOtherRaidScenarios())
             v.push_back(std::move(d));
         // The names are built once and kept: ScenarioDef carries char const*.

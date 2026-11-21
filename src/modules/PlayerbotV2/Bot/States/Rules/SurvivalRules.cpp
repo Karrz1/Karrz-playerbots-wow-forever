@@ -65,8 +65,16 @@ bool FleeDamagingLiquidGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView 
 
 bool FleeDamagingLiquidFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,BotIntentEmitter& emit, uint32)
 {
+    // The nearest dry ground the builder found (EnvironmentState::water_escape_*, set in a burning liquid too). A random heading from
+    // the middle of the Tar Pits ended in tar again and the move gate refused it as Magma (shapers_full af51, 20 Nov).
+    if (s.water_escape_valid())
+    {
+        emit.move_to(s.water_escape_x(), s.water_escape_y(), s.water_escape_z(), /*run*/ true);
+        ai.set_last_rule_fired("idle:flee_damaging_liquid");
+        return true;
+    }
     float bx, by, bz; s.position(bx, by, bz);
-    // One heading per 8 s window: a new random heading every second zig-zagged the bot inside the liquid.
+    // No dry ground within 60 y: one heading per 8 s window. A new random heading every second zig-zagged the bot inside the liquid.
     const uint32 epoch = s.published_at_ms() / 8000u;
     const uint64 mixed = (uint64(s.bot_id()) * 0x9E3779B97F4A7C15ULL)
                        ^ (uint64(epoch) * 0xBF58476D1CE4E5B9ULL);

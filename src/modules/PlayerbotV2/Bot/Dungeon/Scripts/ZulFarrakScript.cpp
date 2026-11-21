@@ -27,9 +27,23 @@ public:
         };
     }
 
+    // The pyramid event. Sergeant Bly and his crew sit in the Troll Cages on top of the pyramid (141070-141074, doors with no lock); a
+    // player opens one and all of them are free (classic_zulfarrak.cpp go_troll_cage: every cage starts the event). Only one is listed:
+    // a second cage opened later would set the event back to its start in the middle of the waves.
+    std::vector<uint32_t> hand_doors() const override { return { 141074 }; }
+
     DungeonAdvice get_advice(BotSnapshotView const& /*s*/) const override
     {
         DungeonAdvice a;
+        // After the three waves of trolls up the pyramid stairs, Weegli Blastfuse blows up the End Door (146084) to Chief Ukorz when
+        // asked ("Will you blow up that door now?"), the only way it opens. Then Sergeant Bly, a boss on the route, is told to fight
+        // ("That's it! I'm tired of helping you out...") and he and his crew turn on the party. Bly is asked only once the door is
+        // open: told first, the crew turns hostile with Weegli and the door is never blown. Both stand at the top of the stairs.
+        // Zum'rah must be dead before the Weegli talk, so a tank still at Zum'rah (249 y from the stairs) is not pulled away.
+        a.door_talks = {
+            { 7607, 1883.87f, 1263.49f, 41.55f, 7267, { 7271 } },          // Weegli Blastfuse -> the End Door to Chief Ukorz
+            { 7604, 1887.17f, 1263.72f, 41.48f, 7604, { 7271 }, 146084 },  // Sergeant Bly, once the End Door is open
+        };
         a.high_priority_kill_entries = {
             5650,   // Sandfury Witch Doctor
             5648,   // Sandfury Shadowcaster

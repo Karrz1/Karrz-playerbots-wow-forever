@@ -107,10 +107,23 @@ int WoundedCount(ApPredicateContext const& ctx, int32 below_pct)
 
 // ======================= Shared =======================
 
-bool ShouldLightningShield(ApPredicateContext const& ctx)
+// Lightning Shield has three charges, and each hit the shaman takes uses one. A shaman under attack (a battleground, a mob on the
+// healer) lost the shield every few hits and cast it again at once at any mana: the bot spent its whole pool on the shield (a level 22
+// restoration bot in a battleground, 54 of 2147 mana, Discord 18 Nov). In a fight it now goes up again only at the mana the spec
+// spends on damage: a healer at 70% (its nukes' floor), the others at 40% (Earth Shock's). Out of a fight it is a long buff, put up
+// from half mana.
+int32 LightningShieldManaFloor(ApPredicateContext const& ctx, bool healer)
 {
-    return Ready(ctx, LIGHTNING_SHIELD) && !ctx.bot.has_aura(LIGHTNING_SHIELD);
+    if (!ctx.bot.in_combat())
+        return 50;
+    return healer ? 70 : 40;
 }
+bool LightningShieldReady(ApPredicateContext const& ctx, bool healer)
+{
+    return Ready(ctx, LIGHTNING_SHIELD) && !ctx.bot.has_aura(LIGHTNING_SHIELD) && ManaPct(ctx) >= LightningShieldManaFloor(ctx, healer);
+}
+bool ShouldLightningShield(ApPredicateContext const& ctx) { return LightningShieldReady(ctx, false); }
+bool ShouldHealerLightningShield(ApPredicateContext const& ctx) { return LightningShieldReady(ctx, true); }
 void DoLightningShield(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(LIGHTNING_SHIELD); }
 
 bool ShouldResurrection(ApPredicateContext const& ctx)
@@ -246,7 +259,7 @@ bool ShouldTopOffLesser(ApPredicateContext const& ctx)
 // the five-second rule).
 bool HealerMayDps(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && ctx.bot.in_combat() && WoundedCount(ctx, 90) == 0 && LowestFriendOrSelf(ctx).hp_pct > 90
+    return HasLiveTarget(ctx) && (ctx.bot.in_combat() || ctx.bot.victim_is_group_target()) && WoundedCount(ctx, 90) == 0 && LowestFriendOrSelf(ctx).hp_pct > 90
         && ClassicHeal::RaidHealerMayDamage(ctx.bot, ctx.group);
 }
 
@@ -295,7 +308,7 @@ ApRule const kHealerRules[] = {
     { Interrupt::Purge::Should,        Interrupt::Purge::Cast, "classic_sham_heal:purge" },
     { ShouldTopOffLesser,              DoLesserHealingWave,   "classic_sham_heal:top_off" },
     { ShouldResurrection,              DoResurrection,        "classic_sham_heal:ancestral_spirit" },
-    { ShouldLightningShield,           DoLightningShield,     "classic_sham_heal:lightning_shield" },
+    { ShouldHealerLightningShield,     DoLightningShield,     "classic_sham_heal:lightning_shield" },
     { ShouldImbue,                     DoImbue,               "classic_sham_heal:imbue" },
     { ShouldHealerSchoolNuke,          DoHealerSchoolNuke,    "classic_sham_heal:school_nuke" },
     { ShouldHealerLightningBolt,       DoLightningBolt,       "classic_sham_heal:lightning_bolt" },

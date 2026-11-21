@@ -78,6 +78,11 @@ struct Fight
 // Gahz'ranka, Hakkar: one boss (Hakkar's Sons of Hakkar have their own rules, RaidEncounterData_ZG.cpp).
 // Edge of Madness: Hazza'rah's Nightmare Illusions (15163, 457 hp) before him; Gri'lek, Renataki and Wushoolay are one boss each.
 // Not scripted: Thekal (the three must fall within 10 s of each other: the killTogether rule spreads the damage, one focus would break it).
+// Fankriss the Unyielding (AQ40 531): a Spawn of Fankriss (15630) first, then the Vekniss Hatchlings (15962, one rank), then Fankriss. A
+// Spawn enrages 10 s after it engages (classic_boss_fankriss.cpp, Enrage 26662) and then hits for 9-28k. aq40_fankriss af52 sweep (1120):
+// with no script the Priority rows only steered a DPS bot with no target, so the bots already on Fankriss or a Hatchling stayed there
+// ("on the focus 0", 13-21 of 24 on one other enemy); the Spawns lived 12-25 s, each at 93-95% 6-8 s in, and from 215 s the enraged
+// ones killed 39 of the 40. Fankriss himself has no enrage: his tank keeps him while the adds die.
 inline constexpr Fight kFights[] = {
     { 409, 12118, { 12119, 12118, 0, 0 }, kRaidBossOpenWaitMs, "Lucifron" },
     { 409, 12057, { 12057, 0, 0, 0 }, kRaidBossOpenWaitMs, "Garr" },
@@ -100,6 +105,7 @@ inline constexpr Fight kFights[] = {
     { 309, 15083, { 15163, 15083, 0, 0 }, kRaidBossOpenWaitMs, "Hazza'rah" },
     { 309, 15084, { 15084, 0, 0, 0 }, kRaidBossOpenWaitMs, "Renataki" },
     { 309, 15085, { 15085, 0, 0, 0 }, kRaidBossOpenWaitMs, "Wushoolay" },
+    { 531, 15510, { 15630, 15962, 15510, 0 }, kRaidBossOpenWaitMs, "Fankriss the Unyielding" },
 };
 
 // The fight an engaged enemy belongs to on this map (nullptr: none).

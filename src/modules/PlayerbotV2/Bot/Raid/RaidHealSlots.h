@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace Playerbot::Raid {
@@ -53,6 +54,25 @@ inline std::vector<uint64_t> SoakHealSlotOrder(uint64_t main_tank, uint64_t off_
     if (order.size() > slots)
         order.resize(slots);
     return order;
+}
+
+// The tanks in the order their healer slots go when not every tank holds a mob: the spare tanks that an engaged enemy is hitting come
+// before the ones that hold nothing (each part in its own order), and an off tank that holds nothing gives up its off tank slots while a
+// spare holds one: it is returned as 0 and stands first among the idle spares. A spare tank that waits (the Four Horsemen's next tanks,
+// a tank kept for an add that has not come) needs no healer of its own while a tank beside it is being hit. Returns (off tank, spares).
+template <typename Holds>
+std::pair<uint64_t, std::vector<uint64_t>> HeldTanksFirst(uint64_t off_tank, std::vector<uint64_t> const& spare_tanks, Holds const& holds)
+{
+    std::vector<uint64_t> held, idle;
+    for (uint64_t t : spare_tanks)
+        (t && holds(t) ? held : idle).push_back(t);
+    if (off_tank && !holds(off_tank) && !held.empty())
+    {
+        idle.insert(idle.begin(), off_tank);
+        off_tank = 0;
+    }
+    held.insert(held.end(), idle.begin(), idle.end());
+    return { off_tank, held };
 }
 
 } // namespace Playerbot::Raid

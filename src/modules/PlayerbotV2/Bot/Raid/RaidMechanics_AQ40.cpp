@@ -11,6 +11,9 @@
 //    walks onto the exit spot (area trigger 4033: a punt knocks it up into trigger 4034, which ports it out). A client
 //    sends both triggers on entering them; a bot fires them through the raid order. Bots outside never target the
 //    stomach tentacles.
+//  * C'Thun himself (classic_boss_cthun.cpp UpdateInvulnerablePhase): Carapace 26156 keeps him invulnerable until both Flesh
+//    Tentacles in the stomach are dead; then he is Weakened (26235, red) for 45 s and the raid kills him in that window. While
+//    the carapace is up the DPS outside never pick him; while he is weakened every DPS bot outside the stomach hits him.
 
 #include "RaidBrainInternal.h"
 
@@ -84,6 +87,9 @@ constexpr uint32_t kFleshTentacle  = 15802;
 constexpr uint32_t kStomachGround  = 4033;    // AREATRIGGER_STOMACH_GROUND: starts the punt
 constexpr uint32_t kStomachAir     = 4034;    // AREATRIGGER_STOMACH_AIR: ports out
 constexpr uint32_t kAcidLeave      = 8;       // leave the stomach at this many acid stacks
+constexpr uint32_t kCthun          = 15727;
+constexpr uint32_t kCarapace       = 26156;   // SPELL_CTHUN_CARAPACE: invulnerable
+constexpr uint32_t kWeakened       = 26235;   // SPELL_CTHUN_VULNERABLE: the 45 s window (WEAKNESS_DURATION)
 
 float Normalize(float a)
 {
@@ -199,6 +205,37 @@ void ElectStomach(Election& e)
     }
 }
 
+// Outside the stomach: C'Thun is off every DPS bot while his carapace is up (the tentacles' Priority rows pick among the rest), and
+// the one enemy every DPS bot hits while he is weakened. The Priority rows rank every tentacle above him, and they only steer a bot
+// with no target, so without this the 45 s window went to the tentacles and he got his carapace back. Tanks and healers keep their
+// jobs; a bot the move pass is moving (dark glare, a ground rupture) moves first.
+void ElectWeakened(Election& e)
+{
+    Plan& plan = e.plan;
+    Unit* cthun = nullptr;
+    for (Unit* enemy : plan.enemies)
+        if (enemy->GetEntry() == kCthun && enemy->IsAlive())
+            cthun = enemy;
+    if (!cthun)
+        return;
+    bool const weakened = cthun->HasAura(kWeakened) && !cthun->HasAura(kCarapace);
+    bool const shelled = cthun->HasAura(kCarapace);
+    if (!weakened && !shelled)
+        return;
+    for (Member const& m : plan.members)
+    {
+        if (!m.bot || m.tank || m.healer || InStomach(m.p))
+            continue;
+        RaidOrder* o = e.OrderOf(m.p);
+        if (!o)
+            continue;
+        if (shelled)
+            o->forbidden_targets.push_back(cthun->GetGUID());
+        else if (!o->move)
+            o->attack_target = cthun->GetGUID();
+    }
+}
+
 } // namespace
 
 bool Aq40MechanicsMove(Plan const& plan, Member const& self, uint32_t /*now*/, RaidOrder& out)
@@ -210,6 +247,7 @@ void Aq40MechanicsElect(Election& e, uint32_t /*now*/)
 {
     ElectViscidusFrost(e);
     ElectStomach(e);
+    ElectWeakened(e);
 }
 
 } // namespace Playerbot::Raid::detail

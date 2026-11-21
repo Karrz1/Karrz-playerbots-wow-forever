@@ -180,6 +180,8 @@ void RegisterElevatorRules(IdleRuleRegistry& r);
 void RegisterCraftOrderRules(IdleRuleRegistry& r);
 void RegisterFarTravelRules(IdleRuleRegistry& r);
 void RegisterClassicUpkeepRules(IdleRuleRegistry& r);
+// The bot's next blessing / class buff waits only on the global cooldown (ClassicUpkeepRules.cpp): no rest starts in that gap.
+bool ClassicUpkeepCastPending(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms);
 void RegisterRpgRules(IdleRuleRegistry& r);
 void RegisterRaidIdleRules(IdleRuleRegistry& r);   // Bot/Raid/RaidCombat.cpp
 // SurvivalRules registered at priority 880-900; dispatched from OnTick's

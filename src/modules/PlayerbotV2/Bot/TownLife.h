@@ -96,15 +96,16 @@ inline void PactSet(std::uint64_t target, std::uint64_t initiator, std::uint32_t
     auto& t = Pacts();
     if (t.size() > 256)
         for (auto it = t.begin(); it != t.end();)
-            it = (now_ms - it->second.second > 60000u) ? t.erase(it) : std::next(it);
+            it = (now_ms - it->second.second > 120000u) ? t.erase(it) : std::next(it);
     t[target] = { initiator, now_ms };
 }
 
-inline bool PactHolds(std::uint64_t target, std::uint64_t initiator, std::uint32_t now_ms)
+// window_ms: 30 s for a duel one bot asked another for; a bot that told a player "sure, send it" keeps its word for 2 minutes.
+inline bool PactHolds(std::uint64_t target, std::uint64_t initiator, std::uint32_t now_ms, std::uint32_t window_ms = 30000u)
 {
     std::lock_guard<std::mutex> g(PactMutex());
     auto const it = Pacts().find(target);
-    return it != Pacts().end() && it->second.first == initiator && now_ms - it->second.second <= 30000u;
+    return it != Pacts().end() && it->second.first == initiator && now_ms - it->second.second <= window_ms;
 }
 
 } // namespace Playerbot::V2::TownLife

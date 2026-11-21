@@ -241,4 +241,24 @@ inline bool IdleFault(Mode mode, bool healer, bool controlled, uint32_t idle_sin
     return mode == Mode::Fight && !healer && !controlled && idle_since_ms != 0 && now_ms - idle_since_ms > kIdleFaultMs;
 }
 
+// Rule 2 between heals: the mob a healer's damage rules (wand, Smite, Wrath, Lightning Bolt, Judgement) aim at while nobody needs
+// healing. A healer takes no Attack order and opens on nothing itself, so with no target of its own it had none: outside an instance
+// with a tank it only ever hit what was hitting it, even on the leader's Attack (VempirE, #bot-feedback 2026-11-20: "when my bot is
+// set as a healer, it only heals and doesn't attack at all unless it's defending itself, not even when I use the attack command").
+// In the group's fight it takes the leader's target (the group's kill target, the one Attack names), else the tank's; in its own
+// fight with no group fight (a raid boss, a hold) the tank's, else the leader's. Never in a battleground, which has its own picks.
+// The target is for ranged spells only: the healer does not walk in or start a melee swing for it (State_InCombat).
+enum class HealerTarget : uint8_t { None, Leader, Tank };
+
+inline HealerTarget HealerFillerTarget(bool battleground, bool group_fight, bool self_in_combat, bool leader_target_ok, bool tank_target_ok)
+{
+    if (battleground)
+        return HealerTarget::None;
+    if (group_fight)
+        return leader_target_ok ? HealerTarget::Leader : tank_target_ok ? HealerTarget::Tank : HealerTarget::None;
+    if (self_in_combat)
+        return tank_target_ok ? HealerTarget::Tank : leader_target_ok ? HealerTarget::Leader : HealerTarget::None;
+    return HealerTarget::None;
+}
+
 } // namespace Playerbot::GroupFight

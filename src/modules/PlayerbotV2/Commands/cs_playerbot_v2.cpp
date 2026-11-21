@@ -19,6 +19,7 @@
 #include "Group.h"
 #include "GroupMgr.h"
 #include "Item.h"                // .bot itemstats
+#include "Loot.h"                // .playerbot bugprobe gouse: loot items
 #include "Map.h"                 // .playerbot bgzones â object store + player list
 #include "MapReference.h"
 #include "GridDefines.h"         // INVALID_HEIGHT â .playerbot terrainprofile void check
@@ -36,6 +37,7 @@
 #include "../Bot/BotBridge.h"           // .playerbot bridgeask
 #include "GameTime.h"
 #include "MotionMaster.h"
+#include "Session/HumanLogin.h"
 #include "MovementPackets.h"
 #include "PartyPackets.h"           // .playerbot setrole
 #include "Pet.h"                    // .playerbot petspells
@@ -68,6 +70,7 @@
 #include "Fleet/BotComposition.h"
 #include "Fleet/BotIdentityRegistry.h"
 #include "Fleet/BotPopulationManager.h"
+#include "Fleet/AutoRaid.h"    // a raid made for one more member may go back to a party
 #include "Fleet/BotSize.h"
 #include "Fleet/InstanceGroupCap.h"
 #include "Fleet/BotSetupPipeline.h"
@@ -111,8 +114,10 @@
 #include "SpellMgr.h"
 #include "ClassicRage.h"          // .playerbot rageprobe
 #include "Api/BotItemScorer.h"     // .playerbot gearpick
+#include "Bot/Gear/BotGearGenerator.h"   // .playerbot pairprobe
 #include "ConditionMgr.h"         // .playerbot visualprobe
 #include "Trainer.h"
+#include "LootMgr.h"              // .playerbot skincycle
 #include "TraitMgr.h"
 #include "TransmogrificationPackets.h"  // .playerbot transmogprobe
 #include "TransmogMgr.h"                // .playerbot transmogprobe
@@ -262,6 +267,11 @@ uint8 ParseClass(std::string const& token)
 //   2. Every boss creature_template entry resolves via sObjectMgr.
 //   3. Every mandatory_interrupt_spells id resolves via sSpellMgr.
 //   4. Every dangerous_auras id resolves via sSpellMgr.
+//   5. progression_waypoints[i] is the spot of bosses[i]: the owed-boss navigator steers to waypoints[i] for bosses[i], so a list
+//      with an entrance spot first, or a boss with no waypoint in the middle, sends the tank to the wrong boss's room. Each pair is
+//      checked against the boss's spawns on the map (wp_far: more than 40 y from every spawn; no_spawn: a boss with no spawn that
+//      event_summoned_bosses() does not declare; extra_wp: more waypoints than bosses). Every boss with its waypoint and spawns is
+//      written to DungeonBossSpawns.tsv in the logs folder, the data to correct the lists from.
 // Counts PASS/WARN/FAIL per script and prints a summary table. Runs
 // synchronously on the calling thread â no bots involved.
 bool RunDungeonValidation(ChatHandler* handler, uint32 only_map)
@@ -284,6 +294,15 @@ bool RunDungeonValidation(ChatHandler* handler, uint32 only_map)
     uint32 fail_count    = 0;
     std::vector<std::string> fail_lines;
     std::vector<std::string> warn_lines;
+
+    // Boss spawns by (map, entry), one pass over the creature store.
+    std::map<std::pair<uint32, uint32>, std::vector<Position>> spawns;
+    for (auto const& [guid, data] : sObjectMgr->GetAllCreatureData())
+        spawns[{ data.mapId, data.id }].push_back(data.spawnPoint);
+    std::string const tsv_path = sLog->GetLogsDir() + "DungeonBossSpawns.tsv";
+    std::ofstream tsv(tsv_path, std::ios::trunc);
+    if (tsv)
+        tsv << "script\tmap\tindex\tboss\tname\tevent_summoned\twp_x\twp_y\twp_z\tspawns\tnearest_d\tspawn_list\n";
 
     mgr.for_each_script([&](Playerbot::DungeonScript const& script)
     {
@@ -319,6 +338,64 @@ bool RunDungeonValidation(ChatHandler* handler, uint32 only_map)
             {
                 ++local_fail;
                 detail += fmt::format("bad_boss_entry={} ", e);
+            }
+        }
+        // 5. waypoints[i] belongs to bosses[i].
+        {
+            std::vector<uint32_t> const summoned = script.event_summoned_bosses();
+            constexpr float kWpFar = 40.0f;
+            for (size_t i = 0; i < a.bosses.size(); ++i)
+            {
+                uint32 const e = a.bosses[i];
+                bool const is_summoned = std::find(summoned.begin(), summoned.end(), e) != summoned.end();
+                auto const it = spawns.find({ script.map_id(), e });
+                std::vector<Position> const none;
+                std::vector<Position> const& sp = it != spawns.end() ? it->second : none;
+                bool const has_wp = i < a.progression_waypoints.size();
+                float nearest = -1.0f;
+                if (has_wp)
+                    for (Position const& p : sp)
+                    {
+                        auto const& w = a.progression_waypoints[i];
+                        float const d = std::sqrt((p.GetPositionX() - w.x) * (p.GetPositionX() - w.x) + (p.GetPositionY() - w.y) * (p.GetPositionY() - w.y) +
+                                                  (p.GetPositionZ() - w.z) * (p.GetPositionZ() - w.z));
+                        if (nearest < 0.0f || d < nearest)
+                            nearest = d;
+                    }
+                if (sp.empty() && !is_summoned)
+                {
+                    ++local_warn;
+                    detail += fmt::format("no_spawn[{}]={} ", i, e);
+                }
+                else if (has_wp && nearest > kWpFar)
+                {
+                    ++local_warn;
+                    detail += fmt::format("wp_far[{}]={}:{:.0f}y ", i, e, nearest);
+                }
+                if (tsv)
+                {
+                    CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(e);
+                    std::string list;
+                    for (Position const& p : sp)
+                        list += fmt::format("{}{:.1f},{:.1f},{:.1f}", list.empty() ? "" : ";", p.GetPositionX(), p.GetPositionY(), p.GetPositionZ());
+                    tsv << script.name() << '\t' << script.map_id() << '\t' << i << '\t' << e << '\t' << (ct ? ct->Name : std::string("?")) << '\t'
+                        << (is_summoned ? 1 : 0) << '\t';
+                    if (has_wp)
+                        tsv << fmt::format("{:.1f}\t{:.1f}\t{:.1f}", a.progression_waypoints[i].x, a.progression_waypoints[i].y, a.progression_waypoints[i].z);
+                    else
+                        tsv << "\t\t";
+                    tsv << '\t' << sp.size() << '\t' << (nearest < 0.0f ? std::string() : fmt::format("{:.1f}", nearest)) << '\t' << list << '\n';
+                }
+            }
+            if (a.progression_waypoints.size() > a.bosses.size())
+            {
+                ++local_warn;
+                detail += fmt::format("extra_wp={}/{} ", a.progression_waypoints.size(), a.bosses.size());
+                if (tsv)
+                    for (size_t i = a.bosses.size(); i < a.progression_waypoints.size(); ++i)
+                        tsv << script.name() << '\t' << script.map_id() << '\t' << i << "\t0\t(no boss)\t0\t"
+                            << fmt::format("{:.1f}\t{:.1f}\t{:.1f}", a.progression_waypoints[i].x, a.progression_waypoints[i].y, a.progression_waypoints[i].z)
+                            << "\t0\t\t\n";
             }
         }
         for (uint32 s : a.mandatory_interrupt_spells)
@@ -371,6 +448,8 @@ bool RunDungeonValidation(ChatHandler* handler, uint32 only_map)
     for (auto const& l : warn_lines) handler->SendSysMessage(l);
     if (fail_count == 0 && warn_count == 0)
         handler->SendSysMessage("All scripts clean.");
+    if (tsv)
+        handler->PSendSysMessage("Boss waypoints and spawns written to %s", tsv_path.c_str());
 
     return fail_count == 0;
 }
@@ -610,6 +689,7 @@ public:
             { "count",         HandleCount,         rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "login",         HandleLogin,         rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "logout",        HandleLogout,        rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "hold",          HandleHold,          rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "loginall",      HandleLoginAll,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "logoutall",     HandleLogoutAll,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "reload",        HandleReload,        rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -659,11 +739,13 @@ public:
             { "xpprobe",       HandleXpProbe,       rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "questchainprobe", HandleQuestChainProbe, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "groundz",       HandleGroundZ,       rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "nodeheights",   HandleNodeHeights,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "formprobe",     HandleFormProbe,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "setrole",       HandleSetRole,       rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "petspells",     HandlePetSpells,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "inspectprobe",  HandleInspectProbe,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "equipprobe",    HandleEquipProbe,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "pairprobe",     HandlePairProbe,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "gearpick",      HandleGearPick,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "rageprobe",     HandleRageProbe,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "visualprobe",   HandleVisualProbe,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -672,8 +754,10 @@ public:
             { "collisionprobe", HandleCollisionProbe, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "transmogprobe", HandleTransmogProbe, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "skinprobe",     HandleSkinProbe,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "skincycle",     HandleSkinCycle,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "powerprobe",    HandlePowerProbe,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "petprobe",      HandlePetProbe,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "tameprobe",     HandleTameProbe,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "langprobe",     HandleLangProbe,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "learncheck",    HandleLearnCheck,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "traitcheck",    HandleTraitCheck,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -2351,6 +2435,86 @@ public:
         return true;
     }
 
+    // .playerbot hold                  lists the held bots
+    // .playerbot hold <name> [on]      holds the bot in the world (logs it in if it is offline) with no player online
+    // .playerbot hold <name> off       releases it: the world spawner and the shaper treat it as any other bot again
+    // For console probes: with no player online every ambient bot is logged out within seconds ("Bot logic detached").
+    // A hold lasts until it is released or the server restarts. A held bot still logs out on `.playerbot logout`.
+    static bool HandleHold(ChatHandler* handler, Optional<std::string> target_name, Optional<std::string> mode)
+    {
+        if (!Playerbot::Services::Initialized())
+        {
+            handler->SendSysMessage("PlayerbotV2 not initialized.");
+            return false;
+        }
+        auto& population = Playerbot::Services::Population();
+        if (!target_name || target_name->empty())
+        {
+            std::vector<uint64> const held = population.HeldBots();
+            handler->PSendSysMessage("hold: %u bot(s) held.", uint32(held.size()));
+            for (uint64 id : held)
+            {
+                std::string name;
+                sCharacterCache->GetCharacterNameByGuid(ObjectGuid::Create<HighGuid::Player>(id), name);
+                Player const* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
+                handler->PSendSysMessage("  %s (id %llu): %s", name.c_str(), (unsigned long long)id,
+                    p && p->IsInWorld() ? "in the world" : "not in the world");
+            }
+            return true;
+        }
+        bool on = true;
+        if (mode)
+        {
+            std::string m = *mode;
+            std::transform(m.begin(), m.end(), m.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            if (m == "off")
+                on = false;
+            else if (m != "on")
+            {
+                handler->SendSysMessage("Usage: .playerbot hold [<name> [on|off]]");
+                return false;
+            }
+        }
+        Playerbot::BotId const id = ResolveCharacterId(*target_name);
+        if (!id)
+        {
+            handler->PSendSysMessage("No character named '%s' exists.", target_name->c_str());
+            return false;
+        }
+        if (!on)
+        {
+            bool const was = population.IsHeld(uint64(id));
+            population.SetHeld(uint64(id), false);
+            TC_LOG_INFO("playerbot.v2", "[hold] {} (id {}) released", *target_name, uint64(id));
+            handler->PSendSysMessage(was ? "Released '%s': it can be logged out as any other bot again."
+                                         : "'%s' was not held.", target_name->c_str());
+            return true;
+        }
+        ObjectGuid const g = ObjectGuid::Create<HighGuid::Player>(id);
+        Player const* p = ObjectAccessor::FindConnectedPlayer(g);
+        bool const in_world = p && p->IsInWorld();
+        if (p && !Playerbot::Services::Registry().has(id))
+        {
+            handler->PSendSysMessage("'%s' is online as a player, not a bot: nothing to hold.", target_name->c_str());
+            return false;
+        }
+        if (!p)
+        {
+            auto res = Playerbot::Services::SessionMgr().LoginBot(g);
+            if (!res.ok)
+            {
+                handler->PSendSysMessage("Login refused: %s", res.reason.c_str());
+                return false;
+            }
+        }
+        population.SetHeld(uint64(id), true);
+        TC_LOG_INFO("playerbot.v2", "[hold] {} (id {}) held{}", *target_name, uint64(id), p ? "" : ", login submitted");
+        handler->PSendSysMessage("Holding '%s'%s. It stays in the world with no player online until `.playerbot hold %s off`.",
+            target_name->c_str(), in_world ? "" : p ? " (still entering the world)" : " (login submitted: it enters the world in a moment)",
+            target_name->c_str());
+        return true;
+    }
+
     static bool HandleLoginAll(ChatHandler* handler, Optional<uint32> cap_arg)
     {
         if (!Playerbot::Services::Initialized())
@@ -3386,7 +3550,10 @@ public:
             if (m->GetGroup() && !detach_if_bot_group(m))
             { handler->PSendSysMessage("'%s' is grouped with humans â skipped.", names[i].c_str()); continue; }
             if (grp->IsFull() && !grp->isRaidGroup())
+            {
                 grp->ConvertToRaid();
+                ::Playerbot::V2::Fleet::AutoRaid::Mark(grp->GetGUID());
+            }
             if (grp->AddMember(m))
                 ++added;
             else
@@ -5259,6 +5426,125 @@ public:
         return true;
     }
 
+    // .playerbot nodeheights <map> [<zone id, 0 = whole map>] [<tolerance in yd, default 3>]
+    // Read-only. Checks every herb and mining node spawn (objects whose lock asks for Herbalism or Mining) of one map, or of one
+    // zone of it, against the standing surfaces under it, the same surfaces .playerbot groundz lists (terrain .map plus VMap). The
+    // surfaces are searched from 30 yd above the spawn down to 60 yd below it; the one nearest the spawn's z is taken as its ground.
+    // Nodes further off than the tolerance (floating, or buried) go to NodeHeights_<map>_<zone>.tsv in the logs folder, one line
+    // each: guid, entry, kind, pool, zone, area, x, y, z, ground, z - ground, every surface found. The check loads the terrain
+    // tiles of every node of the map, so a whole continent takes a while and holds the world update; run it on dev, one zone at a
+    // time, when nobody is in game. Floating ore at Duskwood 81,28 (Discord, 2026-11-18) was 20 yd off.
+    static bool HandleNodeHeights(ChatHandler* handler, uint32 mapId, Optional<uint32> zoneFilter, Optional<float> toleranceArg)
+    {
+        if (!sMapStore.LookupEntry(mapId))
+        {
+            handler->SendSysMessage("nodeheights: no such map");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        uint32 const zoneId = zoneFilter.value_or(0);
+        float const tolerance = toleranceArg.value_or(3.0f);
+
+        auto nodeKind = [](GameObjectTemplate const* goInfo) -> char const*
+        {
+            LockEntry const* lock = sLockStore.LookupEntry(goInfo->GetLockId());
+            if (!lock)
+                return nullptr;
+            for (uint8 i = 0; i < MAX_LOCK_CASE; ++i)
+            {
+                if (lock->Type[i] != LOCK_KEY_SKILL)
+                    continue;
+                if (lock->Index[i] == LOCKTYPE_HERBALISM)
+                    return "herb";
+                if (lock->Index[i] == LOCKTYPE_MINING || lock->Index[i] == LOCKTYPE_MINING_2)
+                    return "mining";
+            }
+            return nullptr;
+        };
+
+        std::string const path = sLog->GetLogsDir() + Trinity::StringFormat("NodeHeights_{}_{}.tsv", mapId, zoneId);
+        std::ofstream out(path, std::ios::trunc);
+        if (!out)
+        {
+            handler->PSendSysMessage("nodeheights: cannot write %s", path.c_str());
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        out << "guid\tentry\tname\tkind\tpool\tzone\tarea\tx\ty\tz\tground\tz_minus_ground\tsurfaces\n";
+
+        std::shared_ptr<TerrainInfo> terrain = sTerrainMgr.LoadTerrain(mapId);
+        PhaseShift const& phaseShift = PhasingHandler::GetEmptyPhaseShift();
+
+        uint32 checked = 0, off = 0, noGround = 0, shown = 0;
+        for (auto const& [spawnId, data] : sObjectMgr->GetAllGameObjectData())
+        {
+            if (data.mapId != mapId)
+                continue;
+            GameObjectTemplate const* goInfo = sObjectMgr->GetGameObjectTemplate(data.id);
+            if (!goInfo)
+                continue;
+            char const* kind = nodeKind(goInfo);
+            if (!kind)
+                continue;
+
+            float const x = data.spawnPoint.GetPositionX();
+            float const y = data.spawnPoint.GetPositionY();
+            float const z = data.spawnPoint.GetPositionZ();
+            if (!Trinity::IsValidMapCoord(x, y, z))
+                continue;
+
+            uint32 zone = 0, area = 0;
+            terrain->GetZoneAndAreaId(phaseShift, mapId, zone, area, x, y, z);
+            if (zoneId && zone != zoneId)
+                continue;
+            ++checked;
+
+            std::vector<float> surfaces;
+            float searchZ = z + 30.0f;
+            for (uint32 i = 0; i < 10; ++i)
+            {
+                float const surface = terrain->GetStaticHeight(phaseShift, mapId, x, y, searchZ, true, 100.0f);
+                if (surface <= INVALID_HEIGHT || surface < z - 60.0f)
+                    break;
+                surfaces.push_back(surface);
+                searchZ = surface - 3.0f;
+            }
+
+            float ground = INVALID_HEIGHT;
+            for (float s : surfaces)
+                if (ground <= INVALID_HEIGHT || std::fabs(s - z) < std::fabs(ground - z))
+                    ground = s;
+
+            if (ground <= INVALID_HEIGHT)
+                ++noGround;
+            else if (std::fabs(z - ground) <= tolerance)
+                continue;
+            ++off;
+
+            std::string surfaceList;
+            for (float s : surfaces)
+                surfaceList += Trinity::StringFormat("{}{:.2f}", surfaceList.empty() ? "" : ",", s);
+
+            out << spawnId << '\t' << data.id << '\t' << goInfo->name << '\t' << kind << '\t' << data.poolId << '\t' << zone << '\t'
+                << area << '\t' << Trinity::StringFormat("{:.2f}\t{:.2f}\t{:.2f}\t", x, y, z)
+                << (ground <= INVALID_HEIGHT ? std::string("none") : Trinity::StringFormat("{:.2f}\t{:.2f}", ground, z - ground))
+                << (ground <= INVALID_HEIGHT ? "\t" : "") << '\t' << surfaceList << '\n';
+
+            if (shown < 20)
+            {
+                ++shown;
+                handler->PSendSysMessage("nodeheights: guid %s %u %s zone %u (%.1f, %.1f) z %.2f ground %s", std::to_string(spawnId).c_str(),
+                    data.id, goInfo->name.c_str(), zone, x, y, z,
+                    ground <= INVALID_HEIGHT ? "none" : Trinity::StringFormat("{:.2f}", ground).c_str());
+            }
+        }
+
+        handler->PSendSysMessage("nodeheights: map %u zone %u: %u herb/mining nodes checked, %u more than %.1f yd off (%u with no surface"
+            " found), list in %s", mapId, zoneId, checked, off, tolerance, noGround, path.c_str());
+        return true;
+    }
+
     // .playerbot questchainprobe <player> <first quest id>
     // Walks a quest chain the way a player meets it: for each quest it reports who starts it (creatures, objects, items), every
     // requirement check the player fails, then takes, completes and rewards it and looks for what comes next (the reward's next
@@ -5554,6 +5840,37 @@ public:
             "slot %u", p->GetName().c_str(), uint32(p->GetClass()), uint32(p->GetLevel()), itemId, proto->GetName(DEFAULT_LOCALE),
             proto->GetClass(), proto->GetSubClass(), uint32(proto->GetInventoryType()), uint32(use), uint32(equip), equip == EQUIP_ERR_OK ? " (OK)" : "",
             equip == EQUIP_ERR_OK ? uint32(dest & 255) : 255u);
+        return true;
+    }
+
+    // .playerbot pairprobe <player> <two-hand item id>
+    // Whether the bot's auto-equip would put the two-hander on over its worn main hand and off hand below the level cap
+    // (Gear::TwoHandBeatsWornPair): the role score of each piece and the answer. Nothing is created or equipped.
+    static bool HandlePairProbe(ChatHandler* handler, std::string name, uint32 itemId)
+    {
+        Player* p = normalizePlayerName(name) ? ObjectAccessor::FindPlayerByName(name) : nullptr;
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+        if (!p || !p->IsInWorld() || !proto)
+        {
+            handler->SendSysMessage(!proto ? "pairprobe: no such item" : "pairprobe: no such player in the world");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        uint8 const cls = p->GetClass(), level = p->GetLevel();
+        uint16 const spec = uint16(::Playerbot::Classic::EffectiveSpecId(p));
+        Item const* mh = p->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+        Item const* oh = p->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+        uint32 const mhEntry = mh ? mh->GetEntry() : 0, ohEntry = oh ? oh->GetEntry() : 0;
+        auto score = [&](uint32 entry, uint8 slot) -> int32
+        {
+            ItemTemplate const* t = entry ? sObjectMgr->GetItemTemplate(entry) : nullptr;
+            return t ? ::Playerbot::Gear::ScoreItemRaid(t, cls, spec, level, slot) : 0;
+        };
+        bool const takes = ::Playerbot::V2::Gear::TwoHandBeatsWornPair(cls, spec, level, itemId, mhEntry, ohEntry);
+        handler->PSendSysMessage("pairprobe: %s (class %u spec %u level %u) item %u %s (inventory type %u) score %d; main hand %u score %d, "
+            "off hand %u score %d; auto-equip %s", p->GetName().c_str(), uint32(cls), uint32(spec), uint32(level), itemId,
+            proto->GetName(DEFAULT_LOCALE), uint32(proto->GetInventoryType()), score(itemId, EQUIPMENT_SLOT_MAINHAND), mhEntry,
+            score(mhEntry, EQUIPMENT_SLOT_MAINHAND), ohEntry, score(ohEntry, EQUIPMENT_SLOT_OFFHAND), takes ? "TAKES it" : "keeps the pair");
         return true;
     }
 
@@ -6172,6 +6489,281 @@ public:
         return true;
     }
 
+    // .playerbot skincycle <player> [show|learn|unlearn|skin|cycle] [<count>] [<beast entry>] [<trainer spell>]
+    // Skinning through the paths a player takes, without a client (RU #17, Fox: skinning stopped at 34, and at 25 after unlearning
+    // and learning it again). Every step prints Skinning 393 and its child lines as rank / max (step).
+    //   show     the state, the skinning spells known (each with the skill lines it belongs to, how it is learned and the line it
+    //            skills up, and whether EffectSkinning counts it for Skinning 393) and the skill-up config
+    //   learn    as Trainer::TeachSpell does it for the trainer spell that teaches Skinning rank 1 (found in the trainer data, or the
+    //            spell given): cast when it has a learn-spell effect, otherwise LearnSpell. No money is taken.
+    //   unlearn  as the "abandon profession" packet does it (HandleUnlearnSkillOpcode): SetSkill(393, 0, 0, 0) if the skill is unlearnable
+    //   skin     kills up to <count> skinnable beasts within 150 yards (default 20) and skins each with a skinning spell the player
+    //            knows, taking the known skinning spells in turn (a real cast, so Spell::EffectSkinning decides the skill-up); the beast's
+    //            level, the spell and the rank before and after are printed, then a total per spell. Spawned beasts are asked to respawn
+    //            now. With a <beast entry>, beasts of that entry are summoned next to the player for the ones missing. The beasts are
+    //            killed with no killer, so they leave no other loot.
+    //   cycle    show, learn if not known, skin, unlearn, learn, skin; each half uses <count> beasts.
+    // Dev only; it changes the player's skinning for good, so use a bot standing among beasts of the level to test.
+    static bool HandleSkinCycle(ChatHandler* handler, std::string name, Optional<std::string> mode, Optional<uint32> count,
+        Optional<uint32> beastEntry, Optional<uint32> trainerSpellArg)
+    {
+        Player* p = normalizePlayerName(name) ? ObjectAccessor::FindPlayerByName(name) : nullptr;
+        if (!p || !p->IsInWorld() || !p->IsAlive())
+        {
+            handler->SendSysMessage("skincycle: needs the name of a living player in the world");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        std::string const what = mode ? *mode : std::string("show");
+        uint32 const beasts = std::clamp<uint32>(count.value_or(20), 1, 200);
+        uint32 const skill = SKILL_SKINNING;
+        auto say = [&](std::string const& text) { handler->SendSysMessage(text); TC_LOG_INFO("playerbot.v2", "[skincycle] {}", text); };
+
+        auto state = [&](char const* when)
+        {
+            std::string lines = Trinity::StringFormat("{} {} (level {}): skinning {} {} / {} (step {})", when, p->GetName(), uint32(p->GetLevel()),
+                p->HasSkill(skill) ? "known" : "NOT known", uint32(p->GetPureSkillValue(skill)), uint32(p->GetPureMaxSkillValue(skill)),
+                uint32(p->GetSkillStep(skill)));
+            if (std::vector<SkillLineEntry const*> const* children = sDB2Manager.GetSkillLinesForParentSkill(skill))
+                for (SkillLineEntry const* child : *children)
+                    if (p->HasSkill(child->ID) || p->GetPureMaxSkillValue(child->ID))
+                        lines += Trinity::StringFormat("; child {} {} / {} (step {})", child->ID, uint32(p->GetPureSkillValue(child->ID)),
+                            uint32(p->GetPureMaxSkillValue(child->ID)), uint32(p->GetSkillStep(child->ID)));
+            say(lines);
+        };
+
+        // the known spells with a skinning effect: the one the client casts on a corpse
+        auto skinSpells = [&]()
+        {
+            std::vector<uint32> found;
+            for (auto const& [spellId, spell] : p->GetSpellMap())
+            {
+                if (spell.state == PLAYERSPELL_REMOVED || spell.disabled)
+                    continue;
+                if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE))
+                    if (info->HasEffect(SPELL_EFFECT_SKINNING))
+                        found.push_back(spellId);
+            }
+            std::ranges::sort(found);
+            return found;
+        };
+
+        auto show = [&]()
+        {
+            state("state:");
+            if (SkillRaceClassInfoEntry const* rcInfo = sDB2Manager.GetSkillRaceClassInfo(skill, p->GetRace(), p->GetClass()))
+                say(Trinity::StringFormat("race/class info {}: tier {}, flags 0x{:X} (unlearnable: {})", rcInfo->ID, int32(rcInfo->SkillTierID),
+                    uint32(rcInfo->Flags), (rcInfo->Flags & SKILL_FLAG_UNLEARNABLE) ? "yes" : "NO"));
+            else
+                say("race/class info: NONE for this race and class");
+            std::vector<uint32> const spells = skinSpells();
+            if (spells.empty())
+                say("knows no spell with a skinning effect");
+            for (uint32 spellId : spells)
+            {
+                std::string lines = Trinity::StringFormat("knows skinning spell {}: on the Skinning line: {}", spellId,
+                    IsPartOfSkillLine(skill, spellId) ? "yes" : "NO");
+                SkillLineAbilityMapBounds const bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
+                if (bounds.first == bounds.second)
+                    lines += "; on no skill line";
+                for (auto itr = bounds.first; itr != bounds.second; ++itr)
+                {
+                    SkillLineAbilityEntry const* ability = itr->second;
+                    SkillLineEntry const* line = sSkillLineStore.LookupEntry(ability->SkillLine);
+                    lines += Trinity::StringFormat("; line {} (parent {}, {}known), min rank {}, acquire {}, skill-up line {}", ability->SkillLine,
+                        line ? uint32(line->ParentSkillLineID) : 0u, p->HasSkill(ability->SkillLine) ? "" : "not ", int32(ability->MinSkillLineRank),
+                        int32(ability->AcquireMethod), int32(ability->SkillupSkillLineID));
+                }
+                say(lines);
+            }
+            say(Trinity::StringFormat("config: SkillChance orange {} yellow {} green {} grey {}, SkillChance.SkinningSteps {}, SkillGain.Gathering {}",
+                sWorld->getIntConfig(CONFIG_SKILL_CHANCE_ORANGE), sWorld->getIntConfig(CONFIG_SKILL_CHANCE_YELLOW),
+                sWorld->getIntConfig(CONFIG_SKILL_CHANCE_GREEN), sWorld->getIntConfig(CONFIG_SKILL_CHANCE_GREY),
+                sWorld->getIntConfig(CONFIG_SKILL_CHANCE_SKINNING_STEPS), sWorld->getIntConfig(CONFIG_SKILL_GAIN_GATHERING)));
+        };
+
+        auto teachesRankOne = [](uint32 spellId)
+        {
+            if (SpellLearnSkillNode const* learn = sSpellMgr->GetSpellLearnSkill(spellId))
+                if (learn->skill == SKILL_SKINNING && learn->step == 1)
+                    return true;
+            return false;
+        };
+
+        auto learn = [&]() -> bool
+        {
+            // the trainer spell, as the trainer data has it
+            Trainer::Spell const* trainerSpell = nullptr;
+            uint32 trainerId = 0;
+            for (auto const& [id, trainer] : sObjectMgr->GetTrainers())
+            {
+                for (Trainer::Spell const& spell : trainer.GetSpells())
+                {
+                    bool teaches = trainerSpellArg ? spell.SpellId == *trainerSpellArg : teachesRankOne(spell.SpellId);
+                    if (!teaches && !trainerSpellArg)
+                        if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spell.SpellId, DIFFICULTY_NONE))
+                            for (SpellEffectInfo const& effect : info->GetEffects())
+                                if (effect.IsEffect(SPELL_EFFECT_LEARN_SPELL) && teachesRankOne(effect.TriggerSpell))
+                                    teaches = true;
+                    if (teaches)
+                    {
+                        trainerSpell = &spell;
+                        trainerId = id;
+                        break;
+                    }
+                }
+                if (trainerSpell)
+                    break;
+            }
+            if (!trainerSpell)
+            {
+                say(trainerSpellArg ? Trinity::StringFormat("learn: no trainer teaches spell {}", *trainerSpellArg)
+                    : std::string("learn: no trainer spell teaches Skinning rank 1 (FAIL)"));
+                return false;
+            }
+
+            bool const castable = trainerSpell->IsCastable();
+            say(Trinity::StringFormat("learn: trainer {} spell {} (required level {}, {}; player level {})", trainerId, trainerSpell->SpellId,
+                uint32(trainerSpell->ReqLevel), castable ? "cast, it has a learn-spell effect" : "LearnSpell", uint32(p->GetLevel())));
+            if (castable)
+            {
+                SpellCastResult const result = p->CastSpell(p, trainerSpell->SpellId, true);
+                if (result != SPELL_CAST_OK)
+                    say(Trinity::StringFormat("learn: the cast failed, result {}", uint32(result)));
+            }
+            else
+                p->LearnSpell(trainerSpell->SpellId, false);
+            state("after learn:");
+            return true;
+        };
+
+        auto unlearn = [&]()
+        {
+            SkillRaceClassInfoEntry const* rcInfo = sDB2Manager.GetSkillRaceClassInfo(skill, p->GetRace(), p->GetClass());
+            if (!rcInfo || !(rcInfo->Flags & SKILL_FLAG_UNLEARNABLE))
+            {
+                say("unlearn: the abandon packet is refused here, Skinning is not unlearnable for this race and class");
+                return;
+            }
+            p->SetSkill(skill, 0, 0, 0);
+            state("after unlearn:");
+            std::vector<uint32> const spells = skinSpells();
+            say(Trinity::StringFormat("after unlearn: {} skinning spell(s) still known", uint32(spells.size())));
+        };
+
+        auto skin = [&](char const* label)
+        {
+            std::vector<uint32> const spells = skinSpells();
+            if (spells.empty())
+            {
+                say(Trinity::StringFormat("{}: knows no spell with a skinning effect, nothing to cast (FAIL)", label));
+                return;
+            }
+
+            std::vector<std::pair<float, Creature*>> candidates;
+            for (auto const& [spawnId, c] : p->GetMap()->GetCreatureBySpawnIdStore())
+            {
+                if (!c->IsInWorld() || !c->IsAlive() || c->IsSummon() || c->GetRespawnCompatibilityMode() || c->GetNpcFlags() || c->IsDungeonBoss()
+                    || !c->CanHaveLoot() || c->IsInCombat())
+                    continue;
+                CreatureDifficulty const* difficulty = c->GetCreatureDifficulty();
+                if (!difficulty || difficulty->GetRequiredLootSkill() != skill || !LootTemplates_Skinning.HaveLootFor(difficulty->SkinLootID))
+                    continue;
+                float const d = p->GetDistance(c);
+                if (d <= 150.0f)
+                    candidates.emplace_back(d, c);
+            }
+            std::ranges::sort(candidates, {}, &std::pair<float, Creature*>::first);
+            if (candidates.size() > beasts)
+                candidates.resize(beasts);
+            uint32 const spawned = uint32(candidates.size());
+            if (beastEntry && candidates.size() < beasts)
+            {
+                if (!sObjectMgr->GetCreatureTemplate(*beastEntry))
+                    say(Trinity::StringFormat("{}: no creature template {}, nothing summoned", label, *beastEntry));
+                else
+                    for (uint32 i = uint32(candidates.size()); i < beasts; ++i)
+                    {
+                        float const angle = float(i) * 0.7f;
+                        Position pos(p->GetPositionX() + 4.0f * std::cos(angle), p->GetPositionY() + 4.0f * std::sin(angle), p->GetPositionZ());
+                        if (Creature* c = p->SummonCreature(*beastEntry, pos, TEMPSUMMON_TIMED_DESPAWN, 120s))
+                            candidates.emplace_back(p->GetDistance(c), c);
+                    }
+            }
+            if (candidates.empty())
+            {
+                say(Trinity::StringFormat("{}: no living skinnable beast within 150 yards; move the bot among beasts or give a beast entry", label));
+                return;
+            }
+
+            uint16 const startValue = p->GetPureSkillValue(skill);
+            uint32 rose = 0, failed = 0;
+            std::map<uint32, std::array<uint32, 3>> perSpell;   // spell -> casts, failed casts, points
+            for (size_t n = 0; n < candidates.size(); ++n)
+            {
+                auto const& [dist, c] = candidates[n];
+                uint32 const skinSpell = spells[n % spells.size()];
+                uint32 const level = c->GetLevelForTarget(p);
+                uint32 const entry = c->GetEntry();
+                ObjectGuid::LowType const spawnId = n < spawned ? c->GetSpawnId() : 0;
+                Unit::Kill(nullptr, c, false);
+                bool const skinnable = c->HasUnitFlag(UNIT_FLAG_SKINNABLE);
+                uint16 const before = p->GetPureSkillValue(skill);
+                SpellCastResult const result = p->CastSpell(c, skinSpell, CastSpellExtraArgs(TRIGGERED_FULL_MASK));
+                uint16 const after = p->GetPureSkillValue(skill);
+                if (after > before)
+                    ++rose;
+                if (result != SPELL_CAST_OK)
+                    ++failed;
+                std::array<uint32, 3>& tally = perSpell[skinSpell];
+                ++tally[0];
+                tally[1] += result != SPELL_CAST_OK ? 1 : 0;
+                tally[2] += after > before ? 1 : 0;
+                say(Trinity::StringFormat("{}: beast {} level {} at {:.0f} yd, skinnable {}, cast {} -> result {}, skinning {} -> {} / {}", label,
+                    entry, level, dist, skinnable ? "yes" : "NO", skinSpell, uint32(result), uint32(before), uint32(after),
+                    uint32(p->GetPureMaxSkillValue(skill))));
+                p->GetSession()->DoLootReleaseAll();
+                if (spawnId)
+                    p->GetMap()->Respawn(SPAWN_TYPE_CREATURE, spawnId);
+            }
+            for (auto const& [spellId, tally] : perSpell)
+                say(Trinity::StringFormat("{}: spell {} (on the Skinning line: {}): {} skins, {} casts failed, {} gave a point", label, spellId,
+                    IsPartOfSkillLine(skill, spellId) ? "yes" : "NO", tally[0], tally[1], tally[2]));
+            say(Trinity::StringFormat("{}: {} beasts ({} spawned, {} summoned), {} casts failed, {} gave a point; skinning {} -> {} / {}", label,
+                uint32(candidates.size()), spawned, uint32(candidates.size()) - spawned, failed, rose, uint32(startValue),
+                uint32(p->GetPureSkillValue(skill)), uint32(p->GetPureMaxSkillValue(skill))));
+        };
+
+        if (what == "show")
+            show();
+        else if (what == "learn")
+            learn();
+        else if (what == "unlearn")
+            unlearn();
+        else if (what == "skin")
+            skin("skin");
+        else if (what == "cycle")
+        {
+            show();
+            if (!p->HasSkill(skill) && !learn())
+                return true;
+            skin("first skins");
+            unlearn();
+            if (!learn())
+                return true;
+            skin("skins after learning again");
+            show();
+        }
+        else
+        {
+            handler->SendSysMessage("skincycle: mode is show, learn, unlearn, skin or cycle");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        return true;
+    }
+
     // .playerbot powerprobe <player>
     // One look at a player's mana: power type, mana now / max / base, the regen modifiers the client is sent, the spells being cast
     // and every aura with the aura types of its effects. Run it a few times a second or two apart to see where mana goes.
@@ -6271,6 +6863,83 @@ public:
         return true;
     }
 
+    // .playerbot tameprobe <player> [<creature entry>]
+    // Tame Beast (1515) as the player's click casts it (Discord 2026-11-19, Saul: "the button just doesn't work on the beast"). A beast of
+    // the entry (default 299, Young Wolf) is set down 5 y in front of the player with no owner, and the probe prints what the cast checks
+    // read: the beast's type, family, tameable type flag and level, the player's level, its pet out, every active pet slot of its stable
+    // and the Call Pet spell each slot needs (883, 83242-83245). A pet that is out is put in the stable first (it stays the player's,
+    // `.playerbot petprobe` lists it), then 1515 is cast and its result printed (0 = cast; 37 = SPELL_FAILED_DONT_REPORT, the cast was
+    // refused with a tame failure message to the client). The channel takes 20 s: petprobe after that says whether a pet came of it.
+    static bool HandleTameProbe(ChatHandler* handler, std::string name, Optional<uint32> entryArg)
+    {
+        constexpr uint32 SPELL_TAME_BEAST = 1515;
+        Player* p = normalizePlayerName(name) ? ObjectAccessor::FindPlayerByName(name) : nullptr;
+        if (!p || !p->IsInWorld())
+        {
+            handler->SendSysMessage("tameprobe: no such player in the world");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        uint32 const entry = entryArg.value_or(299u);
+        if (!sObjectMgr->GetCreatureTemplate(entry))
+        {
+            handler->PSendSysMessage("tameprobe: no creature template %u", entry);
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        handler->PSendSysMessage("tameprobe: %s level %u class %u knows 1515 %u, 883 %u, 83242 %u, exotic %u, charmed %u",
+            p->GetName().c_str(), uint32(p->GetLevel()), uint32(p->GetClass()), p->HasSpell(SPELL_TAME_BEAST) ? 1u : 0u, p->HasSpell(883) ? 1u : 0u,
+            p->HasSpell(83242) ? 1u : 0u, p->CanTameExoticPets() ? 1u : 0u, p->GetCharmedGUID().IsEmpty() ? 0u : 1u);
+
+        if (Pet* pet = p->GetPet())
+        {
+            handler->PSendSysMessage("tameprobe: pet %u (entry %u) is out: put in the stable before the cast", pet->GetCharmInfo() ? pet->GetCharmInfo()->GetPetNumber() : 0u,
+                pet->GetEntry());
+            p->RemovePet(pet, PET_SAVE_NOT_IN_SLOT);
+        }
+        if (PetStable const* stable = p->GetPetStable())
+        {
+            handler->PSendSysMessage("tameprobe: stable current index %s", stable->CurrentPetIndex ? std::to_string(*stable->CurrentPetIndex).c_str() : "none");
+            for (std::size_t i = 0; i < stable->ActivePets.size(); ++i)
+            {
+                static constexpr uint32 kCallPet[] = { 883, 83242, 83243, 83244, 83245 };
+                uint32 const call = i < std::size(kCallPet) ? kCallPet[i] : 0u;
+                if (stable->ActivePets[i])
+                    handler->PSendSysMessage("tameprobe:   active slot %u: pet %u entry %u level %u health %u", uint32(i), stable->ActivePets[i]->PetNumber,
+                        stable->ActivePets[i]->CreatureId, uint32(stable->ActivePets[i]->Level), stable->ActivePets[i]->Health);
+                else
+                    handler->PSendSysMessage("tameprobe:   active slot %u: free, needs Call Pet %u (known %u)", uint32(i), call, call && p->HasSpell(call) ? 1u : 0u);
+            }
+            handler->PSendSysMessage("tameprobe:   %u unslotted (stabled) pets", uint32(stable->UnslottedPets.size()));
+        }
+        else
+            handler->SendSysMessage("tameprobe: no pet stable loaded");
+
+        Position pos = p->GetPosition();
+        p->MovePosition(pos, 5.0f, 0.0f);
+        TempSummon* beast = p->GetMap()->SummonCreature(entry, pos, nullptr, 120s);
+        if (!beast)
+        {
+            handler->SendSysMessage("tameprobe: the beast could not be set down");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        beast->SetFacingToObject(p);
+        CreatureTemplate const* tmpl = beast->GetCreatureTemplate();
+        CreatureDifficulty const* diff = beast->GetCreatureDifficulty();
+        handler->PSendSysMessage("tameprobe: beast %s entry %u level %u (for the player %u) type %u family %d type flags 0x%08X (tameable bit %u) "
+            "IsTameable %u owner %s", beast->GetName().c_str(), entry, uint32(beast->GetLevel()), uint32(beast->GetLevelForTarget(p)), tmpl->type,
+            int32(tmpl->family), diff ? diff->TypeFlags : 0u, diff && (diff->TypeFlags & CREATURE_TYPE_FLAG_TAMEABLE) ? 1u : 0u,
+            diff && tmpl->IsTameable(p->CanTameExoticPets(), diff) ? 1u : 0u, beast->GetOwnerGUID().IsEmpty() ? "none" : beast->GetOwnerGUID().ToString().c_str());
+
+        p->SetSelection(beast->GetGUID());
+        p->SetFacingToObject(beast);
+        SpellCastResult const r = p->CastSpell(beast, SPELL_TAME_BEAST, false);
+        handler->PSendSysMessage("tameprobe: cast 1515 on the beast: result %u%s", uint32(r), r == SPELL_CAST_OK ? " (channel started)" : "");
+        TC_LOG_INFO("playerbot.v2", "[tameprobe] {} cast 1515 on entry {} result {}", p->GetName(), entry, uint32(r));
+        return true;
+    }
+
     // .playerbot collisionprobe <creature entry> [<player>]
     // The collision height of each model of a creature template: the model's raw CollisionHeight, the height the core uses
     // (CreatureModelDataEntry::GetCollisionHeight, which reads the bounding box when the client marks the height "not set") and the
@@ -6323,7 +6992,8 @@ public:
     // Dev check of the 17 Nov code fixes without a client: each line says PASS or FAIL with the numbers. Run it on a bot standing on open,
     // flat ground with no other creature within 10 yards (a city square is fine). Summons its own test creatures and removes them again.
     //   all          melee reach by height (0001), second target of Blade Flurry / Sweeping Strikes (0019), Retribution Aura and Thorns
-    //                spell power (0021), Triage patient bleed rate (0023), on a shaman totem level (0015), on a mage Missile Barrage (0027),
+    //                spell power (0021), Triage patient bleed rate (0023), on a shaman totem level (0015), on a mage Missile Barrage (0027,
+    //                0035), on a warlock the Imp keeping a learned Firebolt rank (0036),
     //                on a paladin Judgement of Light / Wisdom (0032), Shield Specialization (0033) and Reckoning (0034)
     //   corpse       kills the nearest spawned creature (no NPC flags, within 40 yards) and asks for its respawn now (0012)
     //   corpsecheck  a few seconds later: PASS while only its corpse is there, FAIL if it stands up beside its corpse
@@ -6390,6 +7060,409 @@ public:
                     uint64(s_corpseSpawn), corpses, alive));
             else
                 say(Trinity::StringFormat("0012 corpse: SKIP, the corpse is already gone ({} alive); run 'corpse' again and check sooner", alive));
+            return true;
+        }
+        // 0037 druid tank form (Gremloc, Discord 2026-11-19: a level 15 feral druid alt set to tank tanks in caster form, though the
+        // character knows Bear Form). 'bear' reports every link of the chain the bear rotation hangs on: the real specialization, the
+        // virtual spec override and inference, the spec and role the bot logic reads from its latest snapshot, Bear Form as the
+        // snapshot sees it, the rotation that spec selects and the last rule that fired. 'beartank' first declares the druid a tank
+        // the way the party role menu does (BotCommandParser::DeclareRole), then reports. Run 'bear' again in a fight for the rule.
+        if (what == "bear" || what == "beartank")
+        {
+            using Playerbot::Role;
+            auto roleName = [](Role r) { return r == Role::Tank ? "tank" : r == Role::Healer ? "healer" : r == Role::Dps ? "dps" : "unset"; };
+            if (p->GetClass() != CLASS_DRUID)
+            {
+                say("0037 bear: SKIP, not a druid");
+                return true;
+            }
+            Playerbot::BotId const id = p->GetGUID().GetCounter();
+            Playerbot::BotAI* ai = Playerbot::Services::Registry().ai(id);
+            if (what == "beartank")
+            {
+                if (!ai)
+                {
+                    say("0037 bear: SKIP, not a bot (no bot logic registered)");
+                    return true;
+                }
+                Playerbot::BotCommandParser::DeclareRole(p, Role::Tank);
+                say("0037 bear: declared tank (as the party role menu does); the snapshot follows within a second, run 'bear' then");
+            }
+            uint32 const real = uint32(AsUnderlyingType(p->GetPrimarySpecialization()));
+            uint32 const effective = ::Playerbot::Classic::EffectiveSpecId(p);
+            say(Trinity::StringFormat("0037 bear: {} level {}; real spec {} (retail id {}), override {}, inferred {}, effective {}; own character {}, "
+                "declared role {}, bot role override {}",
+                p->GetName(), uint32(p->GetLevel()), real, ::Playerbot::Classic::IsRetailClassSpec(CLASS_DRUID, real) ? "YES" : "no",
+                ::Playerbot::Classic::GetSpecOverride(p->GetGUID()), ::Playerbot::Classic::InferClassicSpec(p), effective,
+                (p->GetSession() && !Playerbot::Services::Accounts().is_pool_account(p->GetSession()->GetAccountId())) ? "yes" : "no", roleName(Playerbot::Services::Owners().DeclaredRole(id)),
+                ai ? roleName(ai->role_override()) : "(not a bot)"));
+            say(Trinity::StringFormat("0037 bear: character knows Bear Form 5487 {}, Dire Bear 9634 {}, Cat Form 768 {}; in Bear Form {}; "
+                "group {} (party menu role bits {}); druid form cancel config {}",
+                p->HasSpell(5487) ? "yes" : "NO", p->HasSpell(9634) ? "yes" : "no", p->HasSpell(768) ? "yes" : "no",
+                (p->HasAura(5487) || p->HasAura(9634)) ? "yes" : "no", p->GetGroup() ? "yes" : "no",
+                p->GetGroup() ? uint32(p->GetGroup()->GetLfgRoles(p->GetGUID())) : 0u,
+                Playerbot::Services::Config().behavior_druid_heal_form() ? 1 : 0));
+            std::shared_ptr<Playerbot::BotSnapshot const> const snap = Playerbot::Services::Snapshots().latest(id);
+            if (!ai || !snap)
+            {
+                say("0037 bear: SKIP, no bot snapshot (summon the druid as a bot first)");
+                return true;
+            }
+            Playerbot::BotSnapshotView const view(*snap);
+            uint32 const bear = view.knows_spell(9634) ? 9634u : 5487u;
+            Playerbot::ApRotation const* rot = Playerbot::Combat::GetRotation(CLASS_DRUID, view.spec());
+            bool const tankSpec = view.spec() == 104;
+            bool const knows = view.knows_spell(bear);
+            bool const ready = view.is_ready(bear);
+            Role const eff = ai->effective_role(view);
+            say(Trinity::StringFormat("0037 bear: snapshot spec {} (the bear rotation is 104), snapshot role {}, role the bot plays {}; "
+                "snapshot knows {} {}, ready {}, has its aura {}; rotation for the spec {}; in combat {}; last rule {}",
+                view.spec(), roleName(view.my_role()), roleName(eff), bear, knows ? "yes" : "NO", ready ? "yes" : "NO",
+                view.has_aura(bear) ? "yes" : "no", rot ? "registered" : "NONE", view.in_combat() ? "yes" : "no",
+                ai->last_rule_fired() ? ai->last_rule_fired() : "-"));
+            if (eff != Role::Tank)
+                say("0037 bear: SKIP, the bot does not play a tank now (run 'beartank' to declare it one)");
+            else
+                say(Trinity::StringFormat("0037 bear: {} (a tank must play spec 104 and see Bear Form known and ready{})",
+                    verdict(tankSpec && knows && ready), tankSpec ? "" : Trinity::StringFormat("; it plays {}", view.spec())));
+            return true;
+        }
+        // 0038 object use and loot (zorin44, Discord 2026-11-19: since 0.1.38 a companion says it collects the refugee belongings crates
+        // but nothing reaches its bags; its Mining took a Copper Vein away and no ore arrived). 'gouse <entry>' makes the bot use the
+        // nearest object of that entry within 30 yards the way its bot logic does (API::use_game_object), and reports the object's
+        // state, the bot's open loot and every loot item with its flags, before and after. A herb or vein needs a second use once the
+        // 3 s gathering cast is over: 'gouse <entry>' again. The bag counts of the loot items show what arrived.
+        if (what.rfind("gouse", 0) == 0)
+        {
+            uint32 const entry = uint32(std::strtoul(what.c_str() + 5, nullptr, 10));
+            GameObject* go = entry ? p->FindNearestGameObject(entry, 30.0f) : nullptr;
+            if (!go)
+            {
+                say(Trinity::StringFormat("0038 gouse: SKIP, no object of entry {} within 30 yards of {} (mode is gouse<entry>, e.g. gouse1731)",
+                    entry, p->GetName()));
+                return true;
+            }
+            auto report = [&](char const* when)
+            {
+                Loot* loot = go->GetLootForPlayer(p);
+                say(Trinity::StringFormat("0038 gouse {}: {} entry {} type {} spawned {} loot state {} go state {}; for this bot: quest object {}, "
+                    "chest quest {} status {}; bot loot window on it {}; loot {} (looted {}, gold {}); free bag slots {}",
+                    when, go->GetName(), entry, uint32(go->GetGoType()), go->isSpawned() ? "yes" : "NO", uint32(go->getLootState()),
+                    uint32(go->GetGoState()), go->ActivateToQuest(p) ? "usable" : "NOT usable",
+                    go->GetGoType() == GAMEOBJECT_TYPE_CHEST ? go->GetGOInfo()->chest.questID : 0u,
+                    go->GetGoType() == GAMEOBJECT_TYPE_CHEST ? uint32(p->GetQuestStatus(go->GetGOInfo()->chest.questID)) : 0u,
+                    p->GetLootGUID() == go->GetGUID() ? "open" : "no", loot ? "yes" : "none", loot && loot->isLooted() ? "yes" : "no",
+                    loot ? loot->gold : 0u, p->GetFreeInventorySlotCount()));
+                if (!loot)
+                    return;
+                for (uint8 slot = 0; slot < loot->items.size(); ++slot)
+                {
+                    NotNormalLootItem* ffa = nullptr;
+                    LootItem const& raw = loot->items[slot];
+                    LootItem* mine = loot->LootItemInSlot(slot, p, &ffa);
+                    say(Trinity::StringFormat("0038 gouse {}: slot {} item {} x{}: for this bot {}, looted {}{}, blocked {}, quest item {}, "
+                        "free for all {}; in bags {}",
+                        when, uint32(slot), raw.itemid, uint32(raw.count), mine ? "visible" : "NOT visible", raw.is_looted ? "yes" : "no",
+                        ffa ? (ffa->is_looted ? " (own copy looted)" : " (own copy not looted)") : "", raw.is_blocked ? "YES" : "no",
+                        raw.needs_quest ? "yes" : "no", raw.freeforall ? "yes" : "no", p->GetItemCount(raw.itemid)));
+                }
+            };
+            report("before");
+            ::Playerbot::API api(p);
+            ::Playerbot::Result const r = api.use_game_object(go->GetGUID());
+            say(Trinity::StringFormat("0038 gouse: use_game_object result {} (0 = Ok)", uint32(r)));
+            report("after");
+            return true;
+        }
+        // 0039 Unsealed Wrath 1310735 (chris04666, Discord 2026-11-19: the paladin talent does nothing, no buff shows in a fight). It
+        // reports how the spell data lets the talent proc (its effects, the client proc flags, the server's proc entry), then swings at a
+        // test creature under Seal of Righteousness, which must store Echo of Righteousness 1311704 (3 stacks at most), and swings once
+        // under Seal of Command, which must use those stacks up and store Echo of Command 1311703.
+        if (what == "unsealed")
+        {
+            if (p->GetClass() != CLASS_PALADIN)
+            {
+                say("0039 unsealed: SKIP, not a paladin");
+                return true;
+            }
+            SpellInfo const* talentInfo = sSpellMgr->GetSpellInfo(1310735, DIFFICULTY_NONE);
+            if (!talentInfo)
+            {
+                say("0039 unsealed: FAIL, spell 1310735 is not in the spell data");
+                return true;
+            }
+            std::string effects;
+            for (SpellEffectInfo const& eff : talentInfo->GetEffects())
+                effects += Trinity::StringFormat(" [{}: effect {} aura {} misc {} trigger {}]", uint32(eff.EffectIndex), uint32(eff.Effect),
+                    uint32(eff.ApplyAuraName), eff.MiscValue, eff.TriggerSpell);
+            SpellProcEntry const* procEntry = sSpellMgr->GetSpellProcEntry(talentInfo);
+            say(Trinity::StringFormat("0039 unsealed: spell 1310735 effects{}; client proc flags {:#x} {:#x} chance {}; server proc entry {}",
+                effects.empty() ? " none" : effects, uint32(talentInfo->ProcFlags[0]), uint32(talentInfo->ProcFlags[1]), talentInfo->ProcChance,
+                procEntry ? Trinity::StringFormat("flags {:#x} chance {} phase {:#x}", uint32(procEntry->ProcFlags[0]), procEntry->Chance,
+                    procEntry->SpellPhaseMask) : std::string("NONE (the aura never procs, so its script never runs)")));
+
+            std::string dummyError;
+            Creature* target = Playerbot::Diagnostics::Parity::SpawnProcDummy(p, 2.5f, dummyError);
+            if (!target)
+            {
+                say("0039 unsealed: SKIP, no test creature: " + dummyError);
+                return true;
+            }
+            bool const hadTalent = p->HasAura(1310735);
+            if (!hadTalent)
+                p->AddAura(1310735, p);
+            uint32 constexpr Righteousness = 20154, Command = 20375, EchoRighteousness = 1311704, EchoCommand = 1311703;
+            bool const hadRighteousness = p->HasAura(Righteousness), hadCommand = p->HasAura(Command);
+            p->RemoveAurasDueToSpell(Command);
+            p->RemoveAurasDueToSpell(EchoRighteousness);
+            p->RemoveAurasDueToSpell(EchoCommand);
+            p->AddAura(Righteousness, p);
+            p->SetFacingToObject(target);
+            for (uint32 i = 0; i < 10 && target->IsAlive(); ++i)
+            {
+                p->AttackerStateUpdate(target, BASE_ATTACK, true);
+                target->SetFullHealth();
+            }
+            Aura const* stored = p->GetAura(EchoRighteousness);
+            uint32 const storedStacks = stored ? stored->GetStackAmount() : 0;
+            p->RemoveAurasDueToSpell(Righteousness);
+            p->AddAura(Command, p);
+            for (uint32 i = 0; i < 3 && target->IsAlive() && p->HasAura(EchoRighteousness); ++i)
+            {
+                p->AttackerStateUpdate(target, BASE_ATTACK, true);
+                target->SetFullHealth();
+            }
+            bool const usedUp = !p->HasAura(EchoRighteousness);
+            bool const commandStored = p->HasAura(EchoCommand);
+            p->RemoveAurasDueToSpell(EchoRighteousness);
+            p->RemoveAurasDueToSpell(EchoCommand);
+            if (!hadCommand)
+                p->RemoveAurasDueToSpell(Command);
+            if (hadRighteousness)
+                p->AddAura(Righteousness, p);
+            if (!hadTalent)
+                p->RemoveAurasDueToSpell(1310735);
+            target->DespawnOrUnsummon();
+            say(Trinity::StringFormat("0039 unsealed: {} (talent on the paladin before {}; 10 swings under Seal of Righteousness stored {} stacks of "
+                "Echo of Righteousness (want 1 to 3); a swing under Seal of Command used them up {}, stored Echo of Command {})",
+                verdict(storedStacks >= 1 && usedUp && commandStored), hadTalent ? "yes" : "no (added for the test)", storedStacks,
+                usedUp ? "yes" : "NO", commandStored ? "yes" : "NO"));
+            return true;
+        }
+        // 0040 item stats (Dumpins, Discord 2026-11-19: the Trogg Scepter 272996 from Oggleflint in Ragefire gives no healing and no
+        // spell power). 'itemstat<id>' equips a new copy of the item on the bot where a right click would put it, lists its stats as the
+        // server reads them for this bot (type and value per slot) and its effects with each effect spell's auras, and reports how much
+        // the healing and spell damage bonus and the values of the character sheet moved. The copy is destroyed and the bot's own item
+        // goes back on after.
+        if (what.rfind("itemstat", 0) == 0)
+        {
+            uint32 const itemId = uint32(std::strtoul(what.c_str() + 8, nullptr, 10));
+            ItemTemplate const* proto = itemId ? sObjectMgr->GetItemTemplate(itemId) : nullptr;
+            if (!proto)
+            {
+                say(Trinity::StringFormat("0040 itemstat: SKIP, no item {} (mode is itemstat<id>, e.g. itemstat272996)", itemId));
+                return true;
+            }
+            uint16 dest = 0;
+            InventoryResult const canEquip = p->CanEquipNewItem(NULL_SLOT, dest, itemId, true);
+            if (canEquip != EQUIP_ERR_OK)
+            {
+                say(Trinity::StringFormat("0040 itemstat: SKIP, {} cannot equip {} (equip error {}; required level {}, bot level {})",
+                    p->GetName(), itemId, uint32(canEquip), proto->GetBaseRequiredLevel(), uint32(p->GetLevel())));
+                return true;
+            }
+            uint8 const slot = uint8(dest & 255);
+            auto sheet = [&]()
+            {
+                return Trinity::StringFormat("healing bonus {}, holy damage bonus {}, fire {}, shadow {}; sheet healing {}, sheet holy damage {}, "
+                    "sheet fire damage {}", p->SpellBaseHealingBonusDone(SPELL_SCHOOL_MASK_HOLY), p->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_HOLY),
+                    p->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE), p->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_SHADOW),
+                    int32(p->m_activePlayerData->ModHealingDonePos), int32(p->m_activePlayerData->ModDamageDonePos[SPELL_SCHOOL_HOLY]),
+                    int32(p->m_activePlayerData->ModDamageDonePos[SPELL_SCHOOL_FIRE]));
+            };
+
+            // The bot's own item in that slot goes to its bags for the test.
+            Item* own = p->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (own)
+            {
+                ItemPosCountVec bagDest;
+                InventoryResult const canStore = p->CanStoreItem(NULL_BAG, NULL_SLOT, bagDest, own, false);
+                if (canStore != EQUIP_ERR_OK)
+                {
+                    say(Trinity::StringFormat("0040 itemstat: SKIP, no bag room for the bot's own item {} in slot {} (error {})", own->GetEntry(),
+                        uint32(slot), uint32(canStore)));
+                    return true;
+                }
+                p->RemoveItem(INVENTORY_SLOT_BAG_0, slot, true);
+                p->StoreItem(bagDest, own, true);
+            }
+            std::string const before = sheet();
+            Item* copy = p->EquipNewItem(dest, itemId, ItemContext::NONE, true);
+            if (!copy)
+            {
+                say(Trinity::StringFormat("0040 itemstat: FAIL, EquipNewItem gave no item {} in slot {}", itemId, uint32(slot)));
+                return true;
+            }
+            p->AutoUnequipOffhandIfNeed();
+            std::string stats;
+            for (uint32 i = 0; i < MAX_ITEM_PROTO_STATS; ++i)
+                if (int32 const type = copy->GetItemStatType(i); type >= 0)
+                    stats += Trinity::StringFormat(" [{}: type {} value {:.1f}]", i, type, copy->GetItemStatValue(i, p));
+            say(Trinity::StringFormat("0040 itemstat: {} {} in slot {}, item level {} for {}; stats{}", itemId, proto->GetName(LOCALE_enUS),
+                uint32(slot), copy->GetItemLevel(p), p->GetName(), stats.empty() ? " none" : stats));
+            for (ItemEffectEntry const* effect : copy->GetEffects())
+            {
+                std::string auras;
+                if (SpellInfo const* info = sSpellMgr->GetSpellInfo(effect->SpellID, DIFFICULTY_NONE))
+                {
+                    for (SpellEffectInfo const& eff : info->GetEffects())
+                        auras += Trinity::StringFormat(" [{}: effect {} aura {} misc {} amount {}]", uint32(eff.EffectIndex), uint32(eff.Effect),
+                            uint32(eff.ApplyAuraName), eff.MiscValue, eff.CalcValueAsInt(p));
+                    auras += Trinity::StringFormat("; on the bot now {}", p->HasAura(info->Id) ? "yes" : "NO");
+                }
+                else
+                    auras = " NOT in the spell data";
+                say(Trinity::StringFormat("0040 itemstat: effect spell {} trigger {}{}", effect->SpellID, int32(effect->TriggerType), auras));
+            }
+            std::string const after = sheet();
+            say("0040 itemstat: before " + before);
+            say("0040 itemstat: after  " + after);
+
+            // put things back: the copy goes, the bot's own item returns to the slot
+            p->DestroyItem(INVENTORY_SLOT_BAG_0, slot, true);
+            if (own)
+            {
+                uint16 back = 0;
+                if (p->CanEquipItem(slot, back, own, false) == EQUIP_ERR_OK)
+                {
+                    p->RemoveItem(own->GetBagSlot(), own->GetSlot(), true);
+                    p->EquipItem(back, own, true);
+                }
+                else
+                    say(Trinity::StringFormat("0040 itemstat: note, the bot's own item {} stays in its bags", own->GetEntry()));
+            }
+            say(Trinity::StringFormat("0040 itemstat: {} (the item must move the healing or the spell damage bonus; restored: {})",
+                verdict(before != after), sheet()));
+            return true;
+        }
+        // 0041 Judgement weapon proc rolls (wowsims EV-0156, Warcraft Logs: a landed Judgement of Command rolls a chance-on-hit weapon
+        // effect twice, its dummy landing and its damage; since the hotfix of 2026-11-13 the other Judgements roll none). A spell's hit
+        // rolls the weapon's chance-on-hit effects and enchants (Player::CastItemCombatSpell, Spell.cpp) when its damage class is melee or
+        // ranged and it carries neither "cancels auto attack" nor "suppress weapon procs". Judgement 20271 is cast by the paladin; the
+        // seal's judgement and Judgement of Command's damage are cast triggered by the scripts. Read-only.
+        if (what == "judgeprocs")
+        {
+            auto rolls = [&](uint32 spellId, std::string& line) -> int
+            {
+                SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
+                if (!info)
+                {
+                    line += Trinity::StringFormat(" [{} missing]", spellId);
+                    return 0;
+                }
+                bool const melee = info->DmgClass == SPELL_DAMAGE_CLASS_MELEE || info->DmgClass == SPELL_DAMAGE_CLASS_RANGED;
+                bool const cancels = info->HasAttribute(SPELL_ATTR0_CANCELS_AUTO_ATTACK_COMBAT);
+                bool const suppress = info->HasAttribute(SPELL_ATTR4_SUPPRESS_WEAPON_PROCS);
+                bool const roll = melee && !cancels && !suppress;
+                line += Trinity::StringFormat(" [{}: damage class {}, cancels auto attack {}, suppress weapon procs {} -> {}]", spellId,
+                    uint32(info->DmgClass), cancels ? "yes" : "no", suppress ? "yes" : "no", roll ? "ROLLS" : "no roll");
+                return roll ? 1 : 0;
+            };
+            std::string line;
+            int const judgement = rolls(20271, line);
+            say("0041 judgeprocs: Judgement" + line);
+            bool ok = true;
+            struct Kind { char const* name; uint32 judgementSpell; uint32 damageSpell; };
+            for (Kind const& k : { Kind{ "Command r1", 20425, 20467 }, Kind{ "Command r5", 20968, 20966 }, Kind{ "Righteousness", 20187, 0 },
+                Kind{ "Crusader", 21183, 0 }, Kind{ "Light", 20185, 0 }, Kind{ "Wisdom", 20186, 0 }, Kind{ "Justice", 20184, 0 } })
+            {
+                std::string detail;
+                int const n = judgement + rolls(k.judgementSpell, detail) + (k.damageSpell ? rolls(k.damageSpell, detail) : 0);
+                int const want = k.damageSpell ? 2 : 0;
+                ok = ok && n == want;
+                say(Trinity::StringFormat("0041 judgeprocs: {} rolls a weapon proc {} times per landed judgement (live {}){}", k.name, n, want, detail));
+            }
+            say(Trinity::StringFormat("0041 judgeprocs: {} (Judgement of Command rolls twice, the other judgements none)", verdict(ok)));
+            return true;
+        }
+        // 0042 flat damage taken cap and Force of Will (wowsims EV-0154): puts Force of Will's buff 15595 (51 off each hit) on the bot and
+        // reads what a test creature's 60 and 200 damage hits become before armor (Unit::MeleeDamageBonusTaken). Live: at most half of the
+        // hit, so 30 and 149. Also prints the server's proc entry for the trinket's aura 15594 (live: 6%, 30 s cooldown).
+        if (what == "flatcap")
+        {
+            std::string dummyError;
+            Creature* attacker = Playerbot::Diagnostics::Parity::SpawnProcDummy(p, 2.5f, dummyError);
+            if (!attacker)
+            {
+                say("0042 flatcap: SKIP, no test creature: " + dummyError);
+                return true;
+            }
+            bool const hadBuff = p->HasAura(15595);
+            if (!hadBuff)
+                p->AddAura(15595, p);
+            int32 const small = p->MeleeDamageBonusTaken(attacker, 60, BASE_ATTACK, DIRECT_DAMAGE);
+            int32 const big = p->MeleeDamageBonusTaken(attacker, 200, BASE_ATTACK, DIRECT_DAMAGE);
+            int32 const flat = p->GetTotalAuraModifierByMiscMask(SPELL_AURA_MOD_DAMAGE_TAKEN, SPELL_SCHOOL_MASK_NORMAL);
+            if (!hadBuff)
+                p->RemoveAurasDueToSpell(15595);
+            attacker->DespawnOrUnsummon();
+            SpellInfo const* fow = sSpellMgr->GetSpellInfo(15594, DIFFICULTY_NONE);
+            SpellProcEntry const* entry = fow ? sSpellMgr->GetSpellProcEntry(fow) : nullptr;
+            say(Trinity::StringFormat("0042 flatcap: buff 15595: flat physical taken {}; a 60 hit lands at {} (live 30), a 200 hit at {} (live {})",
+                flat, small, big, 200 + std::max(flat, -100)));
+            say(Trinity::StringFormat("0042 flatcap: Force of Will 15594 proc entry {}", entry
+                ? Trinity::StringFormat("flags {:#x} hit mask {:#x} chance {} cooldown {} ms", uint32(entry->ProcFlags[0]), uint32(entry->HitMask),
+                    entry->Chance, entry->Cooldown.count())
+                : std::string("NONE")));
+            bool const capOk = flat < 0 && small == 30 && big == 200 + std::max(flat, -100);
+            bool const procOk = entry && entry->Chance > 5.5f && entry->Chance < 6.5f && entry->Cooldown.count() == 30000;
+            say(Trinity::StringFormat("0042 flatcap: {} (cap {}, Force of Will proc {})", verdict(capOk && procOk), capOk ? "ok" : "WRONG",
+                procOk ? "ok" : "WRONG"));
+            return true;
+        }
+        // 0043 mob tagging, both modes (Classic.FirstTagOwnsMob). 'firsttag<other player>' spawns a test creature, lets this player tag it
+        // and then the other player (not in this player's group), and reads who holds the tag and whether the mob shows tapped, once with
+        // shared tagging and once with the first tag owning the mob. The setting is put back afterwards. Live Classic: with first tag
+        // only this player (and its group) holds it; shared: both do.
+        if (what.rfind("firsttag", 0) == 0)
+        {
+            std::string otherName = what.substr(8);
+            Player* other = normalizePlayerName(otherName) ? ObjectAccessor::FindPlayerByName(otherName) : nullptr;
+            if (!other || other == p || !other->IsInWorld())
+            {
+                say("0043 firsttag: SKIP, mode is firsttag<another player in the world>, e.g. firsttagSomebot");
+                return true;
+            }
+            if (p->GetGroup() && p->GetGroup() == other->GetGroup())
+            {
+                say("0043 firsttag: SKIP, the two players are in one group; take one from another group");
+                return true;
+            }
+            bool const saved = sWorld->getBoolConfig(CONFIG_CLASSIC_FIRST_TAG_OWNS_MOB);
+            bool ok = true;
+            for (bool const firstTag : { false, true })
+            {
+                sWorld->setBoolConfig(CONFIG_CLASSIC_FIRST_TAG_OWNS_MOB, firstTag);
+                std::string dummyError;
+                Creature* mob = Playerbot::Diagnostics::Parity::SpawnProcDummy(p, 2.5f, dummyError);
+                if (!mob)
+                {
+                    say("0043 firsttag: SKIP, no test creature: " + dummyError);
+                    break;
+                }
+                mob->SetTappedBy(p);
+                mob->SetTappedBy(other);
+                bool const mine = mob->isTappedBy(p), theirs = mob->isTappedBy(other);
+                bool const tapped = mob->HasDynamicFlag(UNIT_DYNFLAG_TAPPED);
+                bool const pass = firstTag ? (mine && !theirs && tapped) : (mine && theirs);
+                ok = ok && pass;
+                say(Trinity::StringFormat("0043 firsttag: {} tagging: tap list {} entries; {} holds it {}, {} holds it {}, shows tapped {} -> {}",
+                    firstTag ? "first tag owns" : "shared", uint32(mob->GetTapList().size()), p->GetName(), mine ? "yes" : "no",
+                    other->GetName(), theirs ? "yes" : "no", tapped ? "yes" : "no", verdict(pass)));
+                mob->DespawnOrUnsummon();
+            }
+            sWorld->setBoolConfig(CONFIG_CLASSIC_FIRST_TAG_OWNS_MOB, saved);
+            say(Trinity::StringFormat("0043 firsttag: {} (the setting is back at {})", verdict(ok), saved ? 1 : 0));
             return true;
         }
         if (what != "all")
@@ -6530,9 +7603,181 @@ public:
             bool const ok = plainDuration > 0 && fastDuration * 2 == plainDuration && plainPeriod > 0 && fastPeriod == plainPeriod - 500;
             say(Trinity::StringFormat("0027 Missile Barrage: {} (Arcane Missiles {} ms every {} ms; with the buff {} ms every {} ms; cast results {} {}, "
                 "dummy at {:.1f} yd)", verdict(ok), plainDuration, plainPeriod, fastDuration, fastPeriod, castResult[0], castResult[1], p->GetDistance(d)));
+
+            // 0035 Missile Barrage 400588: Arcane Blast gives the buff 400589 about 40% of the time (Discord 19 Nov: every time), and the next
+            // Arcane Missiles uses the buff up. The casts count as the player's own (no proc comes from a triggered cast: Aura::GetProcEffectMask
+            // refuses any spell Spell::IsTriggered, so the first run, cast with TRIGGERED_FULL_MASK, could see neither the proc nor the buff
+            // used up): only the flags outside TRIGGERED_IS_TRIGGERED_MASK (no cast time, no mana) and the global cooldown cleared before each
+            // cast. The checks run on timers so a travelling Arcane Blast and the channel's hit have landed. The lines go to Playerbot.log
+            // ("[bugprobe] 0035").
+            {
+                std::string dummyError;
+                Creature* bd = Playerbot::Diagnostics::Parity::SpawnProcDummy(p, 2.5f, dummyError);
+                if (!bd)
+                    say("0035 Missile Barrage procs: SKIP, no test creature: " + dummyError);
+                else
+                {
+                    bool const hadTalent = p->HasAura(400588);
+                    if (!hadTalent)
+                        p->AddAura(400588, p);
+                    Aura const* talent = p->GetAura(400588);
+                    if (!talent)
+                    {
+                        say("0035 Missile Barrage procs: SKIP, the talent aura 400588 did not come up");
+                        bd->DespawnOrUnsummon();
+                    }
+                    else
+                    {
+                        AuraEffect const* talentEff = talent->GetEffect(EFFECT_0);
+                        SpellProcEntry const* talentProc = sSpellMgr->GetSpellProcEntry(talent->GetSpellInfo());
+                        SpellInfo const* blast = sSpellMgr->GetSpellInfo(400574, DIFFICULTY_NONE);
+                        std::string const setup = Trinity::StringFormat("talent amount {}, proc chance {}, phase {:#x}, Arcane Blast speed {}",
+                            talentEff ? talentEff->GetAmount() : -1, talentProc ? talentProc->Chance : -1.0f,
+                            talentProc ? talentProc->SpellPhaseMask : 0u, blast ? blast->Speed : -1.0f);
+                        say("0035 Missile Barrage procs: 50 Arcane Blasts and one Arcane Missiles on timers; the result follows in the log in about "
+                            "20 seconds (" + setup + ")");
+                        uint32 constexpr casts = 50;
+                        CastSpellExtraArgs args(TriggerCastFlags(TRIGGERED_IGNORE_POWER_COST | TRIGGERED_IGNORE_CAST_IN_PROGRESS |
+                            TRIGGERED_IGNORE_CAST_TIME | TRIGGERED_IGNORE_SHAPESHIFT | TRIGGERED_DONT_REPORT_CAST_ERROR));
+                        auto state = std::make_shared<std::pair<uint32, uint32>>(0u, 0u);   // casts made, procs seen
+                        ObjectGuid const dummyGuid = bd->GetGUID();
+                        auto blastOnce = [p, dummyGuid, args]()
+                        {
+                            Creature* target = ObjectAccessor::GetCreature(*p, dummyGuid);
+                            if (!target || !target->IsAlive())
+                                return false;
+                            p->RemoveAurasDueToSpell(400589);
+                            p->InterruptNonMeleeSpells(true);
+                            p->SetFacingToObject(target);
+                            if (SpellInfo const* info = sSpellMgr->GetSpellInfo(400574, DIFFICULTY_NONE))
+                                p->GetSpellHistory()->CancelGlobalCooldown(info);
+                            p->CastSpell(target, 400574, args);
+                            target->SetFullHealth();
+                            return true;
+                        };
+                        if (blastOnce())
+                            state->first = 1;
+                        for (uint32 i = 1; i <= casts; ++i)
+                            p->m_Events.AddEventAtOffset([p, i, state, blastOnce, dummyGuid, args, hadTalent, setup]()
+                            {
+                                if (p->HasAura(400589))
+                                    ++state->second;
+                                if (i < casts)
+                                {
+                                    if (blastOnce())
+                                        ++state->first;
+                                    return;
+                                }
+                                // the buff is used up by the next Arcane Missiles (spell_proc 400589, on the channel's hit)
+                                p->RemoveAurasDueToSpell(400589);
+                                p->AddAura(400589, p);
+                                Creature* target = ObjectAccessor::GetCreature(*p, dummyGuid);
+                                if (target)
+                                {
+                                    p->InterruptNonMeleeSpells(true);
+                                    p->SetFacingToObject(target);
+                                    if (SpellInfo const* info = sSpellMgr->GetSpellInfo(5143, DIFFICULTY_NONE))
+                                        p->GetSpellHistory()->CancelGlobalCooldown(info);
+                                    p->CastSpell(target, 5143, args);
+                                }
+                                p->m_Events.AddEventAtOffset([p, state, dummyGuid, hadTalent, setup]()
+                                {
+                                    bool const channelUp = p->HasAura(5143);
+                                    bool const buffLeft = p->HasAura(400589);
+                                    p->InterruptNonMeleeSpells(true);
+                                    p->RemoveAurasDueToSpell(5143);
+                                    p->RemoveAurasDueToSpell(400589);
+                                    if (!hadTalent)
+                                        p->RemoveAurasDueToSpell(400588);
+                                    if (Creature* target = ObjectAccessor::GetCreature(*p, dummyGuid))
+                                        target->DespawnOrUnsummon();
+                                    uint32 const made = state->first, procs = state->second;
+                                    bool const rateOk = made == casts && procs >= 8 && procs <= 32;   // 40% of 50 is 20
+                                    TC_LOG_INFO("playerbot.v2", "[bugprobe] 0035 Missile Barrage procs: {} ({} of {} Arcane Blasts gave the buff; {}; "
+                                        "Arcane Missiles channel up {}, buff left after its hit {})", (rateOk && channelUp && !buffLeft) ? "PASS" : "FAIL",
+                                        procs, made, setup, channelUp ? "yes" : "NO", buffLeft ? "YES" : "no");
+                                }, 1s);
+                            }, std::chrono::milliseconds(300 * i));
+                    }
+                }
+            }
         }
         else
             say("0027 Missile Barrage: SKIP, run bugprobe on a mage for this one");
+
+        // 0036 a warlock's Imp keeps a Firebolt rank it learned (grimoire path: Spell::EffectLearnPetSpell) when it is put away and summoned
+        // again (Tryout, Discord 16 Nov: demons forget learned spells after a restart). The pet loads its spells a moment after the summon, so
+        // the steps run on timers and their lines go to Playerbot.log ("[bugprobe] 0036").
+        if (p->GetClass() == CLASS_WARLOCK)
+        {
+            static constexpr uint32 SummonImp = 688;
+            static constexpr uint32 FireboltRank1 = 3110;
+            auto knownFirebolt = [](Pet const* pet) -> uint32
+            {
+                uint32 known = 0;
+                for (uint32 rank = FireboltRank1; rank; rank = sSpellMgr->GetNextSpellInChain(rank))
+                    if (pet->HasSpell(rank))
+                        known = rank;
+                return known;
+            };
+            auto log = [](std::string const& text) { TC_LOG_INFO("playerbot.v2", "[bugprobe] {}", text); };
+
+            p->RemovePet(nullptr, PET_SAVE_NOT_IN_SLOT);
+            p->CastSpell(p, SummonImp, TRIGGERED_FULL_MASK);
+            say("0036 warlock Imp spells: summoned the Imp; the result follows in the log in about 6 seconds");
+            p->m_Events.AddEventAtOffset([p, knownFirebolt, log]()
+            {
+                Pet* pet = p->GetPet();
+                if (!pet || pet->GetEntry() != 416)
+                {
+                    log("0036 warlock Imp spells: SKIP, no Imp came out (Summon Imp 688)");
+                    return;
+                }
+
+                std::string levelup;
+                if (PetLevelupSpellSet const* spells = sSpellMgr->GetPetLevelupSpellList(pet->GetCreatureTemplate()->family))
+                    for (auto const& [level, spellId] : *spells)
+                        levelup += Trinity::StringFormat(" {}@{}", spellId, level);
+                uint32 const before = knownFirebolt(pet);
+                uint32 const next = before ? sSpellMgr->GetNextSpellInChain(before) : 0;
+                SpellInfo const* nextInfo = next ? sSpellMgr->GetSpellInfo(next, DIFFICULTY_NONE) : nullptr;
+                log(Trinity::StringFormat("0036 warlock Imp spells: Imp number {} level {} knows {} spells, Firebolt rank spell {}, next rank {} (level {}); "
+                    "family {} levelup list:{}", pet->GetCharmInfo()->GetPetNumber(), pet->GetLevel(), pet->m_spells.size(), before, next,
+                    nextInfo ? nextInfo->SpellLevel : 0, pet->GetCreatureTemplate()->family, levelup.empty() ? " none" : levelup));
+                if (!next)
+                {
+                    log("0036 warlock Imp spells: SKIP, no higher Firebolt rank in the spell chain");
+                    return;
+                }
+
+                // what a grimoire does (Spell::EffectLearnPetSpell), then put the Imp away and call it again
+                pet->learnSpell(next);
+                pet->SavePetToDB(PET_SAVE_AS_CURRENT);
+                p->PetSpellInitialize();
+                bool const learned = pet->HasSpell(next);
+                uint32 const petNumber = pet->GetCharmInfo()->GetPetNumber();
+                p->RemovePet(pet, PET_SAVE_NOT_IN_SLOT);
+                p->CastSpell(p, SummonImp, TRIGGERED_FULL_MASK);
+
+                p->m_Events.AddEventAtOffset([p, knownFirebolt, log, next, before, learned, petNumber]()
+                {
+                    Pet* again = p->GetPet();
+                    uint32 const after = again ? knownFirebolt(again) : 0;
+                    log(Trinity::StringFormat("0036 warlock Imp spells: {} (learned rank {} at once {}; after put away and summoned again: Imp number {} "
+                        "(before {}), Firebolt rank spell {}, {} spells)", (learned && after == next) ? "PASS" : "FAIL", next, learned ? "yes" : "NO",
+                        again ? again->GetCharmInfo()->GetPetNumber() : 0, petNumber, after, again ? again->m_spells.size() : 0));
+
+                    // give the bot's Imp its old rank back
+                    if (again && after == next && before)
+                    {
+                        again->unlearnSpell(next, true);
+                        again->SavePetToDB(PET_SAVE_AS_CURRENT);
+                    }
+                }, 3s);
+            }, 3s);
+        }
+        else
+            say("0036 warlock Imp spells: SKIP, run bugprobe on a warlock for this one");
 
         // 0015 totems have their caster's level (Stoneskin Totem rank 1)
         if (p->GetClass() == CLASS_SHAMAN)
@@ -7590,9 +8835,23 @@ public:
                 Playerbot::Services::Snapshots().remove(id);
                 Playerbot::Services::Registry().unregister_bot(id);
             }
+            // As the add-on's self toggle (AddonControl HandleSelfToggle): the player's own character loses the mark for good, a bot
+            // pool character someone plays by hand keeps its database row.
             if (is_bot)
-                Playerbot::Services::Lifecycle().unmark_as_bot(id);
+            {
+                Playerbot::V2::HumanLoginAction const action = Playerbot::V2::HumanClientAction(true, false,
+                    Playerbot::Services::Accounts().is_pool_account(sess->GetAccountId()));
+                if (action == Playerbot::V2::HumanLoginAction::Release)
+                    Playerbot::Services::Lifecycle().unmark_as_bot(id);
+                else if (action == Playerbot::V2::HumanLoginAction::SkipThisLogin)
+                    Playerbot::Services::Lifecycle().unmark_as_bot_transient(id);
+            }
             Playerbot::Services::Owners().ClearOwner(id);
+            // The bot logic's last move (a path to a quest giver, a follow, a chase) is a server spline the client cannot steer out of:
+            // it kept the character for up to a minute after `off` (Discord 11-20, Oxide). Stop it and hand control back.
+            me->GetMotionMaster()->Clear();
+            me->StopMoving();
+            me->SetClientControl(me, true);
             handler->SendSysMessage(
                 "Self-bot: OFF. Bot logic detached. You are back to manual control.");
             return true;

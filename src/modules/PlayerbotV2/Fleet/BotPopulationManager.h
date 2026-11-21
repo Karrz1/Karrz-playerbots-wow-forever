@@ -206,6 +206,10 @@ public:
     void CompanionUpkeep(BotId id, Player* p);
     // A hunter companion's starter pet, granted once per bot (OwnerRegistry::StarterPetGranted).
     void GrantCompanionStarterPet(BotId id, Player* p);
+    // Hunter companions whose pet grant answered "not now": bot -> first refused at (getMSTime). DrainPetGrants tries them again.
+    std::unordered_map<uint64, uint32> pending_pet_grants_;
+    uint32 last_pet_grant_try_ms_ = 0;
+    void DrainPetGrants();
     // A bot hunter of level 10+ nobody owns (world, pool and scenario bots) that has no pet, summoned, dismissed or stabled, gets a beast of its own:
     // the setup pipeline's pet step is marked done for characters made before it existed (live DB: 423 of 925 hunters petless). Not a player's
     // character, and not an owned companion (its pet, or its abandoned pet, is the owner's: GrantCompanionStarterPet). Logged when one is given.
@@ -285,6 +289,13 @@ public:
     // spawn; every kick path checks it. World-thread only (no lock).
     void ProtectFromKick(uint64 guid_low, uint32 duration_ms);
     bool IsKickProtected(uint64 guid_low, uint32 now_ms) const;
+
+    // Operator hold (`.playerbot hold <name> on|off`): a GM keeps one bot in the world with no player online, for console probes.
+    // With no anchor the world spawner and the shaper log every ambient bot out within seconds; a held bot counts as kick-protected
+    // on every one of those paths until it is released. Not saved: a restart releases every hold. World-thread only.
+    void SetHeld(uint64 guid_low, bool held);
+    bool IsHeld(uint64 guid_low) const { return held_.contains(guid_low); }
+    std::vector<uint64> HeldBots() const { return { held_.begin(), held_.end() }; }
 
     // Operator-created persistent bots (distribution_level == 0) are dev/test
     // subjects spawned via `.playerbot create`, not ambient population. The
@@ -439,6 +450,8 @@ private:
 
     // guid_low -> getMSTime() expiry of the kick-protection lease.
     std::unordered_map<uint64, uint32> kick_protect_until_ms_;
+    // guid_low of the bots an operator holds in the world (SetHeld).
+    std::unordered_set<uint64> held_;
 
     // #5 session-rhythm: guid_low -> getMSTime() the bot's CURRENT play
     // session began. Stamped lazily on first Reconcile sighting (staggered so

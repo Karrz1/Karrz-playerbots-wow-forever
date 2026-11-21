@@ -23,8 +23,10 @@ struct Request
     State      state = State::Pending;
 };
 
-inline constexpr uint32 kWaitCapMs = 8000;    // the tank waits at most this long for the mob to be held
-inline constexpr uint32 kLifeMs    = 30000;   // a request is dropped this long after it was opened
+inline constexpr uint32 kWaitCapMs = 8000;    // the tank waits this long for the mob to be held ...
+inline constexpr uint32 kWaitHardCapMs = 20000; // ... and up to this long while the mage casts on it or walks into range
+inline constexpr float  kSpellReachY = 30.0f;   // Polymorph's range: a mage farther out is still walking in
+inline constexpr uint32 kLifeMs    = 35000;   // a request is dropped this long after it was opened (> hard cap + kAfterDoneMs)
 inline constexpr uint32 kAfterDoneMs = 12000; // the mark and the mage's release outlast the tank's wait by this
 
 namespace detail {

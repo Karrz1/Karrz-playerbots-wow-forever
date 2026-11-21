@@ -103,6 +103,14 @@ struct DungeonAdvice
     // tight-radius Cell scan for these entries.
     std::vector<uint32_t> bosses;
 
+    // Bosses a script brings in a while after the group reaches their waypoint (Ruins of Lordaeron: a player near the statue starts
+    // three waves, 1.5 min apart, and The Abandoned comes out of it 1.5 min after the last). Until then the boss is in no scan, and
+    // the owed-boss waiver (the tank stood at the owed boss's waypoint for 8 s with the boss unsighted: it is gone, owe the next one)
+    // walked the tank on to the next boss between two waves. Here, how long the waiver waits for such a boss at its waypoint. A
+    // boss that is not listed keeps the 8 s.
+    struct OwedBossHold { uint32_t entry; uint32_t hold_ms; };
+    std::vector<OwedBossHold> owed_boss_holds;
+
     // Creature entries that bots should NEVER target for combat — purely
     // environmental encounter objects (fire platters, bunny stalkers, rope
     // anchors, etc.) that are alive but unkillable. Without this list,
@@ -122,6 +130,89 @@ struct DungeonAdvice
     // empty for every dungeon that has no such gating lever, so this is a
     // strict no-op everywhere it is not authored.
     std::vector<uint32_t> use_go_entries;
+
+    // A boss that stands in a room only the dungeon's own portal reaches (City of Dalaran: the Shade of the Archmage in the
+    // Violet Chamber, through the Portal To the Violet Chamber once Mana Devourer and Fel Ancient are dead). The navmesh has no
+    // path there, so the route ends at the portal and every bot of the party uses it, as players do (idle:dungeon_portal_hop).
+    // The boss's progression waypoint is the portal itself. Empty for every dungeon without such a portal.
+    struct PortalHop
+    {
+        uint32_t go_entry = 0;                  // the portal object
+        float    x = 0.f, y = 0.f, z = 0.f;     // where it stands
+        uint32_t boss_entry = 0;                // the boss beyond it
+        std::vector<uint32_t> opened_by;        // bosses that must be dead before it works
+    };
+    std::vector<PortalHop> portal_hops;
+
+    // A creature the party talks to so that the way on opens (Dire Maul East: Ironbark the Redeemed opens the Conservatory Door to
+    // Alzzin when told "We are ready for you to open the door"). Once every boss in opened_by is dead and boss_entry is alive, the
+    // tank walks to the creature and picks its first plain gossip option, once (idle:dungeon_door_talk). x/y/z is where it stands.
+    // The creature can be the boss itself (Zul'Farrak: Sergeant Bly turns on the party when told to), and a talk can wait for a door
+    // another talk opens (Bly only after Weegli Blastfuse has blown the End Door, or his crew turns before the door is open).
+    struct DoorTalk
+    {
+        uint32_t npc_entry = 0;                 // the creature to talk to
+        float    x = 0.f, y = 0.f, z = 0.f;     // where it stands
+        uint32_t boss_entry = 0;                // the boss beyond the way it opens (may be npc_entry)
+        std::vector<uint32_t> opened_by;        // bosses that must be dead first
+        uint32_t after_door = 0;                // a door (GO entry) that must stand open first; 0 = none
+        // How near the tank must be before it walks over to talk; 0 = 250 y (the creature stands off the route: Ironbark is 71 y
+        // from it). A creature on the route that the boss advance walks the tank up to (Pusillin on his spot) takes a short reach,
+        // so the walk to him is the advance's paced one and not a straight run past the trash in between.
+        float    near_yd = 0.f;
+    };
+    std::vector<DoorTalk> door_talks;
+
+    // An object a player uses with an item to open the way on, standing off the route (Blackrock Depths: the Shadowforge Lock that
+    // opens the Giant Doors takes the Shadowforge Key, and the two Shadowforge Braziers in the Lyceum, both lit with a Shadowforge
+    // Torch, open the Golem Rooms to Magmus). The bot that carries the item, out of combat, within kKeyUseNearYd of the spot and on
+    // its level, walks to the object while it is still unused and uses the item on it, once (idle:dungeon_key_use). x/y/z is where
+    // the object stands. A route detour to such an object does not hold: the route follower cuts across to the crumb nearest the
+    // next boss and walks past it (the far brazier is 82 y from the route).
+    // An object that takes no item and several users at once (Upper Blackrock Spire's Blackrock Altar: three players use it together
+    // to wake Pyroguard Emberseer) has key_item 0: every bot of the party in reach walks to it and uses it, while the creature
+    // `while_alive` is alive and out of combat, and a bot that has `hold_aura` (the altar's channel) stays on it until the object
+    // takes the aura away.
+    // Objects a player uses one after another in a set order (the Sunken Temple's six Atal'ai Statues: the right order raises
+    // Atal'alarion, a wrong one springs a trap) are `in_order` and `tank_only`: only the tank uses them, the next one is the first
+    // in the list that can still be used (the instance makes a statue unselectable once it is used in turn), and while that one
+    // cannot be reached the later ones wait. near_yd / level_yd widen the reach for objects across a large hall or on another floor.
+    struct KeyUse
+    {
+        uint32_t go_entry = 0;                  // the object
+        float    x = 0.f, y = 0.f, z = 0.f;     // where it stands
+        uint32_t key_item = 0;                  // the item used on it; 0 = the object is used itself, by every bot in reach
+        uint32_t while_alive = 0;               // a creature that must be alive and out of combat for the use; 0 = none
+        uint32_t hold_aura = 0;                 // while the bot has this aura it stays at the object; 0 = none
+        float    near_yd = 0.f;                 // 2D reach from the object; 0 = kKeyUseNearYd
+        float    level_yd = 0.f;                // height reach from the object; 0 = kKeyUseLevelYd
+        bool     tank_only = false;             // only the tank uses it (an object a second use would spoil)
+        bool     in_order = false;              // one of a sequence, in list order (see above)
+    };
+    std::vector<KeyUse> key_uses;
+
+    // Area triggers that start an event when a player walks into them and that the instance's own script answers (Upper Blackrock
+    // Spire's stadium, 2026: Lord Victor Nefarius's waves, then Gyth and Warchief Rend Blackhand). A client sends the trigger when
+    // its player crosses into the volume; a bot has no client, so a bot inside one of these sends it as the client would, once each
+    // time it comes in (idle:dungeon_area_trigger). The way into the volume is the route's: the boss waypoint for the event is inside.
+    std::vector<uint32_t> enter_area_triggers;
+
+    // Creatures off the route that the party has to kill so that the way on opens (Stratholme: the five Thuzadin Acolytes inside
+    // each ziggurat keep its Ash'ari Crystal alive, and the Slaughter Square gates to Baron Rivendare open only when all three
+    // crystals are gone). The tank, out of combat, within kClearNearYd of the spot and on its level, walks to the nearest of them
+    // still alive within `radius` of the spot while a full path reaches it (the ziggurat's door opens when its boss dies) and
+    // attacks it when in sight (idle:dungeon_clear_spot). x/y/z is the spot. near_yd / level_yd widen the reach for a spot the
+    // tank has to go a long way round for (the Sunken Temple's six Atal'ai Defenders, each on his own balcony at the top of its own
+    // stairs, 300-450 y of walk apart and 23 y above the temple floor).
+    struct ClearSpot
+    {
+        uint32_t entry = 0;                     // the creatures to kill
+        float    x = 0.f, y = 0.f, z = 0.f;     // where they stand
+        float    radius = 0.f;                  // around the spot
+        float    near_yd = 0.f;                 // 2D reach from the spot; 0 = kClearNearYd
+        float    level_yd = 0.f;                // height reach from the spot; 0 = kClearLevelYd
+    };
+    std::vector<ClearSpot> clear_spots;
 
     // Per-dungeon progression waypoints — ordered positions that lead a
     // tank-spec bot through the canonical clear path. The tank-advance
@@ -214,6 +305,20 @@ public:
     // A zero-spawn boss that is NOT event-summoned is a DATA ERROR (wrong
     // entry id) and must be fixed in bosses[], never masked here.
     virtual std::vector<uint32_t> event_summoned_bosses() const { return {}; }
+
+    // Doors (GO entries) of this dungeon that players open by hand although the door carries no lock that says so. A shut hand door
+    // is normally known by its lock (BotSnapshotBuilder IsShutHandDoor: the Deadmines Heavy Doors' Quick Open). The Hall of Thanes'
+    // Vault Door has no lock and no flag, the same data as the Iron Doors its switch and its bosses open, yet in the official sniff
+    // players opened it: only the dungeon can say which is which. The builder lets a shut door listed here into the snapshot as a
+    // hand door, and idle:dungeon_open_hand_door opens it as it opens the Heavy Doors. Read through the O(1) registry lookup, like
+    // event_summoned_bosses(), so it is a static fact about the dungeon, never snapshot-dependent.
+    virtual std::vector<uint32_t> hand_doors() const { return {}; }
+
+    // Chests (GO entries) of this dungeon that hold the key to a door on the way, opened by the tank as he passes (Dire Maul North:
+    // Fengus's Chest holds the Gordok Courtyard Key). A bot opens no other chest on its own: one it opened for nothing kept loot made
+    // for the bot (api use_game_object). The key itself is used by whichever bot holds it (BotSnapshotBuilder KeyForShutDoor,
+    // idle:dungeon_open_hand_door). Static, like hand_doors().
+    virtual std::vector<uint32_t> key_chests() const { return {}; }
 };
 
 // Registry of all loaded DungeonScripts, keyed by (map_id, difficulty).

@@ -673,7 +673,23 @@ bool SafeTeleport(Player* p, uint32 map_id, float x, float y, float z, float o,
     {
         float const ground = destMap->GetHeight(PhasingHandler::GetEmptyPhaseShift(),
                                                 x, y, MAX_HEIGHT, /*vmap*/ true);
-        if (ground > INVALID_HEIGHT && (z - ground) > kTeleportZSnapThresholdY)
+        // Deep water carries a body: a point on its surface or in it is no fall, however far the floor lies below. The snap to the
+        // floor sent a squad 66 y down to the bed of the sea over the Vile Reef (vile_reef_fight 19 Nov: the destination was the
+        // surface, z 1.0, the floor -66.6); nobody could walk to the surface from there for the first 4 s. A point high above the
+        // water lands on its surface.
+        float const surface = destMap->GetWaterLevel(PhasingHandler::GetEmptyPhaseShift(), x, y);
+        if (ground > INVALID_HEIGHT && surface > ground + kGroundLiftY && (z - ground) > kTeleportZSnapThresholdY)
+        {
+            if (z - surface > kTeleportZSnapThresholdY)
+            {
+                TC_LOG_WARN("playerbot.v2",
+                    "[BotMovement::SafeTeleport] {} dest map={} ({:.1f},{:.1f},{:.1f}) is {:.1f}y above the water ({:.1f}); "
+                    "landing on its surface",
+                    p->GetName(), map_id, x, y, z, z - surface, surface);
+                z = surface;
+            }
+        }
+        else if (ground > INVALID_HEIGHT && (z - ground) > kTeleportZSnapThresholdY)
         {
             float const snapped = ground + kGroundLiftY;
             TC_LOG_WARN("playerbot.v2",

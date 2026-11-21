@@ -100,7 +100,10 @@ struct AvoidCreature { uint32_t entry; float radius; Who who; bool corpse = fals
 // While <enemy> is on its tank and its centre stands within <clear> yards of a living <hazard> creature (Grobbulus' poison clouds, which last),
 // that tank walks to a spot <clear> + 4 yards from every such creature, and he follows it out. Without it he stood in his own clouds and every
 // melee bot held off him (the hold for a victim inside a hazard).
-struct DragOut { uint32_t enemy; uint32_t hazard; float clear; };
+// A hazard whose reach grows with the age of its own aura <growAura> (Grobbulus' cloud: 2 y at its start to 20 y at its end, the script's
+// FilterTargets) reaches growFrom + (growTo - growFrom) * age / duration, plus <clear> - growFrom for both hit boxes; <clear> is the reach of a
+// hazard without that aura.
+struct DragOut { uint32_t enemy; uint32_t hazard; float clear; uint32_t growAura = 0; float growFrom = 0.0f; float growTo = 0.0f; };
 
 // While <enemy> is alive and fighting, matching bots keep at least <radius> from the nearest other raid member.
 // No raid move ends inside this circle while <enemy> is alive and fighting (one clamp for every rule, applied to the finished move target in
@@ -184,7 +187,11 @@ inline bool SpareNow(Spare const& rule, float enemyHpPct, bool gateAlive) { retu
 // <takerStacks>: the taker may carry up to this many stacks itself. An aura the enemy puts on everyone in sight (Firemaw's Flame Buffet) lands
 // on the clean tank as it walks out from cover, before it can taunt: with 0 it was never clean once in reach (bwl_firemaw 4f7b18e3 run 2:
 // 182 walk-outs, no swap).
-struct TankSwap { uint32_t enemy; uint32_t debuffAura; uint32_t stacks; uint32_t takerStacks = 0; };
+// <takerFree>: only a tank that holds no other enemy takes over, by taunt or by walking over. Without it a tank holding another enemy is the
+// last pick, which is right where the other enemies are adds that die with the boss (Gluth's chows), wrong where each is a boss of its own
+// held in its own place (the Four Horsemen: naxx_horsemen r29, at the third mark at 44 s all four horse tanks were sent to take each
+// other's horseman and dragged their own out of the corners; not one taunt was cast in 219 s).
+struct TankSwap { uint32_t enemy; uint32_t debuffAura; uint32_t stacks; uint32_t takerStacks = 0; bool takerFree = false; };
 
 // While <enemy> is alive and fighting, matching bots stay at least <radius> yards from it (point-blank AoE such as Blast Wave).
 // Do not use Who::Tank / Anyone for melee-range bosses: only bots that do not have to stand next to the enemy.
@@ -259,7 +266,12 @@ struct CancelAura { uint32_t enemy; uint32_t aura; Who who; };
 // <spreadPct> health percent below the healthiest one alone, and the healthiest one is the DPS fallback target.
 // pack: further entries that belong to the same pack when its members differ (Zul'Gurub's Thekal, Zath and Lor'Khan: each one feigns death
 // at 1 hp and a standing one resurrects the fallen within 10 s, so all three have to go down together).
-struct KillTogether { uint32_t enemy; uint32_t downAura; float spreadPct; std::vector<uint32_t> pack = {}; };
+// finishPct / finishGap, the finish (0 = none): a member at or below finishPct health is also left alone by the DPS while another member
+// stands more than finishGap above it, so the last of them fall within a few seconds of each other. The spread alone lets the first go
+// down with the others still spreadPct higher: Stalagg and Feugen stand up again 5 s after the first falls (classic_boss_thaddius.cpp
+// fakeDeathTimer), and each side of the raid takes about 1.5% a second off its own add (naxx_thaddius 1118 r8-1: 99% -> 67% in 21 s), so
+// 10% left on the other one is 6-7 s of work, more than the 5 s.
+struct KillTogether { uint32_t enemy; uint32_t downAura; float spreadPct; std::vector<uint32_t> pack = {}; float finishPct = 0.0f; float finishGap = 0.0f; };
 inline bool InPack(KillTogether const& rule, uint32_t entry)
 {
     return entry == rule.enemy || std::find(rule.pack.begin(), rule.pack.end(), entry) != rule.pack.end();
@@ -462,8 +474,9 @@ bool Retaunts(uint32_t mapId, uint32_t entry);
 float ThreatShareAfterDrop(uint32_t mapId, uint32_t entry);
 float ThreatShareAfterDrop(RaidRules const& rules, uint32_t entry);
 
-// Rule-based kill priority for an enemy entry (default 1 when no rule exists).
-int PriorityFor(RaidRules const& rules, uint32_t entry);
+// Rule-based kill priority for an enemy entry (default 1 when no rule exists). With the enemy's health (`hpPct` >= 0), an entry gated on
+// the enemy itself counts when that health is inside its window (Gluth's Zombie Chows at 5% after Decimate: priority 5, not -1).
+int PriorityFor(RaidRules const& rules, uint32_t entry, float hpPct = -1.0f);
 
 // Entries with priority >= 2, highest first (the dungeon advice's high_priority_kill_entries).
 std::vector<uint32_t> KillOrder(uint32_t mapId);

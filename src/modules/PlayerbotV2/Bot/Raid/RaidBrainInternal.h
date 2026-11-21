@@ -55,8 +55,13 @@ struct Plan
 
 bool Matches(Who who, Member const& m, Player* mainTank);
 float Dist2D(float ax, float ay, float bx, float by);
+// The distance from (px, py) to the segment from (ax, ay) to (bx, by).
+float SegmentDist2D(float ax, float ay, float bx, float by, float px, float py);
 bool InsideAny(std::vector<Circle> const& circles, float x, float y, float margin);
 bool Controlled(Unit* u);
+// Why the last Usable() refused a point (0 = it did not), and that reason's name for a log line.
+extern int g_usableWhy;
+char const* UsableWhyName(int why);
 // A point the bot can actually stand on and walk to (height, line of sight, a complete path).
 // Path queries are capped per plan pass (all bots together, see ResetPathProbes): urgent probes (leaving a hazard,
 // a carrier run, scripted mechanics, a breath / cone) may use the whole cap, the rest (spread, role spots, stay near)

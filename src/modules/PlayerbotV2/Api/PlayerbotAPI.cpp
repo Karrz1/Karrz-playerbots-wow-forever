@@ -7,6 +7,7 @@
 #include <mutex>
 #include <set>
 #include <optional>
+#include <ranges>
 #include <unordered_map>
 #include "Api/ForeignClassSpell.h"
 #include "PlayerbotAPI.h"
@@ -74,6 +75,7 @@
 #include "JunkDrop.h"
 #include "VirtualSupply.h"
 #include "Services.h"
+#include "Session/BotSessionMgr.h"   // IsHeadless: a self bot's real client answers its own loot window
 #include "Fleet/BotAccountMgr.h"   // is_pool_account: a player's own alt gets no free gold or repair
 #include "Util/ConfigReader.h"
 #include "BotTrade.h"
@@ -156,6 +158,28 @@ namespace
     std::unordered_map<uint64, uint32> s_followDropActive;
     std::unordered_map<uint64, uint32> s_followDropAir;
     std::unordered_map<uint64, uint32> s_followDropFine;
+
+    // Thrown or jumping: a knockback, a jump, a fall or a charge (an EFFECT generator) still has its spline in the air. A client cannot steer
+    // there either. A move asked for mid-flight found no navmesh under the bot (FARFROMPOLY_START) and snapped it to the nearest floor, and a
+    // stop halted the spline where it was: after Magnetic Pull the tank was put back on its own platform 1 s into an 85 y throw, the other
+    // add walked off its platform after him and the kill sync was lost (naxx_thaddius 1118 r8-1, [offmesh_snap] mid-air). One line per
+    // bot per 2 s says what was held.
+    bool ThrownThroughAir(Player* p, char const* what)
+    {
+        if (p->GetMotionMaster()->GetCurrentMovementGeneratorType() != EFFECT_MOTION_TYPE || p->movespline->Finalized())
+            return false;
+        static std::unordered_map<uint64, uint32> s_heldLog;
+        uint32 const now = GameTime::GetGameTimeMS();
+        uint32& last = s_heldLog[p->GetGUID().GetCounter()];
+        if (!last || now - last >= 2000u)
+        {
+            last = now ? now : 1u;
+            TC_LOG_INFO("playerbot.v2", "[in_flight] {} {} held until the flight lands at {:.1f},{:.1f},{:.1f} ({} ms left)", p->GetName(), what,
+                        p->movespline->FinalDestination().x, p->movespline->FinalDestination().y, p->movespline->FinalDestination().z,
+                        p->movespline->timeRemaining());
+        }
+        return true;
+    }
 
     struct FollowDropPlan
     {
@@ -503,6 +527,9 @@ namespace {
     // (Stormwind, Trade District, bots Nerie/Solin to Darkshire) ping-ponged for ever, each leg looking like progress to the gate.
     std::unordered_map<uint64, Playerbot::BotMovement::PartialRouteStall> g_route_stall{};
     std::unordered_map<uint64, Playerbot::BotMovement::NoMotionGuard> g_no_motion{};
+    // Pocket step (see the non-advancing branch of move_to): when each bot last stepped out of a navmesh pocket, so a pocket the
+    // step cannot leave is not retried every tick. World-thread only.
+    std::unordered_map<uint64, uint32> g_pocket_step_ms{};
     constexpr float  kMaxEscapeClimbYards = 8.0f; // no elevator/ramp-UP stranding (the
                                                   // rolled-back crawl's failure mode)
     constexpr float  kMinEscapeLegYards   = 15.0f;// a real escape leg, not jitter
@@ -681,6 +708,13 @@ void API::set_cast_speed_multiplier(float mult)
 
 // ---- Commands (real bodies) ----------------------------------------------
 
+// How near a player may come to an exit portal's centre before the core takes the portal: its bounds plus the player's combat
+// reach (the trigger's sphere test includes it), and half a yard to spare.
+static float ExitPortalReach(Player const* p, AreaTrigger const* at)
+{
+    return at->GetMaxSearchRadius() + p->GetCombatReach() + 0.5f;
+}
+
 // The static area trigger of a dungeon that teleports to another map (its exit portal) one of the walk segments runs into, or
 // null. A player steps into the portal to leave; a bot that walks across it while backing off or spacing out is thrown out of
 // the instance (Hall of Thanes 2026-10-29: the portal stands 13 y behind the entrance landing, a priest and a hunter landed in
@@ -703,7 +737,10 @@ static AreaTrigger const* ExitPortalOnPath(Player const* p, Position const* pts,
                     exit = exit || loc->Loc.GetMapId() != map->GetId();
         if (!exit)
             continue;
-        float const r = at->GetMaxSearchRadius() + 0.6f;    // the trigger's bounds + a player's own radius
+        // The core counts a unit inside when it is within the trigger's radius PLUS the unit's combat reach (IsWithinDist in
+        // SearchUnitInSphere): 4 + 1.5 y for a player at the Shaper's Terrace exit. The old 0.6 y allowance let a detour pass
+        // 5.2 y from the centre, and the tank was thrown out to Un'Goro 16 s into shapers_full af48-1. Half a yard to spare.
+        float const r = ExitPortalReach(p, at);
         float const ax = at->GetPositionX(), ay = at->GetPositionY(), az = at->GetPositionZ();
         for (size_t i = 0; i + 1 < n; ++i)
         {
@@ -731,50 +768,73 @@ static AreaTrigger const* ExitPortalOnPath(Player const* p, Movement::PointsArra
     return ExitPortalOnPath(p, pts.data(), pts.size());
 }
 
+// A spot beside the exit portal that a bot walks around it by, as a player does: the bot reaches it without touching the portal,
+// and the straight way on from there to the goal passes the portal by (the next move paths on from there). Rings of 3 y, then 6 y,
+// outside the portal's bounds, 16 spots each; the one with the shortest walk plus way on wins. False when no spot qualifies (the
+// portal fills the passage), and the move is refused as before. Shaper's Terrace 2026-11-19: the exit stands in the open field
+// 27 y south of the landing, the first trash is beyond it, and the tank's straight path ran over it: refused every tick, the run
+// stalled at 123 s although the field around the portal is 80 y wide.
+static thread_local int s_exitPortalDetourDepth = 0;
+
+static bool ExitPortalDetour(Player* p, AreaTrigger const* portal, float tx, float ty, float tz, G3D::Vector3& out)
+{
+    float const r = ExitPortalReach(p, portal);
+    float const ax = portal->GetPositionX(), ay = portal->GetPositionY(), az = portal->GetPositionZ();
+    float best = std::numeric_limits<float>::max();
+    bool found = false;
+    for (float const ring : { r + 3.0f, r + 6.0f })
+    {
+        for (int i = 0; i < 16; ++i)
+        {
+            float const a = float(i) * float(M_PI) / 8.0f;
+            float const cx = ax + ring * std::cos(a), cy = ay + ring * std::sin(a);
+            Position const on[2] = { Position(cx, cy, az), Position(tx, ty, tz) };
+            if (ExitPortalOnPath(p, on, 2))
+                continue;
+            PathGenerator path(p);
+            path.SetDisableRoadBonus(true);
+            if (!SehSafeCalculatePath(path, cx, cy, az))
+                continue;
+            if (path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORT | PATHFIND_INCOMPLETE | PATHFIND_FARFROMPOLY_END))
+                continue;
+            G3D::Vector3 const& e = path.GetActualEndPosition();
+            if (std::hypot(e.x - cx, e.y - cy) > 2.0f || std::fabs(e.z - az) > r + 2.5f || ExitPortalOnPath(p, path.GetPath()))
+                continue;
+            float const cost = path.GetPathLength() + std::hypot(tx - e.x, ty - e.y);
+            if (cost < best)
+            {
+                best = cost;
+                out = e;
+                found = true;
+            }
+        }
+        if (found)
+            break;
+    }
+    return found;
+}
+
 // Classic 1.60 rank chains: rotations name a spell by any rank (usually
 // rank 1); cast the highest rank the bot actually knows. Lower ranks stay
 // in the spellbook (HasSpell) after a higher one is learned.
 static uint32 HighestKnownRank(Player const* p, uint32 spell_id)
 {
-    SpellInfo const* base = sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE);
-    uint32 pick = spell_id;
-    uint32 pick_level = base ? base->BaseLevel : 0;
-    auto better = [&](uint32 id, uint32 level)
+    // The ranks are SpellFamily::Ranks, the list the snapshot's knows_spell / resolve_rank reads: the spell data's chain together with
+    // the spells of the same name, spell family and first effect (the Classic data has no chain for most class spells: Healing Touch
+    // 5185, Flash of Light 19750; a partial one for Mark of the Wild 1126). The highest base level the bot has in its spellbook wins.
+    // Both sides read one list, so a rule the snapshot lets fire casts a spell the bot has. Two lists, each with its own start, sent
+    // spells the bot does not have: the requested id was kept whenever no known rank had a higher base level, so a level 12 bear tank
+    // asked for Dire Bear Form 9634 knowing Bear Form 5487 and cast 9634 (API_NOT_KNOWN every 10 s, the whole fight in caster form:
+    // druid-tank-1120 r2), and the level 38 hunter of drowned_full af53 cast Trueshot Aura 19506 knowing only WoW Forever's talent
+    // 1299346 for 90 minutes.
+    for (std::vector<uint32> const ranks = SpellFamily::Ranks(spell_id); uint32 const id : std::views::reverse(ranks))
     {
-        if (level > pick_level || (level == pick_level && id > pick))
-        { pick = id; pick_level = level; }
-    };
-    // The ranks the spell data chains: the highest the bot knows.
-    if (sSpellMgr->GetSpellChainNode(spell_id))
-    {
-        uint32 rank = sSpellMgr->GetFirstSpellInChain(spell_id);
-        for (int guard = 0; rank && guard < 32; ++guard, rank = sSpellMgr->GetNextSpellInChain(rank))
-            if (p->HasSpell(rank))
-                if (SpellInfo const* ri = sSpellMgr->GetSpellInfo(rank, DIFFICULTY_NONE))
-                    better(rank, ri->BaseLevel);
+        auto const it = p->GetSpellMap().find(id);
+        if (it != p->GetSpellMap().end() && it->second.state != PLAYERSPELL_REMOVED && it->second.active && !it->second.disabled)
+            return id;
     }
-    // And the family: the Classic spell data has no chain for most class spells (Healing Touch 5185, Flash of Light 19750: the bots
-    // healed with rank 1) and a partial one for others (Mark of the Wild 1126: the chain held rank 1, the druid knew rank 7 outside
-    // it, and the upkeep cast the lower rank for ever). The ranks are the spells of the same name, spell family and first effect the
-    // bot has; the highest base level wins.
-    if (base && base->SpellName && !base->GetEffects().empty())
-    {
-        LocaleConstant const loc = sWorld->GetDefaultDbcLocale();
-        char const* const name = (*base->SpellName)[loc];
-        if (name && *name)
-            for (auto const& [id, ps] : p->GetSpellMap())
-            {
-                if (ps.state == PLAYERSPELL_REMOVED || !ps.active || ps.disabled || id == spell_id) continue;
-                SpellInfo const* si = sSpellMgr->GetSpellInfo(id, DIFFICULTY_NONE);
-                if (!si || !si->SpellName || si->SpellFamilyName != base->SpellFamilyName || si->GetEffects().empty() ||
-                    si->GetEffect(EFFECT_0).Effect != base->GetEffect(EFFECT_0).Effect || si->IsPassive() != base->IsPassive())
-                    continue;
-                char const* n2 = (*si->SpellName)[loc];
-                if (!n2 || std::strcmp(n2, name) != 0) continue;
-                better(id, si->BaseLevel);
-            }
-    }
-    return pick;
+    // No rank in the spellbook: the requested id, which the caller's "not in spellbook" check refuses.
+    return spell_id;
 }
 
 // Turn a standing bot toward the unit it is about to cast at / attack, the
@@ -1673,6 +1733,10 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
             FLIGHT_MOTION_TYPE)
         return Result::Locked;
 
+    // Thrown, jumping or falling: the flight lands where it lands; the next move is asked for from the floor.
+    if (ThrownThroughAir(p_, "move"))
+        return Result::Ok;
+
     // Follow the owner off a ledge. (x,y,z) is the owner. When his floor is only reached by a drop or a jump (he
     // dropped 11 y into the arena and his bots, with only the walking route, went round through the Blackhand packs and died) and the walking
     // route to him is missing or a long detour, walk to the nearest ledge and leave it; otherwise fall through to the ordinary pathed move.
@@ -2251,6 +2315,9 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
 
     // A path across a dungeon's exit portal throws the bot out of the instance (ExitPortalOnPath). Checked again on the path the
     // liquid gate below sees, since the retries in between can compute a new one.
+    // A way round it (ExitPortalDetour) is walked instead when there is one: the move goes to the spot beside the portal.
+    bool have_portal_detour = false;
+    G3D::Vector3 portal_detour;
     auto refuse_exit_portal = [&]() -> bool
     {
         if (!path_ok || (pt & PATHFIND_NOPATH))
@@ -2261,17 +2328,35 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
         static std::unordered_map<uint64, uint32> s_portalLog;
         uint32 const pnow = GameTime::GetGameTimeMS();
         uint32& plast = s_portalLog[p_->GetGUID().GetCounter()];
-        if (!plast || pnow - plast >= 5000u)
-        {
+        bool const log_now = !plast || pnow - plast >= 5000u;
+        if (log_now)
             plast = pnow ? pnow : 1u;
+        if (s_exitPortalDetourDepth == 0 && ExitPortalDetour(p_, portal, x, y, z, portal_detour))
+        {
+            have_portal_detour = true;
+            if (log_now)
+                TC_LOG_INFO("playerbot.v2", "[exit_portal] {} walks round the exit portal (area trigger {}) at ({:.1f},{:.1f},{:.1f}) by ({:.1f},{:.1f},{:.1f}) on a move to ({:.1f},{:.1f},{:.1f})",
+                    p_->GetName(), portal->GetEntry(), portal->GetPositionX(), portal->GetPositionY(), portal->GetPositionZ(),
+                    portal_detour.x, portal_detour.y, portal_detour.z, x, y, z);
+            return true;
+        }
+        if (log_now)
             TC_LOG_INFO("playerbot.v2", "[exit_portal] {} will not walk into the exit portal (area trigger {}) at ({:.1f},{:.1f},{:.1f}) on a move to ({:.1f},{:.1f},{:.1f})",
                 p_->GetName(), portal->GetEntry(), portal->GetPositionX(), portal->GetPositionY(), portal->GetPositionZ(), x, y, z);
-        }
         NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y, z_ask), pnow);
         return true;
     };
+    auto exit_portal_result = [&]() -> Result
+    {
+        if (!have_portal_detour)
+            return Result::Locked;
+        ++s_exitPortalDetourDepth;
+        Result const r = move_to(portal_detour.x, portal_detour.y, portal_detour.z, run, /*direct*/ false, /*drop*/ false, /*follow_drop*/ false);
+        --s_exitPortalDetourDepth;
+        return r;
+    };
     if (refuse_exit_portal())
-        return Result::Locked;
+        return exit_portal_result();
 
     // A floor with no navmesh: the top of a zeppelin tower is collision a player walks on, but the navmesh has only the ground 25-30 y
     // under it. Every path from up there ends on that ground, so a bot beside its player on the tower walked off it to the ground below
@@ -2820,6 +2905,61 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
                     }
                 }
             }
+            // POCKET STEP (2026-11-19). The bot stands on a scrap of navmesh a few polygons wide that the mesh does not join to the
+            // floor around it, though the ground is one: blackmaw_full af50-1, after Withermaw, the tank chased two Owlbeasts down
+            // into the Festering Grotto pit and stopped on a 3-polygon pocket at (3726.9,3393.4,284.6), the floor polygons around it
+            // at the same height 2-3 y away. Every path from there ended at the pocket's edge (Incomplete, 4.6 y), the tank stood
+            // 120 s and the run failed. When the partial ends close to the bot (the pocket's edge), look for a spot a few yards off,
+            // at about the bot's height and in its line of sight, from which a path to the goal does go on, and walk straight to it.
+            // A real wall or ledge fails the sight or height test; a spot from which no path goes on is not taken.
+            {
+                const float pk_leg = dist3d(path_end.x, path_end.y, path_end.z, p_->GetPositionX(), p_->GetPositionY(), p_->GetPositionZ());
+                uint32 const pk_now = GameTime::GetGameTimeMS();
+                uint32& pk_last = g_pocket_step_ms[p_->GetGUID().GetCounter()];
+                if (pk_leg < 8.0f && cur_to_dst > 10.0f && (pk_last == 0 || pk_now - pk_last > 5000u) &&
+                    PathBudget::HasBudget(pk_now))
+                {
+                    float const px = p_->GetPositionX(), py = p_->GetPositionY(), pz = p_->GetPositionZ();
+                    bool stepped = false;
+                    for (float const ring : { 3.0f, 5.0f })
+                    {
+                        for (int i = 0; i < 8 && !stepped; ++i)
+                        {
+                            float const ang = float(i) * float(M_PI) / 4.0f;
+                            Position spot;
+                            if (!Playerbot::BotMovement::NearestNavPoint(p_, px + ring * std::cos(ang), py + ring * std::sin(ang), pz,
+                                    /*hxy*/ 1.5f, /*hz*/ 2.0f, spot))
+                                continue;
+                            float const sx = spot.GetPositionX(), sy = spot.GetPositionY(), sz = spot.GetPositionZ();
+                            if (std::fabs(sz - pz) > 2.0f || std::hypot(sx - px, sy - py) < 1.5f ||
+                                !p_->IsWithinLOS(sx, sy, sz + 1.0f))
+                                continue;
+                            PathGenerator on(p_);
+                            if (!Playerbot::BotMovement::SehSafeCalculatePathFrom(on, sx, sy, sz, x, y, z))
+                                continue;
+                            if (on.GetPathType() & (PATHFIND_NOPATH | PATHFIND_FARFROMPOLY_START))
+                                continue;
+                            G3D::Vector3 const& oe = on.GetActualEndPosition();
+                            if (dist3d(oe.x, oe.y, oe.z, x, y, z) > end_to_dst - kMinForwardProgressYards)
+                                continue;   // from there the walk does not go on either
+                            if (p_->IsWalking() == run)
+                                p_->SetWalk(!run);
+                            p_->GetMotionMaster()->MovePoint(0, sx, sy, sz, /*generatePath*/ false);
+                            pk_last = pk_now ? pk_now : 1u;
+                            stepped = true;
+                            TC_LOG_INFO("playerbot.v2",
+                                "[pocket_step] {} steps out of a navmesh pocket at ({:.1f},{:.1f},{:.1f}) to ({:.1f},{:.1f},{:.1f}): "
+                                "from here the path ended {:.1f} y off, from there it goes on to {:.1f} y of the goal",
+                                p_->GetName(), px, py, pz, sx, sy, sz, pk_leg, dist3d(oe.x, oe.y, oe.z, x, y, z));
+                        }
+                        if (stepped)
+                            break;
+                    }
+                    if (stepped)
+                        return Result::Ok;
+                    pk_last = pk_now ? pk_now : 1u;   // nothing here: not again for 5 s
+                }
+            }
             // NOTE (2026-06-09): a crawl-on-Incomplete fallback was tried here but
             // ROLLED BACK Ã¢Â€Â” combined with the ramp-climb gate it shoved bots up onto
             // elevator platforms they couldn't then step off (Pyrethel/Gorois stranded
@@ -3078,7 +3218,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop,
     // the mmap read is cheap and only fires on otherwise-valid paths.
     {
         if (refuse_exit_portal())
-            return Result::Locked;
+            return exit_portal_result();
         LiquidData lvData{};
         BotMovement::LiquidVerdict const lv =
             BotMovement::ClassifyDestinationLiquid(p_, x, y, z, &lvData);
@@ -3627,6 +3767,8 @@ Result API::stop_movement(bool clear_generators)
     // (WSG soak on 247: the battleground mount rule stops a moving bot, and Jacelia's drop ended in hover_settle 2 s later, twice).
     if (auto it = s_followDropAir.find(p_->GetGUID().GetCounter()); it != s_followDropAir.end() && GameTime::GetGameTimeMS() < it->second)
         return Result::Ok;
+    if (ThrownThroughAir(p_, "stop"))
+        return Result::Ok;
     if (!clear_generators)
     {
         p_->StopMoving();
@@ -4099,6 +4241,16 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
         p_->GetMotionMaster()->MoveChase(tu, ChaseRange(0.0f, max_chase));
         logHunterChase("opening_ranged");
     }
+    else if (BotMovement::ClassifyDestinationLiquid(p_, tu->GetPositionX(), tu->GetPositionY(), tu->GetPositionZ()) ==
+             BotMovement::LiquidVerdict::Hazard)
+    {
+        // The target stands in a liquid that burns the bot (tar, lava): the core chase walks straight in after it (the player filter of
+        // PathGenerator takes magma polys), and the move gate below refuses only move_to. The bot swings from where it stands and the
+        // mob, in combat with it, comes out to it; the fight's gap-close waits on the bank too (State_InCombat chase_blocked).
+        // shapers_full af51 (20 Nov): the rogue was chased into the Tar Pits by this MoveChase and died there.
+        TC_LOG_INFO("playerbot.v2", "[liquid_hold] {} does not chase {} into a burning liquid at ({:.1f},{:.1f},{:.1f})", p_->GetName(),
+                    tu->GetName(), tu->GetPositionX(), tu->GetPositionY(), tu->GetPositionZ());
+    }
     else
     {
         p_->GetMotionMaster()->MoveChase(tu);
@@ -4297,6 +4449,8 @@ Result API::mount(uint32 mount_id)
     // In the air after a ledge drop or leap: the stop below would halt the jump spline mid-flight.
     if (auto it = s_followDropAir.find(p_->GetGUID().GetCounter()); it != s_followDropAir.end() && GameTime::GetGameTimeMS() < it->second)
         return Result::Locked;
+    if (ThrownThroughAir(p_, "mount"))
+        return Result::Locked;
     // The mount cast is refused while the bot moves (SPELL_FAILED_MOVING): a bot that walks or follows stands still for it.
     if (p_->isMoving())
         p_->StopMoving();
@@ -4342,7 +4496,7 @@ Result API::mount(uint32 mount_id)
                 if (eff.ApplyAuraName == SPELL_AURA_MOUNTED) is_mount = true;
                 else if (eff.ApplyAuraName == SPELL_AURA_MOD_INCREASE_MOUNTED_SPEED) speed = std::max(speed, int32(eff.BasePoints));
             }
-            if (!is_mount || MountDisplayProblem(sid, nullptr)) continue;
+            if (!is_mount || MountDisplayProblem(sid, nullptr) || !RacePermitsMount(p_->GetRace(), sid)) continue;
             if (speed > best_speed || (speed == best_speed && sid < mount_id)) { best_speed = speed; mount_id = sid; }
         }
         if (mount_id == 0)
@@ -5225,6 +5379,13 @@ Result API::enter_area_trigger(uint32 area_trigger_id)
     packet.Entered = true;
     packet.FromClient = true;
     sess->HandleAreaTriggerOpcode(packet);
+    // A trigger with no teleport (an event trigger, such as Upper Blackrock Spire's stadium) is answered by its script; the packet
+    // is all a client does there.
+    if (!dest)
+    {
+        TC_LOG_DEBUG("playerbot.v2", "[area_trigger] {} sends area trigger {} on map {}", p_->GetName(), area_trigger_id, p_->GetMapId());
+        return Result::Ok;
+    }
     const bool ported = p_->IsBeingTeleported();
     // A refusal repeats while the bot stands in the trigger; the rule logs
     // that at INFO on its own pacing, so only the crossing itself is INFO here.
@@ -5432,7 +5593,7 @@ Result API::accept_owner_trade(ObjectGuid owner)
     return trade_with(owner, true);
 }
 
-Result API::trade_with(ObjectGuid owner, bool gift_ok)
+Result API::trade_with(ObjectGuid owner, bool gift_ok, bool from_owner)
 {
     if (!p_) return Result::Other;
     // Per bot: the window being answered and whether it was begun (Trade::Seen, keyed by the window's serial).
@@ -5479,7 +5640,7 @@ Result API::trade_with(ObjectGuid owner, bool gift_ok)
                 break;
         }
     }
-    return TradeShop::Step(p_, mine, his, gift_ok);
+    return TradeShop::Step(p_, mine, his, gift_ok, from_owner);
 }
 
 Result API::accept_group_invite()
@@ -6810,6 +6971,15 @@ static Result UseItemImpl(Player* p, Item* item, ObjectGuid target)
         if (!ti) return Result::InvalidTarget;
         targets.SetItemTarget(ti);
     }
+    else if (target.IsGameObject())
+    {
+        // A key used on the door it opens (the Gordok Courtyard Key on the Courtyard Door): a player's client sends the item use
+        // with the door as the target, and the key's Opening spell (3366) checks the door's lock against the key it is cast from.
+        GameObject* go = p->GetMap() ? p->GetMap()->GetGameObject(target) : nullptr;
+        if (!go || !go->IsInWorld()) return Result::InvalidTarget;
+        targets.SetGOTarget(go);
+        p->SetFacingToObject(go);
+    }
     else if (!target.IsEmpty() && target != p->GetGUID())
     {
         if (Unit* tu = ObjectAccessor::GetUnit(*p, target))
@@ -6965,6 +7135,19 @@ Result API::loot_corpse(ObjectGuid corpse, bool quest_items_only)
     Group* group = p_->GetGroup();
     if (group && group->GetLootMethod() != FREE_FOR_ALL)
     {
+        // A self bot plays a character that a real game client is logged in on. That client answers the loot window itself:
+        // with auto loot on it sends the item requests at once, then closes the window. Closing it here, as for a headless
+        // bot, came before those requests arrived, so the server refused every one and the self bot never looted in a group
+        // unless the player turned auto loot off (Discord, y_dem 2026-11-20). Open the window once and leave it to the client.
+        if (!Services::SessionMgr().IsHeadless(p_->GetGUID()))
+        {
+            bool const already_open = p_->GetAELootView().contains(loot->GetGUID());
+            if (!already_open)
+                p_->SendLoot(*loot, false);
+            TC_LOG_INFO("playerbot.v2", "[loot_window] bot={} corpse={} party loot on a game client: window {}, left to the client",
+                        p_->GetGUID().GetCounter(), corpse.GetCounter(), already_open ? "already open" : "opened");
+            return Result::Ok;
+        }
         p_->SendLoot(*loot, false);
         // SendLoot opens the loot window (LootGUID, UNIT_FLAG_LOOTING = the kneeling loot pose) and a bot has no client to close
         // it: every bot in a group with party loot rules stayed in the loot pose through every fight and cast (playtest, Deadmines
@@ -7485,6 +7668,13 @@ Result API::use_game_object(ObjectGuid go_guid)
                                 raw->IsInWorld() ? 1 : 0, uint32(raw->GetGoState()), raw->HasFlag(GO_FLAG_IN_USE) ? 1 : 0);
                         }
                     }
+        // A door the bot clicked from out of its reach: logged, the hand-door rule clicks again from closer (see [door_use] below).
+        if (Map* dmap3 = p_->GetMap())
+            if (GameObject* raw = dmap3->GetGameObject(go_guid))
+                if (raw->GetGoType() == GAMEOBJECT_TYPE_DOOR)
+                    TC_LOG_INFO("playerbot.v2", "[door_use] {} entry={} guid={} out of reach: d={:.1f} dz={:.1f} state={}", p_->GetName(),
+                        raw->GetEntry(), raw->GetSpawnId(), p_->GetExactDist(raw), raw->GetPositionZ() - p_->GetPositionZ(),
+                        uint32(raw->GetGoState()));
         return Result::InvalidTarget;
     }
     // A chest a player could not click either: despawned, or a quest object (mushroom, flower, crate) for a quest the bot does not
@@ -7607,7 +7797,20 @@ Result API::use_game_object(ObjectGuid go_guid)
         TC_LOG_INFO("playerbot.v2", "[bg_capture] {} success entry={} (Use() now)", p_->GetName(), obj->GetEntry());
     }
 
+    GOState const stateBefore = obj->GetGoState();
     obj->Use(p_);
+
+    // A door the bot clicked says what the click did: the Deadmines Heavy Door the tank clicked in af39 (19 Nov) was still shut a
+    // minute later, and nothing showed why. A door that changed state also changes the walls of this bot's routes: the path failures
+    // it noted against that door (NoPath through a shut door, kept up to 60 s) no longer hold, so they are forgotten.
+    if (obj->GetGoType() == GAMEOBJECT_TYPE_DOOR)
+    {
+        GOState const stateAfter = obj->GetGoState();
+        TC_LOG_INFO("playerbot.v2", "[door_use] {} entry={} guid={} state {} -> {} loot_state={} d={:.1f}", p_->GetName(), obj->GetEntry(),
+            obj->GetSpawnId(), uint32(stateBefore), uint32(stateAfter), uint32(obj->getLootState()), p_->GetExactDist(obj));
+        if (stateAfter != stateBefore)
+            g_path_fail.erase(p_->GetGUID().GetCounter());
+    }
 
     // Auto-loot for lootable GO types (CHEST, GOOBER with loot, etc.): GameObject::Use opens the loot window server-side, and a
     // headless bot has no client to take the items (TakeGameObjectLoot).
@@ -11405,8 +11608,15 @@ uint32 API::unlearn_spells_above_level()
         if (::Playerbot::Api::IsSpellAboveLevel(it != trainerLevel.end() ? it->second : 0, si->SpellLevel, level))
             doomed.push_back(spellId);
     }
+    // A rank the bot learned put the rank below it out of the spellbook (inactive, which the snapshot's knows_spell does not count), and
+    // only a removal with learn_low_rank brings the rank below back, and only while the removed rank is the active one. So the ranks go
+    // highest first, each with learn_low_rank: removing 8 brings back 7, removing 7 brings back 6, and the highest rank kept is the one
+    // in the spellbook. Removed the other way, without learn_low_rank, every rank kept stayed inactive: the level 57 rogue set down to 38
+    // in drowned_full af53 had no Sinister Strike, Eviscerate, Slice and Dice, Kick or Feint for the whole run, only its talents and white
+    // hits.
+    std::sort(doomed.begin(), doomed.end(), [](uint32 a, uint32 b) { return sSpellMgr->GetSpellRank(a) > sSpellMgr->GetSpellRank(b); });
     for (uint32 spellId : doomed)
-        p_->RemoveSpell(spellId, false, false);
+        p_->RemoveSpell(spellId, false, true);
     return uint32(doomed.size());
 }
 
@@ -11757,26 +11967,73 @@ uint32 API::learn_weapon_skills_free()
     return changed;
 }
 
+namespace
+{
+// Each vanilla race's mounts, from the client's mount items (Item, ItemEffect, Spell description; wago 70532): the riding-trainer and
+// vendor mounts, the swift ones and the race's PvP war mount. The first normal and the first swift row of a race are what a bot learns.
+struct RaceMountRow { uint8 race; uint32 spell; bool swift; };
+constexpr std::array<RaceMountRow, 59> kRaceMountRows = {{
+    { RACE_HUMAN, 458, false },   { RACE_HUMAN, 472, false },   { RACE_HUMAN, 6648, false },           // Brown Horse, Pinto, Chestnut Mare
+    { RACE_HUMAN, 23229, true },  { RACE_HUMAN, 23227, true },  { RACE_HUMAN, 23228, true },           // Swift Brown Steed, Palomino, White Steed
+    { RACE_HUMAN, 22717, true },  { RACE_HUMAN, 23510, true },                                         // Black War Steed, Stormpike Battle Charger
+    { RACE_ORC, 580, false },     { RACE_ORC, 6653, false },    { RACE_ORC, 6654, false },             // Timber, Dire, Brown Wolf
+    { RACE_ORC, 23250, true },    { RACE_ORC, 23251, true },    { RACE_ORC, 23252, true },             // Swift Brown, Timber, Gray Wolf
+    { RACE_ORC, 22724, true },    { RACE_ORC, 23509, true },                                           // Black War Wolf, Frostwolf Howler
+    { RACE_DWARF, 6899, false },  { RACE_DWARF, 6777, false },  { RACE_DWARF, 6898, false },           // Brown, Gray, White Ram
+    { RACE_DWARF, 23238, true },  { RACE_DWARF, 23239, true },  { RACE_DWARF, 23240, true },           // Swift Brown, Gray, White Ram
+    { RACE_DWARF, 22720, true },                                                                       // Black War Ram
+    { RACE_NIGHTELF, 10793, false }, { RACE_NIGHTELF, 8394, false }, { RACE_NIGHTELF, 10789, false },  // Striped Nightsaber, Striped and
+    { RACE_NIGHTELF, 10792, false },                                                                   // Spotted Frostsaber, Spotted Nightsaber
+    { RACE_NIGHTELF, 23221, true }, { RACE_NIGHTELF, 23219, true }, { RACE_NIGHTELF, 23338, true },    // Swift Frostsaber, Mistsaber, Stormsaber
+    { RACE_NIGHTELF, 22723, true },                                                                    // Black War Tiger
+    { RACE_UNDEAD_PLAYER, 17462, false }, { RACE_UNDEAD_PLAYER, 17463, false },                        // Red, Blue Skeletal Horse
+    { RACE_UNDEAD_PLAYER, 17464, false },                                                              // Brown Skeletal Horse
+    { RACE_UNDEAD_PLAYER, 17465, true }, { RACE_UNDEAD_PLAYER, 23246, true },                          // Green, Purple Skeletal Warhorse
+    { RACE_UNDEAD_PLAYER, 22722, true },                                                               // Red Skeletal Warhorse
+    { RACE_TAUREN, 18990, false }, { RACE_TAUREN, 18989, false },                                      // Brown, Gray Kodo
+    { RACE_TAUREN, 23249, true },  { RACE_TAUREN, 23247, true }, { RACE_TAUREN, 23248, true },         // Great Brown, White, Gray Kodo
+    { RACE_TAUREN, 18991, true },  { RACE_TAUREN, 22718, true },                                       // Green Kodo, Black War Kodo
+    { RACE_GNOME, 10873, false },  { RACE_GNOME, 10969, false }, { RACE_GNOME, 17453, false },         // Red, Blue, Green Mechanostrider
+    { RACE_GNOME, 17454, false },                                                                      // Unpainted Mechanostrider
+    { RACE_GNOME, 23225, true },   { RACE_GNOME, 23222, true },  { RACE_GNOME, 23223, true },          // Swift Green, Yellow, White Mechanostrider
+    { RACE_GNOME, 22719, true },                                                                       // Black Battlestrider
+    { RACE_TROLL, 8395, false },   { RACE_TROLL, 10796, false }, { RACE_TROLL, 10799, false },         // Emerald, Turquoise, Violet Raptor
+    { RACE_TROLL, 23241, true },   { RACE_TROLL, 23242, true },  { RACE_TROLL, 23243, true },          // Swift Blue, Olive, Orange Raptor
+    { RACE_TROLL, 22721, true },                                                                       // Black War Raptor
+}};
+}
+
 bool API::RaceMountSpells(uint8 race, uint32& normal, uint32& swift)
 {
-    // Each race's vanilla riding-trainer mount and its epic, by spell.
-    struct RaceMounts { uint8 race; uint32 normal; uint32 swift; };
-    static constexpr std::array<RaceMounts, 8> kMounts = {{
-        { RACE_HUMAN,     458, 23229 },   // Brown Horse, Swift Brown Steed
-        { RACE_ORC,       580, 23250 },   // Timber Wolf, Swift Brown Wolf
-        { RACE_DWARF,    6899, 23238 },   // Brown Ram, Swift Brown Ram
-        { RACE_NIGHTELF, 10793, 23221 },  // Striped Nightsaber, Swift Frostsaber
-        { RACE_UNDEAD_PLAYER, 17462, 17465 }, // Red Skeletal Horse, Green Skeletal Warhorse
-        { RACE_TAUREN,  18990, 23249 },   // Brown Kodo, Great Brown Kodo
-        { RACE_GNOME,   10873, 23225 },   // Red Mechanostrider, Swift Green Mechanostrider
-        { RACE_TROLL,    8395, 23241 },   // Emerald Raptor, Swift Blue Raptor
-    }};
-    auto const itr = std::ranges::find(kMounts, race, &RaceMounts::race);
-    if (itr == kMounts.end())
-        return false;
-    normal = itr->normal;
-    swift = itr->swift;
-    return true;
+    // Each race's vanilla riding-trainer mount and its epic, by spell: the first normal and swift row of the race.
+    normal = 0;
+    swift = 0;
+    for (RaceMountRow const& row : kRaceMountRows)
+        if (row.race == race)
+        {
+            uint32& slot = row.swift ? swift : normal;
+            if (!slot)
+                slot = row.spell;
+        }
+    return normal && swift;
+}
+
+uint8 API::MountRaceOf(uint32 spell_id)
+{
+    for (RaceMountRow const& row : kRaceMountRows)
+        if (row.spell == spell_id)
+            return row.race;
+    return 0;
+}
+
+bool API::RacePermitsMount(uint8 race, uint32 spell_id)
+{
+    uint8 const mount_race = MountRaceOf(spell_id);
+    if (!mount_race || mount_race == race)
+        return true;
+    // A race without vanilla mounts of its own rides those of its faction's races.
+    uint32 normal = 0, swift = 0;
+    return !RaceMountSpells(race, normal, swift) && Player::TeamForRace(mount_race) == Player::TeamForRace(race);
 }
 
 uint32 API::learn_riding_free()
@@ -11829,9 +12086,11 @@ uint32 API::learn_riding_free()
     }
 
     auto isMount = [](SpellInfo const* info) { return info && info->HasAura(SPELL_AURA_MOUNTED); };
+    // Only a mount of the bot's own race counts: mounts are account-wide, so a pool bot also knows the mounts its account's other
+    // characters learned (an orc with a human's Brown Horse never learned its wolf and rode the horse, energetik 19 Nov).
     uint32 known = 0;
     for (auto const& [spellId, spell] : p_->GetSpellMap())
-        if (spell.state != PLAYERSPELL_REMOVED && spell.active && !spell.disabled &&
+        if (spell.state != PLAYERSPELL_REMOVED && spell.active && !spell.disabled && MountRaceOf(spellId) == p_->GetRace() &&
             isMount(sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE)))
             known = spellId;
 
@@ -11847,18 +12106,9 @@ uint32 API::learn_riding_free()
         // The race's table spell is not a mount in this data: take the next mount of the race that is (the other vanilla ground mounts of the race,
         // then its swift mount at 60).
         std::vector<uint32> alternatives;
-        switch (p_->GetRace())
-        {
-            case RACE_HUMAN:        alternatives = epic ? std::vector<uint32>{ 23227, 23228 } : std::vector<uint32>{ 472, 6648, 458 }; break;
-            case RACE_ORC:          alternatives = epic ? std::vector<uint32>{ 23251, 23252 } : std::vector<uint32>{ 6653, 6654, 580 }; break;
-            case RACE_DWARF:        alternatives = epic ? std::vector<uint32>{ 23239, 23240 } : std::vector<uint32>{ 6777, 6898, 6899 }; break;
-            case RACE_NIGHTELF:     alternatives = epic ? std::vector<uint32>{ 23219, 23338 } : std::vector<uint32>{ 8394, 10789, 10792, 66847, 10793 }; break;
-            case RACE_UNDEAD_PLAYER: alternatives = epic ? std::vector<uint32>{ 23246, 23247 } : std::vector<uint32>{ 17463, 17464, 17462 }; break;
-            case RACE_TAUREN:       alternatives = epic ? std::vector<uint32>{ 23248, 23249 } : std::vector<uint32>{ 18989, 18991, 18990 }; break;
-            case RACE_GNOME:        alternatives = epic ? std::vector<uint32>{ 23222, 23223 } : std::vector<uint32>{ 17453, 10969, 10873 }; break;
-            case RACE_TROLL:        alternatives = epic ? std::vector<uint32>{ 23242, 23243 } : std::vector<uint32>{ 10796, 10799, 8395 }; break;
-            default: break;
-        }
+        for (RaceMountRow const& row : kRaceMountRows)
+            if (row.race == p_->GetRace() && row.swift == epic)
+                alternatives.push_back(row.spell);
         uint32 found = 0;
         for (uint32 candidate : alternatives)
             if (candidate != want && isMount(sSpellMgr->GetSpellInfo(candidate, DIFFICULTY_NONE)))

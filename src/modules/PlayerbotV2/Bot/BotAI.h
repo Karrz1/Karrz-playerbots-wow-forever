@@ -652,6 +652,12 @@ public:
         use_stay_.store(false, std::memory_order_relaxed);   // any new order replaces the use's Stay
         stay_return_set_.store(false, std::memory_order_relaxed);   // and the spot an old Stay walks back to
         stay_return_pinned_.store(false, std::memory_order_relaxed);
+        // The owner's Attack on a target is the "the condition may have cleared" retry the start_attack lockout waits 30 s for: an
+        // earlier refusal on the same mob (refused while mounted, before the bot came in sight of it) left the engage rules dropping
+        // every StartAttack on it after the order's own one, so a bot that lost its swing in the first seconds stood and watched
+        // (Discord 6_1_8_8_1: grouped bots "sometimes do not attack after using the Attack command" in the open world).
+        if (cmd == OwnerCommand::Engage)
+            forgive_start_attack(target.GetCounter(), now_ms);
     }
     // The Stay a "use <object>" leaves after the use: ends once the use is done (no channel 5 s after it, idle:owner_stay), when the
     // bot's or the group's fight starts (DispatchInCombat, idle:owner_stay), a two-minute backstop otherwise.
@@ -1720,6 +1726,42 @@ public:
         }
     }
 
+    // ---- boss-stride headway (2026-11-19) ----
+    // The tank's direct stride toward a boss holds its step while the bot is moving with that step as its spline's end
+    // (DungeonStepAlreadyInFlight) and re-emits it whenever the spline ends, so a step the bot can never reach is walked at
+    // forever as long as the bot keeps moving: drowned_full af47-1, the stride from Var'Taka to Captain Dreadrise pointed
+    // into a pit at (-13610.7,2775.3,-37.0); the tank ran down and back up the slope beside it every 7 s for 29 minutes
+    // (1,700 s, z -29 to -37) and the group stood idle below. This tracks the bot's best distance to the step it strides
+    // at; no headway for kStrideStallMs means the step is a dead end.
+    static constexpr float  kStrideSameStepY = 5.0f;    // two steps this close are the same step (the start point moves)
+    static constexpr float  kStrideHeadwayY  = 1.5f;    // the best distance must shrink by this much to count
+    static constexpr uint32 kStrideStallMs   = 8000;
+    static constexpr uint32 kStrideGapMs     = 2000;    // not striding for this long starts the watch afresh
+    // Returns how long the bot has gone without headway on this step (0 while it closes in).
+    uint32 stride_note(uint32 map_id, float sx, float sy, float sz, float bx, float by, float bz, uint32 now_ms)
+    {
+        float const ddx = sx - stride_x_, ddy = sy - stride_y_, ddz = sz - stride_z_;
+        float const d = std::sqrt((bx - sx) * (bx - sx) + (by - sy) * (by - sy) + (bz - sz) * (bz - sz));
+        bool const same = stride_map_ == map_id && stride_seen_ms_ && now_ms - stride_seen_ms_ < kStrideGapMs &&
+                          ddx * ddx + ddy * ddy + ddz * ddz <= kStrideSameStepY * kStrideSameStepY;
+        stride_seen_ms_ = now_ms ? now_ms : 1u;
+        if (!same)
+        {
+            stride_map_ = map_id;
+            stride_x_ = sx; stride_y_ = sy; stride_z_ = sz;
+            stride_best_ = d;
+            stride_best_ms_ = stride_seen_ms_;
+            return 0;
+        }
+        if (stride_best_ - d > kStrideHeadwayY)
+        {
+            stride_best_ = d;
+            stride_best_ms_ = stride_seen_ms_;
+        }
+        return now_ms - stride_best_ms_;
+    }
+    float stride_best() const { return stride_best_; }
+
     // ---- refused-destination memory (refusal-aware target selection,
     // 2026-07-20) ----
     // BUG THIS FIXES: PlayerbotAPI::move_to keeps a PER-DESTINATION path-fail
@@ -1748,6 +1790,12 @@ public:
     {
         move_refused_[move_refused_head_] = RefusedDst{x, y, z, now_ms ? now_ms : 1u};
         move_refused_head_ = (move_refused_head_ + 1) % move_refused_.size();
+    }
+    // Forget every refusal: the geometry that refused them changed (the bot opened a door across its route).
+    void clear_move_refusals()
+    {
+        move_refused_.fill(RefusedDst{});
+        move_refused_head_ = 0;
     }
     bool move_refused_recently(float x, float y, float z, uint32 now_ms) const
     {
@@ -2811,6 +2859,13 @@ public:
         AlwaysBuff      = 58,  // target = kAlwaysBuffLockKey. idle:always_buff (Playerbot.AlwaysBuffs): 10s between passes.
         BgCaptureHold   = 59,  // target = the node key of BgTryUseObjectiveGo. A bot that started a banner capture stands still at the
                                // banner for 7s, so the 5s channel completes on its next click instead of being broken by another rule's move.
+        DungeonHandDoor = 60,  // target = door GO guid_low. idle:dungeon_open_hand_door: one click per shut hand door per 5 s; a door
+                               // that opened leaves the snapshot's hand doors, one still shut is clicked again (see the lockout below).
+        DungeonPortalHop = 61, // target = the portal's GO entry. idle:dungeon_portal_hop: a bot that used a dungeon's own portal to
+                               // the next boss room waits 8s before it uses it again (the teleport lands it out of range at once; a
+                               // portal that refused, its bosses not all dead yet, is not clicked every tick).
+        DungeonDoorTalk = 62,  // target = the creature's entry. idle:dungeon_door_talk: the tank told a dungeon's door opener
+                               // (advice.door_talks: Ironbark the Redeemed) to open the way: not again for the 5 min default.
     };
     static constexpr uint32 kActionRetryLockoutMs = 5u * 60u * 1000u;
     // Per-kind cooldown override — most actions use the 5 min default, but
@@ -2942,6 +2997,8 @@ public:
             case ActionKind::BgFormHold:
                 // Past the 3 s BgUseGo retry, so the second click lands out of form.
                 return 6u * 1000u;
+            case ActionKind::DungeonPortalHop:
+                return 8u * 1000u;
             case ActionKind::BgCaptureHold:
                 // The 5 s capture channel plus the 3 s click that completes it, less the click already made at its start.
                 return 7u * 1000u;
@@ -3007,6 +3064,12 @@ public:
                 // recovers the critical_repair gate stops firing entirely, so a
                 // no-op RepairAll on already-full gear never spams.
                 return 5u * 1000u;
+            case ActionKind::DungeonHandDoor:
+                // 5 s, not the 5 min default: the click has no feedback to the rule, and a door the click did not open stays shut
+                // across the tank's path for the whole group (deadmines_full af39 19 Nov: one click on the second Heavy Door, the door
+                // still shut 60 s later, the run stalled at 120 s). An opened door is no longer a hand door in the snapshot, so the
+                // retry ends the moment the door opens.
+                return 5u * 1000u;
             default:
                 return kActionRetryLockoutMs;
         }
@@ -3071,11 +3134,39 @@ public:
         return now_ms < it->second;
     }
     // Raid buffs this bot cast itself (ClassicBuffLedger.h): a buff the group snapshot cannot see is not recast for a part of its length.
-    void note_buff_cast(uint64 key, uint32 now_ms) { buff_cast_ms_[key] = now_ms ? now_ms : 1u; }
+    // `spell` and `target` are what the intent asked for, so a refusal of that cast (note_cast_refused) takes the trust back.
+    void note_buff_cast(uint64 key, uint32 now_ms, uint32 spell = 0, ObjectGuid target = ObjectGuid::Empty)
+    {
+        buff_cast_ms_[key] = BuffCastNote{ now_ms ? now_ms : 1u, spell, target.GetCounter() };
+    }
+    // How the core answered the cast noted for `key`: not refused, refused for a passing reason (the global cooldown, another cast
+    // still running: try again now), or refused for good (range, line of sight: the 30 s retry lockout stands, the trust does not).
+    enum class BuffCastRefusal : uint8 { None, Passing, Lasting };
+    BuffCastRefusal buff_cast_refusal(uint64 key) const
+    {
+        auto const it = buff_cast_ms_.find(key);
+        if (it == buff_cast_ms_.end() || !it->second.spell)
+            return BuffCastRefusal::None;
+        std::lock_guard<std::mutex> lk(cast_refused_mtx_);
+        for (CastRefusedNote const& r : cast_refused_)
+            if (r.spell == it->second.spell && r.target == it->second.target && Classic::CastRefusedAfter(it->second.ms, r.ms))
+                return r.passing ? BuffCastRefusal::Passing : BuffCastRefusal::Lasting;
+        return BuffCastRefusal::None;
+    }
     bool buff_cast_trusted(uint64 key, uint32 now_ms) const
     {
         auto const it = buff_cast_ms_.find(key);
-        return it != buff_cast_ms_.end() && Classic::BuffCastTrusted(key, it->second, now_ms);
+        return it != buff_cast_ms_.end() && Classic::BuffCastTrusted(key, it->second.ms, now_ms)
+            && buff_cast_refusal(key) == BuffCastRefusal::None;
+    }
+    // World thread (BotIntentExecutor): the core refused a cast intent. Kept in a small ring the rule thread reads under the mutex.
+    void note_cast_refused(uint32 spell, ObjectGuid target, uint32 now_ms, bool passing)
+    {
+        if (!spell)
+            return;
+        std::lock_guard<std::mutex> lk(cast_refused_mtx_);
+        cast_refused_[cast_refused_next_] = CastRefusedNote{ now_ms ? now_ms : 1u, spell, target.GetCounter(), passing };
+        cast_refused_next_ = uint8((cast_refused_next_ + 1) % cast_refused_.size());
     }
     void prune_action_retry_cache(uint32 now_ms)
     {
@@ -3360,6 +3451,7 @@ private:
     // engages a mob himself. Runs every tick before the state dispatch.
     void update_dungeon_autopilot_hold(BotSnapshotView, GroupSnapshotView);
     void update_group_fight(BotSnapshotView, GroupSnapshotView);
+    void dispatch_state(BotSnapshotView s, GroupSnapshotView g, BotIntentEmitter& em);
 
     BotId          bot_id_;
     BotPersonality personality_;
@@ -3377,6 +3469,11 @@ private:
     uint32         rule_fire_seq_ = 0;
 public:
     uint32         rule_fire_seq() const { return rule_fire_seq_; }
+    // [attack_rule]: the target of an [attack_start] line logged during this tick's dispatch, and the rule count then. The line names
+    // the rule that fired BEFORE the attack; dispatch_primary names the one that started it once the tick is done.
+    void note_attack_start_logged(ObjectGuid target) { attack_log_target_ = target; attack_log_seq_ = rule_fire_seq_; }
+    ObjectGuid     attack_log_target_;
+    uint32         attack_log_seq_ = 0;
 
     // [dps_idle] tracker (bot worker; State_InCombat's end-of-tick probe).
     // idle_since = first tick of the current no-action streak (0 = acting),
@@ -4092,6 +4189,11 @@ private:
     // progress_ms_ = the timestamp that best distance was last improved.
     // See move_commit_note_progress()/move_commit_active() above.
     float          move_commit_best_d2_     = 0.f;
+    uint32         stride_map_              = 0;      // boss-stride headway (stride_note)
+    float          stride_x_ = 0.f, stride_y_ = 0.f, stride_z_ = 0.f;
+    float          stride_best_             = 0.f;
+    uint32         stride_best_ms_          = 0;
+    uint32         stride_seen_ms_          = 0;
     uint32         move_commit_progress_ms_ = 0;
     // Refused-destination ring (see move_refused_recently() above).
     struct RefusedDst { float x = 0.f, y = 0.f, z = 0.f; uint32 ms = 0; };
@@ -5176,7 +5278,12 @@ private:
     std::unordered_map<uint64, uint32> chest_loot_until_ms_;
     // Generic action retry cooldown — see ActionKind / kActionRetryLockoutMs.
     std::unordered_map<uint64, uint32> action_retry_until_ms_;
-    std::unordered_map<uint64, uint32> buff_cast_ms_;   // note_buff_cast
+    struct BuffCastNote { uint32 ms = 0; uint32 spell = 0; uint64 target = 0; };
+    std::unordered_map<uint64, BuffCastNote> buff_cast_ms_;   // note_buff_cast (rule thread)
+    struct CastRefusedNote { uint32 ms = 0; uint32 spell = 0; uint64 target = 0; bool passing = false; };
+    mutable std::mutex cast_refused_mtx_;                     // note_cast_refused (world thread) / buff_cast_refusal (rule thread)
+    std::array<CastRefusedNote, 16> cast_refused_{};
+    uint8 cast_refused_next_ = 0;
     // #4B-1 Part 2: per-item AH sell-price memory — see SellPriceMemo above.
     // Keyed by item_entry. Bounded naturally by the bot's distinct sellable
     // inventory; the AhPostItem 5-min retry lockout limits churn so this map
@@ -5304,6 +5411,15 @@ public:
     {
         if (target_low == 0) return;
         start_attack_until_ms_[target_low] = now_ms + kStartAttackLockoutMs;
+    }
+    // Ends a lockout early (the owner ordered the attack). The entry is expired in place, not erased: the map is written on the world
+    // thread and read by the bot worker, and an in-place store changes no bucket under a reader.
+    void forgive_start_attack(uint64 target_low, uint32 now_ms)
+    {
+        if (target_low == 0) return;
+        auto const it = start_attack_until_ms_.find(target_low);
+        if (it != start_attack_until_ms_.end() && it->second > now_ms)
+            it->second = now_ms;
     }
     bool start_attack_recently_refused(uint64 target_low, uint32 now_ms) const
     {

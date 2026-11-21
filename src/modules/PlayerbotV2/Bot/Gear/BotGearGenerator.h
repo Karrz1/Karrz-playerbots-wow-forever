@@ -144,6 +144,18 @@ bool RaidEquipUpgrade(uint8 cls, uint16 spec, uint8 level, uint8 slot, uint32 ba
                       uint32 cur_entry, uint32 cur_mainhand_entry, uint32 cur_offhand_entry,
                       bool world_bot = false, uint64 bot_id = 0);
 
+// Below the level cap the bag-item and need-roll compares rank by EquipFitScore (item level and weighted stats), which knows no
+// armor type: a level 21 warrior wore an agility leather chest over its mail one (DoctorSun, Discord 17 Nov), and the same
+// warrior rolled need on it. Each side of such a compare is multiplied by this: the share of its worth the piece `entry` keeps
+// for the wearer (Playerbot::Gear::ArmorTypeFitFactor; 1 for no armor piece, an unknown entry or 0). Item templates only.
+float LevellingArmorFactor(uint32 entry, uint8 cls, uint16 spec, uint8 level);
+
+// Below the level cap: whether a two-hander in the bags may replace the worn main hand when an off hand is worn too. Equipping
+// it takes both off, so it has to beat the pair (ScoreItemRaid, which counts +healing and spell damage equip spells and each
+// class's weapon style), not the main hand alone. True when no off hand is worn or the item is no two-hander. Item templates
+// and DB2 only, like RaidEquipUpgrade.
+bool TwoHandBeatsWornPair(uint8 cls, uint16 spec, uint8 level, uint32 bag_entry, uint32 cur_mainhand_entry, uint32 cur_offhand_entry);
+
 // A fishing pole: no weapon to the bots' own gear rules (bots do not fish). A worn one counts as an empty main hand, so any
 // weapon replaces it, and one in the bags is never put on by itself (a player gave "different gear sets" to a tank bot and it
 // tanked with a fishing pole: the pole is a two-hander, so no shield could go on next to it).
@@ -154,6 +166,11 @@ bool IsFishingPole(uint32 entry);
 // slots: a two-hander or an off-hand weapon would push the shield off, and EnsureShieldTankWeapon puts it back (the old churn).
 // Item templates only, safe on the snapshot build / bot worker threads.
 uint8 AutoEquipSlot(uint16 spec, uint8 slot, uint32 entry);
+// A shield tank (73 / 66) whose off hand holds no shield (empty, or a one-hander it was given): a shield from the bags goes on
+// there whatever the two score. A weapon's damage outscores a shield's stats in every compare, so a tank that once had a
+// weapon in the off hand kept it and its shield stayed in the bags (DoctorSun, RU Discord 11-21: two one-handers, no shield,
+// the tank died). `slot` is the one AutoEquipSlot gave, `worn_entry` what is in it now (0 = nothing). Item templates only.
+bool ShieldGoesOnShieldTank(uint16 spec, uint8 slot, uint32 bag_entry, uint32 worn_entry);
 
 // Build per-class candidate pools at module init. Idempotent. Walks
 // sObjectMgr->GetItemTemplateStore() exactly once.
@@ -174,7 +191,9 @@ bool UsesThrownRanged(uint8 cls);
 uint32 PickThrownWeapon(Player const* wearer);
 
 // Whether a bot may wear this item at all. Classic 1.60 (Forever) also ships Season of Discovery items (ids from
-// ~208000, rune set bonuses); bots there wear vanilla's own items, which all sit below 25000, and no honor-rank rewards.
+// ~208000, rune set bonuses); bots there are dressed in vanilla's own items, which all sit below 25000, and no honor-rank
+// rewards. A non-vanilla piece the realm itself hands out (loot, vendor, quest reward: Forever's new dungeon gear) is kept
+// once a bot has it; the gear pools still leave it out.
 // Holiday items only while their holiday runs, and none with Bots.HolidayClothes = 0 (worn ones come off at the next gear check).
 bool IsBotWearableItemId(uint32 entry);
 

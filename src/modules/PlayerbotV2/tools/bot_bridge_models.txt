@@ -2,7 +2,11 @@
 #
 #   <tier> = <Ollama model> | <download GB> | <graphics card memory GB it needs, 0 = none> | <answers at once>
 #
-# One line per tier: the model the tab suggests for that size of graphics card. "Answers at once" is both the AI program's
+#   <tier>.ru = <Ollama model> | <download GB> | <graphics card memory GB it needs, 0 = none> | <answers at once>
+#
+# One line per tier: the model the tab suggests for that size of graphics card. A <tier>.ru line is the tier's model in the
+# Russian launcher (a model that talks Russian better; pick it with bot_bridge_eval.py --lang ru). Without one the Russian
+# launcher keeps the plain line. Launchers older than 0.1.37 skip the .ru lines. "Answers at once" is both the AI program's
 # --workers and Ollama's OLLAMA_NUM_PARALLEL (the launcher sets it when it starts Ollama). Each one keeps its own context in
 # the card's memory, so small cards keep 2. A tier missing here keeps the launcher's own default.
 #

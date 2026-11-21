@@ -35,14 +35,20 @@ public:
 
     // Vital
     bool   in_combat()    const { return s_->vitals.in_combat; }
+    // The victim is the group's target, given to a healer for its ranged damage between heals (CombatTargetsState::victim_group_target).
+    bool   victim_is_group_target() const { return s_->combat.victim_group_target; }
     bool   is_alive()     const { return s_->vitals.is_alive; }
     bool   is_stunned()   const { return s_->vitals.is_stunned; }
     bool   is_silenced()  const { return s_->vitals.is_silenced; }
     bool   is_rooted()    const { return s_->vitals.is_rooted; }
     bool   is_feared()    const { return s_->vitals.is_feared; }
     bool   is_confused()  const { return s_->vitals.is_confused; }
-    // A heal is refused (PREVENTED_BY_MECHANIC) while stunned, feared, confused or silenced.
-    bool   cannot_heal()  const { return s_->vitals.is_stunned || s_->vitals.is_feared || s_->vitals.is_confused || s_->vitals.is_silenced; }
+    // A heal is refused (PREVENTED_BY_MECHANIC) while stunned, feared, confused or silenced, and fizzles under Loatheb's
+    // Corrupted Mind lock (heals_locked).
+    bool   cannot_heal()  const { return s_->vitals.is_stunned || s_->vitals.is_feared || s_->vitals.is_confused || s_->vitals.is_silenced
+                                         || s_->vitals.heals_locked; }
+    bool   heals_locked()    const { return s_->vitals.heals_locked; }
+    bool   heal_lock_armed() const { return s_->vitals.heal_lock_armed; }
     bool   is_pvp()       const { return s_->vitals.is_pvp; }
     bool   pvp_wanted()   const { return s_->vitals.pvp_wanted; }
     // True when any state would block cast attempts (stun + silence + active
@@ -63,6 +69,8 @@ public:
     bool   has_summon_pending()    const { return s_->social_events.has_summon_pending; }
     bool   has_guild_invite()      const { return s_->guild.has_invite; }
     uint64 guild_invite_id()       const { return s_->guild.invite_id; }
+    bool   guild_invite_bot_owned() const { return s_->guild.invite_bot_owned; }
+    bool   guild_invite_to_owner_guild() const { return s_->guild.invite_to_owner_guild; }
     uint64 guild_id()              const { return s_->guild.id; }
     bool   in_guild()              const { return s_->guild.id != 0; }
     uint8  guild_rank_id()         const { return s_->guild.rank_id; }
@@ -142,6 +150,7 @@ public:
     bool   group_invite_leader_gm() const { return s_->social_events.group_invite_leader_gm; }
     bool   group_invite_leader_friend() const { return s_->social_events.group_invite_leader_friend; }
     bool   group_invite_leader_guildmate() const { return s_->social_events.group_invite_leader_guildmate; }
+    bool   group_invite_bot_owned() const { return s_->social_events.group_invite_bot_owned; }
     uint32 lfg_proposal_id()       const { return s_->lfg.proposal_id; }
     bool   has_lfg_proposal()      const { return s_->lfg.proposal_id != 0; }
     bool   lfg_role_check_pending() const { return s_->lfg.role_check_pending; }

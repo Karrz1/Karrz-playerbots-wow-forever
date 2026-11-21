@@ -1,4 +1,5 @@
 #include "BotItemScorer.h"
+#include "Bot/Gear/ArmorTypeFit.h"
 #include "ClassicSpec.h"
 #include "Bot/ClassTables.h"   // IsVanillaRealm()
 #include "ItemTemplate.h"
@@ -680,10 +681,11 @@ int32 ScoreItemRaid(ItemTemplate const* tpl, uint8 cls, uint16 spec, uint8 level
 
     // Armor of the piece (tanks live on it) and weapon damage per second.
     if (w.armor > 0.0f && tpl->GetClass() == ITEM_CLASS_ARMOR)
-        total += w.armor * float(tpl->GetArmor(ilvl));
+        total += w.armor * (float(tpl->GetArmor(ilvl)) + tpl->GetClassicBonusArmor());   // Classic 1.60: green bonus armor too
     if (tpl->GetClass() == ITEM_CLASS_WEAPON)
     {
-        float const dps = tpl->GetDPS(ilvl);
+        // Classic 1.60 (WoW Forever): a reduced caster weapon deals its share of the table (EV-0097)
+        float const dps = tpl->GetClassicDPS(ilvl, tpl->HasFlag(ITEM_FLAG4_REGULATED_COMMODITY));
         if (slot == EQUIPMENT_SLOT_RANGED)
             total += w.ranged_dps * dps;
         else if (slot == EQUIPMENT_SLOT_OFFHAND)
@@ -709,15 +711,9 @@ int32 ScoreItemRaid(ItemTemplate const* tpl, uint8 cls, uint16 spec, uint8 level
             total -= 60.0f;
     }
 
-    // Armor type: a piece one tier under the best the wearer can put on at its level (mail on a level 40 warrior, leather on a
-    // level 20 one) loses the armor and the class bonuses; about a fifth of what it is worth, and again for each further tier.
+    // Armor type: a piece under the best type the wearer can put on at its level loses a fifth a tier (ArmorTypeFit.h).
     if (tpl->GetClass() == ITEM_CLASS_ARMOR && IsArmorPieceSlotType(inv))
-    {
-        ItemSubclassArmor const preferred = WearableArmorForClass(cls, level);
-        uint32 const sub = tpl->GetSubClass();
-        if (sub >= ITEM_SUBCLASS_ARMOR_CLOTH && sub <= ITEM_SUBCLASS_ARMOR_PLATE && sub < uint32(preferred))
-            total *= std::pow((role == RaidRole::Tank) ? 0.6f : 0.8f, float(uint32(preferred) - sub));
-    }
+        total *= ArmorTierFactor(tpl->GetSubClass(), uint32(WearableArmorForClass(cls, level)), role == RaidRole::Tank);
 
     // Weapon style. A two-hander carries the budget of both hands and leaves no offhand: right for the classes that
     // fight with one (arms, retribution, enhancement, feral and bear, hunter melee), wrong for the ones that
@@ -749,6 +745,13 @@ int32 ScoreItemForBot(ItemTemplate const* tpl, Player* bot)
     if (!bot) return -1000;
     uint16 spec = uint16(::Playerbot::Classic::EffectiveSpecId(bot));
     return ScoreItemForClass(tpl, bot->GetClass(), spec, bot->GetLevel());
+}
+
+float ArmorTypeFitFactor(ItemTemplate const* tpl, uint8 cls, uint16 spec, uint8 level)
+{
+    if (!tpl || tpl->GetClass() != ITEM_CLASS_ARMOR || !IsArmorPieceSlotType(uint8(tpl->GetInventoryType())))
+        return 1.0f;
+    return ArmorTierFactor(tpl->GetSubClass(), uint32(WearableArmorForClass(cls, level)), RaidRoleForBot(cls, spec) == RaidRole::Tank);
 }
 
 } // namespace Playerbot::Gear

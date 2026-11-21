@@ -433,6 +433,9 @@ int32 OocDrinkStartManaPct(BotSnapshotView const& s, GroupSnapshotView const* g,
 // or below, healthstone first, then a healing potion; kept while a heal is
 // about to land unless the bot is at 20% or below. 0 = nothing to use.
 uint32 PickCombatHealthItem(BotSnapshotView const& s, GroupSnapshotView const& g);
+// The bot carries a harmful aura the raid keeps on (Raid::KeepsAura): no self cure that takes every harmful effect at once (Every Man for
+// Himself, Divine Shield) while it does. Sapphiron's Icebolt 28522: its end deletes the ice block (spell_sapphiron_icebolt HandleRemove).
+bool CarriesKeptAura(BotSnapshotView const& s);
 
 // In-combat mana item: at 20% mana or below (a group healer in a boss fight,
 // BossFight: 35%), a conjured mana gem, then a mana potion, then a Dark /
@@ -444,6 +447,14 @@ uint32 PickCombatManaItem(BotSnapshotView const& s, GroupSnapshotView const* g =
 
 // Health % at or below which PickCombatHealthItem uses an item.
 constexpr int32 kCombatHealthItemPct = 30;
+// Loatheb's Inevitable Doom (29204, SpellEffect: one periodic tick of 2550 shadow at 10 s): in its last kInevitableDoomItemMs a bot with
+// no more than the tick and kInevitableDoomMargin left uses its health item (the margin covers a melee swing or a spore landing first).
+constexpr uint32 kInevitableDoom       = 29204;
+constexpr uint32 kLoathebEntry         = 16011;
+constexpr int32  kLoathebHealthItemPct = 50;   // in his fight the health item is used from this health on
+constexpr int32  kInevitableDoomDamage = 2550;
+constexpr int32  kInevitableDoomMargin = 500;
+constexpr int64  kInevitableDoomItemMs = 3000;
 // Mana % at or below which a group healer in a boss fight uses a mana item.
 constexpr int32 kBossHealerManaItemPct = 35;
 // ... and the mana % above which it does not even look. The items are on a 2-minute cooldown: spent at 71-81 % (UBRS 20 Oct, both priests)

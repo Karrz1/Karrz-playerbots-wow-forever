@@ -622,17 +622,32 @@ void DoMockingBlow(ApPredicateContext const& ctx, BotIntentEmitter& e)
         }
 }
 
-// -- Thunder Clap on a trash pack --
-// 3+ engaged mobs within the clap's 8 yd, trash only, no crowd-controlled mob
+// -- Thunder Clap on a trash pack, or on adds held away from the boss --
+// 3+ engaged mobs within the clap's 8 yd, trash or adds clear of the boss (ClapClearOfBoss), no crowd-controlled mob
 // or another tank's mob in reach, and 20 rage kept through the stance change
 // (Tactical Mastery 4+). Once per dance lockout (the clap's cooldown is
 // shorter): the switch costs every point of rage above what is kept.
 constexpr float kThunderClapRange = 8.0f;
 constexpr int32 kThunderClapRage  = 20;
 
+// In a boss fight, only a tank holding adds well away from every boss claps: its victim is no boss and no boss stands within the clap's
+// reach and a margin, so the stance change costs the boss's tanking nothing. Gluth's chow tanks hold 6-8 Zombie Chows each 51-65 y from him
+// and never clapped (naxx_gluth 1118 r4: no Thunder Clap in any run, the bear chow tank dead at 72-87 s, before the first Decimate).
+constexpr float kClapBossClear = 20.0f;
+bool ClapClearOfBoss(ApPredicateContext const& ctx)
+{
+    NearbyUnit const* v = ctx.bot.victim_info();
+    if (!v || Classic::IsBossUnit(*v))
+        return false;
+    for (NearbyUnit const& u : ctx.bot.nearby_enemies())
+        if (Classic::IsBossUnit(u) && u.hp > 0 && TankThreat::Dist2(ctx.bot, u) <= kClapBossClear * kClapBossClear)
+            return false;
+    return true;
+}
+
 bool ThunderClapWorth(ApPredicateContext const& ctx)
 {
-    return ctx.bot.in_combat() && HasLiveTarget(ctx) && !Classic::BossFight(ctx.bot) && !BossCastingOnMe(ctx)
+    return ctx.bot.in_combat() && HasLiveTarget(ctx) && (!Classic::BossFight(ctx.bot) || ClapClearOfBoss(ctx)) && !BossCastingOnMe(ctx)
         && TankThreat::EngagedWithin(ctx.bot, kThunderClapRange) >= 3
         && MeleeAoeSafe(ctx.bot, InRaid(ctx), kThunderClapRange, /*tank*/ true, "Thunder Clap")
         && AoeSafeAroundSelf(ctx.bot, kThunderClapRange, /*damaging*/ true, /*tank*/ true, "Thunder Clap", THUNDER_CLAP)

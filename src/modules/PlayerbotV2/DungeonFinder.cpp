@@ -26,6 +26,7 @@
 #include "Services.h"
 #include "Util/ConfigReader.h"
 
+#include <optional>
 #include <unordered_map>
 
 namespace Playerbot::V2
@@ -118,17 +119,36 @@ namespace
         return {};
     }
 
-    // The door of the dungeon: the named areatrigger when it leads into the map, else the first entrance the server knows.
-    AreaTriggerTeleport const* DoorOf(ListedActivity const& act)
+    // Where the door of a dungeon lands: `id` is the areatrigger_teleport id, or the world_safe_locs id of a Forever dungeon's landing.
+    struct Door
     {
-        uint32 const trigger = FinderEntranceTrigger(act.activity, Playerbot::Services::Config().lfg_finder_entrances());
+        WorldLocation loc;
+        uint32 id = 0;
+        char const* kind = "";
+    };
+
+    // The door of the dungeon: the named areatrigger when it leads into the map, else a Forever dungeon's landing (its door is a server
+    // areatrigger that teleports there), else the first entrance the server knows.
+    std::optional<Door> DoorOf(ListedActivity const& act)
+    {
+        auto const& overrides = Playerbot::Services::Config().lfg_finder_entrances();
+        uint32 const trigger = FinderEntranceTrigger(act.activity, overrides);
         AreaTriggerTeleport const* door = trigger ? sObjectMgr->GetAreaTrigger(trigger) : nullptr;
         if (door && door->Loc.GetMapId() == act.map)
-            return door;
+            return Door{ door->Loc, door->ID, "areatrigger" };
         if (trigger)
             TC_LOG_INFO("playerbot.v2", "[dungeon_finder] entrance {} of activity {} does not lead into map {}: the map's first entrance is used",
                         trigger, act.activity, act.map);
-        return sObjectMgr->GetMapEntranceTrigger(act.map);
+        if (uint32 const landing = FinderLandingSafeLoc(act.activity, overrides))
+        {
+            if (WorldSafeLocsEntry const* safe = sObjectMgr->GetWorldSafeLoc(landing); safe && safe->Loc.GetMapId() == act.map)
+                return Door{ safe->Loc, landing, "landing" };
+            TC_LOG_INFO("playerbot.v2", "[dungeon_finder] landing {} of activity {} is missing or not in map {}: the map's first entrance is used",
+                        landing, act.activity, act.map);
+        }
+        if (AreaTriggerTeleport const* first = sObjectMgr->GetMapEntranceTrigger(act.map))
+            return Door{ first->Loc, first->ID, "areatrigger" };
+        return std::nullopt;
     }
 
     uint32 MembersOf(Player const* leader)
@@ -242,7 +262,7 @@ bool DungeonFinderQueue(Player* leader, std::string const& what, Playerbot::Role
     }
     ListedActivity const& act = dungeons[picks.front()];
     std::string const name = NameOf(act);
-    AreaTriggerTeleport const* door = DoorOf(act);
+    std::optional<Door> const door = DoorOf(act);
     if (!door)
     { msg = "Dungeon finder: no entrance of " + name + " is known on this realm."; return false; }
     // The same check the dungeon's portal makes (level, attunement, a save of another instance): said now rather than after the wait.
@@ -253,9 +273,9 @@ bool DungeonFinderQueue(Player* leader, std::string const& what, Playerbot::Role
     std::string report;
     uint32 const started = LfgFillToSize(leader, ownRole, act.size, gap, report);
     uint32 const now = getMSTime();
-    g_runs[key] = FinderRun{ Phase::Forming, act.activity, act.map, act.size, door->Loc, now, name };
-    TC_LOG_INFO("playerbot.v2", "[dungeon_finder] {} (level {}) queued for {} (activity {} map {} entrance loc {}): party of {}, missing {} -> {} bot(s) started.{}",
-                leader->GetName(), leader->GetLevel(), name, act.activity, act.map, door->ID, act.size, GapText(gap), started, report);
+    g_runs[key] = FinderRun{ Phase::Forming, act.activity, act.map, act.size, door->loc, now, name };
+    TC_LOG_INFO("playerbot.v2", "[dungeon_finder] {} (level {}) queued for {} (activity {} map {} {} {}): party of {}, missing {} -> {} bot(s) started.{}",
+                leader->GetName(), leader->GetLevel(), name, act.activity, act.map, door->kind, door->id, act.size, GapText(gap), started, report);
     msg = "Dungeon finder: " + name + " (levels " + std::to_string(act.levelMin) + "-" + std::to_string(act.levelMax) + ").";
     if (gap.Total())
         msg += " " + std::to_string(started) + " bot(s) are joining (" + GapText(gap) + " missing). You go in when the group is complete.";
