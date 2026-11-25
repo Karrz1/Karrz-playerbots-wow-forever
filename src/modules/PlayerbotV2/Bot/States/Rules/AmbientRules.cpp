@@ -19,6 +19,7 @@
 #include "Bot/BotSnapshotView.h"
 #include "Bot/BotIntentEmitter.h"
 #include "Bot/BotIntent.h"
+#include "Bot/BotTextMgr.h"
 #include "DB2Stores.h"
 #include "World.h"
 #include "Util/ConfigReader.h"
@@ -1804,8 +1805,14 @@ bool KindHealFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
     }
     if (urand(0, 3) == 0)
     {
-        static constexpr char const* kLines[] = { "there you go", "patched you up", "heal inc", "careful out there", "you looked like you needed that" };
-        emit.say_world(kLines[urand(0, uint32(std::size(kLines)) - 1)]);
+        // Migration 9003: the text table's say_kindness_heal key first; the builtin pool otherwise.
+        std::string line = BotTextMgr::instance().Get("say_kindness_heal");
+        if (line.empty())
+        {
+            static constexpr char const* kLines[] = { "there you go", "patched you up", "heal inc", "careful out there", "you looked like you needed that" };
+            line = kLines[urand(0, uint32(std::size(kLines)) - 1)];
+        }
+        emit.say_world(std::move(line));
     }
     board.heals.fetch_add(1, std::memory_order_relaxed);
     TC_LOG_INFO("playerbot.v2", "[kindness] {} heals a passing player (guid {}) at {}% with {}", s.name(), t->guid, t->hp_pct, rank);
@@ -1870,8 +1877,14 @@ bool KindRezFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, 
     ObjectGuid const target = ObjectGuid::Create<HighGuid::Player>(t->guid);
     emit.face_target(target);
     if (!emit.cast(KindRezSpell(s.cls()), target)) return false;
-    static constexpr char const* kLines[] = { "rez inc", "hold on, rezzing you", "got you", "rez coming", "don't release, rezzing" };
-    emit.say_world(kLines[urand(0, uint32(std::size(kLines)) - 1)]);
+    // Migration 9003: the text table's say_kindness_rez key first; the builtin pool otherwise.
+    std::string rez_line = BotTextMgr::instance().Get("say_kindness_rez");
+    if (rez_line.empty())
+    {
+        static constexpr char const* kLines[] = { "rez inc", "hold on, rezzing you", "got you", "rez coming", "don't release, rezzing" };
+        rez_line = kLines[urand(0, uint32(std::size(kLines)) - 1)];
+    }
+    emit.say_world(std::move(rez_line));
     board.rezzes.fetch_add(1, std::memory_order_relaxed);
     TC_LOG_INFO("playerbot.v2", "[kindness] {} resurrects a player (guid {})", s.name(), t->guid);
     ai.set_last_rule_fired("idle:kind_rez");

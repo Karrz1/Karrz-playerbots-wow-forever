@@ -2052,16 +2052,23 @@ void BotChatReactor::ReactGuildJoin(uint64 guild_id, ObjectGuid joiner_guid,
     // Compose a welcome line. Address the joiner by first name where possible.
     std::string first = joiner_name;
     if (auto sp = first.find(' '); sp != std::string::npos) first.resize(sp);
-    static constexpr char const* kTemplates[] = {
-        "welcome {}!", "welcome to the guild {} :)", "hey {}, welcome!",
-        "welcome aboard {}!", "{} welcome! :)", "glad to have you {}!",
-    };
-    constexpr size_t kN = sizeof(kTemplates) / sizeof(*kTemplates);
-    std::string line = kTemplates[seed % kN];
-    if (auto pos = line.find("{}"); pos != std::string::npos)
+    // Migration 9003: the text table's guild_join_welcome key first (%s = the joiner);
+    // the builtin templates otherwise, picked by the same stable seed.
+    std::string line = BotTextMgr::instance().Get("guild_join_welcome",
+        { { "%s", first.empty() ? std::string("friend") : first } });
+    if (line.empty())
     {
-        if (!first.empty()) line.replace(pos, 2, first);
-        else                line.replace(pos, 2, "friend");
+        static constexpr char const* kTemplates[] = {
+            "welcome {}!", "welcome to the guild {} :)", "hey {}, welcome!",
+            "welcome aboard {}!", "{} welcome! :)", "glad to have you {}!",
+        };
+        constexpr size_t kN = sizeof(kTemplates) / sizeof(*kTemplates);
+        line = kTemplates[seed % kN];
+        if (auto pos = line.find("{}"); pos != std::string::npos)
+        {
+            if (!first.empty()) line.replace(pos, 2, first);
+            else                line.replace(pos, 2, "friend");
+        }
     }
 
     // Stamp throttle only now that we will emit.
