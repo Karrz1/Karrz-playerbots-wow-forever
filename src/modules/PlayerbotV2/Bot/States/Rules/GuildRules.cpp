@@ -423,10 +423,21 @@ bool GuildChatQuietGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView cons
     return true;
 }
 
+// A /g line needs a real guild member online to hear it: without one, guild chat is bots talking to an
+// empty channel — the gate stays closed so the line waits for an audience instead of being spent unheard.
+// RecruitChannelGate keeps the plain QuietGate on purpose: its post goes to a public channel, where
+// recruiting for a bot-only guild is the point. The event HoldGates keep it too: the gathering itself
+// still happens, only the chatter waits.
+bool GuildChatAudienceGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
+{
+    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    return s.guild_online_human_member_count() > 0;
+}
+
 // ---------- idle:guild_chat:ding ----------
 bool ChatDingGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     return s.level() > ai.guild_chat_last_ding_level();
 }
 
@@ -454,7 +465,7 @@ bool ChatDingFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& 
 // ---------- idle:guild_chat:login_greet ----------
 bool ChatLoginGreetGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     return ai.guild_chat_login_greeted_ms() == 0 &&
            s.guild_online_member_count() >= 2;
 }
@@ -477,12 +488,7 @@ bool ChatLoginGreetFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView c
 // ---------- idle:guild_chat:smalltalk ----------
 bool ChatSmalltalkGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
-    // SC-P3c: require at least one ONLINE human guildmate. Smalltalk is
-    // self-initiated ambient chatter; with no human in the guild it's bots
-    // babbling to each other, which is pointless traffic and reads as a tell.
-    // Reactive announces (ding/login_greet/quest_brag) stay unconditional.
-    if (s.guild_online_human_member_count() < 1) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     if (s.guild_online_member_count() < 3) return false;
     const uint32 gc_now_ms = GameTime::GetGameTimeMS();
     if (ai.guild_chat_last_smalltalk_ms() != 0 &&
@@ -521,11 +527,8 @@ bool ChatSmalltalkFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView cons
 // ---------- idle:guild_chat:tavern_hangout ----------
 bool ChatTavernHangoutGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
-    // SC-P3c: the tavern-hangout pitch is broadcast to /g, so it needs a
-    // human audience to be worth sending. (The cluster check below only
-    // confirms 2+ guildmates are physically nearby — those can all be bots.)
-    if (s.guild_online_human_member_count() < 1) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
+    // The cluster check below confirms 2+ guildmates are physically nearby — those can all be bots.
     const uint32 gc_now_ms = GameTime::GetGameTimeMS();
     if (ai.guild_chat_last_hangout_ms() != 0 &&
         gc_now_ms - ai.guild_chat_last_hangout_ms() <= 60u * 60u * 1000u)
@@ -556,7 +559,7 @@ bool ChatTavernHangoutFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotVie
 // ---------- idle:guild_chat:rival_banter ----------
 bool ChatRivalBanterGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     if (s.guild_rival_id() == 0) return false;
     const uint32 gc_now_ms = GameTime::GetGameTimeMS();
     if (ai.guild_chat_last_smalltalk_ms() != 0 &&
@@ -590,7 +593,7 @@ bool ChatRivalBanterFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView co
 // ---------- idle:guild_chat:quest_brag ----------
 bool ChatQuestBragGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     const uint16 quest_count_now = s.completed_quest_count();
     if (ai.guild_chat_last_seen_quest_count() == 0xFFFF)
     {
@@ -635,7 +638,7 @@ bool ChatQuestBragFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView co
 // ---------- idle:guild_chat:lfm_pulse ----------
 bool ChatLfmPulseGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     const uint32 gc_now_ms = GameTime::GetGameTimeMS();
     if (!s.lfg_in_queue())
     {
@@ -665,7 +668,7 @@ bool ChatLfmPulseFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView const
 // ---------- idle:guild_event:announce ----------
 bool EventAnnounceGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     return s.guild_has_pending_callout() && s.guild_rank_id() <= 1;
 }
 
@@ -785,7 +788,7 @@ bool EventStagingHoldFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView
 // ---------- idle:guild_event:tavern (dance / chat, in its place) ----------
 bool EventTavernGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     EventPlace p;
     return GuildEventPlace(s, /*tavern*/ true, p) && p.dist <= kEventPlaceReach;
 }
@@ -823,7 +826,7 @@ bool EventTavernFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView const&
 // ---------- idle:guild_event:staging (chat, in its place) ----------
 bool EventStagingGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     EventPlace p;
     return GuildEventPlace(s, /*tavern*/ false, p) && p.dist <= kEventPlaceReach;
 }
