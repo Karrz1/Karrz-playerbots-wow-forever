@@ -244,10 +244,16 @@ void DispatchDead(BotAI& ai,
         {
             if (s_last_wipe_chat_ms.compare_exchange_strong(last, wnow ? wnow : 1u))
             {
-                static constexpr char const* kWipe[] = {
-                    "well, that went badly", "wipe :(", "ouch", "ok that one is on me", "and we're all dead",
-                };
-                emit.say(kWipe[ai.rng().int_range(0, int32_t(sizeof(kWipe) / sizeof(*kWipe)))]);
+                // Migration 9003: the text table's banter_raid_wipe key first; the builtin pool otherwise.
+                std::string wipe_line = BotTextMgr::instance().Get("banter_raid_wipe");
+                if (wipe_line.empty())
+                {
+                    static constexpr char const* kWipe[] = {
+                        "well, that went badly", "wipe :(", "ouch", "ok that one is on me", "and we're all dead",
+                    };
+                    wipe_line = kWipe[ai.rng().int_range(0, int32_t(sizeof(kWipe) / sizeof(*kWipe)))];
+                }
+                emit.say(std::move(wipe_line));
             }
         }
     }

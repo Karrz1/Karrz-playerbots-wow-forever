@@ -112,6 +112,12 @@ public:
     Line        Pick(std::string_view key, TextPlaceholders const& ph = {}) const;
     std::string Get(std::string_view key, TextPlaceholders const& ph = {}) const { return Pick(key, ph).text; }
 
+    // One weighted random line among the merged rows of `keys` (a base key and its role / class /
+    // personality variants, e.g. 'banter_ready' + 'banter_ready_tank'). Keys without rows are skipped;
+    // empty when none of them has rows.
+    Line        PickKeys(std::vector<std::string_view> const& keys, TextPlaceholders const& ph = {}) const;
+    std::string GetKeys(std::vector<std::string_view> const& keys, TextPlaceholders const& ph = {}) const { return PickKeys(keys, ph).text; }
+
     // Random 'reply' row of the given type, %s filled with `other_name`. Empty when none.
     std::string GetReply(ReplyType type, std::string const& other_name) const;
 
@@ -132,6 +138,9 @@ private:
     // Weighted pick among `rows` (those passing `accept`); null when none qualifies.
     template <typename Accept>
     static Row const* PickWeighted(std::vector<Row> const& rows, Accept&& accept);
+
+    // Row -> Line: text + say_type, placeholders filled; empty when an unfilled one remains.
+    static Line FromRow(Row const* row, TextPlaceholders const& ph);
 
     std::unordered_map<std::string, std::vector<Row>> texts_;
     std::unordered_map<std::string, float>            chance_;

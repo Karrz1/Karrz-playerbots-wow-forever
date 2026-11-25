@@ -158,15 +158,9 @@ BotTextMgr::Row const* BotTextMgr::PickWeighted(std::vector<Row> const& rows, Ac
     return nullptr;
 }
 
-BotTextMgr::Line BotTextMgr::Pick(std::string_view key, TextPlaceholders const& ph) const
+BotTextMgr::Line BotTextMgr::FromRow(Row const* row, TextPlaceholders const& ph)
 {
     Line out;
-    auto it = texts_.find(std::string(key));
-    if (it == texts_.end())
-        return out;
-    Row const* row = PickWeighted(it->second, [](Row const&) { return true; });
-    if (!row)
-        return out;
     out.text = row->text;
     out.yell = row->say_type == 1;
     Fill(out.text, ph);
@@ -174,6 +168,44 @@ BotTextMgr::Line BotTextMgr::Pick(std::string_view key, TextPlaceholders const& 
     if (V2::ChannelTalk::HasUnfilledPlaceholder(out.text))
         out.text.clear();
     return out;
+}
+
+BotTextMgr::Line BotTextMgr::Pick(std::string_view key, TextPlaceholders const& ph) const
+{
+    auto it = texts_.find(std::string(key));
+    if (it == texts_.end())
+        return {};
+    Row const* row = PickWeighted(it->second, [](Row const&) { return true; });
+    return row ? FromRow(row, ph) : Line{};
+}
+
+BotTextMgr::Line BotTextMgr::PickKeys(std::vector<std::string_view> const& keys, TextPlaceholders const& ph) const
+{
+    uint64 total = 0;
+    for (std::string_view key : keys)
+    {
+        auto it = texts_.find(std::string(key));
+        if (it == texts_.end())
+            continue;
+        for (Row const& r : it->second)
+            total += r.weight;
+    }
+    if (total == 0)
+        return {};
+    uint64 roll = urand(0, uint32(std::min<uint64>(total, 0xFFFFFFFFu) - 1));
+    for (std::string_view key : keys)
+    {
+        auto it = texts_.find(std::string(key));
+        if (it == texts_.end())
+            continue;
+        for (Row const& r : it->second)
+        {
+            if (roll < r.weight)
+                return FromRow(&r, ph);
+            roll -= r.weight;
+        }
+    }
+    return {};
 }
 
 std::string BotTextMgr::GetReply(ReplyType type, std::string const& other_name) const
@@ -1388,6 +1420,52 @@ std::string PickBanter(Banter kind, uint8 cls, Role role, BotPersonality const& 
     bool const polite = pers.politeness == Politeness::Polite;
     bool const rude   = pers.politeness == Politeness::Rude;
     bool const rp     = pers.verbosity == Verbosity::Roleplay;
+
+    // The text table's banter_<kind> key first (migration 9003), its role / class / personality
+    // variants merged in with the same conditionals as the builtin pools below; those pools stand
+    // for a server whose table has no banter rows.
+    char const* base = nullptr;
+    switch (kind)
+    {
+        case Banter::Ready:    base = "banter_ready"; break;
+        case Banter::Wipe:     base = "banter_wipe"; break;
+        case Banter::Thanks:   base = "banter_thanks"; break;
+        case Banter::Ouch:     base = "banter_ouch"; break;
+        case Banter::BossKill: base = "banter_bosskill"; break;
+    }
+    std::vector<std::string> wanted = { base };
+    auto add_key = [&](char const* suffix) { wanted.emplace_back(std::string(base) + suffix); };
+    switch (kind)
+    {
+        case Banter::Ready:
+            if (tank)   add_key("_tank");
+            if (healer) add_key("_healer");
+            else if (caster) add_key("_caster");
+            if (rp)     add_key("_rp");
+            break;
+        case Banter::Wipe:
+            if (tank)   add_key("_tank");
+            if (healer) add_key("_healer");
+            if (polite) add_key("_polite");
+            if (rude)   add_key("_rude");
+            break;
+        case Banter::Thanks:
+            if (polite) add_key("_polite");
+            if (rude)   add_key("_rude");
+            break;
+        case Banter::Ouch:
+            if (tank)   add_key("_tank");
+            if (caster) add_key("_caster");
+            break;
+        case Banter::BossKill:
+            if (polite) add_key("_polite");
+            if (tank)   add_key("_tank");
+            if (rp)     add_key("_rp");
+            break;
+    }
+    std::vector<std::string_view> keys(wanted.begin(), wanted.end());
+    if (std::string line = BotTextMgr::instance().GetKeys(keys); !line.empty())
+        return line;
 
     std::array<LineSpan, 6> pools{};
     size_t n = 0;
